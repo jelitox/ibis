@@ -1,4 +1,5 @@
 import datetime
+import enum
 from collections import OrderedDict
 
 import pandas as pd
@@ -149,6 +150,12 @@ def test_struct_with_string_types():
             ('d', dt.int8),
         ]
     )
+
+
+def test_struct_from_dict():
+    result = dt.Struct.from_dict({'b': 'int64', 'a': dt.float64})
+
+    assert result == dt.Struct(names=['b', 'a'], types=[dt.int64, dt.float64])
 
 
 @pytest.mark.parametrize(
@@ -360,6 +367,11 @@ def test_time_valid():
     assert dt.dtype('time').equals(dt.time)
 
 
+class Foo(enum.Enum):
+    a = 1
+    b = 2
+
+
 @pytest.mark.parametrize(
     ('value', 'expected_dtype'),
     [
@@ -425,6 +437,7 @@ def test_time_valid():
                 ]
             ),
         ),
+        (Foo.a, dt.Enum(dt.string, dt.int8)),
         param(
             datetime.timedelta(hours=5),
             dt.Interval(unit='h'),

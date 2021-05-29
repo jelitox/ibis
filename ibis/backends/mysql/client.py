@@ -6,10 +6,13 @@ import pymysql  # NOQA fail early if the driver is missing
 import sqlalchemy as sa
 import sqlalchemy.dialects.mysql as mysql
 
-import ibis.backends.base_sqlalchemy.alchemy as alch
 import ibis.expr.datatypes as dt
-
-from .compiler import MySQLDialect
+from ibis.backends.base.sql.alchemy import (
+    AlchemyClient,
+    AlchemyDatabase,
+    AlchemyDatabaseSchema,
+    AlchemyTable,
+)
 
 # TODO(kszucs): unsigned integers
 
@@ -34,19 +37,19 @@ def mysql_blob(satype, nullable=True):
     return dt.Binary(nullable=nullable)
 
 
-class MySQLTable(alch.AlchemyTable):
+class MySQLTable(AlchemyTable):
     pass
 
 
-class MySQLSchema(alch.AlchemyDatabaseSchema):
+class MySQLSchema(AlchemyDatabaseSchema):
     pass
 
 
-class MySQLDatabase(alch.AlchemyDatabase):
+class MySQLDatabase(AlchemyDatabase):
     schema_class = MySQLSchema
 
 
-class MySQLClient(alch.AlchemyClient):
+class MySQLClient(AlchemyClient):
 
     """The Ibis MySQL client class
 
@@ -55,12 +58,9 @@ class MySQLClient(alch.AlchemyClient):
     con : sqlalchemy.engine.Engine
     """
 
-    dialect = MySQLDialect
-    database_class = MySQLDatabase
-    table_class = MySQLTable
-
     def __init__(
         self,
+        backend,
         host='localhost',
         user=None,
         password=None,
@@ -69,6 +69,9 @@ class MySQLClient(alch.AlchemyClient):
         url=None,
         driver='pymysql',
     ):
+        self.dialect = backend.dialect
+        self.database_class = backend.database_class
+        self.table_class = backend.table_class
         if url is None:
             if driver != 'pymysql':
                 raise NotImplementedError(

@@ -4,10 +4,9 @@ import ibis.common.exceptions as com
 import ibis.expr.types as types
 from ibis.backends.spark.client import SparkClient
 from ibis.expr.scope import Scope
-from ibis.expr.timecontext import canonicalize_context
+from ibis.expr.timecontext import canonicalize_context, localize_context
 
-from .compiler import PySparkDialect, PySparkExprTranslator
-from .operations import PySparkTable
+from .compiler import PySparkExprTranslator
 
 
 class PySparkClient(SparkClient):
@@ -15,11 +14,8 @@ class PySparkClient(SparkClient):
     An ibis client that uses PySpark SQL Dataframe
     """
 
-    dialect = PySparkDialect
-    table_class = PySparkTable
-
-    def __init__(self, session):
-        super().__init__(session)
+    def __init__(self, backend, session):
+        super().__init__(backend, session)
         self.translator = PySparkExprTranslator()
 
     def compile(self, expr, timecontext=None, params=None, *args, **kwargs):
@@ -27,7 +23,15 @@ class PySparkClient(SparkClient):
         """
 
         if timecontext is not None:
-            timecontext = canonicalize_context(timecontext)
+            session_timezone = self._session.conf.get(
+                'spark.sql.session.timeZone'
+            )
+            # Since spark use session timezone for tz-naive timestamps
+            # we localize tz-naive context here to match that behavior
+            timecontext = localize_context(
+                canonicalize_context(timecontext), session_timezone
+            )
+
         # Insert params in scope
         if params is None:
             scope = Scope()

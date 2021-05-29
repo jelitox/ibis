@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-import pandas.util.testing as tm
+import pandas.testing as tm
 import pytest
 
 import ibis
@@ -10,50 +10,7 @@ from ibis.expr import schema as sch
 pytestmark = pytest.mark.pandas
 
 
-@pytest.mark.parametrize(
-    ('column', 'expected_dtype'),
-    [
-        ([True, False, False], dt.boolean),
-        (np.int8([-3, 9, 17]), dt.int8),
-        (np.uint8([3, 0, 16]), dt.uint8),
-        (np.int16([-5, 0, 12]), dt.int16),
-        (np.uint16([5569, 1, 33]), dt.uint16),
-        (np.int32([-12, 3, 25000]), dt.int32),
-        (np.uint32([100, 0, 6]), dt.uint32),
-        (np.uint64([666, 2, 3]), dt.uint64),
-        (np.int64([102, 67228734, -0]), dt.int64),
-        (np.float32([45e-3, -0.4, 99.0]), dt.float),
-        (np.float64([-3e43, 43.0, 10000000.0]), dt.double),
-        (['foo', 'bar', 'hello'], dt.string),
-        (
-            [
-                pd.Timestamp('2010-11-01 00:01:00'),
-                pd.Timestamp('2010-11-01 00:02:00.1000'),
-                pd.Timestamp('2010-11-01 00:03:00.300000'),
-            ],
-            dt.timestamp,
-        ),
-        (
-            pd.date_range('20130101', periods=3, tz='US/Eastern'),
-            dt.Timestamp('US/Eastern'),
-        ),
-        (
-            [
-                pd.Timedelta('1 days'),
-                pd.Timedelta('-1 days 2 min 3us'),
-                pd.Timedelta('-2 days +23:57:59.999997'),
-            ],
-            dt.Interval('ns'),
-        ),
-        (pd.Series(['a', 'b', 'c', 'a']).astype('category'), dt.Category()),
-    ],
-)
-def test_infer_simple_dataframe(column, expected_dtype):
-    df = pd.DataFrame({'col': column})
-    assert sch.infer(df) == ibis.schema([('col', expected_dtype)])
-
-
-def test_infer_exhaustive_dataframe():
+def test_infer_basic_types():
     df = pd.DataFrame(
         {
             'bigint_col': np.array(
@@ -192,6 +149,37 @@ def test_infer_exhaustive_dataframe():
         ('timestamp_col', dt.timestamp),
         ('tinyint_col', dt.int8),
         ('year', dt.int64),
+    ]
+
+    assert sch.infer(df) == ibis.schema(expected)
+
+
+def test_infer_array():
+    df = pd.DataFrame(
+        {
+            # Columns containing np.arrays
+            'int64_arr_col': [
+                np.array([0, 1], dtype='int64'),
+                np.array([3, 4], dtype='int64'),
+            ],
+            'string_arr_col': [np.array(['0', '1']), np.array(['3', '4'])],
+            # Columns containing pd.Series
+            'int64_series_col': [
+                pd.Series([0, 1], dtype='int64'),
+                pd.Series([3, 4], dtype='int64'),
+            ],
+            'string_series_col': [
+                pd.Series(['0', '1']),
+                pd.Series(['3', '4']),
+            ],
+        }
+    )
+
+    expected = [
+        ('int64_arr_col', dt.Array(dt.int64)),
+        ('string_arr_col', dt.Array(dt.string)),
+        ('int64_series_col', dt.Array(dt.int64)),
+        ('string_series_col', dt.Array(dt.string)),
     ]
 
     assert sch.infer(df) == ibis.schema(expected)

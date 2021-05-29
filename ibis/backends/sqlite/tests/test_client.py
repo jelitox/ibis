@@ -2,16 +2,13 @@ import os
 import uuid
 
 import numpy as np
-import pandas.util.testing as tm
+import pandas.testing as tm
 import pytest
 
 import ibis
 import ibis.config as config
 import ibis.expr.types as ir
 from ibis.util import guid
-
-sa = pytest.importorskip('sqlalchemy')
-
 
 pytestmark = pytest.mark.sqlite
 

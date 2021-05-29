@@ -103,7 +103,7 @@ def one_of(inners, arg):
 
 @validator
 def all_of(inners, arg):
-    """All of the inner valudators must pass.
+    """All of the inner validators must pass.
 
     The order of inner validators matters.
 
@@ -137,6 +137,8 @@ def isin(values, arg):
 
 @validator
 def member_of(obj, arg):
+    if isinstance(arg, ir.EnumValue):
+        arg = arg.op().value
     if isinstance(arg, enum.Enum):
         enum.unique(obj)  # check that enum has unique values
         arg = arg.name
@@ -243,6 +245,11 @@ def array_of(inner, arg):
             '{}'.format(val, val.type())
         )
     return value(dt.Array(inner(val[0]).type()), val)
+
+
+@validator
+def optional(validator, arg):
+    return one_of([instance_of(type(None)), validator], arg)
 
 
 any = value(dt.any)

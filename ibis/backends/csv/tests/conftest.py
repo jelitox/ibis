@@ -1,7 +1,64 @@
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
-from ibis.backends.csv import CSVClient
+import ibis
+import ibis.expr.datatypes as dt
+import ibis.expr.types as ir
+from ibis.backends.pandas.tests.conftest import TestConf as PandasTest
+
+
+class TestConf(PandasTest):
+    check_names = False
+    supports_divide_by_zero = True
+    returned_timestamp_unit = 'ns'
+
+    @staticmethod
+    def connect(data_directory: Path) -> ibis.client.Client:
+        filename = data_directory / 'functional_alltypes.csv'
+        if not filename.exists():
+            pytest.skip('test data set {} not found'.format(filename))
+        return ibis.csv.connect(data_directory)
+
+    @property
+    def functional_alltypes(self) -> ir.TableExpr:
+        schema = ibis.schema(
+            [
+                ('bool_col', dt.boolean),
+                ('string_col', dt.string),
+                ('timestamp_col', dt.timestamp),
+            ]
+        )
+        return self.connection.table('functional_alltypes', schema=schema)
+
+    @property
+    def batting(self) -> ir.TableExpr:
+        schema = ibis.schema(
+            [
+                ('lgID', dt.string),
+                ('G', dt.float64),
+                ('AB', dt.float64),
+                ('R', dt.float64),
+                ('H', dt.float64),
+                ('X2B', dt.float64),
+                ('X3B', dt.float64),
+                ('HR', dt.float64),
+                ('RBI', dt.float64),
+                ('SB', dt.float64),
+                ('CS', dt.float64),
+                ('BB', dt.float64),
+                ('SO', dt.float64),
+            ]
+        )
+        return self.connection.table('batting', schema=schema)
+
+    @property
+    def awards_players(self) -> ir.TableExpr:
+        schema = ibis.schema(
+            [('lgID', dt.string), ('tie', dt.string), ('notes', dt.string)]
+        )
+        return self.connection.table('awards_players', schema=schema)
 
 
 @pytest.fixture
@@ -12,7 +69,7 @@ def csv(tmpdir, file_backends_data):
         f = csv / '{}.csv'.format(k)
         v.to_csv(str(f), index=False)
 
-    return CSVClient(tmpdir).database()
+    return ibis.csv.connect(tmpdir).database()
 
 
 @pytest.fixture
@@ -22,4 +79,4 @@ def csv2(tmpdir, file_backends_data):
     f = csv2 / 'df.csv'
     df.to_csv(str(f), index=False)
 
-    return CSVClient(tmpdir).database()
+    return ibis.csv.connect(tmpdir).database()

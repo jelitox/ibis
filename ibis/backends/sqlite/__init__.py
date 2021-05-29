@@ -12,34 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from ibis.backends.base import BaseBackend
+from ibis.backends.base.sql.alchemy import AlchemyQueryBuilder
 
-from .client import SQLiteClient
-from .compiler import dialect, rewrites  # noqa: F401
-
-
-def compile(expr, params=None):
-    """
-    Force compilation of expression for the SQLite target
-    """
-    from ibis.backends.base_sqlalchemy.alchemy import to_sqlalchemy
-
-    return to_sqlalchemy(expr, dialect.make_context(params=params))
+from .client import SQLiteClient, SQLiteDatabase, SQLiteTable
+from .compiler import SQLiteExprTranslator
 
 
-def connect(path=None, create=False):
+class Backend(BaseBackend):
+    name = 'sqlite'
+    kind = 'sqlalchemy'
+    builder = AlchemyQueryBuilder
+    translator = SQLiteExprTranslator
+    database_class = SQLiteDatabase
+    table_class = SQLiteTable
 
-    """
-    Create an Ibis client connected to a SQLite database.
+    def connect(self, path=None, create=False):
 
-    Multiple database files can be created using the attach() method
+        """
+        Create an Ibis client connected to a SQLite database.
 
-    Parameters
-    ----------
-    path : string, default None
-        File path to the SQLite database file. If None, creates an in-memory
-        transient database and you can use attach() to add more files
-    create : boolean, default False
-        If file does not exist, create it
-    """
+        Multiple database files can be created using the attach() method
 
-    return SQLiteClient(path, create=create)
+        Parameters
+        ----------
+        path : string, default None
+            File path to the SQLite database file. If None, creates an
+            in-memory transient database and you can use attach() to add more
+            files
+        create : boolean, default False
+            If file does not exist, create it
+        """
+        return SQLiteClient(backend=self, path=path, create=create)

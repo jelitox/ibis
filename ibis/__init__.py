@@ -1,67 +1,65 @@
 """Initialize Ibis module."""
-from contextlib import suppress
+import pkg_resources
 
-import ibis.config_init  # noqa: F401
-import ibis.expr.api as api  # noqa: F401
-import ibis.expr.types as ir  # noqa: F401
-import ibis.util as util  # noqa: F401
+import ibis.config
+import ibis.expr.types as ir
+from ibis import util
 
 # pandas backend is mandatory
 from ibis.backends import pandas  # noqa: F401
-from ibis.common.exceptions import IbisError  # noqa: F401
-from ibis.config import options  # noqa: F401
+from ibis.common.exceptions import IbisError
+from ibis.config import options
+from ibis.expr import api
 from ibis.expr.api import *  # noqa: F401,F403
-from ibis.filesystems import HDFS, WebHDFS, hdfs_connect  # noqa: F401
 
 from ._version import get_versions  # noqa: E402
 
-with suppress(ImportError):
-    # pip install ibis-framework[csv]
-    from ibis.backends import csv  # noqa: F401
+__all__ = ['api', 'ir', 'util', 'IbisError', 'options']
+__all__ += api.__all__
 
-with suppress(ImportError):
-    # pip install ibis-framework[parquet]
-    from ibis.backends import parquet  # noqa: F401
 
-with suppress(ImportError):
-    # pip install  ibis-framework[hdf5]
-    from ibis.backends import hdf5  # noqa: F401
-
-with suppress(ImportError):
-    # pip install ibis-framework[impala]
-    import ibis.impala.api as impala  # noqa: F401
-
-with suppress(ImportError):
-    # pip install ibis-framework[sqlite]
-    from ibis.backends import sqlite  # noqa: F401
-
-with suppress(ImportError):
-    # pip install ibis-framework[postgres]
-    from ibis.backends import postgres  # noqa: F401
-
-with suppress(ImportError):
-    # pip install ibis-framework[mysql]
-    from ibis.backends import mysql  # noqa: F401
-
-with suppress(ImportError):
-    # pip install ibis-framework[clickhouse]
-    from ibis.backends import clickhouse  # noqa: F401
-
-with suppress(ImportError):
-    # pip install ibis-framework[bigquery]
-    from ibis.backends import bigquery  # noqa: F401
-
-with suppress(ImportError):
-    # pip install ibis-framework[omniscidb]
-    from ibis.backends import omniscidb  # noqa: F401
-
-with suppress(ImportError):
-    # pip install ibis-framework[spark]
-    from ibis.backends import spark  # noqa: F401
-
-with suppress(ImportError):
-    from ibis.backends import pyspark  # noqa: F401
-
+ibis.config.register_option(
+    'interactive', False, validator=ibis.config.is_bool
+)
+ibis.config.register_option('verbose', False, validator=ibis.config.is_bool)
+ibis.config.register_option('verbose_log', None)
+ibis.config.register_option(
+    'graphviz_repr',
+    True,
+    """\
+Whether to render expressions as GraphViz PNGs when repr-ing in a Jupyter
+notebook.
+""",
+    validator=ibis.config.is_bool,
+)
+ibis.config.register_option('default_backend', None)
+with ibis.config.config_prefix('context_adjustment'):
+    ibis.config.register_option(
+        'time_col',
+        'time',
+        'Name of the timestamp col for execution with a timecontext'
+        'See ibis.expr.timecontext for details.',
+        validator=ibis.config.is_str,
+    )
+with ibis.config.config_prefix('sql'):
+    ibis.config.register_option(
+        'default_limit',
+        10_000,
+        'Number of rows to be retrieved for an unlimited table expression',
+    )
 
 __version__ = get_versions()['version']
 del get_versions
+
+for entry_point in pkg_resources.iter_entry_points(
+    group='ibis.backends', name=None
+):
+    try:
+        backend_module = entry_point.resolve()
+    except ImportError:
+        pass
+    else:
+        backend = backend_module.Backend()
+        setattr(ibis, entry_point.name, backend)
+        with ibis.config.config_prefix(entry_point.name):
+            backend.register_options()

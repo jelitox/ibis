@@ -5,24 +5,28 @@ from typing import Optional
 import psycopg2  # NOQA fail early if the driver is missing
 import sqlalchemy as sa
 
-import ibis.backends.base_sqlalchemy.alchemy as alch
+from ibis.backends.base.sql.alchemy import (
+    AlchemyClient,
+    AlchemyDatabase,
+    AlchemyDatabaseSchema,
+    AlchemyTable,
+)
 from ibis.backends.postgres import udf
-from ibis.backends.postgres.compiler import PostgreSQLDialect
 
 
-class PostgreSQLTable(alch.AlchemyTable):
+class PostgreSQLTable(AlchemyTable):
     pass
 
 
-class PostgreSQLSchema(alch.AlchemyDatabaseSchema):
+class PostgreSQLSchema(AlchemyDatabaseSchema):
     pass
 
 
-class PostgreSQLDatabase(alch.AlchemyDatabase):
+class PostgreSQLDatabase(AlchemyDatabase):
     schema_class = PostgreSQLSchema
 
 
-class PostgreSQLClient(alch.AlchemyClient):
+class PostgreSQLClient(AlchemyClient):
 
     """The Ibis PostgreSQL client class
 
@@ -31,12 +35,9 @@ class PostgreSQLClient(alch.AlchemyClient):
     con : sqlalchemy.engine.Engine
     """
 
-    dialect = PostgreSQLDialect
-    database_class = PostgreSQLDatabase
-    table_class = PostgreSQLTable
-
     def __init__(
         self,
+        backend,
         host: str = 'localhost',
         user: str = getpass.getuser(),
         password: Optional[str] = None,
@@ -45,6 +46,9 @@ class PostgreSQLClient(alch.AlchemyClient):
         url: Optional[str] = None,
         driver: str = 'psycopg2',
     ):
+        self.dialect = backend.dialect
+        self.database_class = backend.database_class
+        self.table_class = backend.table_class
         if url is None:
             if driver != 'psycopg2':
                 raise NotImplementedError(

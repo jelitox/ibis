@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-import io
 import logging
 import os
 import warnings
@@ -326,102 +325,6 @@ def sqlite(database, schema, tables, data_directory, **params):
 
 @cli.command()
 @click.option('-h', '--host', default='localhost')
-@click.option('-P', '--port', default=6274, type=int)
-@click.option('-u', '--user', default='admin')
-@click.option('-p', '--password', default='HyperInteractive')
-@click.option('-D', '--database', default='ibis_testing')
-@click.option('--protocol', default='binary')
-@click.option(
-    '-S',
-    '--schema',
-    type=click.File('rt'),
-    default=str(SCRIPT_DIR / 'schema' / 'omniscidb.sql'),
-    help='Path to SQL file that initializes the database via DDL.',
-)
-@click.option('-t', '--tables', multiple=True, default=TEST_TABLES + ['geo'])
-@click.option('-d', '--data-directory', default=DATA_DIR)
-def omniscidb(schema, tables, data_directory, **params):
-    import pymapd
-
-    data_directory = Path(data_directory)
-    reserved_words = ['table', 'year', 'month']
-
-    # connection
-    logger.info('Initializing OmniSci...')
-    default_db = 'omnisci'
-    database = params["database"]
-
-    if database != default_db:
-        conn = pymapd.connect(
-            host=params['host'],
-            user=params['user'],
-            password=params['password'],
-            port=params['port'],
-            dbname=default_db,
-            protocol=params['protocol'],
-        )
-        stmt = "DROP DATABASE IF EXISTS {}".format(database)
-        try:
-            conn.execute(stmt)
-        except Exception:
-            logger.warning('OmniSci DDL statement %r failed', stmt)
-
-        stmt = 'CREATE DATABASE {}'.format(database)
-        try:
-            conn.execute(stmt)
-        except Exception:
-            logger.exception('OmniSci DDL statement %r failed', stmt)
-        conn.close()
-
-    conn = pymapd.connect(
-        host=params['host'],
-        user=params['user'],
-        password=params['password'],
-        port=params['port'],
-        dbname=database,
-        protocol=params['protocol'],
-    )
-
-    # create tables
-    for stmt in filter(None, map(str.strip, schema.read().split(';'))):
-        try:
-            conn.execute(stmt)
-        except Exception:
-            logger.exception('OmniSci DDL statement \n%r\n failed', stmt)
-
-    # import data
-    for table, df in read_tables(tables, data_directory):
-        if table == 'batting':
-            # float nan problem
-            cols = df.select_dtypes([float]).columns
-            df[cols] = df[cols].fillna(0).astype(int)
-
-            # string None driver problem
-            cols = df.select_dtypes([object]).columns
-            df[cols] = df[cols].fillna('')
-        elif table == 'awards_players':
-            # string None driver problem
-            cols = df.select_dtypes([object]).columns
-            df[cols] = df[cols].fillna('')
-
-        # rename fields
-        for df_col in df.columns:
-            if ' ' in df_col or ':' in df_col:
-                column = df_col.replace(' ', '_').replace(':', '_')
-            elif df_col in reserved_words:
-                column = '{}_'.format(df_col)
-            else:
-                continue
-            df.rename(columns={df_col: column}, inplace=True)
-
-        load_method = 'rows' if table == 'geo' else 'columnar'
-        conn.load_table(table, df, method=load_method)
-
-    conn.close()
-
-
-@cli.command()
-@click.option('-h', '--host', default='localhost')
 @click.option('-P', '--port', default=3306, type=int)
 @click.option('-u', '--user', default='ibis')
 @click.option('-p', '--password', default='ibis')
@@ -482,147 +385,21 @@ def clickhouse(schema, tables, data_directory, **params):
 
 
 @cli.command()
-@click.option(
-    '-S',
-    '--schema',
-    type=click.File('rt'),
-    default=str(SCRIPT_DIR / 'schema' / 'bigquery.sql'),
-    help='Path to SQL file that initializes the database via DDL.',
-)
-@click.option('-d', '--data-directory', default=DATA_DIR)
-@click.option('-i', '--ignore-missing-dependency', is_flag=True, default=False)
-def bigquery(schema, data_directory, ignore_missing_dependency, **params):
-    try:
-        import google.api_core.exceptions
-        from google.cloud import bigquery
-    except ImportError:
-        msg = 'google-cloud-bigquery dependency is missing'
-        if ignore_missing_dependency:
-            logger.warning('Ignored: %s', msg)
-            return 0
-        else:
-            raise click.ClickException(msg)
-
-    project_id = os.environ['GOOGLE_BIGQUERY_PROJECT_ID']
-    bqclient = bigquery.Client(project=project_id)
-
-    # Create testing dataset.
-    testing_dataset = bigquery.DatasetReference(bqclient.project, 'testing')
-    try:
-        bqclient.create_dataset(bigquery.Dataset(testing_dataset))
-    except google.api_core.exceptions.Conflict:
-        pass  # Skip if already created.
-
-    # Set up main data tables.
-    job = bqclient.query(schema.read())
-    job.result()
-    if job.error_result:
-        raise click.ClickException(str(job.error_result))
-
-    # Load main data table.
-    data_directory = Path(data_directory)
-    functional_alltypes_path = data_directory / 'functional_alltypes.csv'
-    load_config = bigquery.LoadJobConfig()
-    load_config.skip_leading_rows = 1  # skip the header row.
-    with open(str(functional_alltypes_path), 'rb') as csvfile:
-        job = bqclient.load_table_from_file(
-            csvfile,
-            testing_dataset.table('functional_alltypes'),
-            job_config=load_config,
-        ).result()
-
-        if job.error_result:
-            raise click.ClickException(str(job.error_result))
-
-    # Load an ingestion time partitioned table.
-    with open(str(functional_alltypes_path), 'rb') as csvfile:
-        job = bqclient.load_table_from_file(
-            csvfile,
-            testing_dataset.table('functional_alltypes_parted'),
-            job_config=load_config,
-        ).result()
-
-        if job.error_result:
-            raise click.ClickException(str(job.error_result))
-
-    # Create a table with complex data types (nested and repeated).
-    struct_table_path = data_directory / 'struct_table.avro'
-    with open(str(struct_table_path), 'rb') as avrofile:
-        load_config = bigquery.LoadJobConfig()
-        load_config.write_disposition = 'WRITE_TRUNCATE'
-        load_config.source_format = 'AVRO'
-        job = bqclient.load_table_from_file(
-            avrofile,
-            testing_dataset.table('struct_table'),
-            job_config=load_config,
-        )
-
-        if job.error_result:
-            raise click.ClickException(str(job.error_result))
-
-    # Create empty date-partitioned table.
-    date_table = bigquery.Table(testing_dataset.table('date_column_parted'))
-    date_table.schema = [
-        bigquery.SchemaField('my_date_parted_col', 'DATE'),
-        bigquery.SchemaField('string_col', 'STRING'),
-        bigquery.SchemaField('int_col', 'INTEGER'),
-    ]
-    date_table.time_partitioning = bigquery.TimePartitioning(
-        field='my_date_parted_col'
-    )
-    bqclient.create_table(date_table, exists_ok=True)
-
-    # Create empty timestamp-partitioned tables.
-    timestamp_table = bigquery.Table(
-        testing_dataset.table('timestamp_column_parted')
-    )
-    timestamp_table.schema = [
-        bigquery.SchemaField('my_timestamp_parted_col', 'DATE'),
-        bigquery.SchemaField('string_col', 'STRING'),
-        bigquery.SchemaField('int_col', 'INTEGER'),
-    ]
-    timestamp_table.time_partitioning = bigquery.TimePartitioning(
-        field='my_timestamp_parted_col'
-    )
-    bqclient.create_table(timestamp_table, exists_ok=True)
-
-    # Create a table with a numeric column
-    numeric_table = bigquery.Table(testing_dataset.table('numeric_table'))
-    numeric_table.schema = [
-        bigquery.SchemaField('string_col', 'STRING'),
-        bigquery.SchemaField('numeric_col', 'NUMERIC'),
-    ]
-    bqclient.create_table(numeric_table, exists_ok=True)
-
-    df = pd.read_csv(
-        str(functional_alltypes_path),
-        usecols=['string_col', 'double_col'],
-        header=0,
-    )
-    numeric_csv = io.StringIO()
-    df.to_csv(numeric_csv, header=False, index=False)
-    csvfile = io.BytesIO(numeric_csv.getvalue().encode('utf-8'))
-    load_config = bigquery.LoadJobConfig()
-    load_config.write_disposition = 'WRITE_TRUNCATE'
-    load_config.skip_leading_rows = 1  # skip the header row.
-    load_config.schema = numeric_table.schema
-
-    job = bqclient.load_table_from_file(
-        csvfile,
-        testing_dataset.table('numeric_table'),
-        job_config=load_config,
-    ).result()
-
-    if job.error_result:
-        raise click.ClickException(str(job.error_result))
-
-
-@cli.command()
 def pandas(**params):
     """
     The pandas backend does not need test data, but we still
     have an option for the backend for consistency, and to not
     have to avoid calling `./datamgr.py pandas` in the CI.
+    """
+    pass
+
+
+@cli.command()
+def dask(**params):
+    """
+    The dask backend does not need test data, but we still
+    have an option for the backend for consistency, and to not
+    have to avoid calling `./datamgr.py dask` in the CI.
     """
     pass
 

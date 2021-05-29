@@ -12,8 +12,8 @@ from plumbum import CommandNotFound, local
 from plumbum.cmd import cmake, make
 
 import ibis
+from ibis.backends.impala.tests.conftest import IbisTestEnv
 from ibis.common.exceptions import IbisError
-from ibis.impala.tests.conftest import IbisTestEnv
 
 SCRIPT_DIR = Path(__file__).parent.absolute()
 DATA_DIR = Path(
@@ -36,7 +36,7 @@ for key, value in env_items:
 
 
 def make_ibis_client(env):
-    hc = ibis.hdfs_connect(
+    hc = ibis.impala.hdfs_connect(
         host=env.nn_host,
         port=env.webhdfs_port,
         auth_mechanism=env.auth_mechanism,

@@ -1,13 +1,12 @@
 import numpy as np
 import pandas as pd
-import pandas.util.testing as tm
+import pandas.testing as tm
 import pyspark
 import pytest
 from pytest import param
 
 import ibis
 
-pytest.importorskip('pyspark')
 pytestmark = pytest.mark.pyspark
 
 

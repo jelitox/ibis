@@ -4,13 +4,13 @@ from operator import methodcaller
 import numpy as np
 import numpy.testing as npt
 import pandas as pd
-import pandas.util.testing as tm
+import pandas.testing as tm
 import pytest
 
 import ibis
 import ibis.expr.datatypes as dt
 
-from ... import connect, execute
+from ... import Backend, execute
 
 pytestmark = pytest.mark.pandas
 
@@ -24,11 +24,6 @@ def test_table_column(t, df):
 
 def test_literal(client):
     assert client.execute(ibis.literal(1)) == 1
-
-
-def test_read_with_undiscoverable_type(client):
-    with pytest.raises(TypeError):
-        client.table('df')
 
 
 def test_selection(t, df):
@@ -321,7 +316,7 @@ def test_nullif(t, df, left, right, expected, compare):
 
 def test_nullif_inf():
     df = pd.DataFrame({'a': [np.inf, 3.14, -np.inf, 42.0]})
-    con = connect(dict(t=df))
+    con = Backend().connect({'t': df})
     t = con.table('t')
     expr = t.a.nullif(np.inf).nullif(-np.inf)
     result = expr.execute()
@@ -681,15 +676,15 @@ def test_summary_numeric(batting, batting_df):
     assert len(result) == 1
 
     G = batting_df.G
-    expected = dict(
-        count=G.count(),
-        nulls=G.isnull().sum(),
-        min=G.min(),
-        max=G.max(),
-        sum=G.sum(),
-        mean=G.mean(),
-        approx_nunique=G.nunique(),
-    )
+    expected = {
+        'count': G.count(),
+        'nulls': G.isnull().sum(),
+        'min': G.min(),
+        'max': G.max(),
+        'sum': G.sum(),
+        'mean': G.mean(),
+        'approx_nunique': G.nunique(),
+    }
     assert dict(result.iloc[0]) == expected
 
 
@@ -700,15 +695,15 @@ def test_summary_numeric_group_by(batting, batting_df):
         batting_df.groupby('teamID')
         .G.apply(
             lambda s: pd.DataFrame(
-                dict(
-                    count=s.count(),
-                    nulls=s.isnull().sum(),
-                    min=s.min(),
-                    max=s.max(),
-                    sum=s.sum(),
-                    mean=s.mean(),
-                    approx_nunique=s.nunique(),
-                ),
+                {
+                    'count': s.count(),
+                    'nulls': s.isnull().sum(),
+                    'min': s.min(),
+                    'max': s.max(),
+                    'sum': s.sum(),
+                    'mean': s.mean(),
+                    'approx_nunique': s.nunique(),
+                },
                 index=[0],
             )
         )
@@ -726,11 +721,11 @@ def test_summary_non_numeric(batting, batting_df):
     result = expr.execute()
     assert len(result) == 1
     assert len(result.columns) == 3
-    expected = dict(
-        count=batting_df.teamID.count(),
-        nulls=batting_df.teamID.isnull().sum(),
-        uniques=batting_df.teamID.nunique(),
-    )
+    expected = {
+        'count': batting_df.teamID.count(),
+        'nulls': batting_df.teamID.isnull().sum(),
+        'uniques': batting_df.teamID.nunique(),
+    }
     assert dict(result.iloc[0]) == expected
 
 
@@ -741,11 +736,11 @@ def test_summary_non_numeric_group_by(batting, batting_df):
         batting_df.groupby('teamID')
         .playerID.apply(
             lambda s: pd.DataFrame(
-                dict(
-                    count=s.count(),
-                    nulls=s.isnull().sum(),
-                    uniques=s.nunique(),
-                ),
+                {
+                    'count': s.count(),
+                    'nulls': s.isnull().sum(),
+                    'uniques': s.nunique(),
+                },
                 index=[0],
             )
         )

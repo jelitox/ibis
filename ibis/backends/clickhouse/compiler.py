@@ -1,12 +1,19 @@
 from io import StringIO
 
-import ibis.backends.base_sqlalchemy.compiler as comp
 import ibis.common.exceptions as com
 import ibis.expr.operations as ops
 import ibis.util as util
+from ibis.backends.base.sql.compiler import (
+    ExprTranslator,
+    QueryBuilder,
+    QueryContext,
+    Select,
+    SelectBuilder,
+    TableSetFormatter,
+)
 
 from .identifiers import quote_identifier
-from .operations import _name_expr, _operation_registry
+from .registry import operation_registry
 
 
 def build_ast(expr, context):
@@ -14,19 +21,7 @@ def build_ast(expr, context):
     return builder.get_result()
 
 
-def _get_query(expr, context):
-    ast = build_ast(expr, context)
-    query = ast.queries[0]
-
-    return query
-
-
-def to_sql(expr, context=None):
-    query = _get_query(expr, context)
-    return query.compile()
-
-
-class ClickhouseSelectBuilder(comp.SelectBuilder):
+class ClickhouseSelectBuilder(SelectBuilder):
     @property
     def _select_class(self):
         return ClickhouseSelect
@@ -35,17 +30,20 @@ class ClickhouseSelectBuilder(comp.SelectBuilder):
         return exprs
 
 
-class ClickhouseQueryBuilder(comp.QueryBuilder):
+class ClickhouseQueryBuilder(QueryBuilder):
 
     select_builder = ClickhouseSelectBuilder
 
 
-class ClickhouseQueryContext(comp.QueryContext):
+class ClickhouseQueryContext(QueryContext):
     def _to_sql(self, expr, ctx):
-        return to_sql(expr, context=ctx)
+        builder = ClickhouseQueryBuilder(expr, context=ctx)
+        ast = builder.get_result()
+        query = ast.queries[0]
+        return query.compile()
 
 
-class ClickhouseSelect(comp.Select):
+class ClickhouseSelect(Select):
     @property
     def translator(self):
         return ClickhouseExprTranslator
@@ -90,7 +88,7 @@ class ClickhouseSelect(comp.Select):
         return buf.getvalue()
 
 
-class ClickhouseTableSetFormatter(comp.TableSetFormatter):
+class ClickhouseTableSetFormatter(TableSetFormatter):
 
     _join_names = {
         ops.InnerJoin: 'ALL INNER JOIN',
@@ -151,23 +149,17 @@ class ClickhouseTableSetFormatter(comp.TableSetFormatter):
         return quote_identifier(name)
 
 
-class ClickhouseExprTranslator(comp.ExprTranslator):
+class ClickhouseExprTranslator(ExprTranslator):
 
-    _registry = _operation_registry
+    _registry = operation_registry
     context_class = ClickhouseQueryContext
 
     def name(self, translated, name, force=True):
-        return _name_expr(translated, quote_identifier(name, force=force))
+        return '{0!s} AS {1!s}'.format(
+            translated, quote_identifier(name, force=force)
+        )
 
 
-class ClickhouseDialect(comp.Dialect):
-
-    translator = ClickhouseExprTranslator
-
-
-dialect = ClickhouseDialect
-
-compiles = ClickhouseExprTranslator.compiles
 rewrites = ClickhouseExprTranslator.rewrites
 
 

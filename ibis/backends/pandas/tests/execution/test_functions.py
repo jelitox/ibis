@@ -6,7 +6,7 @@ from operator import methodcaller
 
 import numpy as np
 import pandas as pd
-import pandas.util.testing as tm  # noqa: E402
+import pandas._testing as tm
 import pytest
 
 import ibis
@@ -121,49 +121,6 @@ def test_round_decimal_with_negative_places(t, df):
 @pytest.mark.parametrize(
     ('ibis_func', 'pandas_func'),
     [
-        (lambda x: x.clip(lower=0), lambda x: x.clip(lower=0)),
-        (lambda x: x.clip(lower=0.0), lambda x: x.clip(lower=0.0)),
-        (lambda x: x.clip(upper=0), lambda x: x.clip(upper=0)),
-        (
-            lambda x: x.clip(lower=x - 1, upper=x + 1),
-            lambda x: x.clip(lower=x - 1, upper=x + 1),
-        ),
-        (
-            lambda x: x.clip(lower=0, upper=1),
-            lambda x: x.clip(lower=0, upper=1),
-        ),
-        (
-            lambda x: x.clip(lower=0, upper=1.0),
-            lambda x: x.clip(lower=0, upper=1.0),
-        ),
-    ],
-)
-def test_clip(t, df, ibis_func, pandas_func):
-    result = ibis_func(t.float64_with_zeros).execute()
-    expected = pandas_func(df.float64_with_zeros)
-    tm.assert_series_equal(result, expected)
-
-
-@pytest.mark.parametrize(
-    ('ibis_func', 'pandas_func'),
-    [
-        (
-            lambda x: x.quantile([0.25, 0.75]),
-            lambda x: list(x.quantile([0.25, 0.75])),
-        )
-    ],
-)
-@pytest.mark.parametrize('column', ['float64_with_zeros', 'int64_with_zeros'])
-def test_quantile_list(t, df, ibis_func, pandas_func, column):
-    expr = ibis_func(t[column])
-    result = expr.execute()
-    expected = pandas_func(df[column])
-    assert result == expected
-
-
-@pytest.mark.parametrize(
-    ('ibis_func', 'pandas_func'),
-    [
         (lambda x: x.quantile(0), lambda x: x.quantile(0)),
         (lambda x: x.quantile(1), lambda x: x.quantile(1)),
         (
@@ -172,13 +129,33 @@ def test_quantile_list(t, df, ibis_func, pandas_func, column):
         ),
     ],
 )
-def test_quantile_scalar(t, df, ibis_func, pandas_func):
+def test_quantile(t, df, ibis_func, pandas_func):
     result = ibis_func(t.float64_with_zeros).execute()
     expected = pandas_func(df.float64_with_zeros)
+    assert result == expected
+
+    assert result == expected
 
     result = ibis_func(t.int64_with_zeros).execute()
     expected = pandas_func(df.int64_with_zeros)
     assert result == expected
+
+
+@pytest.mark.parametrize(
+    ('ibis_func', 'pandas_func'),
+    [
+        (
+            lambda x: x.quantile([0.25, 0.75]),
+            lambda x: np.array(x.quantile([0.25, 0.75])),
+        )
+    ],
+)
+@pytest.mark.parametrize('column', ['float64_with_zeros', 'int64_with_zeros'])
+def test_quantile_multi(t, df, ibis_func, pandas_func, column):
+    expr = ibis_func(t[column])
+    result = expr.execute()
+    expected = pandas_func(df[column])
+    tm.assert_numpy_array_equal(result, expected)
 
 
 @pytest.mark.parametrize(
@@ -197,7 +174,7 @@ def test_arraylike_functions_transform_errors(t, df, ibis_func, exc):
         ibis_func(t.float64_with_zeros).execute()
 
 
-def test_quantile_array_access(client, t, df):
+def test_quantile_multi_array_access(client, t, df):
     quantile = t.float64_with_zeros.quantile([0.25, 0.5])
     expr = quantile[0], quantile[1]
     result = tuple(map(client.execute, expr))

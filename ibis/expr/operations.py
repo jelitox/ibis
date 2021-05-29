@@ -5,6 +5,7 @@ import operator
 from contextlib import suppress
 from typing import List
 
+import numpy as np
 import toolz
 
 import ibis.common.exceptions as com
@@ -867,6 +868,63 @@ class Count(Reduction):
 class Arbitrary(Reduction):
     arg = Arg(rlz.column(rlz.any))
     how = Arg(rlz.isin({'first', 'last', 'heavy'}), default=None)
+    where = Arg(rlz.boolean, default=None)
+    output_type = rlz.scalar_like('arg')
+
+
+class BitAnd(Reduction):
+    """Aggregate bitwise AND operation.
+
+    All elements in an integer column are ANDed together. This can be used
+    to determine which bit flags are set on all elements.
+
+    Resources:
+
+    * `BigQuery BIT_AND
+      <https://cloud.google.com/bigquery/docs/reference/standard-sql/aggregate_functions#bit_and>`_
+    * `MySQL BIT_AND
+      <https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_bit-and>`_
+    """
+
+    arg = Arg(rlz.column(rlz.integer))
+    where = Arg(rlz.boolean, default=None)
+    output_type = rlz.scalar_like('arg')
+
+
+class BitOr(Reduction):
+    """Aggregate bitwise OR operation.
+
+    All elements in an integer column are ORed together. This can be used
+    to determine which bit flags are set on any element.
+
+    Resources:
+
+    * `BigQuery BIT_OR
+      <https://cloud.google.com/bigquery/docs/reference/standard-sql/aggregate_functions#bit_or>`_
+    * `MySQL BIT_OR
+      <https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_bit-or>`_
+    """
+
+    arg = Arg(rlz.column(rlz.integer))
+    where = Arg(rlz.boolean, default=None)
+    output_type = rlz.scalar_like('arg')
+
+
+class BitXor(Reduction):
+    """Aggregate bitwise XOR operation.
+
+    All elements in an integer column are XORed together. This can be used
+    as a parity checksum of element values.
+
+    Resources:
+
+    * `BigQuery BIT_XOR
+      <https://cloud.google.com/bigquery/docs/reference/standard-sql/aggregate_functions#bit_xor>`_
+    * `MySQL BIT_XOR
+      <https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_bit-xor>`_
+    """
+
+    arg = Arg(rlz.column(rlz.integer))
     where = Arg(rlz.boolean, default=None)
     output_type = rlz.scalar_like('arg')
 
@@ -2514,56 +2572,56 @@ class TimestampUnaryOp(UnaryOp):
     arg = Arg(rlz.timestamp)
 
 
-_date_units = dict(
-    Y='Y',
-    y='Y',
-    year='Y',
-    YEAR='Y',
-    YYYY='Y',
-    SYYYY='Y',
-    YYY='Y',
-    YY='Y',
-    Q='Q',
-    q='Q',
-    quarter='Q',
-    QUARTER='Q',
-    M='M',
-    month='M',
-    MONTH='M',
-    w='W',
-    W='W',
-    week='W',
-    WEEK='W',
-    d='D',
-    D='D',
-    J='D',
-    day='D',
-    DAY='D',
-)
+_date_units = {
+    'Y': 'Y',
+    'y': 'Y',
+    'year': 'Y',
+    'YEAR': 'Y',
+    'YYYY': 'Y',
+    'SYYYY': 'Y',
+    'YYY': 'Y',
+    'YY': 'Y',
+    'Q': 'Q',
+    'q': 'Q',
+    'quarter': 'Q',
+    'QUARTER': 'Q',
+    'M': 'M',
+    'month': 'M',
+    'MONTH': 'M',
+    'w': 'W',
+    'W': 'W',
+    'week': 'W',
+    'WEEK': 'W',
+    'd': 'D',
+    'D': 'D',
+    'J': 'D',
+    'day': 'D',
+    'DAY': 'D',
+}
 
-_time_units = dict(
-    h='h',
-    H='h',
-    HH24='h',
-    hour='h',
-    HOUR='h',
-    m='m',
-    MI='m',
-    minute='m',
-    MINUTE='m',
-    s='s',
-    second='s',
-    SECOND='s',
-    ms='ms',
-    millisecond='ms',
-    MILLISECOND='ms',
-    us='us',
-    microsecond='ms',
-    MICROSECOND='ms',
-    ns='ns',
-    nanosecond='ns',
-    NANOSECOND='ns',
-)
+_time_units = {
+    'h': 'h',
+    'H': 'h',
+    'HH24': 'h',
+    'hour': 'h',
+    'HOUR': 'h',
+    'm': 'm',
+    'MI': 'm',
+    'minute': 'm',
+    'MINUTE': 'm',
+    's': 's',
+    'second': 's',
+    'SECOND': 's',
+    'ms': 'ms',
+    'millisecond': 'ms',
+    'MILLISECOND': 'ms',
+    'us': 'us',
+    'microsecond': 'ms',
+    'MICROSECOND': 'ms',
+    'ns': 'ns',
+    'nanosecond': 'ns',
+    'NANOSECOND': 'ns',
+}
 
 _timestamp_units = toolz.merge(_date_units, _time_units)
 
@@ -2704,8 +2762,14 @@ class DecimalScale(UnaryOp):
 
 class Hash(ValueOp):
     arg = Arg(rlz.any)
-    how = Arg(rlz.isin({'fnv'}))
+    how = Arg(rlz.isin({'fnv', 'farm_fingerprint'}))
     output_type = rlz.shape_like('arg', dt.int64)
+
+
+class HashBytes(ValueOp):
+    arg = Arg(rlz.one_of({rlz.value(dt.string), rlz.value(dt.binary)}))
+    how = Arg(rlz.isin({'md5', 'sha1', 'sha256', 'sha512'}))
+    output_type = rlz.shape_like('arg', dt.binary)
 
 
 class DateAdd(BinaryOp):
@@ -2827,6 +2891,21 @@ class IntervalFromInteger(ValueOp):
     def output_type(self):
         dtype = dt.Interval(self.unit, self.arg.type())
         return rlz.shape_like(self.arg, dtype=dtype)
+
+
+class ArrayColumn(ValueOp):
+    cols = Arg(rlz.list_of(rlz.column(rlz.any), min_length=1))
+
+    def _validate(self):
+        if len(set([col.type() for col in self.cols])) > 1:
+            raise com.IbisTypeError(
+                f'The types of all input columns must match exactly in a '
+                f'{type(self).__name__} operation.'
+            )
+
+    def output_type(self):
+        first_dtype = self.cols[0].type()
+        return dt.Array(first_dtype).column_type()
 
 
 class ArrayLength(UnaryOp):
@@ -2957,12 +3036,19 @@ class Literal(ValueOp):
         )
 
     def equals(self, other, cache=None):
-        return (
+        # Check types
+        if not (
             isinstance(other, Literal)
             and isinstance(other.value, type(self.value))
-            and self.value == other.value
             and self.dtype == other.dtype
-        )
+        ):
+            return False
+
+        # Check values
+        if isinstance(self.value, np.ndarray):
+            return np.array_equal(self.value, other.value)
+        else:
+            return self.value == other.value
 
     def output_type(self):
         return self.dtype.scalar_type()
@@ -3590,3 +3676,21 @@ class AnalyticVectorizedUDF(AnalyticOp):
         )
 
         return result
+
+
+class ExistsSubquery(Node):
+    """Helper class"""
+
+    foreign_table = Arg(rlz.noop)
+    predicates = Arg(rlz.noop)
+
+    def output_type(self):
+        return ir.ExistsExpr
+
+
+class NotExistsSubquery(Node):
+    foreign_table = Arg(rlz.noop)
+    predicates = Arg(rlz.noop)
+
+    def output_type(self):
+        return ir.ExistsExpr

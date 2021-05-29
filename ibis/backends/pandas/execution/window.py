@@ -3,7 +3,7 @@
 import functools
 import operator
 import re
-from typing import Any, List, NoReturn, Optional
+from typing import Any, List, NoReturn, Optional, Union
 
 import pandas as pd
 import toolz
@@ -13,7 +13,10 @@ import ibis.common.exceptions as com
 import ibis.expr.operations as ops
 import ibis.expr.window as win
 from ibis.expr.scope import Scope
-from ibis.expr.timecontext import TIME_COL
+from ibis.expr.timecontext import (
+    construct_time_context_aware_series,
+    get_time_col,
+)
 from ibis.expr.typing import TimeContext
 
 from .. import aggcontext as agg_ctx
@@ -32,16 +35,30 @@ from ..execution import util
 
 
 def _post_process_empty(
-    result: Any, parent: pd.DataFrame, order_by: List[str], group_by: List[str]
+    result: Any,
+    parent: pd.DataFrame,
+    order_by: List[str],
+    group_by: List[str],
+    timecontext: Optional[TimeContext],
 ) -> pd.Series:
+    # This is the post process of the no groupby nor orderby window
+    # `result` could be a Series, DataFrame, or a scalar. generated
+    # by `agg` method of class `Window`. For window without grouby or
+    # orderby, `agg` calls pands method directly. So if timecontext is
+    # present, we need to insert 'time' column into index for trimming the
+    # result. For cases when grouby or orderby is present, `agg` calls
+    # Ibis method `window_agg_built_in` and `window_agg_udf`, time
+    # context is already inserted there.
     assert not order_by and not group_by
-    if isinstance(result, pd.Series):
-        # `result` is a Series when an analytic operation is being
-        # applied over the window, since analytic operations are N->N
+    if isinstance(result, (pd.Series, pd.DataFrame)):
+        if timecontext:
+            result = construct_time_context_aware_series(result, parent)
         return result
     else:
         # `result` is a scalar when a reduction operation is being
         # applied over the window, since reduction operations are N->1
+        # in this case we do not need to trim result by timecontext,
+        # just expand reduction result to be a Series with `index`.
         index = parent.index
         result = pd.Series([result]).repeat(len(index))
         result.index = index
@@ -53,13 +70,18 @@ def _post_process_group_by(
     parent: pd.DataFrame,
     order_by: List[str],
     group_by: List[str],
+    timecontext: Optional[TimeContext],
 ) -> pd.Series:
     assert not order_by and group_by
     return series
 
 
 def _post_process_order_by(
-    series, parent: pd.DataFrame, order_by: List[str], group_by: List[str]
+    series,
+    parent: pd.DataFrame,
+    order_by: List[str],
+    group_by: List[str],
+    timecontext: Optional[TimeContext],
 ) -> pd.Series:
     assert order_by and not group_by
     indexed_parent = parent.set_index(order_by)
@@ -76,6 +98,7 @@ def _post_process_group_by_order_by(
     parent: pd.DataFrame,
     order_by: List[str],
     group_by: List[str],
+    timecontext: Optional[TimeContext],
 ) -> pd.Series:
     indexed_parent = parent.set_index(group_by + order_by, append=True)
     index = indexed_parent.index
@@ -156,45 +179,59 @@ def get_aggcontext_window(
     return aggcontext
 
 
-def trim_with_timecontext(data, timecontext: Optional[TimeContext]):
+def trim_window_result(
+    data: Union[pd.Series, pd.DataFrame], timecontext: Optional[TimeContext]
+):
     """ Trim data within time range defined by timecontext
 
         This is a util function used in ``execute_window_op``, where time
         context might be adjusted for calculation. Data must be trimmed
         within the original time context before return.
+        `data` is a pd.Series with Multiindex for most cases, for multi
+        column udf result, `data` could be a pd.DataFrame
 
         Params
         ------
-        data: pd.Series with MultiIndex
+        data: pd.Series or pd.DataFrame
         timecontext: Optional[TimeContext]
 
         Returns:
         ------
-        a trimmed pd.Series with same Multiindex struct as data
+        a trimmed pd.Series or or pd.DataFrame with the same Multiindex
+        as data's
 
     """
     # noop if timecontext is None
     if not timecontext:
         return data
-    # reset multiindex and turn series into a dateframe
+    assert isinstance(
+        data, (pd.Series, pd.DataFrame)
+    ), 'window computed columns is not a pd.Series nor a pd.DataFrame'
+
+    # reset multiindex, convert Series into a DataFrame
     df = data.reset_index()
-    name = data.name
 
     # Filter the data, here we preserve the time index so that when user is
     # computing a single column, the computation and the relevant time
-    # indexes are retturned.
-    if TIME_COL not in df:
+    # indexes are returned.
+    time_col = get_time_col()
+    if time_col not in df:
         return data
-    subset = df.loc[df[TIME_COL].between(*timecontext)]
 
-    # re-indexing index to count from 0
-    subset = subset.reset_index(drop=True).reset_index()
+    subset = df.loc[df[time_col].between(*timecontext)]
 
-    # get index columns for the Series
-    non_target_columns = list(subset.columns.difference([name]))
+    # Get columns to set for index
+    if isinstance(data, pd.Series):
+        # if Series dosen't contain a name, reset_index will assign
+        # '0' as the column name for the column of value
+        name = data.name if data.name else 0
+        index_columns = list(subset.columns.difference([name]))
+    else:
+        name = data.columns
+        index_columns = list(subset.columns.difference(name))
 
-    # set the correct index for return Seires
-    indexed_subset = subset.set_index(non_target_columns)
+    # set the correct index for return Series / DataFrame
+    indexed_subset = subset.set_index(index_columns)
     return indexed_subset[name]
 
 
@@ -336,14 +373,16 @@ def execute_window_op(
         clients=clients,
         **kwargs,
     )
-    series = post_process(result, data, ordering_keys, grouping_keys)
-
+    result = post_process(
+        result, data, ordering_keys, grouping_keys, adjusted_timecontext,
+    )
     assert len(data) == len(
-        series
+        result
     ), 'input data source and computed column do not have the same length'
+
     # trim data to original time context
-    series = trim_with_timecontext(series, timecontext)
-    return series
+    result = trim_window_result(result, timecontext)
+    return result
 
 
 @execute_node.register(

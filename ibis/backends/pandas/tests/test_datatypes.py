@@ -1,3 +1,6 @@
+from datetime import time
+from decimal import Decimal
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -32,7 +35,6 @@ def test_no_infer_ambiguities():
         (np.float64(5.55), dt.double),
         (np.bool_(True), dt.boolean),
         (np.bool_(False), dt.boolean),
-        (np.arange(5, dtype='int32'), dt.Array(dt.int32)),
         # pandas types
         (
             pd.Timestamp('2015-01-01 12:00:00', tz='US/Eastern'),
@@ -42,6 +44,60 @@ def test_no_infer_ambiguities():
 )
 def test_infer_dtype(value, expected_dtype):
     assert dt.infer(value) == expected_dtype
+
+
+@pytest.mark.parametrize(
+    ('value', 'expected_dtypes'),
+    [
+        # Explicitly-defined dtype
+        (np.array([1, 2, 3], dtype='int8'), (dt.Array(dt.int8),)),
+        (np.array([1, 2, 3], dtype='int16'), (dt.Array(dt.int16),)),
+        (np.array([1, 2, 3], dtype='int32'), (dt.Array(dt.int32),)),
+        (np.array([1, 2, 3], dtype='int64'), (dt.Array(dt.int64),)),
+        (np.array([1, 2, 3], dtype='uint8'), (dt.Array(dt.uint8),)),
+        (np.array([1, 2, 3], dtype='uint16'), (dt.Array(dt.uint16),)),
+        (np.array([1, 2, 3], dtype='uint32'), (dt.Array(dt.uint32),)),
+        (np.array([1, 2, 3], dtype='uint64'), (dt.Array(dt.uint64),)),
+        (np.array([1.0, 2.0, 3.0], dtype='float32'), (dt.Array(dt.float32),)),
+        (np.array([1.0, 2.0, 3.0], dtype='float64'), (dt.Array(dt.float64),)),
+        (np.array([True, False, True], dtype='bool'), (dt.Array(dt.boolean),)),
+        # Implicit dtype
+        # Integer array could be inferred to int64 or int32 depending on system
+        (np.array([1, 2, 3]), (dt.Array(dt.int64), dt.Array(dt.int32))),
+        (np.array([1.0, 2.0, 3.0]), (dt.Array(dt.float64),)),
+        (np.array([np.nan, np.nan, np.nan]), (dt.Array(dt.float64),)),
+        (np.array([True, False, True]), (dt.Array(dt.boolean),)),
+        (np.array(['1', '2', '3']), (dt.Array(dt.string),)),
+        (
+            np.array(
+                [
+                    pd.Timestamp('2015-01-01 12:00:00'),
+                    pd.Timestamp('2015-01-02 12:00:00'),
+                    pd.Timestamp('2015-01-03 12:00:00'),
+                ]
+            ),
+            (dt.Array(dt.timestamp),),
+        ),
+        # Implied from object dtype
+        (np.array([1, 2, 3], dtype=object), (dt.Array(dt.int64),)),
+        (np.array([1.0, 2.0, 3.0], dtype=object), (dt.Array(dt.float64),)),
+        (np.array([True, False, True], dtype=object), (dt.Array(dt.boolean),)),
+        (np.array(['1', '2', '3'], dtype=object), (dt.Array(dt.string),)),
+        (
+            np.array(
+                [
+                    pd.Timestamp('2015-01-01 12:00:00'),
+                    pd.Timestamp('2015-01-02 12:00:00'),
+                    pd.Timestamp('2015-01-03 12:00:00'),
+                ],
+                dtype=object,
+            ),
+            (dt.Array(dt.timestamp),),
+        ),
+    ],
+)
+def test_infer_np_array(value, expected_dtypes):
+    assert dt.infer(value) in expected_dtypes
 
 
 @pytest.mark.parametrize(
@@ -92,122 +148,77 @@ def test_series_to_ibis_literal():
     assert expr.equals(expected)
 
 
-def test_dtype_bool():
-    df = pd.DataFrame({'col': [True, False, False]})
-    inferred = sch.infer(df)
-    expected = ibis.schema([('col', 'boolean')])
-    assert inferred == expected
-
-
-def test_dtype_int8():
-    df = pd.DataFrame({'col': np.int8([-3, 9, 17])})
-    inferred = sch.infer(df)
-    expected = ibis.schema([('col', 'int8')])
-    assert inferred == expected
-
-
-def test_dtype_int16():
-    df = pd.DataFrame({'col': np.int16([-5, 0, 12])})
-    inferred = sch.infer(df)
-    expected = ibis.schema([('col', 'int16')])
-    assert inferred == expected
-
-
-def test_dtype_int32():
-    df = pd.DataFrame({'col': np.int32([-12, 3, 25000])})
-    inferred = sch.infer(df)
-    expected = ibis.schema([('col', 'int32')])
-    assert inferred == expected
-
-
-def test_dtype_int64():
-    df = pd.DataFrame({'col': np.int64([102, 67228734, -0])})
-    inferred = sch.infer(df)
-    expected = ibis.schema([('col', 'int64')])
-    assert inferred == expected
-
-
-def test_dtype_float32():
-    df = pd.DataFrame({'col': np.float32([45e-3, -0.4, 99.0])})
-    inferred = sch.infer(df)
-    expected = ibis.schema([('col', 'float')])
-    assert inferred == expected
-
-
-def test_dtype_float64():
-    df = pd.DataFrame({'col': np.float64([-3e43, 43.0, 10000000.0])})
-    inferred = sch.infer(df)
-    expected = ibis.schema([('col', 'double')])
-    assert inferred == expected
-
-
-def test_dtype_uint8():
-    df = pd.DataFrame({'col': np.uint8([3, 0, 16])})
-    inferred = sch.infer(df)
-    expected = ibis.schema([('col', 'uint8')])
-    assert inferred == expected
-
-
-def test_dtype_uint16():
-    df = pd.DataFrame({'col': np.uint16([5569, 1, 33])})
-    inferred = sch.infer(df)
-    expected = ibis.schema([('col', 'uint16')])
-    assert inferred == expected
-
-
-def test_dtype_uint32():
-    df = pd.DataFrame({'col': np.uint32([100, 0, 6])})
-    inferred = sch.infer(df)
-    expected = ibis.schema([('col', 'uint32')])
-    assert inferred == expected
-
-
-def test_dtype_uint64():
-    df = pd.DataFrame({'col': np.uint64([666, 2, 3])})
-    inferred = sch.infer(df)
-    expected = ibis.schema([('col', 'uint64')])
-    assert inferred == expected
-
-
-def test_dtype_datetime64():
-    df = pd.DataFrame(
-        {
-            'col': [
+@pytest.mark.parametrize(
+    ('col_data', 'schema_type'),
+    [
+        ([True, False, False], 'bool'),
+        (np.int8([-3, 9, 17]), 'int8'),
+        (np.int16([-5, 0, 12]), 'int16'),
+        (np.int32([-12, 3, 25000]), 'int32'),
+        (np.int64([102, 67228734, -0]), 'int64'),
+        (np.float32([45e-3, -0.4, 99.0]), 'float'),
+        (np.float64([-3e43, 43.0, 10000000.0]), 'double'),
+        (np.uint8([3, 0, 16]), 'uint8'),
+        (np.uint16([5569, 1, 33]), 'uint16'),
+        (np.uint32([100, 0, 6]), 'uint32'),
+        (np.uint64([666, 2, 3]), 'uint64'),
+        (
+            [
                 pd.Timestamp('2010-11-01 00:01:00'),
                 pd.Timestamp('2010-11-01 00:02:00.1000'),
                 pd.Timestamp('2010-11-01 00:03:00.300000'),
-            ]
-        }
-    )
-    inferred = sch.infer(df)
-    expected = ibis.schema([('col', 'timestamp')])
-    assert inferred == expected
-
-
-def test_dtype_timedelta64():
-    df = pd.DataFrame(
-        {
-            'col': [
+            ],
+            'timestamp',
+        ),
+        (
+            [
                 pd.Timedelta('1 days'),
                 pd.Timedelta('-1 days 2 min 3us'),
                 pd.Timedelta('-2 days +23:57:59.999997'),
-            ]
-        }
-    )
+            ],
+            "interval('ns')",
+        ),
+        (['foo', 'bar', 'hello'], "string"),
+        (pd.Series(['a', 'b', 'c', 'a']).astype('category'), dt.Category()),
+        (pd.Series([b'1', b'2', b'3']), dt.string),
+        (pd.Series([1, 2, '3']), dt.binary),
+        (pd.Series([1, 2, 3.0]), dt.float64),
+        (
+            pd.Series([Decimal('1.0'), Decimal('2.0'), Decimal('3.0')]),
+            dt.binary,
+        ),
+        (pd.Series([1 + 1j, 1 + 2j, 1 + 3j], dtype=object), dt.binary),
+        (
+            pd.Series(
+                [
+                    pd.to_datetime('2010-11-01'),
+                    pd.to_datetime('2010-11-02'),
+                    pd.to_datetime('2010-11-03'),
+                ]
+            ),
+            dt.timestamp,
+        ),
+        (pd.Series([time(1), time(2), time(3)]), dt.time),
+        (
+            pd.Series(
+                [
+                    pd.Period('2011-01'),
+                    pd.Period('2011-02'),
+                    pd.Period('2011-03'),
+                ],
+                dtype=object,
+            ),
+            dt.binary,
+        ),
+        # mixed
+        (pd.Series([b'1', '2', 3.0]), dt.binary),
+        # empty
+        (pd.Series([], dtype='object'), dt.binary),
+    ],
+)
+def test_schema_infer(col_data, schema_type):
+    df = pd.DataFrame({'col': col_data})
+
     inferred = sch.infer(df)
-    expected = ibis.schema([('col', "interval('ns')")])
-    assert inferred == expected
-
-
-def test_dtype_string():
-    df = pd.DataFrame({'col': ['foo', 'bar', 'hello']})
-    inferred = sch.infer(df)
-    expected = ibis.schema([('col', 'string')])
-    assert inferred == expected
-
-
-def test_dtype_categorical():
-    df = pd.DataFrame({'col': ['a', 'b', 'c', 'a']}, dtype='category')
-    inferred = sch.infer(df)
-    expected = ibis.schema([('col', dt.Category())])
+    expected = ibis.schema([('col', schema_type)])
     assert inferred == expected

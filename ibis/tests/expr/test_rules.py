@@ -93,7 +93,7 @@ def test_valid_value(dtype, value, expected):
     ('dtype', 'value', 'expected'),
     [
         (dt.uint8, -3, IbisTypeError),
-        (dt.int32, dict(), IbisTypeError),
+        (dt.int32, {}, IbisTypeError),
         (dt.string, 1, IbisTypeError),
         (dt.Array(dt.float), ['s'], IbisTypeError),
         (
@@ -159,6 +159,7 @@ class Baz:
         (Bar, 'a', 'A'),
         (Bar, 'b', 'B'),
         (Baz(2), 'a', 2),
+        (Foo, ibis.literal(Foo.a), Foo.a),
     ],
 )
 def test_valid_member_of(obj, value, expected):
@@ -326,3 +327,20 @@ def test_array_of(rule, input):
 def test_array_of_invalid_input(rule, input):
     with pytest.raises(IbisTypeError):
         rule(input)
+
+
+@pytest.mark.parametrize(
+    ('validator', 'input'),
+    [
+        (rlz.array_of(rlz.integer), [1, 2, 3]),
+        (rlz.list_of(rlz.integer), (3, 2)),
+        (rlz.instance_of(int), 32),
+    ],
+)
+def test_optional(validator, input):
+    expected = validator(input)
+    if isinstance(expected, ibis.Expr):
+        assert rlz.optional(validator)(input).equals(expected)
+    else:
+        assert rlz.optional(validator)(input) == expected
+    assert rlz.optional(validator)(None) is None

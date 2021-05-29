@@ -7,7 +7,9 @@ import toolz
 
 import ibis.common.exceptions as com
 import ibis.util
+from ibis.expr import operations as ops
 from ibis.expr import types as ir
+from ibis.expr.schema import coerce_to_dataframe
 from ibis.expr.scope import Scope
 
 from ..core import execute
@@ -83,22 +85,48 @@ def coerce_to_output(
     Returns
     -------
     result: A Series or DataFrame
+
+    Examples
+    --------
+    For dataframe outputs, see ``ibis.util.coerce_to_dataframe``.
+
+    >>> coerce_to_output(pd.Series(1), expr)
+    0    1
+    Name: result, dtype: int64
+    >>> coerce_to_output(1, expr)
+    0    1
+    Name: result, dtype: int64
+    >>> coerce_to_output(1, expr, [1,2,3])
+    1    1
+    2    1
+    3    1
+    Name: result, dtype: int64
+    >>> coerce_to_output([1,2,3], expr)
+    0    [1, 2, 3]
+    Name: result, dtype: object
     """
     result_name = getattr(expr, '_name', None)
 
     if isinstance(expr, (ir.DestructColumn, ir.StructColumn)):
-        return ibis.util.coerce_to_dataframe(result, expr.type().names)
+        return coerce_to_dataframe(result, expr.type())
     elif isinstance(expr, (ir.DestructScalar, ir.StructScalar)):
         # Here there are two cases, if this is groupby aggregate,
         # then the result e a Series of tuple/list, or
         # if this is non grouped aggregate, then the result
-        return ibis.util.coerce_to_dataframe(result, expr.type().names)
-    elif np.isscalar(result):
+        return coerce_to_dataframe(result, expr.type())
+    elif isinstance(result, pd.Series):
+        return result.rename(result_name)
+    elif isinstance(expr.op(), ops.Reduction):
         if index is None:
-            return pd.Series(result, name=result_name)
+            # Wrap `result` into a single-element Series.
+            return pd.Series([result], name=result_name)
         else:
+            # Broadcast `result` to a multi-element Series according to the
+            # given `index`.
             return pd.Series(
                 np.repeat(result, len(index)), index=index, name=result_name,
             )
+    elif isinstance(result, np.ndarray):
+        return pd.Series(result, name=result_name)
     else:
-        return result.rename(result_name)
+        raise ValueError(f"Cannot coerce_to_output. Result: {result}")

@@ -228,6 +228,10 @@ import ibis
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.util
+from ibis.expr.timecontext import (
+    construct_time_context_aware_series,
+    get_time_col,
+)
 
 
 class AggregationContext(abc.ABC):
@@ -359,7 +363,21 @@ class Summarize(AggregationContext):
                 'Object {} is not callable or a string'.format(function)
             )
 
-        return grouped_data.agg(wrap_for_agg(function, args, kwargs))
+        if isinstance(grouped_data, pd.core.groupby.generic.SeriesGroupBy):
+            # `SeriesGroupBy.agg` does not allow np.arrays to be returned
+            # from UDFs. To avoid `SeriesGroupBy.agg`, we will us
+            # `Series.agg` manually on each group. (#2768)
+            aggs = {}
+            for k, v in grouped_data:
+                aggs[k] = v.agg(wrap_for_agg(function, args, kwargs))
+                grouped_col_name = v.name
+            return (
+                pd.Series(aggs)
+                .rename(grouped_col_name)
+                .rename_axis(grouped_data.grouper.names)
+            )
+        else:
+            return grouped_data.agg(wrap_for_agg(function, args, kwargs))
 
 
 class Transform(AggregationContext):
@@ -371,9 +389,15 @@ class Transform(AggregationContext):
         # Instead, we need to use "apply", which can return a non
         # numeric type, e.g, tuple of two double.
         if isinstance(self.output_type, dt.Struct):
-            return grouped_data.apply(function, *args, **kwargs)
+            res = grouped_data.apply(function, *args, **kwargs)
         else:
-            return grouped_data.transform(function, *args, **kwargs)
+            res = grouped_data.transform(function, *args, **kwargs)
+
+        # The result series uses the name of the input. We should
+        # unset it to avoid confusion, when result is not guranteed
+        # to be the same series / have the same type after transform
+        res.name = None
+        return res
 
 
 @functools.singledispatch
@@ -494,14 +518,14 @@ def window_agg_udf(
     masked_window_lower_indices = window_lower_indices[mask].astype('i8')
     masked_window_upper_indices = window_upper_indices[mask].astype('i8')
 
-    input_iters = list(
+    input_iters = [
         create_window_input_iter(
             arg, masked_window_lower_indices, masked_window_upper_indices
         )
         if isinstance(arg, (pd.Series, SeriesGroupBy))
         else itertools.repeat(arg)
         for arg in inputs
-    )
+    ]
 
     valid_result = pd.Series(
         function(*(next(gen) for gen in input_iters))
@@ -620,13 +644,23 @@ class Window(AggregationContext):
                 mask = ~(window_sizes.isna())
                 window_upper_indices = pd.Series(range(len(window_sizes))) + 1
                 window_lower_indices = window_upper_indices - window_sizes
+                # The result Series of udf may need to be trimmed by
+                # timecontext. In order to do so, 'time' must be added
+                # as an index to the Series, if present. Here We extract
+                # time column from the parent Dataframe `frame`.
+                if get_time_col() in frame:
+                    result_index = construct_time_context_aware_series(
+                        obj, frame
+                    ).index
+                else:
+                    result_index = obj.index
                 result = window_agg_udf(
                     grouped_data,
                     function,
                     window_lower_indices,
                     window_upper_indices,
                     mask,
-                    obj.index,
+                    result_index,
                     self.dtype,
                     self.max_lookback,
                     *args,

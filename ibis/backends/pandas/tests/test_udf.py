@@ -2,14 +2,14 @@ import collections
 
 import numpy as np
 import pandas as pd
-import pandas.util.testing as tm
+import pandas._testing as tm
 import pytest
 
 import ibis
 import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
 
-from .. import connect, execute
+from .. import Backend
 from ..udf import nullable, udf
 
 
@@ -41,7 +41,7 @@ def df2():
 
 @pytest.fixture
 def con(df, df2):
-    return connect({'df': df, 'df2': df2})
+    return Backend().connect({'df': df, 'df2': df2})
 
 
 @pytest.fixture
@@ -94,16 +94,11 @@ def zscore(series):
     return (series - series.mean()) / series.std()
 
 
-@udf.elementwise([], dt.int64)
-def a_single_number(**kwargs):
-    return 1
-
-
 @udf.reduction(
     input_type=[dt.double], output_type=dt.Array(dt.double),
 )
 def quantiles(series, *, quantiles):
-    return list(series.quantile(quantiles))
+    return np.array(series.quantile(quantiles))
 
 
 def test_udf(t, df):
@@ -114,12 +109,6 @@ def test_udf(t, df):
     result = expr.execute()
     expected = df.a.str.len().mul(2)
     tm.assert_series_equal(result, expected)
-
-
-def test_zero_argument_udf(con, t, df):
-    expr = t.projection([a_single_number().name('foo')])
-    result = execute(expr)
-    assert result is not None
 
 
 def test_elementwise_udf_with_non_vectors(con):
@@ -190,6 +179,7 @@ def test_udaf_analytic_groupby(con, t, df):
         return s.sub(s.mean()).div(s.std())
 
     expected = df.groupby('key').c.transform(f)
+    expected.name = None
     tm.assert_series_equal(result, expected)
 
 
@@ -203,7 +193,7 @@ def test_udaf_groupby():
             'key': list('ddeefff'),
         }
     )
-    con = connect({'df': df})
+    con = Backend().connect({'df': df})
     t = con.table('df')
 
     expr = t.groupby(t.key).aggregate(my_corr=my_corr(t.a, t.b))
@@ -298,7 +288,7 @@ def test_udaf_window_interval():
         )
     )
 
-    con = connect({'df': df})
+    con = Backend().connect({'df': df})
     t = con.table('df')
     window = ibis.trailing_range_window(
         ibis.interval(days=2), order_by='time', group_by='key'
@@ -340,7 +330,7 @@ def test_multiple_argument_udaf_window():
             'key': list('deefefd'),
         }
     )
-    con = connect({'df': df})
+    con = Backend().connect({'df': df})
     t = con.table('df')
     window = ibis.trailing_window(2, order_by='a', group_by='key')
     window2 = ibis.trailing_window(1, order_by='b', group_by='key')
@@ -384,7 +374,7 @@ def test_udaf_window_nan():
             'key': list('ddeefffggh'),
         }
     )
-    con = connect({'df': df})
+    con = Backend().connect({'df': df})
     t = con.table('df')
     window = ibis.trailing_window(2, order_by='a', group_by='key')
     expr = t.mutate(rolled=my_mean(t.b).over(window))
@@ -404,18 +394,37 @@ def qs(request):
 
 
 def test_array_return_type_reduction(con, t, df, qs):
+    """Tests reduction UDF returning an array."""
     expr = quantiles(t.b, quantiles=qs)
     result = expr.execute()
-    expected = df.b.quantile(qs)
-    assert result == expected.tolist()
+    expected = np.array(df.b.quantile(qs))
+    tm.assert_numpy_array_equal(result, expected)
 
 
 def test_array_return_type_reduction_window(con, t, df, qs):
+    """Tests reduction UDF returning an array, used over a window."""
     expr = quantiles(t.b, quantiles=qs).over(ibis.window())
     result = expr.execute()
     expected_raw = df.b.quantile(qs).tolist()
     expected = pd.Series([expected_raw] * len(df))
     tm.assert_series_equal(result, expected)
+
+
+def test_array_return_type_reduction_group_by(con, t, df, qs):
+    """Tests reduction UDF returning an array, used in a grouped aggregation.
+
+    Getting this use case to succeed required avoiding use of
+    `SeriesGroupBy.agg` in the `Summarize` aggcontext implementation (#2768).
+    """
+    expr = t.groupby(t.key).aggregate(
+        quantiles_col=quantiles(t.b, quantiles=qs)
+    )
+    result = expr.execute()
+
+    expected_col = df.groupby(df.key).b.agg(lambda s: s.quantile(qs).tolist())
+    expected = pd.DataFrame({'quantiles_col': expected_col}).reset_index()
+
+    tm.assert_frame_equal(result, expected)
 
 
 def test_elementwise_udf_with_many_args(t2):

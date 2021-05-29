@@ -1,12 +1,12 @@
 import numpy as np
 import pandas as pd
-import pandas.util.testing as tm
+import pandas.testing as tm
 import pytest
 from pytest import param
 
 import ibis
 
-from .. import connect
+from .. import Backend
 from ..client import PandasTable  # noqa: E402
 
 pytestmark = pytest.mark.pandas
@@ -14,7 +14,7 @@ pytestmark = pytest.mark.pandas
 
 @pytest.fixture
 def client():
-    return connect(
+    return Backend().connect(
         {
             'df': pd.DataFrame({'a': [1, 2, 3], 'b': list('abc')}),
             'df_unknown': pd.DataFrame(
@@ -29,6 +29,14 @@ def table(client):
     return client.table('df')
 
 
+@pytest.fixture
+def test_data():
+    test_data = test_data = pd.DataFrame(
+        {"A": [1, 2, 3, 4, 5], "B": list("abcde")}
+    )
+    return test_data
+
+
 def test_client_table(table):
     assert isinstance(table.op(), ibis.expr.operations.DatabaseTable)
     assert isinstance(table.op(), PandasTable)
@@ -38,14 +46,15 @@ def test_client_table_repr(table):
     assert 'PandasTable' in repr(table)
 
 
-def test_load_data(client):
-    client.load_data('testing', tm.makeDataFrame())
+def test_load_data(client, test_data):
+
+    client.load_data('testing', test_data)
     assert client.exists_table('testing')
     assert client.get_schema('testing')
 
 
-def test_create_table(client):
-    client.create_table('testing', obj=tm.makeDataFrame())
+def test_create_table(client, test_data):
+    client.create_table('testing', obj=test_data)
     assert client.exists_table('testing')
     client.create_table('testingschema', schema=client.get_schema('testing'))
     assert client.exists_table('testingschema')
@@ -61,11 +70,6 @@ def test_list_tables(client):
     assert client.list_tables(like='df_unknown')
     assert not client.list_tables(like='not_in_the_database')
     assert client.list_tables()
-
-
-def test_read_with_undiscoverable_type(client):
-    with pytest.raises(TypeError):
-        client.table('df_unknown')
 
 
 def test_drop(table):

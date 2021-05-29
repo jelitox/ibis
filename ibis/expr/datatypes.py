@@ -1,6 +1,7 @@
 import builtins
 import collections
 import datetime
+import enum
 import functools
 import itertools
 import numbers
@@ -392,29 +393,29 @@ class Interval(DataType):
     __slots__ = 'value_type', 'unit'
 
     # based on numpy's units
-    _units = dict(
-        Y='year',
-        Q='quarter',
-        M='month',
-        W='week',
-        D='day',
-        h='hour',
-        m='minute',
-        s='second',
-        ms='millisecond',
-        us='microsecond',
-        ns='nanosecond',
-    )
+    _units = {
+        'Y': 'year',
+        'Q': 'quarter',
+        'M': 'month',
+        'W': 'week',
+        'D': 'day',
+        'h': 'hour',
+        'm': 'minute',
+        's': 'second',
+        'ms': 'millisecond',
+        'us': 'microsecond',
+        'ns': 'nanosecond',
+    }
 
-    _timedelta_to_interval_units = dict(
-        days='D',
-        hours='h',
-        minutes='m',
-        seconds='s',
-        milliseconds='ms',
-        microseconds='us',
-        nanoseconds='ns',
-    )
+    _timedelta_to_interval_units = {
+        'days': 'D',
+        'hours': 'h',
+        'minutes': 'm',
+        'seconds': 's',
+        'milliseconds': 'ms',
+        'microseconds': 'us',
+        'nanoseconds': 'ns',
+    }
 
     def _convert_timedelta_unit_to_interval_unit(self, unit: str):
         if unit not in self._timedelta_to_interval_units:
@@ -524,6 +525,13 @@ class Struct(DataType):
         nullable: bool = True,
     ) -> 'Struct':
         names, types = zip(*pairs)
+        return cls(list(names), list(map(dtype, types)), nullable=nullable)
+
+    @classmethod
+    def from_dict(
+        cls, pairs: Mapping[str, Union[str, DataType]], nullable: bool = True,
+    ) -> 'Struct':
+        names, types = pairs.keys(), pairs.values()
         return cls(list(names), list(map(dtype, types)), nullable=nullable)
 
     @property
@@ -945,9 +953,9 @@ class Tokens:
         return _token_names[value]
 
 
-_token_names = dict(
-    (getattr(Tokens, n), n) for n in dir(Tokens) if n.isalpha() and n.isupper()
-)
+_token_names = {
+    getattr(Tokens, n): n for n in dir(Tokens) if n.isalpha() and n.isupper()
+}
 
 Token = collections.namedtuple('Token', ('type', 'value'))
 
@@ -1705,6 +1713,11 @@ def infer_integer(value: int, allow_overflow: bool = False) -> Integer:
         raise OverflowError(value)
 
     return int64
+
+
+@infer.register(enum.Enum)
+def infer_enum(value: enum.Enum) -> Enum:
+    return Enum(infer(value.name), infer(value.value),)
 
 
 @infer.register(bool)

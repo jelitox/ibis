@@ -8,13 +8,11 @@ from typing import Optional
 import regex as re
 import sqlalchemy as sa
 
-import ibis.backends.base_sqlalchemy.alchemy as alch
+from ibis.backends.base.sql.alchemy import AlchemyClient, AlchemyTable
 from ibis.client import Database
 
-from .compiler import SQLiteDialect
 
-
-class SQLiteTable(alch.AlchemyTable):
+class SQLiteTable(AlchemyTable):
     pass
 
 
@@ -313,15 +311,14 @@ def _register_aggregate(agg, con):
     con.connection.connection.create_aggregate(agg.__name__, nargs, agg)
 
 
-class SQLiteClient(alch.AlchemyClient):
+class SQLiteClient(AlchemyClient):
     """The Ibis SQLite client class."""
 
-    dialect = SQLiteDialect
-    database_class = SQLiteDatabase
-    table_class = SQLiteTable
-
-    def __init__(self, path=None, create=False):
+    def __init__(self, backend, path=None, create=False):
         super().__init__(sa.create_engine("sqlite://"))
+        self.dialect = backend.dialect
+        self.database_class = backend.database_class
+        self.table_class = backend.table_class
         self.name = path
         self.database_name = "base"
 

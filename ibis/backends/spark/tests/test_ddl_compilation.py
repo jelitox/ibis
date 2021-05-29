@@ -1,24 +1,21 @@
 import pytest
 
 import ibis
+from ibis.backends.base.sql.ddl import DropTable
 
-from ..compiler import (  # noqa: E402, isort:skip
-    SparkDialect,
-    build_ast,
-)
-from .. import ddl  # noqa: E402, isort:skip
-
+from .. import ddl
+from ..compiler import build_ast
 
 pytestmark = pytest.mark.spark
 
 
 def test_drop_table_compile():
-    statement = ddl.DropTable('foo', database='bar', must_exist=True)
+    statement = DropTable('foo', database='bar', must_exist=True)
     query = statement.compile()
     expected = "DROP TABLE bar.`foo`"
     assert query == expected
 
-    statement = ddl.DropTable('foo', database='bar', must_exist=False)
+    statement = DropTable('foo', database='bar', must_exist=False)
     query = statement.compile()
     expected = "DROP TABLE IF EXISTS bar.`foo`"
     assert query == expected
@@ -33,7 +30,7 @@ def test_select_basics(t):
     name = 'testing123456'
 
     expr = t.limit(10)
-    ast = build_ast(expr, SparkDialect.make_context())
+    ast = build_ast(expr)
     select = ast.queries[0]
 
     stmt = ddl.InsertSelect(name, select, database='foo')
@@ -141,7 +138,7 @@ def test_partition_by():
 def _create_table(
     table_name, expr, database=None, can_exist=False, format='parquet'
 ):
-    ast = build_ast(expr, SparkDialect.make_context())
+    ast = build_ast(expr)
     select = ast.queries[0]
     statement = ddl.CTAS(
         table_name,

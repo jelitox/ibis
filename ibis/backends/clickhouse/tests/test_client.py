@@ -1,7 +1,7 @@
 from io import StringIO
 
 import pandas as pd
-import pandas.util.testing as tm
+import pandas.testing as tm
 import pytest
 
 import ibis
@@ -9,7 +9,6 @@ import ibis.config as config
 import ibis.expr.types as ir
 from ibis import literal as L
 
-pytest.importorskip('clickhouse_driver')
 pytestmark = pytest.mark.clickhouse
 
 

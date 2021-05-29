@@ -1,18 +1,39 @@
 import os
+from pathlib import Path
 
 import pytest
 
 import ibis
+import ibis.expr.types as ir
+from ibis.backends.tests.base import BackendTest, RoundAwayFromZero
+
+
+class TestConf(BackendTest, RoundAwayFromZero):
+    supports_arrays = False
+    supports_arrays_outside_of_select = supports_arrays
+    supports_window_operations = True
+    check_dtype = False
+    returned_timestamp_unit = 's'
+
+    @staticmethod
+    def connect(data_directory: Path) -> ibis.client.Client:
+        path = Path(
+            os.environ.get(
+                'IBIS_TEST_SQLITE_DATABASE', data_directory / 'ibis_testing.db'
+            )
+        )
+        return ibis.sqlite.connect(str(path))
+
+    @property
+    def functional_alltypes(self) -> ir.TableExpr:
+        t = self.db.functional_alltypes
+        return t.mutate(timestamp_col=t.timestamp_col.cast('timestamp'))
 
 
 @pytest.fixture(scope='module')
 def dbpath(data_directory):
     default = str(data_directory / 'ibis_testing.db')
-    path = os.environ.get('IBIS_TEST_SQLITE_DATABASE', default)
-    if not os.path.exists(path):
-        pytest.skip('SQLite testing db {} does not exist'.format(path))
-    else:
-        return path
+    return os.environ.get('IBIS_TEST_SQLITE_DATABASE', default)
 
 
 @pytest.fixture(scope='module')
@@ -34,21 +55,21 @@ def dialect():
 
 @pytest.fixture
 def translate(dialect):
-    from .sqlite.compiler import SQLiteDialect
+    from ibis.backends.sqlite import Backend
 
-    ibis_dialect = SQLiteDialect()
+    ibis_dialect = Backend().dialect()
     context = ibis_dialect.make_context()
     return lambda expr: str(
         ibis_dialect.translator(expr, context)
         .get_result()
-        .compile(dialect=dialect, compile_kwargs=dict(literal_binds=True))
+        .compile(dialect=dialect, compile_kwargs={'literal_binds': True})
     )
 
 
 @pytest.fixture
 def sqla_compile(dialect):
     return lambda expr: str(
-        expr.compile(dialect=dialect, compile_kwargs=dict(literal_binds=True))
+        expr.compile(dialect=dialect, compile_kwargs={'literal_binds': True})
     )
 
 

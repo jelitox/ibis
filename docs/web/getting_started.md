@@ -4,7 +4,7 @@
 
 The next steps provides the easiest and recommended way to set up your
 environment to use {{ ibis.project_name }}. Other installation options can be found in
-the [advanced installation page]({{ base_url}}/docs/getting_started/install.html).
+the [advanced installation page]({{ base_url}}/docs/index.html#installation).
 
 1. Download [Anaconda](https://www.anaconda.com/distribution/) for your operating system and
    the latest Python version, run the installer, and follow the steps. Detailed instructions
@@ -35,5 +35,5 @@ the [advanced installation page]({{ base_url}}/docs/getting_started/install.html
 ## Tutorials
 
 You can learn more about {{ ibis.project_name }} in the
-[tutorials](https://mybinder.org/v2/gh/ibis-project/ibis/master?filepath=docs%2Fsource%2Fnotebooks%2Ftutorial),
+[tutorials](https://ibis-project.org/docs/tutorial/index.html),
 and more about JupyterLab in the [JupyterLab documentation](https://jupyterlab.readthedocs.io/en/stable/user/interface.html).

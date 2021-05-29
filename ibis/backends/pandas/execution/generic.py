@@ -22,7 +22,7 @@ import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
 from ibis.expr.scope import Scope
-from ibis.expr.timecontext import TIME_COL
+from ibis.expr.timecontext import get_time_col
 from ibis.expr.typing import TimeContext
 
 from .. import aggcontext as agg_ctx
@@ -66,6 +66,11 @@ def execute_node_literal_any_boolean_datatype(op, value, datatype, **kwargs):
 @execute_literal.register(ops.Literal, object, dt.Floating)
 def execute_node_literal_any_floating_datatype(op, value, datatype, **kwargs):
     return float(value)
+
+
+@execute_literal.register(ops.Literal, object, dt.Array)
+def execute_node_literal_any_array_datatype(op, value, datatype, **kwargs):
+    return np.array(value)
 
 
 @execute_literal.register(ops.Literal, dt.DataType)
@@ -258,20 +263,18 @@ def execute_series_quantile(op, data, quantile, aggcontext=None, **kwargs):
     )
 
 
-@execute_node.register(ops.MultiQuantile, pd.Series, collections.abc.Sequence)
-def execute_series_quantile_sequence(
+@execute_node.register(ops.MultiQuantile, pd.Series, np.ndarray)
+def execute_series_quantile_multi(
     op, data, quantile, aggcontext=None, **kwargs
 ):
     result = aggcontext.agg(
         data, 'quantile', q=quantile, interpolation=op.interpolation
     )
-    return list(result)
+    return np.array(result)
 
 
-@execute_node.register(
-    ops.MultiQuantile, SeriesGroupBy, collections.abc.Sequence
-)
-def execute_series_quantile_groupby(
+@execute_node.register(ops.MultiQuantile, SeriesGroupBy, np.ndarray)
+def execute_series_quantile_multi_groupby(
     op, data, quantile, aggcontext=None, **kwargs
 ):
     def q(x, quantile, interpolation):
@@ -761,7 +764,9 @@ def execute_null_if_zero_series(op, data, **kwargs):
 
 @execute_node.register(ops.StringSplit, pd.Series, (pd.Series, str))
 def execute_string_split(op, data, delimiter, **kwargs):
-    return data.str.split(delimiter)
+    # Doing the iteration using `map` is much faster than doing the iteration
+    # using `Series.apply` due to Pandas-related overhead.
+    return pd.Series(map(lambda s: np.array(s.split(delimiter)), data))
 
 
 @execute_node.register(
@@ -920,13 +925,14 @@ def execute_database_table_client(
     df = client.dictionary[op.name]
     if timecontext:
         begin, end = timecontext
-        if TIME_COL not in df:
+        time_col = get_time_col()
+        if time_col not in df:
             raise com.IbisError(
-                f'Table {op.name} must have a time column named {TIME_COL}'
+                f'Table {op.name} must have a time column named {time_col}'
                 ' to execute with time context.'
             )
         # filter with time context
-        mask = df[TIME_COL].between(begin, end)
+        mask = df[time_col].between(begin, end)
         return df.loc[mask].reset_index(drop=True)
     return df
 

@@ -3,6 +3,8 @@ import enum
 import functools
 import operator
 
+import numpy as np
+import pyspark
 import pyspark.sql.functions as F
 from pyspark.sql import Window
 from pyspark.sql.functions import PandasUDFType, pandas_udf
@@ -14,17 +16,20 @@ import ibis.expr.types as ir
 import ibis.expr.types as types
 from ibis import interval
 from ibis.backends.pandas.execution import execute
-from ibis.backends.spark.compiler import SparkContext, SparkDialect
+from ibis.backends.spark.compiler import SparkContext
 from ibis.backends.spark.datatypes import (
     ibis_array_dtype_to_spark_dtype,
     ibis_dtype_to_spark_dtype,
     spark_dtype,
 )
 from ibis.expr.timecontext import adjust_context
-from ibis.util import coerce_to_dataframe
+from ibis.util import guid
 
-from .operations import PySparkTable
 from .timecontext import combine_time_context, filter_by_time_context
+
+
+class PySparkTable(ops.DatabaseTable):
+    pass
 
 
 class PySparkContext(SparkContext):
@@ -80,12 +85,7 @@ class PySparkExprTranslator:
             )
 
 
-class PySparkDialect(SparkDialect):
-    translator = PySparkExprTranslator
-
-
 compiles = PySparkExprTranslator.compiles
-dialect = PySparkDialect
 
 
 @compiles(PySparkTable)
@@ -102,6 +102,23 @@ def compile_sql_query_result(t, expr, scope, timecontext, **kwargs):
     return client._session.sql(query)
 
 
+def _can_be_replaced_by_column_name(column_expr, table):
+    """
+    Return whether the given column_expr can be replaced by its literal
+    name, which is True when column_expr and table[column_expr.get_name()]
+    is semantically the same.
+    """
+    # Each check below is necessary to distinguish a pure projection from
+    # other valid selections, such as a mutation that assigns a new column
+    # or changes the value of an existing column.
+    return (
+        isinstance(column_expr.op(), ops.TableColumn)
+        and column_expr.op().table == table
+        and column_expr.get_name() in table.schema()
+        and column_expr.op() == table[column_expr.get_name()].op()
+    )
+
+
 @compiles(ops.Selection)
 def compile_selection(t, expr, scope, timecontext, **kwargs):
     op = expr.op()
@@ -115,43 +132,73 @@ def compile_selection(t, expr, scope, timecontext, **kwargs):
         for node in op.selections
         if timecontext
     ]
-    combined_timecontext = combine_time_context(arg_timecontexts)
-    src_table = t.translate(op.table, scope, combined_timecontext)
+    adjusted_timecontext = combine_time_context(arg_timecontexts)
+    # If this is a sort or filter node, op.selections is empty
+    # in this case, we use the original timecontext
+    if not adjusted_timecontext:
+        adjusted_timecontext = timecontext
+    src_table = t.translate(op.table, scope, adjusted_timecontext)
 
     col_in_selection_order = []
+    col_to_drop = []
+    result_table = src_table
     for selection in op.selections:
         if isinstance(selection, types.TableExpr):
             col_in_selection_order.extend(selection.columns)
         elif isinstance(selection, types.DestructColumn):
-            struct_col = t.translate(selection, scope, combined_timecontext)
+            struct_col = t.translate(selection, scope, adjusted_timecontext)
+            # assign struct col and drop it later
+            # This is a work around to ensure that the struct_col
+            # is only executed once
+            struct_col_name = f"destruct_col_{guid()}"
+            result_table = result_table.withColumn(struct_col_name, struct_col)
+            col_to_drop.append(struct_col_name)
             cols = [
-                struct_col[name].alias(name) for name in selection.type().names
+                result_table[struct_col_name][name].alias(name)
+                for name in selection.type().names
             ]
-            col_in_selection_order += cols
+            col_in_selection_order.extend(cols)
         elif isinstance(selection, (types.ColumnExpr, types.ScalarExpr)):
-            col = t.translate(selection, scope, combined_timecontext).alias(
-                selection.get_name()
-            )
-            col_in_selection_order.append(col)
+            # If the selection is a straightforward projection of a table
+            # column from the root table itself (i.e. excluding mutations and
+            # renames), we can get the selection name directly.
+            if _can_be_replaced_by_column_name(selection, op.table):
+                col_in_selection_order.append(selection.get_name())
+            else:
+                col = t.translate(
+                    selection, scope, adjusted_timecontext
+                ).alias(selection.get_name())
+                col_in_selection_order.append(col)
         else:
             raise NotImplementedError(
                 f"Unrecoginized type in selections: {type(selection)}"
             )
-
     if col_in_selection_order:
-        src_table = src_table[col_in_selection_order]
+        result_table = result_table[col_in_selection_order]
+
+    if col_to_drop:
+        result_table = result_table.drop(*col_to_drop)
 
     for predicate in op.predicates:
         col = t.translate(predicate, scope, timecontext)
-        src_table = src_table[col]
+        # Due to an upstream Spark issue (SPARK-33057) we cannot
+        # directly use filter with a window operation. The workaround
+        # here is to assign a temporary column for the filter predicate,
+        # do the filtering, and then drop the temporary column.
+        filter_column = f'predicate_{guid()}'
+        result_table = result_table.withColumn(filter_column, col)
+        result_table = result_table.filter(F.col(filter_column))
+        result_table = result_table.drop(filter_column)
 
     if op.sort_keys:
         sort_cols = [
             t.translate(key, scope, timecontext) for key in op.sort_keys
         ]
-        src_table = src_table.sort(*sort_cols)
+        result_table = result_table.sort(*sort_cols)
 
-    return filter_by_time_context(src_table, timecontext)
+    return filter_by_time_context(
+        result_table, timecontext, adjusted_timecontext
+    )
 
 
 @compiles(ops.SortKey)
@@ -245,6 +292,12 @@ def compile_equals(t, expr, scope, timecontext, **kwargs):
     )
 
 
+@compiles(ops.Not)
+def compile_not(t, expr, scope, timecontext, **kwargs):
+    op = expr.op()
+    return ~t.translate(op.arg, scope, timecontext)
+
+
 @compiles(ops.NotEquals)
 def compile_not_equals(t, expr, scope, timecontext, **kwargs):
     op = expr.op()
@@ -324,8 +377,12 @@ def compile_literal(t, expr, scope, timecontext, raw=False, **kwargs):
             return value
     elif isinstance(value, list):
         return F.array(*[F.lit(v) for v in value])
+    elif isinstance(value, np.ndarray):
+        # Unpack np.generic's using .item(), otherwise Spark
+        # will not accept
+        return F.array(*[F.lit(v.item()) for v in value])
     else:
-        return F.lit(expr.op().value)
+        return F.lit(value)
 
 
 def _compile_agg(t, agg_expr, scope, timecontext, *, context, **kwargs):
@@ -592,6 +649,40 @@ def compile_abs(t, expr, scope, timecontext, **kwargs):
     return F.abs(src_column)
 
 
+@compiles(ops.Clip)
+def compile_clip(t, expr, scope, timecontext, **kwargs):
+    op = expr.op()
+    spark_dtype = ibis_dtype_to_spark_dtype(expr.type())
+    col = t.translate(op.arg, scope, timecontext)
+    upper = (
+        t.translate(op.upper, scope, timecontext)
+        if op.upper is not None
+        else float('inf')
+    )
+    lower = (
+        t.translate(op.lower, scope, timecontext)
+        if op.lower is not None
+        else float('-inf')
+    )
+
+    def column_min(value, limit):
+        """Given the minimum limit, return values that are greater
+        than or equal to this limit."""
+        return F.when(value < limit, limit).otherwise(value)
+
+    def column_max(value, limit):
+        """Given the maximum limit, return values that are less
+        than or equal to this limit."""
+        return F.when(value > limit, limit).otherwise(value)
+
+    def clip(column, lower_value, upper_value):
+        return column_max(
+            column_min(column, F.lit(lower_value)), F.lit(upper_value)
+        )
+
+    return clip(col, lower, upper).cast(spark_dtype)
+
+
 @compiles(ops.Round)
 def compile_round(t, expr, scope, timecontext, **kwargs):
     op = expr.op()
@@ -814,16 +905,19 @@ def compile_capitalize(t, expr, scope, timecontext, **kwargs):
 @compiles(ops.Substring)
 def compile_substring(t, expr, scope, timecontext, **kwargs):
     op = expr.op()
-
-    @F.udf('string')
-    def substring(s, start, length):
-        end = start + length
-        return s[start:end]
-
     src_column = t.translate(op.arg, scope, timecontext)
-    start_column = t.translate(op.start, scope, timecontext)
-    length_column = t.translate(op.length, scope, timecontext)
-    return substring(src_column, start_column, length_column)
+    start = t.translate(op.start, scope, timecontext, raw=True) + 1
+    length = t.translate(op.length, scope, timecontext, raw=True)
+
+    if isinstance(start, pyspark.sql.Column) or isinstance(
+        length, pyspark.sql.Column
+    ):
+        raise NotImplementedError(
+            "Specifiying Start and length with column expressions "
+            "are not supported."
+        )
+
+    return src_column.substr(start, length)
 
 
 @compiles(ops.StringLength)
@@ -1549,6 +1643,14 @@ def compile_interval_from_integer(t, expr, scope, timecontext, **kwargs):
 # -------------------------- Array Operations ----------------------------
 
 
+@compiles(ops.ArrayColumn)
+def compile_array_column(t, expr, scope, timecontext, **kwargs):
+    op = expr.op()
+
+    cols = t.translate(op.cols, scope, timecontext)
+    return F.array(cols)
+
+
 @compiles(ops.ArrayLength)
 def compile_array_length(t, expr, scope, timecontext, **kwargs):
     op = expr.op()
@@ -1648,24 +1750,11 @@ def compile_not_null(t, expr, scope, timecontext, **kwargs):
 # ------------------------- User defined function ------------------------
 
 
-def _wrap_struct_func(func, output_cols):
-    @functools.wraps(func)
-    def wrapped(*args, **kwargs):
-        result = func(*args, **kwargs)
-        return coerce_to_dataframe(result, output_cols)
-
-    return wrapped
-
-
 @compiles(ops.ElementWiseVectorizedUDF)
 def compile_elementwise_udf(t, expr, scope, timecontext, **kwargs):
     op = expr.op()
     spark_output_type = spark_dtype(op._output_type)
-    if isinstance(expr, (types.StructColumn, types.DestructColumn)):
-        func = _wrap_struct_func(op.func, spark_output_type.names)
-    else:
-        func = op.func
-
+    func = op.func
     spark_udf = pandas_udf(func, spark_output_type, PandasUDFType.SCALAR)
     func_args = (t.translate(arg, scope, timecontext) for arg in op.func_args)
     return spark_udf(*func_args)
@@ -1687,3 +1776,25 @@ def compile_reduction_udf(t, expr, scope, timecontext, context=None, **kwargs):
     else:
         src_table = t.translate(op.func_args[0].op().table, scope, timecontext)
         return src_table.agg(col)
+
+
+@compiles(ops.SearchedCase)
+def compile_searched_case(t, expr, scope, timecontext, **kwargs):
+    op = expr.op()
+    existing_when = None
+
+    for case, result in zip(op.cases, op.results):
+        if existing_when is not None:
+            # Spark allowed chained when statement
+            when = existing_when.when
+        else:
+            when = F.when
+
+        existing_when = when(
+            t.translate(case, scope, timecontext, **kwargs),
+            t.translate(result, scope, timecontext, **kwargs),
+        )
+
+    return existing_when.otherwise(
+        t.translate(op.default, scope, timecontext, **kwargs)
+    )

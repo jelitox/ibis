@@ -1,11 +1,11 @@
+import clickhouse_driver
 import pandas as pd
-import pandas.util.testing as tm
+import pandas.testing as tm
 import pytest
 
 import ibis
 import ibis.common.exceptions as com
 
-driver = pytest.importorskip('clickhouse_driver')
 pytestmark = pytest.mark.clickhouse
 
 
@@ -474,7 +474,7 @@ def test_join_with_external_table_errors(con, alltypes, df):
         external_table.a, external_table.c, alltypes.id
     ]
 
-    with pytest.raises(driver.errors.ServerException):
+    with pytest.raises(clickhouse_driver.errors.ServerException):
         expr.execute()
 
     with pytest.raises(TypeError):
