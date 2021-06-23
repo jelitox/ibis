@@ -13,7 +13,6 @@ import ibis.expr.window as W
 
 from .database import AlchemyTable
 from .geospatial import geospatial_supported
-from .query_builder import to_sqlalchemy
 
 
 def variance_reduction(func_name):
@@ -116,6 +115,8 @@ def _table_array_view(t, expr):
 
 
 def _exists_subquery(t, expr):
+    from .query_builder import AlchemyCompiler
+
     op = expr.op()
     ctx = t.context
 
@@ -124,7 +125,7 @@ def _exists_subquery(t, expr):
     )
 
     sub_ctx = ctx.subcontext()
-    clause = to_sqlalchemy(filtered, sub_ctx, exists=True)
+    clause = AlchemyCompiler.to_sql(filtered, sub_ctx, exists=True)
 
     if isinstance(op, ops.NotExistsSubquery):
         clause = sa.not_(clause)
@@ -265,6 +266,16 @@ def _string_like(t, expr):
     arg, pattern, escape = expr.op().args
     result = t.translate(arg).like(t.translate(pattern), escape=escape)
     return result
+
+
+def _startswith(t, expr):
+    arg, start = expr.op().args
+    return t.translate(arg).startswith(t.translate(start))
+
+
+def _endswith(t, expr):
+    arg, start = expr.op().args
+    return t.translate(arg).endswith(t.translate(start))
 
 
 _cumulative_to_reduction = {
@@ -444,6 +455,8 @@ sqlalchemy_operation_registry = {
     ops.StringLength: unary(sa.func.length),
     ops.StringReplace: fixed_arity(sa.func.replace, 3),
     ops.StringSQLLike: _string_like,
+    ops.StartsWith: _startswith,
+    ops.EndsWith: _endswith,
     # math
     ops.Ln: unary(sa.func.ln),
     ops.Exp: unary(sa.func.exp),

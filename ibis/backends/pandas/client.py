@@ -14,12 +14,12 @@ from multipledispatch import Dispatcher
 from pandas.api.types import CategoricalDtype, DatetimeTZDtype
 from pkg_resources import parse_version
 
-import ibis.client as client
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
+from ibis.backends.base import Client, Database
 
 from .core import execute_and_reset
 
@@ -86,9 +86,9 @@ _inferable_pandas_dtypes = {
     'integer': dt.int64,
     'mixed-integer': dt.binary,
     'mixed-integer-float': dt.float64,
-    'decimal': dt.binary,
+    'decimal': dt.float64,
     'complex': dt.binary,
-    'categorical': dt.binary,
+    'categorical': dt.category,
     'boolean': dt.boolean,
     'datetime64': dt.timestamp,
     'datetime': dt.timestamp,
@@ -157,7 +157,7 @@ def _infer_pandas_series_contents(s: pd.Series) -> dt.DataType:
     """
     if s.dtype == np.object_:
         inferred_dtype = infer_pandas_dtype(s, skipna=True)
-        if inferred_dtype in {'mixed', 'decimal'}:
+        if inferred_dtype == 'mixed':
             # We need to inspect an element to determine the Ibis dtype
             value = s.iloc[0]
             if isinstance(value, (np.ndarray, list, pd.Series)):
@@ -404,9 +404,8 @@ class PandasTable(ops.DatabaseTable):
     pass
 
 
-class PandasClient(client.Client):
+class PandasClient(Client):
     def __init__(self, backend, dictionary):
-        self.dialect = backend.dialect
         self.database_class = backend.database_class
         self.table_class = backend.table_class
         self.dictionary = dictionary
@@ -517,5 +516,5 @@ class PandasClient(client.Client):
         return parse_version(pd.__version__)
 
 
-class PandasDatabase(client.Database):
+class PandasDatabase(Database):
     pass
