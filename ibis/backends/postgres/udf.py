@@ -1,23 +1,28 @@
+from __future__ import annotations
+
 import collections
 import inspect
 import itertools
 from textwrap import dedent
+from typing import Any, Callable, MutableMapping, Sequence
 
 import sqlalchemy as sa
-from sqlalchemy.dialects.postgresql import dialect as sa_postgres_dialect
+from sqlalchemy.dialects.postgresql import dialect
 
+import ibis
+import ibis.expr.datatypes as dt
 import ibis.expr.rules as rlz
 import ibis.udf.validate as v
 from ibis import IbisError
 from ibis.backends.base.sql.alchemy import to_sqla_type
 from ibis.backends.postgres.compiler import (
-    PostgreSQLCompiler,
     PostgreSQLExprTranslator,
     PostgresUDFNode,
 )
-from ibis.expr.signature import Argument as Arg
 
-_udf_name_cache = collections.defaultdict(itertools.count)
+_udf_name_cache: MutableMapping[str, Any] = collections.defaultdict(
+    itertools.count
+)
 
 
 class PostgresUDFError(IbisError):
@@ -34,7 +39,7 @@ def _sa_type_to_postgres_str(sa_type):
     string"""
     if callable(sa_type):
         sa_type = sa_type()
-    return sa_type.compile(dialect=sa_postgres_dialect())
+    return sa_type.compile(dialect=dialect())
 
 
 def _ibis_to_postgres_str(ibis_type):
@@ -42,23 +47,26 @@ def _ibis_to_postgres_str(ibis_type):
     return _sa_type_to_postgres_str(_ibis_to_pg_sa_type(ibis_type))
 
 
-def _create_udf_node(name, fields):
+def _create_udf_node(
+    name: str,
+    fields: dict[str, Any],
+) -> type[PostgresUDFNode]:
     """Create a new UDF node type.
 
     Parameters
     ----------
-    name : str
+    name
         Then name of the UDF node
-    fields : OrderedDict
+    fields
         Mapping of class member name to definition
 
     Returns
     -------
-    type
+    type[PostgresUDFNode]
         A new PostgresUDFNode subclass
     """
     definition = next(_udf_name_cache[name])
-    external_name = '{}_{:d}'.format(name, definition)
+    external_name = f'{name}_{definition:d}'
     return type(external_name, (PostgresUDFNode,), fields)
 
 
@@ -81,7 +89,7 @@ def existing_udf(name, input_types, output_type, schema=None, parameters=None):
     """
 
     if parameters is None:
-        parameters = ['v{}'.format(i) for i in range(len(input_types))]
+        parameters = [f'v{i}' for i in range(len(input_types))]
     elif len(input_types) != len(parameters):
         raise ValueError(
             (
@@ -94,7 +102,7 @@ def existing_udf(name, input_types, output_type, schema=None, parameters=None):
 
     udf_node_fields = collections.OrderedDict(
         [
-            (name, Arg(rlz.value(type_)))
+            (name, rlz.value(type_))
             for name, type_ in zip(parameters, input_types)
         ]
         + [
@@ -120,7 +128,7 @@ def existing_udf(name, input_types, output_type, schema=None, parameters=None):
 
         return func_obj(*sa_args)
 
-    PostgreSQLCompiler.add_operation(udf_node, _translate_udf)
+    PostgreSQLExprTranslator.add_operation(udf_node, _translate_udf)
 
     def wrapped(*args, **kwargs):
         node = udf_node(*args, **kwargs)
@@ -130,30 +138,39 @@ def existing_udf(name, input_types, output_type, schema=None, parameters=None):
 
 
 def udf(
-    client,
-    python_func,
-    in_types,
-    out_type,
-    schema=None,
-    replace=False,
-    name=None,
+    client: ibis.backends.postgres.Backend,
+    python_func: Callable[..., Any],
+    in_types: Sequence[dt.DataType],
+    out_type: dt.DataType,
+    schema: str | None = None,
+    replace: bool = False,
+    name: str | None = None,
+    language: str = "plpythonu",
 ):
-    """Defines a UDF in the database
+    """Define a UDF in the database.
 
     Parameters
     ----------
-    client: PostgreSQLClient
-    python_func: python function
-    in_types: List[DataType]
-    out_type : DataType
-    schema: str - optionally specify the schema in which to define the UDF
-    replace: bool - replace UDF in database if already exists
-    name: str - name for the UDF to be defined in database
+    client
+        A postgres Backend instance
+    python_func
+        Python function
+    in_types
+        Input DataTypes
+    out_type
+        Output DataType
+    schema
+        The postgres schema in which to define the UDF
+    replace
+        Replace UDF in database if already exists
+    name
+        Name for the UDF to be defined in database
+    language
+        The language to use for the UDF
 
     Returns
     -------
     Callable
-
         The ibis UDF object as a wrapped function
     """
     if name is None:
@@ -167,7 +184,7 @@ def udf(
     template = """CREATE {replace} FUNCTION
 {schema_fragment}{name}({signature})
 RETURNS {return_type}
-LANGUAGE plpythonu
+LANGUAGE {language}
 AS $$
 {func_definition}
 return {internal_name}({args})
@@ -175,7 +192,7 @@ $$;
 """
 
     postgres_signature = ', '.join(
-        '{name} {type}'.format(name=name, type=_ibis_to_postgres_str(type_))
+        f'{name} {_ibis_to_postgres_str(type_)}'
         for name, type_ in zip(parameter_names, in_types)
     )
     return_type = _ibis_to_postgres_str(out_type)
@@ -201,6 +218,7 @@ $$;
         name=internal_name,
         signature=postgres_signature,
         return_type=return_type,
+        language=language,
         func_definition=func_definition,
         # for internal_name, need to make sure this works if passing
         # name parameter

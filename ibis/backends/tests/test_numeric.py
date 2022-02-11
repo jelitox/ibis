@@ -16,32 +16,9 @@ from ibis.tests.util import assert_equal
 try:
     import sqlalchemy as sa
 except ImportError:
-    sa = None
-
-
-@pytest.fixture
-def df_decimal():
-    return pd.DataFrame(
-        {
-            'n1': [
-                decimal.Decimal('12.1234'),
-                decimal.Decimal('333.878787'),
-                decimal.Decimal('1090.4949'),
-            ],
-            'n2': [
-                decimal.Decimal('5454.0904'),
-                decimal.Decimal('904.889282'),
-                decimal.Decimal('9893.09022'),
-            ],
-        }
-    )
-
-
-@pytest.fixture
-def sch_decimal():
-    return ibis.schema(
-        [('index', 'int64'), ('n1', 'decimal'), ('n2', 'decimal')]
-    )
+    sa = postgresql = mysql = None
+else:
+    from sqlalchemy.dialects import mysql, postgresql
 
 
 @pytest.mark.parametrize(
@@ -56,19 +33,16 @@ def sch_decimal():
             lambda t: ibis.literal(np.nan),
             lambda t: np.nan,
             id='nan-literal',
-            marks=pytest.mark.xfail_backends(['omniscidb']),
         ),
         param(
             lambda t: ibis.literal(np.inf),
             lambda t: np.inf,
             id='inf-literal',
-            marks=pytest.mark.xfail_backends(['omniscidb']),
         ),
         param(
             lambda t: ibis.literal(-np.inf),
             lambda t: -np.inf,
             id='-inf-literal',
-            marks=pytest.mark.xfail_backends(['omniscidb']),
         ),
     ],
 )
@@ -133,7 +107,6 @@ def test_isnan_isinf(
 @pytest.mark.xfail_unsupported
 def test_math_functions_literals(backend, con, alltypes, df, expr, expected):
     result = con.execute(expr)
-
     if isinstance(result, decimal.Decimal):
         # in case of Impala the result is decimal
         # >>> decimal.Decimal('5.56') == 5.56
@@ -296,6 +269,7 @@ def test_backend_specific_numerics(
     ],
     ids=lambda op: op.__name__,
 )
+@pytest.mark.xfail_unsupported
 def test_binary_arithmetic_operations(backend, alltypes, df, op):
     smallint_col = alltypes.smallint_col + 1  # make it nonzero
     smallint_series = df.smallint_col + 1
@@ -310,9 +284,7 @@ def test_binary_arithmetic_operations(backend, alltypes, df, op):
         result = result.astype('float64')
 
     expected = backend.default_series_rename(expected)
-    backend.assert_series_equal(
-        result, expected, check_exact=False, check_less_precise=True
-    )
+    backend.assert_series_equal(result, expected, check_exact=False)
 
 
 def test_mod(backend, alltypes, df):
@@ -334,9 +306,7 @@ def test_floating_mod(backend, alltypes, df):
     expected = operator.mod(df.double_col, df.smallint_col + 1)
 
     expected = backend.default_series_rename(expected)
-    backend.assert_series_equal(
-        result, expected, check_exact=False, check_less_precise=True
-    )
+    backend.assert_series_equal(result, expected, check_exact=False)
 
 
 @pytest.mark.parametrize(
@@ -353,9 +323,7 @@ def test_floating_mod(backend, alltypes, df):
 @pytest.mark.parametrize('denominator', [0, 0.0])
 def test_divide_by_zero(backend, alltypes, df, column, denominator):
     if not backend.supports_divide_by_zero:
-        pytest.skip(
-            '{} does not support safe division by zero'.format(backend)
-        )
+        pytest.skip(f'{backend} does not support safe division by zero')
     expr = alltypes[column] / denominator
     expected = backend.default_series_rename(df[column].div(denominator))
     result = expr.execute()
@@ -369,7 +337,7 @@ def test_divide_by_zero(backend, alltypes, df, column, denominator):
     'dialects, default_precisions, default_scales',
     [
         (
-            {'postgres': sa.dialects.postgresql, 'mysql': sa.dialects.mysql},
+            {'postgres': postgresql, 'mysql': mysql},
             {'postgres': 1000, 'mysql': 10},
             {'postgres': 0, 'mysql': 0},
         )
@@ -456,3 +424,19 @@ def test_clip(alltypes, df, ibis_func, pandas_func):
     # Names won't match in the Pyspark backend since Pyspark
     # gives 'tmp' name when executing a ColumnExpr
     tm.assert_series_equal(result, expected, check_names=False)
+
+
+@pytest.mark.skip_backends(
+    [
+        'pandas',
+        'dask',
+        'csv',
+        'datafusion',
+        'pyspark',
+        'clickhouse',
+    ]
+)
+def test_histogram(con, alltypes):
+    n = 10
+    results = con.execute(alltypes.int_col.histogram(n))
+    assert len(results.value_counts()) == n

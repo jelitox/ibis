@@ -1,64 +1,102 @@
-from typing import Dict
+from __future__ import annotations
 
-from dask.dataframe import DataFrame
+from typing import Any, Mapping
 
+import dask
+import dask.dataframe as dd
+import pandas as pd
+from dask.base import DaskMethodsMixin
+
+# import the pandas execution module to register dispatched implementations of
+# execute_node that the dask backend will later override
+import ibis.backends.pandas.execution  # noqa: F401
 import ibis.config
-from ibis.backends.base import BaseBackend
+import ibis.expr.schema as sch
+import ibis.expr.types as ir
+from ibis.backends.pandas import BasePandasBackend
 
-from . import udf  # noqa: F401,F403 - register dispatchers
-from .client import DaskClient, DaskDatabase, DaskTable
-from .execution import execute  # noqa F401
+from .client import DaskDatabase, DaskTable, ibis_schema_to_dask
+from .core import execute_and_reset
+
+# Make sure that the pandas backend options have been loaded
+ibis.pandas
 
 
-class Backend(BaseBackend):
+class Backend(BasePandasBackend):
     name = 'dask'
-    kind = 'pandas'
     database_class = DaskDatabase
     table_class = DaskTable
+    backend_table_type = dd.DataFrame
 
-    def connect(self, dictionary: Dict[str, DataFrame]) -> DaskClient:
-        """Construct a dask client from a dictionary of DataFrames.
+    def do_connect(self, dictionary):
+        # register dispatchers
+        from . import udf  # noqa: F401
 
-        Parameters
-        ----------
-        dictionary : dict
+        super().do_connect(dictionary)
 
-        Returns
-        -------
-        DaskClient
+    @property
+    def version(self):
+        return dask.__version__
+
+    def execute(
+        self,
+        query: ir.Expr,
+        params: Mapping[ir.Expr, object] = None,
+        limit: str = 'default',
+        **kwargs,
+    ):
+        if limit != 'default':
+            raise ValueError(
+                'limit parameter to execute is not yet implemented in the '
+                'dask backend'
+            )
+
+        if not isinstance(query, ir.Expr):
+            raise TypeError(
+                "`query` has type {!r}, expected ibis.expr.types.Expr".format(
+                    type(query).__name__
+                )
+            )
+
+        result = self.compile(query, params, **kwargs)
+        if isinstance(result, DaskMethodsMixin):
+            return result.compute()
+        else:
+            return result
+
+    def compile(
+        self, query: ir.Expr, params: Mapping[ir.Expr, object] = None, **kwargs
+    ):
+        """Compile `expr`.
+
+        Notes
+        -----
+        For the dask backend returns a dask graph that you can run ``.compute``
+        on to get a pandas object.
         """
-        return DaskClient(backend=self, dictionary=dictionary)
+        return execute_and_reset(query, params=params, **kwargs)
 
-    def from_dataframe(
-        self, df: DataFrame, name: str = 'df', client: DaskClient = None
-    ) -> DaskTable:
-        """
-        convenience function to construct an ibis table
-        from a DataFrame
+    @classmethod
+    def _supports_conversion(cls, obj: Any) -> bool:
+        return isinstance(obj, cls.backend_table_type)
 
-        Parameters
-        ----------
-        df : DataFrame
-        name : str, default 'df'
-        client : Client, default new DaskClient
-            client dictionary will be mutated with the
-            name of the DataFrame
+    @staticmethod
+    def _from_pandas(df: pd.DataFrame, npartitions: int = 1) -> dd.DataFrame:
+        return dd.from_pandas(df, npartitions=npartitions)
 
-        Returns
-        -------
-        Table
-        """
+    @staticmethod
+    def _convert_schema(schema: sch.Schema):
+        return ibis_schema_to_dask(schema)
 
-        if client is None:
-            return self.connect({name: df}).table(name)
-        client.dictionary[name] = df
-        return client.table(name)
+    @classmethod
+    def _convert_object(cls, obj: dd.DataFrame) -> dd.DataFrame:
+        return obj
 
-    def register_options(self):
-        ibis.config.register_option(
-            'enable_trace',
-            False,
-            'Whether enable tracing for dask execution. '
-            'See ibis.dask.trace for details.',
-            validator=ibis.config.is_bool,
-        )
+    def create_table(
+        self,
+        table_name: str,
+        obj: dd.DataFrame | None = None,
+        schema: sch.Schema | None = None,
+    ):
+        """Create a table."""
+        super().create_table(table_name, obj=obj, schema=schema)

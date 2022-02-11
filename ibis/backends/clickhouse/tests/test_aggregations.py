@@ -7,8 +7,6 @@ import pytest
 
 from ibis import literal as L
 
-pytestmark = pytest.mark.clickhouse
-
 
 @pytest.mark.parametrize(
     ('reduction', 'func_translated'),
@@ -40,8 +38,8 @@ def test_std_var_pop(con, alltypes, translate):
 
     assert translate(expr1) == 'stddevPopIf(`double_col`, `bigint_col` < 70)'
     assert translate(expr2) == 'varPopIf(`double_col`, `bigint_col` < 70)'
-    assert isinstance(con.execute(expr1), np.float)
-    assert isinstance(con.execute(expr2), np.float)
+    assert isinstance(con.execute(expr1), float)
+    assert isinstance(con.execute(expr2), float)
 
 
 @pytest.mark.parametrize('reduction', ['sum', 'count', 'max', 'min'])
@@ -182,7 +180,9 @@ def test_anonymus_aggregate(alltypes, df, translate):
 
 
 def test_boolean_summary(alltypes):
-    expr = alltypes.bool_col.summary()
+    bool_col_summary = alltypes.bool_col.summary()
+    expr = alltypes.aggregate(bool_col_summary)
+
     result = expr.execute()
     expected = pd.DataFrame(
         [[7300, 0, 0, 1, 3650, 0.5, 2]],

@@ -49,7 +49,7 @@ def execute_cross_join(op, left, right, **kwargs):
 
     """
     # generate a unique name for the temporary join key
-    key = "cross_join_{}".format(ibis.util.guid())
+    key = f"cross_join_{ibis.util.guid()}"
     join_key = {key: True}
     new_left = left.assign(**join_key)
     new_right = right.assign(**join_key)
@@ -69,15 +69,15 @@ def execute_cross_join(op, left, right, **kwargs):
     return result
 
 
-# TODO - execute_materialized_join - #2553
+# TODO - execute_join - #2553
 @execute_node.register(ops.Join, dd.DataFrame, dd.DataFrame)
-def execute_materialized_join(op, left, right, **kwargs):
+def execute_join(op, left, right, **kwargs):
     op_type = type(op)
 
     try:
         how = constants.JOIN_TYPES[op_type]
     except KeyError:
-        raise NotImplementedError('{} not supported'.format(op_type.__name__))
+        raise NotImplementedError(f'{op_type.__name__} not supported')
 
     left_op = op.left.op()
     right_op = op.right.op()

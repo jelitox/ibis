@@ -1,13 +1,12 @@
 """Dispatching code for Selection operations.
 """
 
-from __future__ import absolute_import
 
 import functools
 import operator
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from operator import methodcaller
-from typing import Optional
+from typing import List, Optional
 
 import pandas as pd
 from multipledispatch import Dispatcher
@@ -66,6 +65,9 @@ def compute_projection_scalar_expr(
 
     data_columns = frozenset(data.columns)
 
+    if scope is None:
+        scope = Scope()
+
     scope = scope.merge_scopes(
         Scope(
             {
@@ -102,23 +104,16 @@ def compute_projection_column_expr(
     if isinstance(op, ops.TableColumn):
         # slightly faster path for simple column selection
         name = op.name
+        assert isinstance(name, str)
 
         if name in data:
             return data[name].rename(result_name or name)
 
         if not isinstance(parent_table_op, ops.Join):
             raise KeyError(name)
-        (root_table,) = op.root_tables()
-        left_root, right_root = ops.distinct_roots(
-            parent_table_op.left, parent_table_op.right
-        )
-        suffixes = {
-            left_root: constants.LEFT_JOIN_SUFFIX,
-            right_root: constants.RIGHT_JOIN_SUFFIX,
-        }
-        return data.loc[:, name + suffixes[root_table]].rename(
-            result_name or name
-        )
+
+        suffix = util.get_join_suffix_for_op(op, parent_table_op)
+        return data.loc[:, name + suffix].rename(result_name or name)
 
     data_columns = frozenset(data.columns)
 
@@ -254,10 +249,7 @@ def _compute_predicates(
             mapping = remap_overlapping_column_names(
                 table_op, root_table, data_columns
             )
-            if mapping is not None:
-                new_data = data.loc[:, mapping.keys()].rename(columns=mapping)
-            else:
-                new_data = data
+            new_data = map_new_column_names_to_data(mapping, data)
             additional_scope = additional_scope.merge_scope(
                 Scope({root_table: new_data}, timecontext)
             )
@@ -309,6 +301,74 @@ def physical_tables_node(node):
     return list(unique(concat(map(physical_tables, node.root_tables()))))
 
 
+def build_df_from_selection(
+    selection_exprs: List[ir.ColumnExpr],
+    data: pd.DataFrame,
+    table_op: ops.Node,
+) -> pd.DataFrame:
+    """Build up a df by doing direct selections, renaming if necessary.
+
+    Special logic for:
+    - Joins where suffixes have been added to column names
+    - Cases where new columns are created and selected.
+    """
+    cols = defaultdict(list)
+
+    for expr in selection_exprs:
+        selection = expr.op().name
+        if selection not in data:
+            if not isinstance(table_op, ops.Join):
+                raise KeyError(selection)
+            join_suffix = util.get_join_suffix_for_op(expr.op(), table_op)
+            if selection + join_suffix not in data:
+                raise KeyError(selection)
+            selection += join_suffix
+        cols[selection].append(getattr(expr, "_name", selection))
+
+    result = data[list(cols.keys())]
+
+    renamed_cols = {}
+    for from_col, to_cols in cols.items():
+        if len(to_cols) == 1 and from_col != to_cols[0]:
+            renamed_cols[from_col] = to_cols[0]
+        else:
+            for new_col in to_cols:
+                result[new_col] = result.loc[:, from_col]
+
+    if renamed_cols:
+        result = result.rename(columns=renamed_cols)
+
+    return result
+
+
+def build_df_from_projection(
+    selection_exprs: List[ir.Expr],
+    op: ops.Selection,
+    data: pd.DataFrame,
+    **kwargs,
+) -> pd.DataFrame:
+    data_pieces = [
+        compute_projection(expr, op, data, **kwargs)
+        for expr in selection_exprs
+    ]
+
+    new_pieces = [
+        piece.reset_index(level=list(range(1, piece.index.nlevels)), drop=True)
+        if piece.index.nlevels > 1
+        else piece
+        for piece in data_pieces
+    ]
+    # Result series might be trimmed by time context, thus index may
+    # have changed. To concat rows properly, we first `sort_index` on
+    # each pieces then assign data index manually to series
+    for i in range(len(new_pieces)):
+        assert len(new_pieces[i].index) == len(data.index)
+        new_pieces[i] = new_pieces[i].sort_index()
+        new_pieces[i].index = data.index
+
+    return pd.concat(new_pieces, axis=1)
+
+
 @execute_node.register(ops.Selection, pd.DataFrame)
 def execute_selection_dataframe(
     op, data, scope: Scope, timecontext: Optional[TimeContext], **kwargs
@@ -320,34 +380,17 @@ def execute_selection_dataframe(
 
     # Build up the individual pandas structures from column expressions
     if selections:
-        data_pieces = []
-        for selection in selections:
-            pandas_object = compute_projection(
-                selection,
+        if all(isinstance(s.op(), ops.TableColumn) for s in selections):
+            result = build_df_from_selection(selections, data, op.table.op())
+        else:
+            result = build_df_from_projection(
+                selections,
                 op,
                 data,
                 scope=scope,
                 timecontext=timecontext,
                 **kwargs,
             )
-            data_pieces.append(pandas_object)
-
-        new_pieces = [
-            piece.reset_index(
-                level=list(range(1, piece.index.nlevels)), drop=True
-            )
-            if piece.index.nlevels > 1
-            else piece
-            for piece in data_pieces
-        ]
-        # Result series might be trimmed by time context, thus index may
-        # have changed. To concat rows properly, we first `sort_index` on
-        # each pieces then assign data index manually to series
-        for i in range(len(new_pieces)):
-            assert len(new_pieces[i].index) == len(data.index)
-            new_pieces[i] = new_pieces[i].sort_index()
-            new_pieces[i].index = data.index
-        result = pd.concat(new_pieces, axis=1)
 
     if predicates:
         predicates = _compute_predicates(

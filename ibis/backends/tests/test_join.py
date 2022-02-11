@@ -2,8 +2,14 @@ import pandas as pd
 import pytest
 from pytest import param
 
+import ibis.common.exceptions as exc
+
 # add here backends that passes join tests
-all_db_join_supported = ['pandas', 'pyspark', 'dask']
+all_db_join_supported = [
+    'dask',
+    'pandas',
+    'pyspark',
+]
 
 
 @pytest.mark.parametrize(
@@ -16,21 +22,20 @@ all_db_join_supported = ['pandas', 'pyspark', 'dask']
         param(
             'semi',
             marks=pytest.mark.xfail(
-                raises=NotImplementedError, reason='Semi join not implemented'
+                raises=(exc.OperationNotDefinedError, NotImplementedError),
+                reason='Semi join not implemented',
             ),
         ),
         param(
             'anti',
             marks=pytest.mark.xfail(
-                raises=NotImplementedError, reason='Anti join not implemented'
+                raises=(exc.OperationNotDefinedError, NotImplementedError),
+                reason='Anti join not implemented',
             ),
         ),
     ],
 )
 @pytest.mark.only_on_backends(all_db_join_supported)
-# Csv is a subclass of Pandas so need to skip it explicitly.
-@pytest.mark.skip_backends(['csv'])
-@pytest.mark.xfail_unsupported
 def test_join_project_left_table(backend, con, batting, awards_players, how):
 
     left = batting[batting.yearID == 2015]

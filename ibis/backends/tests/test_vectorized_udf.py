@@ -229,7 +229,8 @@ def overwrite_struct_reduction(v, w):
 
 
 @reduction(
-    input_type=[dt.double], output_type=dt.Array(dt.double),
+    input_type=[dt.double],
+    output_type=dt.Array(dt.double),
 )
 def quantiles(series, *, quantiles):
     return series.quantile(quantiles)
@@ -265,8 +266,7 @@ def test_analytic_udf(backend, alltypes, df):
     backend.assert_series_equal(result, expected, check_names=False)
 
 
-@pytest.mark.only_on_backends(['pandas', 'pyspark'])
-# TODO - windowing - #2553
+@pytest.mark.only_on_backends(['pandas', 'pyspark', 'dask'])
 @pytest.mark.xfail_unsupported
 @pytest.mark.parametrize('udf', calc_zscore_udfs)
 def test_analytic_udf_mutate(backend, alltypes, df, udf):
@@ -300,6 +300,21 @@ def test_reduction_udf_array_return_type(backend, alltypes, df):
         .reset_index(drop=True)
     )
     backend.assert_frame_equal(result, expected)
+
+
+@pytest.mark.only_on_backends(['pandas', 'pyspark', 'dask'])
+@pytest.mark.xfail_unsupported
+def test_reduction_udf_on_empty_data(backend, alltypes):
+    """Test that summarization can handle empty data"""
+    # First filter down to zero rows
+    t = alltypes[alltypes['int_col'] > np.inf]
+    result = (
+        t.groupby('year').aggregate(mean=calc_mean(t['int_col'])).execute()
+    )
+    expected = pd.DataFrame({'year': [], 'mean': []})
+    # We check that the result is an empty DataFrame,
+    # rather than an error.
+    backend.assert_frame_equal(result, expected, check_dtype=False)
 
 
 @pytest.mark.only_on_backends(['pandas', 'pyspark', 'dask'])
@@ -449,7 +464,8 @@ def test_elementwise_udf_destruct(backend, alltypes, udf):
     ).execute()
 
     expected = alltypes.mutate(
-        col1=alltypes['double_col'] + 1, col2=alltypes['double_col'] + 2,
+        col1=alltypes['double_col'] + 1,
+        col2=alltypes['double_col'] + 2,
     ).execute()
 
     backend.assert_frame_equal(result, expected)
@@ -463,7 +479,8 @@ def test_elementwise_udf_overwrite_destruct(backend, alltypes):
     ).execute()
 
     expected = alltypes.mutate(
-        double_col=alltypes['double_col'] + 1, col2=alltypes['double_col'] + 2,
+        double_col=alltypes['double_col'] + 1,
+        col2=alltypes['double_col'] + 2,
     ).execute()
 
     # TODO issue #2649
@@ -582,15 +599,14 @@ def test_elementwise_udf_struct(backend, alltypes):
     )
     result = result.drop('new_col', axis=1)
     expected = alltypes.mutate(
-        col1=alltypes['double_col'] + 1, col2=alltypes['double_col'] + 2,
+        col1=alltypes['double_col'] + 1,
+        col2=alltypes['double_col'] + 2,
     ).execute()
 
     backend.assert_frame_equal(result, expected)
 
 
-@pytest.mark.only_on_backends(['pandas'])
-# TODO - windowing - #2553
-@pytest.mark.xfail_backends(['dask'])
+@pytest.mark.only_on_backends(['pandas', 'dask'])
 @pytest.mark.parametrize('udf', demean_struct_udfs)
 def test_analytic_udf_destruct(backend, alltypes, udf):
     w = window(preceding=None, following=None, group_by='year')
@@ -603,13 +619,10 @@ def test_analytic_udf_destruct(backend, alltypes, udf):
         demean=alltypes['double_col'] - alltypes['double_col'].mean().over(w),
         demean_weight=alltypes['int_col'] - alltypes['int_col'].mean().over(w),
     ).execute()
-
     backend.assert_frame_equal(result, expected)
 
 
-@pytest.mark.only_on_backends(['pandas'])
-# TODO - udf - #2553
-@pytest.mark.xfail_backends(['dask'])
+@pytest.mark.only_on_backends(['pandas', 'dask'])
 def test_analytic_udf_destruct_no_groupby(backend, alltypes):
     w = window(preceding=None, following=None)
 
@@ -630,9 +643,7 @@ def test_analytic_udf_destruct_no_groupby(backend, alltypes):
     backend.assert_frame_equal(result, expected)
 
 
-@pytest.mark.only_on_backends(['pandas', 'pyspark'])
-# TODO - windowing - #2553
-@pytest.mark.xfail_backends(['dask'])
+@pytest.mark.only_on_backends(['pandas', 'pyspark', 'dask'])
 @pytest.mark.xfail_unsupported
 def test_analytic_udf_destruct_overwrite(backend, alltypes):
     w = window(preceding=None, following=None, group_by='year')

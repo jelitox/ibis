@@ -1,27 +1,14 @@
 """The pandas client implementation."""
 
-from __future__ import absolute_import
-
-import re
-from functools import partial
-
-import dateutil.parser
 import numpy as np
 import pandas as pd
-import pytz
 import toolz
-from multipledispatch import Dispatcher
 from pandas.api.types import CategoricalDtype, DatetimeTZDtype
-from pkg_resources import parse_version
 
-import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.schema as sch
-import ibis.expr.types as ir
-from ibis.backends.base import Client, Database
-
-from .core import execute_and_reset
+from ibis.backends.base import Database
 
 infer_pandas_dtype = pd.api.types.infer_dtype
 
@@ -125,15 +112,7 @@ def from_pandas_categorical(value):
     return dt.Category()
 
 
-@dt.infer.register(
-    (np.generic,)
-    + tuple(
-        frozenset(
-            np.signedinteger.__subclasses__()
-            + np.unsignedinteger.__subclasses__()  # np.int64, np.uint64, etc.
-        )
-    )  # we need this because in Python 2 int is a parent of np.integer
-)
+@dt.infer.register(np.generic)
 def infer_numpy_scalar(value):
     return dt.dtype(value.dtype)
 
@@ -245,7 +224,7 @@ def ibis_dtype_to_pandas(ibis_dtype):
     if isinstance(ibis_dtype, dt.Timestamp) and ibis_dtype.timezone:
         return DatetimeTZDtype('ns', ibis_dtype.timezone)
     elif isinstance(ibis_dtype, dt.Interval):
-        return np.dtype('timedelta64[{}]'.format(ibis_dtype.unit))
+        return np.dtype(f'timedelta64[{ibis_dtype.unit}]')
     elif isinstance(ibis_dtype, dt.Category):
         return CategoricalDtype()
     elif type(ibis_dtype) in _ibis_dtypes:
@@ -258,30 +237,7 @@ def ibis_schema_to_pandas(schema):
     return list(zip(schema.names, map(ibis_dtype_to_pandas, schema.types)))
 
 
-convert = Dispatcher(
-    'convert',
-    doc="""\
-Convert `column` to the pandas dtype corresponding to `out_dtype`, where the
-dtype of `column` is `in_dtype`.
-
-Parameters
-----------
-in_dtype : Union[np.dtype, pandas_dtype]
-    The dtype of `column`, used for dispatching
-out_dtype : ibis.expr.datatypes.DataType
-    The requested ibis type of the output
-column : pd.Series
-    The column to convert
-
-Returns
--------
-result : pd.Series
-    The converted column
-""",
-)
-
-
-@convert.register(DatetimeTZDtype, dt.Timestamp, pd.Series)
+@sch.convert.register(DatetimeTZDtype, dt.Timestamp, pd.Series)
 def convert_datetimetz_to_timestamp(in_dtype, out_dtype, column):
     output_timezone = out_dtype.timezone
     if output_timezone is not None:
@@ -289,64 +245,22 @@ def convert_datetimetz_to_timestamp(in_dtype, out_dtype, column):
     return column.astype(out_dtype.to_pandas(), errors='ignore')
 
 
-def convert_timezone(obj, timezone):
-    """Convert `obj` to the timezone `timezone`.
-
-    Parameters
-    ----------
-    obj : datetime.date or datetime.datetime
-
-    Returns
-    -------
-    type(obj)
-    """
-    if timezone is None:
-        return obj.replace(tzinfo=None)
-    return pytz.timezone(timezone).localize(obj)
-
-
 PANDAS_STRING_TYPES = {'string', 'unicode', 'bytes'}
 PANDAS_DATE_TYPES = {'datetime', 'datetime64', 'date'}
 
 
-@convert.register(np.dtype, dt.Timestamp, pd.Series)
-def convert_datetime64_to_timestamp(in_dtype, out_dtype, column):
-    if in_dtype.type == np.datetime64:
-        return column.astype(out_dtype.to_pandas(), errors='ignore')
-    try:
-        series = pd.to_datetime(column, utc=True)
-    except pd.errors.OutOfBoundsDatetime:
-        inferred_dtype = infer_pandas_dtype(column, skipna=True)
-        if inferred_dtype in PANDAS_DATE_TYPES:
-            # not great, but not really any other option
-            return column.map(
-                partial(convert_timezone, timezone=out_dtype.timezone)
-            )
-        if inferred_dtype not in PANDAS_STRING_TYPES:
-            raise TypeError(
-                (
-                    'Conversion to timestamp not supported for Series of type '
-                    '{!r}'
-                ).format(inferred_dtype)
-            )
-        return column.map(dateutil.parser.parse)
-    else:
-        utc_dtype = DatetimeTZDtype('ns', 'UTC')
-        return series.astype(utc_dtype).dt.tz_convert(out_dtype.timezone)
-
-
-@convert.register(np.dtype, dt.Interval, pd.Series)
+@sch.convert.register(np.dtype, dt.Interval, pd.Series)
 def convert_any_to_interval(_, out_dtype, column):
     return column.values.astype(out_dtype.to_pandas())
 
 
-@convert.register(np.dtype, dt.String, pd.Series)
+@sch.convert.register(np.dtype, dt.String, pd.Series)
 def convert_any_to_string(_, out_dtype, column):
     result = column.astype(out_dtype.to_pandas(), errors='ignore')
     return result
 
 
-@convert.register(np.dtype, dt.Boolean, pd.Series)
+@sch.convert.register(np.dtype, dt.Boolean, pd.Series)
 def convert_boolean_to_series(in_dtype, out_dtype, column):
     # XXX: this is a workaround until #1595 can be addressed
     in_dtype_type = in_dtype.type
@@ -356,164 +270,17 @@ def convert_boolean_to_series(in_dtype, out_dtype, column):
     return column
 
 
-@convert.register(object, dt.DataType, pd.Series)
+@sch.convert.register(object, dt.DataType, pd.Series)
 def convert_any_to_any(_, out_dtype, column):
     return column.astype(out_dtype.to_pandas(), errors='ignore')
 
 
-def ibis_schema_apply_to(schema, df):
-    """Applies the Ibis schema to a pandas DataFrame
-
-    Parameters
-    ----------
-    schema : ibis.schema.Schema
-    df : pandas.DataFrame
-
-    Returns
-    -------
-    df : pandas.DataFrame
-
-    Notes
-    -----
-    Mutates `df`
-    """
-
-    for column, dtype in schema.items():
-        pandas_dtype = dtype.to_pandas()
-        col = df[column]
-        col_dtype = col.dtype
-
-        try:
-            not_equal = pandas_dtype != col_dtype
-        except TypeError:
-            # ugh, we can't compare dtypes coming from pandas, assume not equal
-            not_equal = True
-
-        if not_equal or isinstance(dtype, dt.String):
-            df[column] = convert(col_dtype, dtype, col)
-
-    return df
-
-
-dt.DataType.to_pandas = ibis_dtype_to_pandas
-sch.Schema.to_pandas = ibis_schema_to_pandas
-sch.Schema.apply_to = ibis_schema_apply_to
+dt.DataType.to_pandas = ibis_dtype_to_pandas  # type: ignore
+sch.Schema.to_pandas = ibis_schema_to_pandas  # type: ignore
 
 
 class PandasTable(ops.DatabaseTable):
     pass
-
-
-class PandasClient(Client):
-    def __init__(self, backend, dictionary):
-        self.database_class = backend.database_class
-        self.table_class = backend.table_class
-        self.dictionary = dictionary
-
-    def table(self, name, schema=None):
-        df = self.dictionary[name]
-        schema = sch.infer(df, schema=schema)
-        return self.table_class(name, schema, self).to_expr()
-
-    def execute(self, query, params=None, limit='default', **kwargs):
-        if limit != 'default':
-            raise ValueError(
-                'limit parameter to execute is not yet implemented in the '
-                'pandas backend'
-            )
-
-        if not isinstance(query, ir.Expr):
-            raise TypeError(
-                "`query` has type {!r}, expected ibis.expr.types.Expr".format(
-                    type(query).__name__
-                )
-            )
-        return execute_and_reset(query, params=params, **kwargs)
-
-    def compile(self, expr, *args, **kwargs):
-        """Compile `expr`.
-
-        Notes
-        -----
-        For the pandas backend this is a no-op.
-
-        """
-        return expr
-
-    def database(self, name=None):
-        """Construct a database called `name`."""
-        return self.database_class(name, self)
-
-    def list_tables(self, like=None):
-        """List the available tables."""
-        tables = list(self.dictionary.keys())
-        if like is not None:
-            pattern = re.compile(like)
-            return list(filter(lambda t: pattern.findall(t), tables))
-        return tables
-
-    def load_data(self, table_name, obj, **kwargs):
-        """Load data from `obj` into `table_name`.
-
-        Parameters
-        ----------
-        table_name : str
-        obj : pandas.DataFrame
-
-        """
-        # kwargs is a catch all for any options required by other backends.
-        self.dictionary[table_name] = pd.DataFrame(obj)
-
-    def create_table(self, table_name, obj=None, schema=None):
-        """Create a table."""
-        if obj is None and schema is None:
-            raise com.IbisError('Must pass expr or schema')
-
-        if obj is not None:
-            df = pd.DataFrame(obj)
-        else:
-            dtypes = ibis_schema_to_pandas(schema)
-            df = schema.apply_to(
-                pd.DataFrame(columns=list(map(toolz.first, dtypes)))
-            )
-
-        self.dictionary[table_name] = df
-
-    def get_schema(self, table_name, database=None):
-        """Return a Schema object for the indicated table and database.
-
-        Parameters
-        ----------
-        table_name : str
-            May be fully qualified
-        database : str
-
-        Returns
-        -------
-        ibis.expr.schema.Schema
-
-        """
-        return sch.infer(self.dictionary[table_name])
-
-    def exists_table(self, name):
-        """Determine if the indicated table or view exists.
-
-        Parameters
-        ----------
-        name : str
-        database : str
-
-        Returns
-        -------
-        bool
-
-        """
-        return bool(self.list_tables(like=name))
-
-    @property
-    def version(self) -> str:
-        """Return the version of the underlying backend library."""
-        return parse_version(pd.__version__)
 
 
 class PandasDatabase(Database):

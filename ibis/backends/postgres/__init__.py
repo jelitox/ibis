@@ -1,17 +1,19 @@
 """PostgreSQL backend."""
-from ibis.backends.base import BaseBackend
+import contextlib
 
-from .client import PostgreSQLClient, PostgreSQLDatabase, PostgreSQLTable
+import sqlalchemy
+
+from ibis.backends.base.sql.alchemy import BaseAlchemyBackend
+
+from .compiler import PostgreSQLCompiler
+from .udf import udf
 
 
-class Backend(BaseBackend):
+class Backend(BaseAlchemyBackend):
     name = 'postgres'
-    kind = 'sqlalchemy'
-    client = PostgreSQLClient
-    database_class = PostgreSQLDatabase
-    table_class = PostgreSQLTable
+    compiler = PostgreSQLCompiler
 
-    def connect(
+    def do_connect(
         self,
         host='localhost',
         user=None,
@@ -21,24 +23,30 @@ class Backend(BaseBackend):
         url=None,
         driver='psycopg2',
     ):
-        """Create an Ibis client located at `user`:`password`@`host`:`port`
-        connected to a PostgreSQL database named `database`.
+        """Create an Ibis client connected to PostgreSQL database.
 
         Parameters
         ----------
-        host : string, default 'localhost'
-        user : string, default None
-        password : string, default None
-        port : string or integer, default 5432
-        database : string, default None
-        url : string, default None
+        host
+            Hostname
+        user
+            Username
+        password
+            Password
+        port
+            Port number
+        database
+            Database to connect to
+        url
             Complete SQLAlchemy connection string. If passed, the other
             connection arguments are ignored.
-        driver : string, default 'psycopg2'
+        driver
+            Database driver
 
         Returns
         -------
-        PostgreSQLClient
+        Backend
+            Ibis backend instance
 
         Examples
         --------
@@ -78,13 +86,126 @@ class Backend(BaseBackend):
             year : int32
             month : int32
         """
-        return PostgreSQLClient(
-            backend=self,
+        if driver != 'psycopg2':
+            raise NotImplementedError(
+                'psycopg2 is currently the only supported driver'
+            )
+        alchemy_url = self._build_alchemy_url(
+            url=url,
             host=host,
+            port=port,
             user=user,
             password=password,
-            port=port,
             database=database,
-            url=url,
-            driver=driver,
+            driver=f'postgresql+{driver}',
+        )
+        self.database_name = alchemy_url.database
+        super().do_connect(sqlalchemy.create_engine(alchemy_url))
+
+    def list_databases(self, like=None):
+        # http://dba.stackexchange.com/a/1304/58517
+        databases = [
+            row.datname
+            for row in self.con.execute(
+                'SELECT datname FROM pg_database WHERE NOT datistemplate'
+            )
+        ]
+        return self._filter_with_like(databases, like)
+
+    def list_schemas(self, like=None):
+        """List all the schemas in the current database."""
+        # In Postgres we support schemas, which in other engines (e.g. MySQL)
+        # are databases
+        return super().list_databases(like)
+
+    def list_tables(self, like=None, database=None):
+        # PostgreSQL requires passing `database=None` for current database
+        if database == self.current_database:
+            database = None
+        return super().list_tables(like, database)
+
+    @contextlib.contextmanager
+    def begin(self):
+        with super().begin() as bind:
+            previous_timezone = bind.execute('SHOW TIMEZONE').scalar()
+            bind.execute('SET TIMEZONE = UTC')
+            try:
+                yield bind
+            finally:
+                bind.execute(f"SET TIMEZONE = '{previous_timezone}'")
+
+    def table(self, name, database=None, schema=None):
+        """Create a table expression that references a particular a table
+        called `name` in a PostgreSQL database called `database`.
+
+        Parameters
+        ----------
+        name : str
+            The name of the table to retrieve.
+        database : str, optional
+            The database in which the table referred to by `name` resides. If
+            ``None`` then the ``current_database`` is used.
+        schema : str, optional
+            The schema in which the table resides.  If ``None`` then the
+            `public` schema is assumed.
+
+        Returns
+        -------
+        table : TableExpr
+            A table expression.
+        """
+        if database is not None and database != self.current_database:
+            return self.database(name=database).table(name=name, schema=schema)
+        else:
+            alch_table = self._get_sqla_table(name, schema=schema)
+            node = self.table_class(alch_table, self, self._schemas.get(name))
+            return self.table_expr_class(node)
+
+    def udf(
+        self,
+        pyfunc,
+        in_types,
+        out_type,
+        schema=None,
+        replace=False,
+        name=None,
+        language="plpythonu",
+    ):
+        """Decorator that defines a PL/Python UDF in-database.
+
+        Parameters
+        ----------
+        pyfunc
+            Python function
+        in_types
+            Input types
+        out_type
+            Output type
+        schema
+            The postgres schema in which to define the UDF
+        replace
+            replace UDF in database if already exists
+        name
+            name for the UDF to be defined in database
+        language
+            Language extension to use for PL/Python
+
+        Returns
+        -------
+        Callable
+            A callable ibis expression
+
+        Function that takes in ColumnExpr arguments and returns an instance
+        inheriting from PostgresUDFNode
+        """
+
+        return udf(
+            client=self,
+            python_func=pyfunc,
+            in_types=in_types,
+            out_type=out_type,
+            schema=schema,
+            replace=replace,
+            name=name,
+            language=language,
         )

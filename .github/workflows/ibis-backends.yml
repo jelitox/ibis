@@ -1,0 +1,507 @@
+# vim: filetype=yaml
+name: Backends
+
+on:
+  push:
+    # Skip the backend suite if all changes are in the docs directory
+    paths-ignore:
+      - "docs/**"
+    branches:
+      - master
+  pull_request:
+    # Skip the backend suite if all changes are in the docs directory
+    paths-ignore:
+      - "docs/**"
+    branches:
+      - master
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  test_simple_backends:
+    name: ${{ matrix.backend.title }} ${{ matrix.os }} python-${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+        python-version:
+          - "3.8"
+          - "3.10"
+        backend:
+          - name: dask
+            title: Dask
+          - name: pandas
+            title: Pandas
+          - name: sqlite
+            title: SQLite
+    steps:
+      - name: checkout
+        uses: actions/checkout@v2
+
+      - name: install python
+        uses: actions/setup-python@v2
+        id: install_python
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: syphar/restore-virtualenv@v1
+        with:
+          requirement_files: poetry.lock
+          custom_cache_key_element: ${{ matrix.backend.name }}-${{ steps.install_python.outputs.python-version }}
+
+      - uses: syphar/restore-pip-download-cache@v1
+        with:
+          requirement_files: poetry.lock
+          custom_cache_key_element: ${{ matrix.backend.name }}-${{ steps.install_python.outputs.python-version }}
+
+      - run: python -m pip install --upgrade pip poetry
+
+      - name: install ibis
+        run: poetry install --extras ${{ matrix.backend.name }}
+
+      - name: download backend data
+        run: poetry run python ci/datamgr.py download
+
+      - name: install backend data
+        run: poetry run python ci/datamgr.py ${{ matrix.backend.name }}
+
+      - name: run tests
+        shell: bash
+        env:
+          PYTEST_BACKENDS: ${{ matrix.backend.name }}
+        run: ./ci/run_tests.sh --numprocesses auto
+
+      - name: publish test report
+        uses: actions/upload-artifact@v2
+        if: success() || failure()
+        with:
+          name: ${{ matrix.backend.name }}-${{ matrix.os }}-${{ matrix.python-version }}
+          path: junit.xml
+
+  test_dask_min_version:
+    name: Dask Min Version ${{ matrix.os }} python-${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+        python-version:
+          - "3.8"
+          - "3.10"
+    steps:
+      - name: checkout
+        uses: actions/checkout@v2
+
+      - name: install python
+        uses: actions/setup-python@v2
+        id: install_python
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - run: python -m pip install --upgrade pip poetry
+
+      - name: install minimum dask version
+        run: poetry add --lock --optional dask@2021.10.0 --extras array --extras dataframe
+
+      - name: install ibis
+        run: poetry install --extras dask
+
+      - name: download backend data
+        run: poetry run python ci/datamgr.py download
+
+      - name: run tests
+        shell: bash
+        env:
+          PYTEST_BACKENDS: dask
+        run: ./ci/run_tests.sh
+
+      - name: publish test report
+        uses: actions/upload-artifact@v2
+        if: success() || failure()
+        with:
+          name: dask-min-version-${{ join(matrix.backend.deps, '-') }}-${{ matrix.os }}-${{ matrix.python-version }}
+          path: junit.xml
+
+  test_postgres:
+    name: PostgreSQL deps-unbounded python-${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.8"
+          - "3.9"
+    steps:
+      - name: checkout
+        uses: actions/checkout@v2
+
+      - name: start postgres container
+        run: docker compose up --build -d postgres
+
+      - name: install python
+        uses: actions/setup-python@v2
+        id: install_python
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: install libgeos for shapely
+        run: sudo apt-get install -qq -y build-essential libgeos-dev python-dev
+
+      - uses: syphar/restore-virtualenv@v1
+        with:
+          requirement_files: poetry.lock
+          custom_cache_key_element: postgres-geospatial-${{ steps.install_python.outputs.python-version }}
+
+      - uses: syphar/restore-pip-download-cache@v1
+        with:
+          requirement_files: poetry.lock
+          custom_cache_key_element: postgres-geospatial-${{ steps.install_python.outputs.python-version }}
+
+      - run: python -m pip install --upgrade pip poetry
+
+      - name: install ibis
+        run: poetry install --extras postgres --extras geospatial
+
+      - name: download backend data
+        run: poetry run python ci/datamgr.py download
+
+      - name: install backend data
+        run: poetry run python ci/datamgr.py postgres
+
+      - name: run tests
+        env:
+          PYTEST_BACKENDS: postgres
+        run: ./ci/run_tests.sh --numprocesses auto
+
+      - name: publish test report
+        uses: actions/upload-artifact@v2
+        if: success() || failure()
+        with:
+          name: postgres-geospatial-${{ matrix.python-version }}
+          path: junit.xml
+
+  test_postgres_min_version:
+    name: PostgreSQL deps-bounded python-3.8
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v2
+
+      - name: start postgres container
+        run: docker compose up --build -d postgres
+
+      - name: install python
+        uses: actions/setup-python@v2
+        id: install_python
+        with:
+          python-version: "3.8"
+
+      - name: install libgeos for shapely
+        run: sudo apt-get install -qq -y build-essential libgeos-dev python-dev
+
+      - run: python -m pip install --upgrade pip poetry
+
+      - name: install minimum postgres dependencies
+        run: poetry add --lock --optional "psycopg2@2.8.4" --optional "geoalchemy@0.6" --optional "geopandas@0.6" --optional "shapely@1.6"
+
+      - name: install ibis
+        run: poetry install --extras postgres --extras geospatial
+
+      - name: download backend data
+        run: poetry run python ci/datamgr.py download
+
+      - name: install backend data
+        run: poetry run python ci/datamgr.py postgres
+
+      - name: run tests
+        env:
+          PYTEST_BACKENDS: postgres
+        run: ./ci/run_tests.sh --numprocesses auto
+
+      - name: publish test report
+        uses: actions/upload-artifact@v2
+        if: success() || failure()
+        with:
+          name: postgres-geospatial-bounded-3.8
+          path: junit.xml
+
+  test_pyspark:
+    name: "PySpark 3 python-${{ matrix.python-version }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.8"
+          - "3.10"
+    steps:
+      - name: checkout
+        uses: actions/checkout@v2
+
+      - name: install python
+        uses: actions/setup-python@v2
+        id: install_python
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions/setup-java@v2
+        with:
+          distribution: temurin
+          java-version: 11
+
+      - uses: syphar/restore-virtualenv@v1
+        with:
+          requirement_files: poetry.lock
+          custom_cache_key_element: pyspark-${{ steps.install_python.outputs.python-version }}
+
+      - uses: syphar/restore-pip-download-cache@v1
+        with:
+          requirement_files: poetry.lock
+          custom_cache_key_element: pyspark-${{ steps.install_python.outputs.python-version }}
+
+      - run: python -m pip install --upgrade pip poetry
+
+      - name: install ibis
+        run: poetry install --extras pyspark
+
+      - name: download backend data
+        run: poetry run python ci/datamgr.py download
+
+      - name: run tests
+        run: ./ci/run_tests.sh
+        env:
+          PYTEST_BACKENDS: pyspark
+
+      - name: publish test report
+        uses: actions/upload-artifact@v2
+        if: success() || failure()
+        with:
+          name: pyspark-${{ matrix.python-version }}
+          path: junit.xml
+
+  test_impala:
+    name: Impala python-${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    env:
+      IBIS_TEST_NN_HOST: localhost
+      IBIS_TEST_IMPALA_HOST: localhost
+      IBIS_TEST_IMPALA_PORT: 21050
+      IBIS_TEST_WEBHDFS_PORT: 50070
+      IBIS_TEST_WEBHDFS_USER: hdfs
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.8"
+          # XXX: unlikely that impala will ever support 3.10
+          - "3.9"
+    steps:
+      - name: checkout
+        uses: actions/checkout@v2
+
+      - name: start impala and kudu containers
+        run: docker compose up -d impala kudu
+
+      - name: install python
+        uses: actions/setup-python@v2
+        id: install_python
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: install system dependencies
+        run: sudo apt-get install -qq -y build-essential cmake krb5-config python-dev libkrb5-dev libboost-all-dev
+
+      - uses: syphar/restore-virtualenv@v1
+        with:
+          requirement_files: poetry.lock
+          custom_cache_key_element: impala-${{ steps.install_python.outputs.python-version }}
+
+      - uses: syphar/restore-pip-download-cache@v1
+        with:
+          requirement_files: poetry.lock
+          custom_cache_key_element: impala-${{ steps.install_python.outputs.python-version }}
+
+      - run: python -m pip install --upgrade pip poetry
+
+      - name: install ibis
+        run: poetry install --extras impala
+
+      - name: download backend data
+        run: poetry run python ci/datamgr.py download
+
+      - name: install backend data
+        run: poetry run python ci/impalamgr.py load --data
+
+      - name: run tests
+        env:
+          PYTEST_BACKENDS: impala
+        run: ./ci/run_tests.sh
+
+      - name: publish test report
+        uses: actions/upload-artifact@v2
+        if: success() || failure()
+        with:
+          name: impala-${{ matrix.python-version }}
+          path: junit.xml
+
+  test_mysql_clickhouse:
+    name: ${{ matrix.backend.title }} python-${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.8"
+          - "3.10"
+        backend:
+          - name: mysql
+            title: MySQL
+          - name: clickhouse
+            title: ClickHouse
+    steps:
+      - name: checkout
+        uses: actions/checkout@v2
+
+      - name: start ${{ matrix.backend.name }} container
+        run: docker compose up -d ${{ matrix.backend.name }}
+
+      - name: install python
+        uses: actions/setup-python@v2
+        id: install_python
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: syphar/restore-virtualenv@v1
+        with:
+          requirement_files: poetry.lock
+          custom_cache_key_element: ${{ matrix.backend.name }}-${{ steps.install_python.outputs.python-version }}
+
+      - uses: syphar/restore-pip-download-cache@v1
+        with:
+          requirement_files: poetry.lock
+          custom_cache_key_element: ${{ matrix.backend.name }}-${{ steps.install_python.outputs.python-version }}
+
+      - run: python -m pip install --upgrade pip poetry
+
+      - name: install ibis
+        run: poetry install --extras ${{ matrix.backend.name }}
+
+      - name: download backend data
+        run: poetry run python ci/datamgr.py download
+
+      - name: install backend data
+        run: poetry run python ci/datamgr.py ${{ matrix.backend.name }}
+
+      - name: run tests
+        env:
+          PYTEST_BACKENDS: ${{ matrix.backend.name }}
+        run: ./ci/run_tests.sh --numprocesses auto
+
+      - name: publish test report
+        uses: actions/upload-artifact@v2
+        if: success() || failure()
+        with:
+          name: ${{ matrix.backend.name }}-${{ matrix.python-version }}
+          path: junit.xml
+
+  test_datafusion:
+    name: DataFusion ${{ matrix.datafusion-version }} python-${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        datafusion-version:
+          - master
+          - latest
+        python-version:
+          - "3.9"
+    steps:
+      - name: checkout ibis
+        uses: actions/checkout@v2
+        with:
+          path: ibis
+
+      - name: checkout datafusion
+        uses: actions/checkout@v2
+        if: ${{ matrix.datafusion-version == 'master' }}
+        with:
+          path: datafusion
+          repository: datafusion-contrib/datafusion-python
+
+      - name: install rust
+        uses: actions-rs/toolchain@v1
+        if: ${{ matrix.datafusion-version == 'master' }}
+        with:
+          profile: minimal
+          toolchain: stable
+
+      - name: install python
+        id: install_python
+        uses: actions/setup-python@v2
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: restore virtualenv
+        uses: syphar/restore-virtualenv@v1
+        with:
+          requirement_files: ibis/poetry.lock
+          custom_cache_key_element: datafusion-${{ matrix.datafusion-version }}-${{ steps.install_python.outputs.python-version }}
+
+      - name: upgrade pip
+        run: pip install -U pip
+
+      - uses: syphar/restore-pip-download-cache@v1
+        with:
+          requirement_files: ibis/poetry.lock
+          custom_cache_key_element: datafusion-${{ matrix.datafusion-version }}-${{ steps.install_python.outputs.python-version }}
+
+      - name: install maturin and poetry
+        run: pip install poetry maturin
+
+      - name: install datafusion
+        if: ${{ matrix.datafusion-version == 'master' }}
+        working-directory: datafusion
+        run: maturin develop
+
+      - name: install ibis
+        working-directory: ibis
+        run: poetry install --extras datafusion
+
+      - name: download backend data
+        working-directory: ibis
+        run: python ci/datamgr.py download
+
+      - name: run tests
+        working-directory: ibis
+        run: ./ci/run_tests.sh --numprocesses auto
+        env:
+          PYTEST_BACKENDS: datafusion
+
+      - name: publish test report
+        uses: actions/upload-artifact@v2
+        if: success() || failure()
+        with:
+          name: datafusion-${{ matrix.datafusion-version }}-${{ matrix.python-version }}
+          path: ibis/junit.xml
+
+  backends:
+    # this job exists so that we can use a single job from this workflow to gate merging
+    runs-on: ubuntu-latest
+    needs:
+      - test_dask_min_version
+      - test_datafusion
+      - test_impala
+      - test_mysql_clickhouse
+      - test_postgres
+      - test_postgres_min_version
+      - test_pyspark
+      - test_simple_backends
+    steps:
+      - run: exit 0

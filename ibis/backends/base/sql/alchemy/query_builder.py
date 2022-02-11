@@ -40,8 +40,10 @@ class _AlchemyTableSetFormatter(TableSetFormatter):
             else:
                 onclause = None
 
-            if jtype in (ops.InnerJoin, ops.CrossJoin):
+            if jtype is ops.InnerJoin:
                 result = result.join(table, onclause)
+            elif jtype is ops.CrossJoin:
+                result = result.join(table, sa.literal(True))
             elif jtype is ops.LeftJoin:
                 result = result.join(table, onclause, isouter=True)
             elif jtype is ops.RightJoin:
@@ -59,6 +61,7 @@ class _AlchemyTableSetFormatter(TableSetFormatter):
             else:
                 raise NotImplementedError(jtype)
 
+        self.context.set_ref(self.expr, result)
         return result
 
     def _get_join_type(self, op):
@@ -81,11 +84,8 @@ class _AlchemyTableSetFormatter(TableSetFormatter):
             # use SQLAlchemy's TableClause and ColumnClause for unbound tables
             schema = ref_op.schema
             result = sa.table(
-                ref_op.name if ref_op.name is not None else ctx.get_ref(expr),
-                *(
-                    sa.column(n, to_sqla_type(t))
-                    for n, t in zip(schema.names, schema.types)
-                ),
+                ref_op.name,
+                *(sa.column(n, to_sqla_type(t)) for n, t in schema.items()),
             )
         else:
             # A subquery
@@ -96,18 +96,19 @@ class _AlchemyTableSetFormatter(TableSetFormatter):
 
                 # hack
                 if isinstance(op, ops.SelfReference):
-                    table = ctx.get_table(ref_expr)
-                    self_ref = table.alias(alias)
-                    ctx.set_table(expr, self_ref)
+                    table = ctx.get_ref(ref_expr)
+                    self_ref = (
+                        alias if hasattr(alias, "name") else table.alias(alias)
+                    )
+                    ctx.set_ref(expr, self_ref)
                     return self_ref
-                else:
-                    return ctx.get_table(expr)
+                return alias
 
-            result = ctx.get_compiled_expr(expr)
             alias = ctx.get_ref(expr)
+            result = ctx.get_compiled_expr(expr)
 
-        result = result.alias(alias)
-        ctx.set_table(expr, result)
+        result = alias if hasattr(alias, "name") else result.alias(alias)
+        ctx.set_ref(expr, result)
         return result
 
 
@@ -169,7 +170,7 @@ class AlchemySelect(Select):
             result = self.context.get_compiled_expr(expr)
             alias = self.context.get_ref(expr)
             result = result.cte(alias)
-            self.context.set_table(expr, result)
+            self.context.set_ref(expr, result)
 
     def _compile_table_set(self):
         if self.table_set is not None:
@@ -192,15 +193,14 @@ class AlchemySelect(Select):
                 arg = self._translate(expr, named=True)
             elif isinstance(expr, ir.TableExpr):
                 if expr.equals(self.table_set):
-                    cached_table = self.context.get_table(expr)
+                    cached_table = self.context.get_ref(expr)
                     if cached_table is None:
-                        # the select * case from materialized join
                         has_select_star = True
                         continue
                     else:
                         arg = table_set
                 else:
-                    arg = self.context.get_table(expr)
+                    arg = self.context.get_ref(expr)
                     if arg is None:
                         raise ValueError(expr)
 

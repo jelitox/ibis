@@ -10,8 +10,6 @@ import ibis
 import ibis.expr.datatypes as dt
 from ibis import literal as L
 
-pytestmark = pytest.mark.clickhouse
-
 
 @pytest.mark.parametrize(
     ('left', 'right', 'type'),
@@ -78,7 +76,7 @@ def test_binary_arithmetic(con, func, left, right, expected):
         (lambda a, b: a - b, '`int_col` - `tinyint_col`'),
         (lambda a, b: a * b, '`int_col` * `tinyint_col`'),
         (lambda a, b: a / b, '`int_col` / `tinyint_col`'),
-        (lambda a, b: a ** b, 'pow(`int_col`, `tinyint_col`)'),
+        (lambda a, b: a**b, 'pow(`int_col`, `tinyint_col`)'),
         (lambda a, b: a < b, '`int_col` < `tinyint_col`'),
         (lambda a, b: a <= b, '`int_col` <= `tinyint_col`'),
         (lambda a, b: a > b, '`int_col` > `tinyint_col`'),
@@ -164,15 +162,16 @@ def test_string_temporal_compare_between_datetimes(con, left, right):
 
 @pytest.mark.parametrize('container', [list, tuple, set])
 def test_field_in_literals(con, alltypes, translate, container):
-    foobar = container(['foo', 'bar', 'baz'])
-    expected = tuple(set(foobar))
+    values = {'foo', 'bar', 'baz'}
+    foobar = container(values)
+    expected = tuple(values)
 
     expr = alltypes.string_col.isin(foobar)
-    assert translate(expr) == "`string_col` IN {}".format(expected)
+    assert translate(expr) == f"`string_col` IN {expected}"
     assert len(con.execute(expr))
 
     expr = alltypes.string_col.notin(foobar)
-    assert translate(expr) == "`string_col` NOT IN {}".format(expected)
+    assert translate(expr) == f"`string_col` NOT IN {expected}"
     assert len(con.execute(expr))
 
 
@@ -180,7 +179,7 @@ def test_field_in_literals(con, alltypes, translate, container):
 def test_negate(con, alltypes, translate, column):
     # clickhouse represent boolean as UInt8
     expr = -getattr(alltypes, column)
-    assert translate(expr) == '-`{0}`'.format(column)
+    assert translate(expr) == f'-`{column}`'
     assert len(con.execute(expr))
 
 
@@ -274,3 +273,65 @@ def test_search_case(con, alltypes, translate):
 END"""
     assert translate(expr) == expected
     assert len(con.execute(expr))
+
+
+@pytest.mark.parametrize(
+    'arr',
+    [
+        [1, 2, 3],
+        ['qw', 'wq', '1'],
+        [1.2, 0.3, 0.4],
+        [[1], [1, 2], [1, 2, 3]],
+    ],
+)
+@pytest.mark.parametrize(
+    'ids',
+    [
+        lambda arr: range(len(arr)),
+        lambda arr: range(-len(arr), 0),
+    ],
+)
+def test_array_index(con, arr, ids):
+    expr = L(arr)
+    for i in ids(arr):
+        el_expr = expr[i]
+        el = con.execute(el_expr)
+        assert el == arr[i]
+
+
+@pytest.mark.parametrize(
+    'arrays',
+    [
+        ([1], [2]),
+        ([1], [1, 2]),
+        ([1, 2], [1]),
+        ([1, 2], [3, 4]),
+        ([1, 2], [3, 4], [5, 6]),
+    ],
+)
+def test_array_concat(con, arrays):
+    expr = L([]).cast(dt.Array(dt.int8))
+    expected = sum(arrays, [])
+    for arr in arrays:
+        expr += L(arr)
+
+    assert con.execute(expr) == expected
+
+
+@pytest.mark.parametrize(
+    ('arr', 'times'),
+    [([1], 1), ([1], 2), ([1], 3), ([1, 2], 1), ([1, 2], 2), ([1, 2], 3)],
+)
+def test_array_repeat(con, arr, times):
+    expected = arr * times
+    expr = L(arr)
+
+    assert con.execute(expr * times) == expected
+
+
+@pytest.mark.parametrize('arr', [[], [1], [1, 2, 3, 4, 5, 6]])
+@pytest.mark.parametrize('start', [None, 0, 1, 2, -1, -3])
+@pytest.mark.parametrize('stop', [None, 0, 1, 3, -2, -4])
+def test_array_slice(con, arr, start, stop):
+    expr = L(arr)
+    assert con.execute(expr[start:stop]) == arr[start:stop]

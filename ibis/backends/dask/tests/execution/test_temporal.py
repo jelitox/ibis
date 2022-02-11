@@ -9,13 +9,11 @@ from dask.dataframe.utils import tm  # noqa: E402
 from pkg_resources import parse_version
 from pytest import param
 
+import ibis
 from ibis import literal as L  # noqa: E402
 from ibis.expr import datatypes as dt
 
-from ... import Backend
 from ...execution import execute
-
-pytestmark = pytest.mark.dask
 
 
 @pytest.mark.parametrize(
@@ -70,7 +68,8 @@ def test_cast_datetime_strings_to_date(t, df, column):
     df_computed = df.compute()
     expected = dd.from_pandas(
         pd.to_datetime(
-            df_computed[column], infer_datetime_format=True,
+            df_computed[column],
+            infer_datetime_format=True,
         ).dt.normalize(),
         npartitions=1,
     )
@@ -147,7 +146,9 @@ def test_times_ops(t, df):
     'column', ['plain_datetimes_utc', 'plain_datetimes_naive']
 )
 def test_times_ops_with_tz(t, df, tz, rconstruct, column):
-    expected = dd.from_array(rconstruct(len(df), dtype=bool),)
+    expected = dd.from_array(
+        rconstruct(len(df), dtype=bool),
+    )
     time = t[column].time()
     expr = time.between('01:00', '02:00', timezone=tz)
     result = expr.compile()
@@ -184,7 +185,7 @@ def test_times_ops_with_tz(t, df, tz, rconstruct, column):
 def test_interval_arithmetic(op, expected):
     data = pd.timedelta_range('0 days', '10 days', freq='D')
     pandas_df = pd.DataFrame({'td': data})
-    con = Backend().connect(
+    con = ibis.dask.connect(
         {
             'df1': dd.from_pandas(pandas_df, npartitions=1),
             'df2': dd.from_pandas(pandas_df, npartitions=1),
@@ -194,6 +195,7 @@ def test_interval_arithmetic(op, expected):
     expr = op(t1.td, t1.td)
     result = expr.compile()
     expected = dd.from_pandas(
-        pd.Series(expected(data, data), name='td'), npartitions=1,
+        pd.Series(expected(data, data), name='td'),
+        npartitions=1,
     )
     tm.assert_series_equal(result.compute(), expected.compute())

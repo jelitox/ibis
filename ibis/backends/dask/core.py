@@ -219,7 +219,7 @@ def execute_until_in_scope(
     scope : Scope
     timecontext : Optional[TimeContext]
     aggcontext : Optional[AggregationContext]
-    clients : List[ibis.backends.base.Client]
+    clients : List[ibis.backends.base.BaseBackend]
     kwargs : Mapping
     """
     # these should never be None
@@ -257,6 +257,7 @@ def execute_until_in_scope(
             num_args=len(computable_args),
             timecontext=timecontext,
             clients=clients,
+            scope=scope,
         )
     else:
         arg_timecontexts = [None] * len(computable_args)
@@ -305,7 +306,7 @@ def execute_until_in_scope(
     # if we're unable to find data then raise an exception
     if not scopes and computable_args:
         raise com.UnboundExpressionError(
-            'Unable to find data for expression:\n{}'.format(repr(expr))
+            f'Unable to find data for expression:\n{repr(expr)}'
         )
 
     # there should be exactly one dictionary per computable argument
@@ -317,7 +318,7 @@ def execute_until_in_scope(
         new_scope.get_value(arg.op(), timecontext)
         if hasattr(arg, 'op')
         else arg
-        for arg in computable_args
+        for (arg, timecontext) in zip(computable_args, arg_timecontexts)
     ]
 
     result = execute_node(
@@ -394,7 +395,11 @@ def main_execute(
     params = {k.op() if hasattr(k, 'op') else k: v for k, v in params.items()}
     scope = scope.merge_scope(Scope(params, timecontext))
     return execute_with_scope(
-        expr, scope, timecontext=timecontext, aggcontext=aggcontext, **kwargs,
+        expr,
+        scope,
+        timecontext=timecontext,
+        aggcontext=aggcontext,
+        **kwargs,
     )
 
 

@@ -69,14 +69,14 @@ def test_group_concat(functional_alltypes):
 
     expr = col.group_concat()
     assert isinstance(expr.op(), ops.GroupConcat)
-    arg, sep, where = expr.op().args
-    assert sep.equals(ibis.literal(','))
-    assert where is None
+    op = expr.op()
+    assert op.sep.equals(ibis.literal(','))
+    assert op.where is None
 
     expr = col.group_concat('|')
-    arg, sep, where = expr.op().args
-    assert sep.equals(ibis.literal('|'))
-    assert where is None
+    op = expr.op()
+    assert op.sep.equals(ibis.literal('|'))
+    assert op.where is None
 
 
 def test_zeroifnull(functional_alltypes):
@@ -205,13 +205,3 @@ def test_floats(sql_table, function):
 
     expr = function(5.5, 5)
     assert isinstance(expr, ir.FloatingScalar)
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_bools():
-    assert False
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_decimal_promotions():
-    assert False

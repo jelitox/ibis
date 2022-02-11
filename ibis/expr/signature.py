@@ -1,194 +1,211 @@
+import copy
 import inspect
-from collections import OrderedDict
+from typing import Any, Callable, Dict
 
-import ibis.expr.rules as rlz
-import ibis.util as util
+from ibis import util
 
-try:
-    from cytoolz import unique
-except ImportError:
-    from toolz import unique
+EMPTY = inspect.Parameter.empty  # marker for missing argument
 
 
-_undefined = object()  # marker for missing argument
+class Validator(Callable):
+    """
+    Abstract base class for defining argument validators.
+    """
 
 
-class Argument:
-    """Argument definition."""
+class Optional(Validator):
+    """
+    Validator to allow missing arguments.
 
-    __slots__ = 'validator', 'default', 'show'
+    Parameters
+    ----------
+    validator : Validator
+        Used to do the actual validation if the argument gets passed.
+    default : Any, default None
+        Value to return with in case of a missing argument.
+    """
 
-    def __init__(self, validator, default=_undefined, show=True):
-        """Argument constructor
+    __slots__ = ('validator', 'default')
 
-        Parameters
-        ----------
-        validator : Union[Callable[[arg], coerced], Type, Tuple[Type]]
-            Function which handles validation and/or coercion of the given
-            argument.
-        default : Union[Any, Callable[[], str]]
-            In case of missing (None) value for validation this will be used.
-            Note, that default value (except for None) must also pass the inner
-            validator.
-            If callable is passed, it will be executed just before the inner,
-            and itsreturn value will be treaded as default.
-        show : bool
-            Whether to show this argument in an :class:`~ibis.expr.types.Expr`
-            that contains it.
-        """
-        self.default = default
-        self.show = show
-        if isinstance(validator, type):
-            self.validator = rlz.instance_of(validator)
-        elif isinstance(validator, tuple):
-            assert util.all_of(validator, type)
-            self.validator = rlz.instance_of(validator)
-        elif callable(validator):
-            self.validator = validator
-        else:
-            raise TypeError(
-                'Argument validator must be a callable, type or '
-                'tuple of types, given: {}'.format(validator)
-            )
+    def __init__(self, validator, default=None):
+        self.validator = validator
+        self.default = copy.deepcopy(default)
 
-    def __eq__(self, other):
-        return (
-            self.validator == other.validator and self.default == other.default
+    def __call__(self, arg, **kwargs):
+        if arg is None:
+            if self.default is None:
+                return None
+            elif util.is_function(self.default):
+                arg = self.default()
+            else:
+                arg = self.default
+
+        return self.validator(arg, **kwargs)
+
+
+class Parameter(inspect.Parameter):
+    """
+    Augmented Parameter class to additionally hold a validator object.
+    """
+
+    __slots__ = ('_validator',)
+
+    def __init__(
+        self,
+        name,
+        kind=inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        *,
+        validator=EMPTY
+    ):
+        super().__init__(
+            name,
+            kind,
+            default=None if isinstance(validator, Optional) else EMPTY,
         )
+        self._validator = validator
 
     @property
-    def optional(self):
-        return self.default is not _undefined
+    def validator(self):
+        return self._validator
 
-    def validate(self, value=_undefined, name=None):
-        """
-        Parameters
-        ----------
-        value : Any, default undefined
-          Raises TypeError if argument is mandatory but not value has been
-          given.
-        name : Optional[str]
-          Argument name for error message
-        """
-        if self.optional:
-            if value is _undefined or value is None:
-                if self.default is None:
-                    return None
-                elif util.is_function(self.default):
-                    value = self.default()
-                else:
-                    value = self.default
-        elif value is _undefined:
-            if name is not None:
-                name_msg = "argument `{}`".format(name)
-            else:
-                name_msg = "unnamed argument"
-            raise TypeError("Missing required value for {}".format(name_msg))
-
-        return self.validator(value)
-
-    __call__ = validate  # syntactic sugar
+    def validate(self, this, arg):
+        if self.validator is EMPTY:
+            return arg
+        else:
+            return self.validator(arg, this=this)
 
 
-class TypeSignature(OrderedDict):
+class _ValidatorFunction(Validator):
+    def __init__(self, fn):
+        self.fn = fn
 
-    __slots__ = ()
+    def __call__(self, *args, **kwargs):
+        return self.fn(*args, **kwargs)
 
-    @classmethod
-    def from_dtypes(cls, dtypes):
-        return cls(
-            ('_{}'.format(i), Argument(rlz.value(dtype)))
-            for i, dtype in enumerate(dtypes)
+
+class _InstanceOf(Validator):
+    def __init__(self, typ):
+        self.typ = typ
+
+    def __call__(self, arg, **kwargs):
+        if not isinstance(arg, self.typ):
+            raise TypeError(self.typ)
+        return arg
+
+
+@util.deprecated(version="3.0", instead="Validator")
+def Argument(validator, default=EMPTY):
+    """Argument constructor
+    Parameters
+    ----------
+    validator : Union[Callable[[arg], coerced], Type, Tuple[Type]]
+        Function which handles validation and/or coercion of the given
+        argument.
+    default : Union[Any, Callable[[], str]]
+        In case of missing (None) value for validation this will be used.
+        Note, that default value (except for None) must also pass the inner
+        validator.
+        If callable is passed, it will be executed just before the inner,
+        and itsreturn value will be treaded as default.
+    """
+    if isinstance(validator, Validator):
+        pass
+    elif isinstance(validator, type):
+        validator = _InstanceOf(validator)
+    elif isinstance(validator, tuple):
+        assert util.all_of(validator, type)
+        validator = _InstanceOf(validator)
+    elif isinstance(validator, Validator):
+        validator = validator
+    elif callable(validator):
+        validator = _ValidatorFunction(validator)
+    else:
+        raise TypeError(
+            'Argument validator must be a callable, type or '
+            'tuple of types, given: {}'.format(validator)
         )
 
-    def validate(self, *args, **kwargs):
-        parameters = [
-            inspect.Parameter(
-                name,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                default=_undefined,
-            )
-            for (name, argument) in self.items()
-        ]
-        sig = inspect.Signature(parameters)
-        bindings = sig.bind(*args, **kwargs)
-
-        # The inspect.Parameter objects in parameters all have default
-        # value _undefined, which will be bound to all arguments that weren't
-        # passed in.
-        bindings.apply_defaults()
-
-        result = []
-        for (name, arg_value) in bindings.arguments.items():
-            argument = self[name]
-            # If this arg wasn't passed in: since argument.default has the
-            # correct value and _undefined was given as the default for the
-            # Parameter object corresponding to this argument, arg_value got
-            # the value _undefined when bindings.apply_defaults() was called,
-            # so the behavior of argument.validate here is correct.
-            value = argument.validate(arg_value, name=name)
-            result.append((name, value))
-
-        return result
-
-    __call__ = validate  # syntactic sugar
-
-    def names(self):
-        return tuple(self.keys())
+    if default is EMPTY:
+        return validator
+    else:
+        return Optional(validator, default=default)
 
 
 class AnnotableMeta(type):
-    @classmethod
-    def __prepare__(metacls, name, bases, **kwds):
-        return OrderedDict()
+    """
+    Metaclass to turn class annotations into a validatable function signature.
+    """
 
-    def __new__(meta, name, bases, dct):
-        slots, signature = [], TypeSignature()
-
+    def __new__(metacls, clsname, bases, dct):
+        params = {}
         for parent in bases:
-            # inherit parent slots
-            if hasattr(parent, '__slots__'):
-                slots += parent.__slots__
             # inherit from parent signatures
-            if hasattr(parent, 'signature'):
-                signature.update(parent.signature)
+            if hasattr(parent, '__signature__'):
+                params.update(parent.__signature__.parameters)
 
-        # finally apply definitions from the currently created class
-        # thanks to __prepare__ attrs are already ordered
+        slots = list(dct.pop('__slots__', []))
         attribs = {}
-        for k, v in dct.items():
-            if isinstance(v, Argument):
+        for name, attrib in dct.items():
+            if isinstance(attrib, Validator):
                 # so we can set directly
-                signature[k] = v
+                params[name] = Parameter(name, validator=attrib)
+                slots.append(name)
             else:
-                attribs[k] = v
+                attribs[name] = attrib
 
-        # if slots or signature are defined no inheritance happens
-        signature = attribs.get('signature', signature)
-        slots = attribs.get('__slots__', tuple(slots)) + signature.names()
+        # mandatory fields without default values must preceed the optional
+        # ones in the function signature, the partial ordering will be kept
+        params = sorted(
+            params.values(), key=lambda p: p.default is EMPTY, reverse=True
+        )
 
-        attribs['signature'] = signature
-        attribs['__slots__'] = tuple(unique(slots))
+        attribs['__slots__'] = tuple(slots)
+        attribs['__signature__'] = inspect.Signature(params)
 
-        return super().__new__(meta, name, bases, attribs)
+        return super().__new__(metacls, clsname, bases, attribs)
 
 
 class Annotable(metaclass=AnnotableMeta):
-
-    __slots__ = ()
+    """
+    Base class for dataclass-like objects with custom validation rules.
+    """
 
     def __init__(self, *args, **kwargs):
-        for name, value in self.signature.validate(*args, **kwargs):
-            setattr(self, name, value)
+        bound = self.__signature__.bind(*args, **kwargs)
+        bound.apply_defaults()
+        for name, value in bound.arguments.items():
+            param = self.__signature__.parameters[name]
+            setattr(self, name, param.validate(self, value))
         self._validate()
 
     def _validate(self):
         pass
 
-    @property
-    def args(self):
-        return tuple(getattr(self, name) for name in self.signature.names())
+    def __eq__(self, other) -> bool:
+        if self is other:
+            return True
+        return type(self) == type(other) and self.args == other.args
+
+    def __getstate__(self) -> Dict[str, Any]:
+        return {
+            key: getattr(self, key)
+            for key in self.__signature__.parameters.keys()
+        }
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        """
+        Parameters
+        ----------
+        state: Dict[str, Any]
+            A dictionary storing the objects attributes.
+        """
+        for key, value in state.items():
+            setattr(self, key, value)
 
     @property
     def argnames(self):
-        return self.signature.names()
+        return tuple(self.__signature__.parameters.keys())
+
+    @property
+    def args(self):
+        return tuple(getattr(self, name) for name in self.argnames)

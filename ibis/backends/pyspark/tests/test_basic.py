@@ -7,8 +7,6 @@ import ibis
 import ibis.common.exceptions as com
 from ibis.backends.pyspark.compiler import _can_be_replaced_by_column_name
 
-pytestmark = pytest.mark.pyspark
-
 
 def test_basic(client):
     table = client.table('basic_table')
@@ -126,7 +124,9 @@ def test_selection(client):
 
 def test_join(client):
     table = client.table('basic_table')
-    result = table.join(table, ['id', 'str_col']).compile()
+    result = table.join(table, ['id', 'str_col'])[
+        table.id, table.str_col
+    ].compile()
     spark_table = table.compile()
     expected = spark_table.join(spark_table, ['id', 'str_col'])
 

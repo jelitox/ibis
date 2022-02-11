@@ -8,8 +8,6 @@ import ibis.expr.datatypes as dt
 import ibis.expr.schema as sch
 from ibis.backends.impala.pandas_interop import DataFrameWriter  # noqa: E402
 
-pytestmark = pytest.mark.impala
-
 
 @pytest.fixture
 def exhaustive_df():
@@ -141,6 +139,15 @@ def test_writer_cleanup_deletes_hdfs_dir(con, hdfs, alltypes_df):
     assert not hdfs.exists(path)
 
 
+def test_writer_cleanup_context_manager(con, hdfs, alltypes_df):
+    with DataFrameWriter(con, alltypes_df) as writer:
+        path = writer.write_temp_csv()
+        assert hdfs.exists(path)
+
+    # the path shouldn't exist after the context manager exits
+    assert not hdfs.exists(path)
+
+
 def test_create_table_from_dataframe(con, alltypes_df, temp_table_db):
     tmp_db, tname = temp_table_db
     con.create_table(tname, alltypes_df, database=tmp_db)
@@ -165,11 +172,6 @@ def test_insert(con, temp_table_db, exhaustive_df):
         table.execute().sort_values(by='tinyint_col').reset_index(drop=True)
     )
     tm.assert_frame_equal(result, exhaustive_df)
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_insert_partition():
-    assert False
 
 
 def test_round_trip_exhaustive(con, exhaustive_df):

@@ -1,8 +1,6 @@
 from io import StringIO
 
-import ibis.common.exceptions as com
 import ibis.expr.operations as ops
-import ibis.util as util
 from ibis.backends.base.sql.compiler import (
     Compiler,
     ExprTranslator,
@@ -11,7 +9,6 @@ from ibis.backends.base.sql.compiler import (
     TableSetFormatter,
 )
 
-from .identifiers import quote_identifier
 from .registry import operation_registry
 
 
@@ -28,10 +25,8 @@ class ClickhouseSelect(Select):
 
         lines = []
         if len(self.group_by) > 0:
-            columns = [
-                '`{0}`'.format(expr.get_name()) for expr in self.group_by
-            ]
-            clause = 'GROUP BY {0}'.format(', '.join(columns))
+            columns = [f'`{expr.get_name()}`' for expr in self.group_by]
+            clause = 'GROUP BY {}'.format(', '.join(columns))
             lines.append(clause)
 
         if len(self.having) > 0:
@@ -39,7 +34,7 @@ class ClickhouseSelect(Select):
             for expr in self.having:
                 translated = self._translate(expr)
                 trans_exprs.append(translated)
-            lines.append('HAVING {0}'.format(' AND '.join(trans_exprs)))
+            lines.append('HAVING {}'.format(' AND '.join(trans_exprs)))
 
         return '\n'.join(lines)
 
@@ -50,9 +45,10 @@ class ClickhouseSelect(Select):
         buf = StringIO()
 
         n, offset = self.limit['n'], self.limit['offset']
-        buf.write('LIMIT {}'.format(n))
         if offset is not None and offset != 0:
-            buf.write(', {}'.format(offset))
+            buf.write(f'LIMIT {offset}, {n}')
+        else:
+            buf.write(f'LIMIT {n}')
 
         return buf.getvalue()
 
@@ -66,56 +62,7 @@ class ClickhouseTableSetFormatter(TableSetFormatter):
         ops.AnyLeftJoin: 'ANY LEFT JOIN',
     }
 
-    def get_result(self):
-        # Got to unravel the join stack; the nesting order could be
-        # arbitrary, so we do a depth first search and push the join tokens
-        # and predicates onto a flat list, then format them
-        op = self.expr.op()
-
-        if isinstance(op, ops.Join):
-            self._walk_join_tree(op)
-        else:
-            self.join_tables.append(self._format_table(self.expr))
-
-        # TODO: Now actually format the things
-        buf = StringIO()
-        buf.write(self.join_tables[0])
-        for jtype, table, preds in zip(
-            self.join_types, self.join_tables[1:], self.join_predicates
-        ):
-            buf.write('\n')
-            buf.write(util.indent('{0} {1}'.format(jtype, table), self.indent))
-
-            if len(preds):
-                buf.write('\n')
-                fmt_preds = map(self._format_predicate, preds)
-                fmt_preds = util.indent(
-                    'USING ' + ', '.join(fmt_preds), self.indent * 2
-                )
-                buf.write(fmt_preds)
-
-        return buf.getvalue()
-
-    def _validate_join_predicates(self, predicates):
-        for pred in predicates:
-            op = pred.op()
-            if not isinstance(op, ops.Equals):
-                raise com.TranslationError(
-                    'Non-equality join predicates are ' 'not supported'
-                )
-
-            left_on, right_on = op.args
-            if left_on.get_name() != right_on.get_name():
-                raise com.TranslationError(
-                    'Joining on different column names ' 'is not supported'
-                )
-
-    def _format_predicate(self, predicate):
-        column = predicate.op().args[0]
-        return quote_identifier(column.get_name(), force=True)
-
-    def _quote_identifier(self, name):
-        return quote_identifier(name)
+    _non_equijoin_supported = False
 
 
 class ClickhouseExprTranslator(ExprTranslator):
@@ -129,6 +76,34 @@ rewrites = ClickhouseExprTranslator.rewrites
 def _floor_divide(expr):
     left, right = expr.op().args
     return left.div(right).floor()
+
+
+@rewrites(ops.DayOfWeekName)
+def day_of_week_name(expr):
+    # ClickHouse 20 doesn't support dateName
+    #
+    # ClickHouse 21 supports dateName is broken for regexen:
+    # https://github.com/ClickHouse/ClickHouse/issues/32777
+    #
+    # ClickHouses 20 and 21 also have a broken case statement hence the ifnull:
+    # https://github.com/ClickHouse/ClickHouse/issues/32849
+    #
+    # We test against 20 in CI, so we implement day_of_week_name as follows
+    return (
+        expr.op()
+        .arg.day_of_week.index()
+        .case()
+        .when(0, "Monday")
+        .when(1, "Tuesday")
+        .when(2, "Wednesday")
+        .when(3, "Thursday")
+        .when(4, "Friday")
+        .when(5, "Saturday")
+        .when(6, "Sunday")
+        .else_("")
+        .end()
+        .nullif("")
+    )
 
 
 class ClickhouseCompiler(Compiler):

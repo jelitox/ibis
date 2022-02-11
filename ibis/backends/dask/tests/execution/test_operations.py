@@ -12,10 +12,7 @@ from dask.dataframe.utils import tm
 import ibis
 import ibis.expr.datatypes as dt
 
-from ... import Backend
 from ...execution import execute
-
-pytestmark = pytest.mark.dask
 
 
 def test_table_column(t, df):
@@ -429,7 +426,7 @@ def test_nullif_inf(npartitions):
         pd.DataFrame({'a': [np.inf, 3.14, -np.inf, 42.0]}),
         npartitions=npartitions,
     )
-    con = Backend().connect({'t': df})
+    con = ibis.dask.connect({'t': df})
     t = con.table('t')
     expr = t.a.nullif(np.inf).nullif(-np.inf)
     result = expr.compile()
@@ -628,7 +625,7 @@ def test_mutate_after_group_by(t, df):
 def test_groupby_with_unnamed_arithmetic(t, df):
     expr = t.groupby(t.dup_strings).aggregate(
         naive_variance=(
-            (t.plain_float64 ** 2).sum() - t.plain_float64.mean() ** 2
+            (t.plain_float64**2).sum() - t.plain_float64.mean() ** 2
         )
         / t.plain_float64.count()
     )
@@ -638,7 +635,7 @@ def test_groupby_with_unnamed_arithmetic(t, df):
         .groupby('dup_strings')
         .agg(
             {
-                'plain_float64': lambda x: ((x ** 2).sum() - x.mean() ** 2)
+                'plain_float64': lambda x: ((x**2).sum() - x.mean() ** 2)
                 / x.count()
             }
         )
@@ -793,6 +790,10 @@ def test_round(t, df):
     npt.assert_almost_equal(result, expected, decimal=precision)
 
 
+@pytest.mark.xfail(
+    raises=NotImplementedError,
+    reason="MultiQuantile is not implemented for the dask backend",
+)
 def test_quantile_groupby(batting, batting_df):
     def q_fun(x, quantile, interpolation):
         res = x.quantile(quantile, interpolation=interpolation).tolist()
@@ -814,8 +815,8 @@ def test_quantile_groupby(batting, batting_df):
 
 
 def test_summary_numeric(batting, batting_df):
-    expr = batting.G.summary()
-    result = expr.compile()
+    expr = batting.aggregate(batting.G.summary())
+    result = expr.execute()
     assert len(result) == 1
 
     G = batting_df.G
@@ -833,26 +834,24 @@ def test_summary_numeric(batting, batting_df):
 
 def test_summary_numeric_group_by(batting, batting_df):
     expr = batting.groupby('teamID').G.summary()
-    result = expr.compile()
+    result = expr.execute()
     expected = (
         batting_df.groupby('teamID')
         .G.apply(
-            lambda s: dd.from_pandas(
-                pd.DataFrame(
-                    {
-                        'count': s.count(),
-                        'nulls': s.isnull().sum(),
-                        'min': s.min(),
-                        'max': s.max(),
-                        'sum': s.sum(),
-                        'mean': s.mean(),
-                        'approx_nunique': s.nunique(),
-                    },
-                    index=[0],
-                ),
-                npartitions=1,
+            lambda s: pd.DataFrame(
+                {
+                    'count': s.count(),
+                    'nulls': s.isnull().sum(),
+                    'min': s.min(),
+                    'max': s.max(),
+                    'sum': s.sum(),
+                    'mean': s.mean(),
+                    'approx_nunique': s.nunique(),
+                },
+                index=[0],
             )
         )
+        .compute()
         .reset_index(level=1, drop=True)
         .reset_index()
     )
@@ -862,8 +861,8 @@ def test_summary_numeric_group_by(batting, batting_df):
 
 
 def test_summary_non_numeric(batting, batting_df):
-    expr = batting.teamID.summary()
-    result = expr.compile()
+    expr = batting.aggregate(batting.teamID.summary())
+    result = expr.execute()
     assert len(result) == 1
     assert len(result.columns) == 3
     expected = {
@@ -876,22 +875,20 @@ def test_summary_non_numeric(batting, batting_df):
 
 def test_summary_non_numeric_group_by(batting, batting_df):
     expr = batting.groupby('teamID').playerID.summary()
-    result = expr.compile()
+    result = expr.execute()
     expected = (
         batting_df.groupby('teamID')
         .playerID.apply(
-            lambda s: dd.from_pandas(
-                pd.DataFrame(
-                    {
-                        'count': s.count(),
-                        'nulls': s.isnull().sum(),
-                        'uniques': s.nunique(),
-                    },
-                    index=[0],
-                ),
-                npartitions=1,
+            lambda s: pd.DataFrame(
+                {
+                    'count': s.count(),
+                    'nulls': s.isnull().sum(),
+                    'uniques': s.nunique(),
+                },
+                index=[0],
             )
         )
+        .compute()
         .reset_index(level=1, drop=True)
         .reset_index()
     )
@@ -997,7 +994,7 @@ def test_difference(client, df1, intersect_df2):
     merged = df1.merge(
         intersect_df2, on=list(df1.columns), how="outer", indicator=True
     )
-    expected = merged[merged["_merge"] != "both"].drop("_merge", 1)
+    expected = merged[merged["_merge"] != "both"].drop("_merge", axis=1)
 
     # force same index
     result = result.compute().reset_index(drop=True)

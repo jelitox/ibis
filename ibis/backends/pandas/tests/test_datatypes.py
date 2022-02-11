@@ -10,7 +10,6 @@ from pandas.api.types import CategoricalDtype, DatetimeTZDtype
 import ibis
 import ibis.expr.datatypes as dt
 import ibis.expr.schema as sch
-import ibis.expr.types as ir
 
 
 def test_no_infer_ambiguities():
@@ -139,29 +138,20 @@ def test_pandas_dtype(pandas_dtype, ibis_dtype):
     assert dt.dtype(pandas_dtype) == ibis_dtype
 
 
-def test_series_to_ibis_literal():
-    values = [1, 2, 3, 4]
-    s = pd.Series(values)
-
-    expr = ir.as_value_expr(s)
-    expected = ir.sequence(list(s))
-    assert expr.equals(expected)
-
-
 @pytest.mark.parametrize(
     ('col_data', 'schema_type'),
     [
         ([True, False, False], 'bool'),
-        (np.int8([-3, 9, 17]), 'int8'),
-        (np.int16([-5, 0, 12]), 'int16'),
-        (np.int32([-12, 3, 25000]), 'int32'),
-        (np.int64([102, 67228734, -0]), 'int64'),
-        (np.float32([45e-3, -0.4, 99.0]), 'float'),
-        (np.float64([-3e43, 43.0, 10000000.0]), 'double'),
-        (np.uint8([3, 0, 16]), 'uint8'),
-        (np.uint16([5569, 1, 33]), 'uint16'),
-        (np.uint32([100, 0, 6]), 'uint32'),
-        (np.uint64([666, 2, 3]), 'uint64'),
+        (np.array([-3, 9, 17], dtype='int8'), 'int8'),
+        (np.array([-5, 0, 12], dtype='int16'), 'int16'),
+        (np.array([-12, 3, 25000], dtype='int32'), 'int32'),
+        (np.array([102, 67228734, -0], dtype='int64'), 'int64'),
+        (np.array([45e-3, -0.4, 99.0], dtype='float32'), 'float'),
+        (np.array([-3e43, 43.0, 10000000.0], dtype='float64'), 'double'),
+        (np.array([3, 0, 16], dtype='uint8'), 'uint8'),
+        (np.array([5569, 1, 33], dtype='uint16'), 'uint16'),
+        (np.array([100, 0, 6], dtype='uint32'), 'uint32'),
+        (np.array([666, 2, 3], dtype='uint64'), 'uint64'),
         (
             [
                 pd.Timestamp('2010-11-01 00:01:00'),

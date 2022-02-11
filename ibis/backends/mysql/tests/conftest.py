@@ -14,6 +14,7 @@ class TestConf(BackendTest, RoundHalfToEven):
     returned_timestamp_unit = 's'
     supports_arrays = False
     supports_arrays_outside_of_select = supports_arrays
+    bool_is_int = True
 
     def __init__(self, data_directory: Path) -> None:
         super().__init__(data_directory)
@@ -36,7 +37,7 @@ class TestConf(BackendTest, RoundHalfToEven):
                 else version_detail[3:6]
             )
             self.__class__.supports_window_operations = version >= (10, 2)
-        elif con.version >= parse_version('8.0'):
+        elif parse_version(con.version) >= parse_version('8.0'):
             # mysql supports window operations after version 8
             self.__class__.supports_window_operations = True
 
@@ -54,9 +55,3 @@ class TestConf(BackendTest, RoundHalfToEven):
             password=password,
             database=database,
         )
-
-    @property
-    def functional_alltypes(self):
-        # BOOLEAN <-> TINYINT(1)
-        t = super().functional_alltypes
-        return t.mutate(bool_col=t.bool_col == 1)

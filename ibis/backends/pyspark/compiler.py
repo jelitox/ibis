@@ -4,6 +4,7 @@ import functools
 import operator
 
 import numpy as np
+import pandas as pd
 import pyspark
 import pyspark.sql.functions as F
 from pyspark.sql import Window
@@ -16,18 +17,18 @@ import ibis.expr.types as ir
 import ibis.expr.types as types
 from ibis import interval
 from ibis.backends.pandas.execution import execute
-from ibis.backends.spark.datatypes import (
+from ibis.expr.timecontext import adjust_context
+from ibis.util import guid
+
+from .datatypes import (
     ibis_array_dtype_to_spark_dtype,
     ibis_dtype_to_spark_dtype,
     spark_dtype,
 )
-from ibis.expr.timecontext import adjust_context
-from ibis.util import guid
-
 from .timecontext import combine_time_context, filter_by_time_context
 
 
-class PySparkTable(ops.DatabaseTable):
+class PySparkDatabaseTable(ops.DatabaseTable):
     pass
 
 
@@ -75,14 +76,14 @@ class PySparkExprTranslator:
             return result
         else:
             raise com.OperationNotDefinedError(
-                'No translation rule for {}'.format(type(op))
+                f'No translation rule for {type(op)}'
             )
 
 
 compiles = PySparkExprTranslator.compiles
 
 
-@compiles(PySparkTable)
+@compiles(PySparkDatabaseTable)
 def compile_datasource(t, expr, scope, timecontext):
     op = expr.op()
     name, _, client = op.args
@@ -122,7 +123,7 @@ def compile_selection(t, expr, scope, timecontext, **kwargs):
     # time context among child nodes, and pass this as context to
     # source table to get all data within time context loaded.
     arg_timecontexts = [
-        adjust_context(node.op(), timecontext)
+        adjust_context(node.op(), scope, timecontext)
         for node in op.selections
         if timecontext
     ]
@@ -350,8 +351,7 @@ def compile_subtract(t, expr, scope, timecontext, **kwargs):
 
 @compiles(ops.Literal)
 def compile_literal(t, expr, scope, timecontext, raw=False, **kwargs):
-    """ If raw is True, don't wrap the result with F.lit()
-    """
+    """If raw is True, don't wrap the result with F.lit()"""
     value = expr.op().value
     dtype = expr.op().dtype
 
@@ -370,11 +370,11 @@ def compile_literal(t, expr, scope, timecontext, raw=False, **kwargs):
         else:
             return value
     elif isinstance(value, list):
-        return F.array(*[F.lit(v) for v in value])
+        return F.array(*(F.lit(v) for v in value))
     elif isinstance(value, np.ndarray):
         # Unpack np.generic's using .item(), otherwise Spark
         # will not accept
-        return F.array(*[F.lit(v.item()) for v in value])
+        return F.array(*(F.lit(v.item()) for v in value))
     else:
         return F.lit(value)
 
@@ -448,6 +448,10 @@ def compile_endswith(t, expr, scope, timecontext, **kwargs):
     return col.startswith(end)
 
 
+def _is_table(table):
+    return isinstance(table.op().arg, ir.TableExpr)
+
+
 def compile_aggregator(
     t, expr, scope, timecontext, *, fn, context=None, **kwargs
 ):
@@ -467,6 +471,8 @@ def compile_aggregator(
         # Here we get the root table df of that column and compile
         # the expr to:
         # df.select(max(some_col))
+        if _is_table(expr):
+            return src_col.select(col)
         return t.translate(
             expr.op().arg.op().table, scope, timecontext
         ).select(col)
@@ -510,7 +516,12 @@ def compile_notany(t, expr, scope, timecontext, *, context=None, **kwargs):
         )
     else:
         return ~compile_any(
-            t, expr, scope, timecontext, context=context, **kwargs,
+            t,
+            expr,
+            scope,
+            timecontext,
+            context=context,
+            **kwargs,
         )
 
 
@@ -534,14 +545,27 @@ def compile_notall(t, expr, scope, timecontext, *, context=None, **kwargs):
         )
     else:
         return ~compile_all(
-            t, expr, scope, timecontext, context=context, **kwargs,
+            t,
+            expr,
+            scope,
+            timecontext,
+            context=context,
+            **kwargs,
         )
+
+
+def _count_star(_):
+    return F.count(F.lit(1))
 
 
 @compiles(ops.Count)
 def compile_count(t, expr, scope, timecontext, context=None, **kwargs):
+    if _is_table(expr):
+        fn = _count_star
+    else:
+        fn = F.count
     return compile_aggregator(
-        t, expr, scope, timecontext, fn=F.count, context=context, **kwargs
+        t, expr, scope, timecontext, fn=fn, context=context, **kwargs
     )
 
 
@@ -586,9 +610,7 @@ def compile_std(t, expr, scope, timecontext, context=None, **kwargs):
     elif how == 'pop':
         fn = F.stddev_pop
     else:
-        raise com.TranslationError(
-            "Unexpected 'how' in translation: {}".format(how)
-        )
+        raise com.TranslationError(f"Unexpected 'how' in translation: {how}")
 
     return compile_aggregator(
         t, expr, scope, timecontext, fn=fn, context=context
@@ -604,9 +626,7 @@ def compile_variance(t, expr, scope, timecontext, context=None, **kwargs):
     elif how == 'pop':
         fn = F.var_pop
     else:
-        raise com.TranslationError(
-            "Unexpected 'how' in translation: {}".format(how)
-        )
+        raise com.TranslationError(f"Unexpected 'how' in translation: {how}")
 
     return compile_aggregator(
         t, expr, scope, timecontext, fn=fn, context=context
@@ -622,7 +642,7 @@ def compile_arbitrary(t, expr, scope, timecontext, context=None, **kwargs):
     elif how == 'last':
         fn = functools.partial(F.last, ignorenulls=True)
     else:
-        raise NotImplementedError("Does not support 'how': {}".format(how))
+        raise NotImplementedError(f"Does not support 'how': {how}")
 
     return compile_aggregator(
         t, expr, scope, timecontext, fn=fn, context=context
@@ -845,7 +865,7 @@ def compile_isnan(t, expr, scope, timecontext, **kwargs):
     op = expr.op()
 
     src_column = t.translate(op.arg, scope, timecontext)
-    return F.isnan(src_column)
+    return F.isnan(src_column) | F.isnull(src_column)
 
 
 @compiles(ops.IsInf)
@@ -1147,7 +1167,7 @@ def compile_join(t, expr, scope, timecontext, *, how):
 
 
 def _canonicalize_interval(t, interval, scope, timecontext, **kwargs):
-    """ Convert interval to integer timestamp of second
+    """Convert interval to integer timestamp of second
 
     When pyspark cast timestamp to integer type, it uses the number of seconds
     since epoch. Therefore, we need cast ibis interval correspondingly.
@@ -1420,7 +1440,7 @@ def compile_date_truncate(t, expr, scope, timecontext, **kwargs):
         unit = _time_unit_mapping[op.unit]
     except KeyError:
         raise com.UnsupportedOperationError(
-            '{!r} unit is not supported in timestamp truncate'.format(op.unit)
+            f'{op.unit!r} unit is not supported in timestamp truncate'
         )
 
     src_column = t.translate(op.arg, scope, timecontext)
@@ -1524,17 +1544,26 @@ def _get_interval_col(
     dtype = op.dtype
     if not isinstance(dtype, dtypes.Interval):
         raise com.UnsupportedArgumentError(
-            '{} expression cannot be converted to interval column. '
-            'Must be Interval dtype.'.format(dtype)
+            f'{dtype} expression cannot be converted to interval column. '
+            'Must be Interval dtype.'
         )
     if allowed_units and dtype.unit not in allowed_units:
         raise com.UnsupportedArgumentError(
-            'Interval unit "{}" is not allowed. Allowed units are: '
-            '{}'.format(dtype.unit, allowed_units)
+            f'Interval unit "{dtype.unit}" is not allowed. Allowed units are: '
+            f'{allowed_units}'
         )
-    return F.expr(
-        'INTERVAL {} {}'.format(op.value, _time_unit_mapping[dtype.unit])
-    )
+
+    if isinstance(op.value, pd.Timedelta):
+        td_nanos = op.value.value
+        if td_nanos % 1000 != 0:
+            raise com.UnsupportedArgumentError(
+                'Interval with nanoseconds is not supported. The '
+                'smallest unit supported by Spark is microseconds.'
+            )
+        td_micros = td_nanos // 1000
+        return F.expr(f'INTERVAL {td_micros} MICROSECOND')
+    else:
+        return F.expr(f'INTERVAL {op.value} {_time_unit_mapping[dtype.unit]}')
 
 
 def _compile_datetime_binop(
@@ -1732,7 +1761,7 @@ def compile_if_null(t, expr, scope, timecontext, **kwargs):
     op = expr.op()
     col = t.translate(op.arg, scope, timecontext)
     ifnull_col = t.translate(op.ifnull_expr, scope, timecontext)
-    return F.when(col.isNull(), ifnull_col).otherwise(col)
+    return F.when(col.isNull() | F.isnan(col), ifnull_col).otherwise(col)
 
 
 @compiles(ops.NullIf)
@@ -1757,13 +1786,33 @@ def compile_not_null(t, expr, scope, timecontext, **kwargs):
     return ~F.isnull(col) & ~F.isnan(col)
 
 
+@compiles(ops.DropNa)
+def compile_dropna_table(t, expr, scope, timecontext, **kwargs):
+    op = expr.op()
+    table = t.translate(op.table, scope, timecontext)
+    subset = [col.get_name() for col in op.subset] if op.subset else None
+    return table.dropna(how=op.how, subset=subset)
+
+
+@compiles(ops.FillNa)
+def compile_fillna_table(t, expr, scope, timecontext, **kwargs):
+    op = expr.op()
+    table = t.translate(op.table, scope, timecontext)
+    replacements = (
+        op.replacements.op().value
+        if hasattr(op.replacements, 'op')
+        else op.replacements
+    )
+    return table.fillna(replacements)
+
+
 # ------------------------- User defined function ------------------------
 
 
 @compiles(ops.ElementWiseVectorizedUDF)
 def compile_elementwise_udf(t, expr, scope, timecontext, **kwargs):
     op = expr.op()
-    spark_output_type = spark_dtype(op._output_type)
+    spark_output_type = spark_dtype(op.return_type)
     func = op.func
     spark_udf = pandas_udf(func, spark_output_type, PandasUDFType.SCALAR)
     func_args = (t.translate(arg, scope, timecontext) for arg in op.func_args)
@@ -1774,7 +1823,7 @@ def compile_elementwise_udf(t, expr, scope, timecontext, **kwargs):
 def compile_reduction_udf(t, expr, scope, timecontext, context=None, **kwargs):
     op = expr.op()
 
-    spark_output_type = spark_dtype(op._output_type)
+    spark_output_type = spark_dtype(op.return_type)
     spark_udf = pandas_udf(
         op.func, spark_output_type, PandasUDFType.GROUPED_AGG
     )

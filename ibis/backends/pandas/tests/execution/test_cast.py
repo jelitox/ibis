@@ -8,10 +8,7 @@ from pytest import param
 
 import ibis
 import ibis.expr.datatypes as dt  # noqa: E402
-
-from ... import execute
-
-pytestmark = pytest.mark.pandas
+from ibis.backends.pandas.execution import execute
 
 
 @pytest.mark.parametrize('from_', ['plain_float64', 'plain_int64'])
@@ -179,7 +176,8 @@ def test_cast_to_decimal(t, df, type):
 
 
 @pytest.mark.parametrize(
-    'column', ['plain_int64', 'dup_strings', 'dup_ints', 'strings_with_nulls'],
+    'column',
+    ['plain_int64', 'dup_strings', 'dup_ints', 'strings_with_nulls'],
 )
 def test_cast_to_category(t, df, column):
     test = t[column].cast('category').execute()

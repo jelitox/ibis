@@ -1,22 +1,30 @@
-#!/bin/bash -e
-# Run the Ibis tests. Two environment variables are considered:
+#!/usr/bin/env bash
+#
+# Run the Ibis test suite.
+#
+# One environment variable is considered:
 # - PYTEST_BACKENDS: Space-separated list of backends to run
-# - PYTEST_EXPRESSION: Marker expression, for example "not udf"
 
-TESTS_DIRS="ibis/tests ibis/backends/tests"
-for BACKEND in $PYTEST_BACKENDS; do
-    if [[ -d ibis/backends/$BACKEND/tests ]]; then
-        TESTS_DIRS="$TESTS_DIRS ibis/backends/$BACKEND/tests"
-    fi
+set -eo pipefail
+
+TESTS_DIRS=()
+
+if [ -n "$PYTEST_BACKENDS" ]; then
+  TESTS_DIRS+=("ibis/backends/tests")
+fi
+
+for backend in $PYTEST_BACKENDS; do
+  backend_test_dir="ibis/backends/$backend/tests"
+  if [ -d "$backend_test_dir" ]; then
+    TESTS_DIRS+=("$backend_test_dir")
+  fi
 done
 
-echo "TESTS_DIRS: $TESTS_DIRS"
-echo "PYTEST_EXPRESSION: $PYTEST_EXPRESSION"
+set -x
 
-
-pytest $TESTS_DIRS \
-    -m "${PYTEST_EXPRESSION}" \
-    -ra \
-    --junitxml=junit.xml \
-    --cov=ibis \
-    --cov-report=xml:coverage.xml
+poetry run pytest "${TESTS_DIRS[@]}" \
+  --durations=25 \
+  -ra \
+  --junitxml=junit.xml \
+  --cov=ibis \
+  --cov-report=xml:coverage.xml "$@"

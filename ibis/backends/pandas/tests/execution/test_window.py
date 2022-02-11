@@ -9,17 +9,14 @@ import ibis
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
+from ibis.backends.pandas import Backend
+from ibis.backends.pandas.aggcontext import AggregationContext, window_agg_udf
+from ibis.backends.pandas.dispatch import pre_execute
+from ibis.backends.pandas.execution import execute
+from ibis.backends.pandas.execution.window import get_aggcontext
 from ibis.expr.scope import Scope
 from ibis.expr.window import get_preceding_value, rows_with_max_lookback
 from ibis.udf.vectorized import reduction
-
-from ... import Backend, PandasClient, execute
-from ...aggcontext import AggregationContext, window_agg_udf
-from ...dispatch import pre_execute
-from ...execution.window import get_aggcontext
-
-pytestmark = pytest.mark.pandas
-
 
 # These custom classes are used inn test_custom_window_udf
 
@@ -39,7 +36,7 @@ class CustomInterval:
 
 
 class CustomWindow(ibis.expr.window.Window):
-    """ This is a dummy custom window that return n preceding rows
+    """This is a dummy custom window that return n preceding rows
     where n is defined by CustomInterval.value."""
 
     def _replace(self, **kwds):
@@ -165,7 +162,7 @@ def test_lead_delta(t, df, range_offset, default, range_window):
         df[['plain_datetimes_naive', 'dup_strings']]
         .set_index('plain_datetimes_naive')
         .squeeze()
-        .tshift(freq=execute(-range_offset))
+        .shift(freq=execute(-range_offset))
         .reindex(df.plain_datetimes_naive)
         .reset_index(drop=True)
     )
@@ -183,7 +180,7 @@ def test_lag_delta(t, df, range_offset, default, range_window):
         df[['plain_datetimes_naive', 'dup_strings']]
         .set_index('plain_datetimes_naive')
         .squeeze()
-        .tshift(freq=execute(range_offset))
+        .shift(freq=execute(range_offset))
         .reindex(df.plain_datetimes_naive)
         .reset_index(drop=True)
     )
@@ -276,7 +273,7 @@ def test_batting_avg_change_in_games_per_year(players, players_df):
     tm.assert_frame_equal(result, expected)
 
 
-@pytest.mark.xfail(AssertionError, reason='NYI')
+@pytest.mark.xfail(raises=AssertionError, reason='NYI')
 def test_batting_most_hits(players, players_df):
     expr = players.mutate(
         hits_rank=lambda t: t.H.rank().over(
@@ -304,7 +301,7 @@ def test_batting_quantile(players, players_df):
 
 @pytest.mark.parametrize('op', ['sum', 'mean', 'min', 'max'])
 def test_batting_specific_cumulative(batting, batting_df, op, sort_kind):
-    ibis_method = methodcaller('cum{}'.format(op))
+    ibis_method = methodcaller(f'cum{op}')
     expr = ibis_method(batting.sort_by([batting.yearID]).G)
     result = expr.execute().astype('float64')
 
@@ -587,7 +584,7 @@ def test_window_with_mlb():
 
 
 def test_window_has_pre_execute_scope():
-    signature = ops.Lag, PandasClient
+    signature = ops.Lag, Backend
     called = [0]
 
     @pre_execute.register(*signature)
@@ -673,7 +670,7 @@ def test_window_on_and_by_key_as_window_input(t, df):
 
 
 def test_custom_window_udf(t, custom_window):
-    """ Test implementing  a (dummy) custom window.
+    """Test implementing  a (dummy) custom window.
 
     This test covers the advance use case to support custom window with udfs.
 

@@ -9,10 +9,8 @@ import pytest
 
 import ibis
 import ibis.expr.datatypes as dt
-
-from ... import Backend, execute
-
-pytestmark = pytest.mark.pandas
+from ibis.backends.pandas import Backend
+from ibis.backends.pandas.execution import execute
 
 
 def test_table_column(t, df):
@@ -347,15 +345,10 @@ def test_frame_limit(t, df, offset):
     tm.assert_frame_equal(result[expected.columns], expected)
 
 
-@pytest.mark.xfail(
-    raises=AttributeError, reason='TableColumn does not implement limit'
-)
 @pytest.mark.parametrize('offset', [0, 2])
 def test_series_limit(t, df, offset):
-    n = 5
-    s_expr = t.plain_int64.limit(n, offset=offset)
-    result = s_expr.execute()
-    tm.assert_series_equal(result, df.plain_int64.iloc[offset : offset + n])
+    with pytest.raises(AttributeError):
+        t.plain_int64.limit(5, offset=offset)
 
 
 @pytest.mark.parametrize(
@@ -487,7 +480,7 @@ def test_mutate_after_group_by(t, df):
 def test_groupby_with_unnamed_arithmetic(t, df):
     expr = t.groupby(t.dup_strings).aggregate(
         naive_variance=(
-            (t.plain_float64 ** 2).sum() - t.plain_float64.mean() ** 2
+            (t.plain_float64**2).sum() - t.plain_float64.mean() ** 2
         )
         / t.plain_float64.count()
     )
@@ -496,7 +489,7 @@ def test_groupby_with_unnamed_arithmetic(t, df):
         df.groupby('dup_strings')
         .agg(
             {
-                'plain_float64': lambda x: ((x ** 2).sum() - x.mean() ** 2)
+                'plain_float64': lambda x: ((x**2).sum() - x.mean() ** 2)
                 / x.count()
             }
         )
@@ -670,8 +663,21 @@ def test_quantile_groupby(batting, batting_df):
     tm.assert_series_equal(result, expected)
 
 
+def test_summary_execute(t):
+    expr = t.group_by('plain_strings').aggregate(
+        [
+            t.plain_int64.summary(prefix='int64_'),
+            t.plain_int64.summary(suffix='_int64'),
+            t.plain_datetimes_utc.summary(prefix='datetime_'),
+            t.plain_datetimes_utc.summary(suffix='_datetime'),
+        ]
+    )
+    result = expr.execute()
+    assert isinstance(result, pd.DataFrame)
+
+
 def test_summary_numeric(batting, batting_df):
-    expr = batting.G.summary()
+    expr = batting.aggregate(batting.G.summary())
     result = expr.execute()
     assert len(result) == 1
 
@@ -717,7 +723,7 @@ def test_summary_numeric_group_by(batting, batting_df):
 
 
 def test_summary_non_numeric(batting, batting_df):
-    expr = batting.teamID.summary()
+    expr = batting.aggregate(batting.teamID.summary())
     result = expr.execute()
     assert len(result) == 1
     assert len(result.columns) == 3
@@ -844,7 +850,7 @@ def test_difference(client, df1, intersect_df2):
     merged = df1.merge(
         intersect_df2, on=list(df1.columns), how="outer", indicator=True
     )
-    expected = merged[merged["_merge"] != "both"].drop("_merge", 1)
+    expected = merged[merged["_merge"] != "both"].drop("_merge", axis=1)
     tm.assert_frame_equal(result, expected)
 
 

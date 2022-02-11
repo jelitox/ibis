@@ -37,12 +37,16 @@ from ibis.backends.pandas.execution.generic import (
     execute_isinf,
     execute_isnan,
     execute_node_contains_series_sequence,
+    execute_node_dropna_dataframe,
+    execute_node_fillna_dataframe_dict,
+    execute_node_fillna_dataframe_scalar,
     execute_node_ifnull_series,
     execute_node_not_contains_series_sequence,
     execute_node_nullif_series,
     execute_node_nullif_series_scalar,
     execute_node_self_reference_dataframe,
     execute_null_if_zero_series,
+    execute_searched_case,
     execute_series_clip,
     execute_series_isnull,
     execute_series_notnnull,
@@ -50,7 +54,8 @@ from ibis.backends.pandas.execution.generic import (
     execute_table_column_df_or_df_groupby,
 )
 
-from ..client import DaskClient, DaskTable
+from .. import Backend as DaskBackend
+from ..client import DaskTable
 from ..core import execute
 from ..dispatch import execute_node
 from .util import (
@@ -107,6 +112,11 @@ DASK_DISPATCH_TYPES: TypeRegistrationDict = {
     ops.Difference: [
         ((dd.DataFrame, dd.DataFrame), execute_difference_dataframe_dataframe)
     ],
+    ops.DropNa: [((dd.DataFrame,), execute_node_dropna_dataframe)],
+    ops.FillNa: [
+        ((dd.DataFrame, simple_types), execute_node_fillna_dataframe_scalar),
+        ((dd.DataFrame,), execute_node_fillna_dataframe_dict),
+    ],
     ops.IsNull: [((dd.Series,), execute_series_isnull)],
     ops.NotNull: [((dd.Series,), execute_series_notnnull)],
     ops.IsNan: [((dd.Series,), execute_isnan)],
@@ -139,7 +149,7 @@ DASK_DISPATCH_TYPES: TypeRegistrationDict = {
 
 register_types_to_dispatcher(execute_node, DASK_DISPATCH_TYPES)
 
-execute_node.register(DaskTable, DaskClient)(execute_database_table_client)
+execute_node.register(DaskTable, DaskBackend)(execute_database_table_client)
 
 
 @execute_node.register(ops.ValueList, collections.abc.Sequence)
@@ -161,7 +171,7 @@ def execute_arbitrary_series_mask(op, data, mask, aggcontext=None, **kwargs):
         index = len(data) - 1  # TODO - computation
     else:
         raise com.OperationNotDefinedError(
-            'Arbitrary {!r} is not supported'.format(op.how)
+            f'Arbitrary {op.how!r} is not supported'
         )
 
     return data.loc[index]
@@ -175,7 +185,7 @@ def execute_arbitrary_series_groupby(op, data, _, aggcontext=None, **kwargs):
 
     if how not in {'first', 'last'}:
         raise com.OperationNotDefinedError(
-            'Arbitrary {!r} is not supported'.format(how)
+            f'Arbitrary {how!r} is not supported'
         )
     return aggcontext.agg(data, how)
 
@@ -216,7 +226,7 @@ def execute_cast_series_timestamp(op, data, type, **kwargs):
         else:
             return timestamps.dt.tz_localize(tz)
 
-    raise TypeError("Don't know how to cast {} to {}".format(from_type, type))
+    raise TypeError(f"Don't know how to cast {from_type} to {type}")
 
 
 @execute_node.register(ops.Cast, dd.Series, dt.Date)
@@ -249,7 +259,7 @@ def execute_cast_series_date(op, data, type, **kwargs):
             to_datetime, unit='D', meta=(data.name, 'datetime64[ns]')
         )
 
-    raise TypeError("Don't know how to cast {} to {}".format(from_type, type))
+    raise TypeError(f"Don't know how to cast {from_type} to {type}")
 
 
 @execute_node.register(ops.Limit, dd.DataFrame, integer_types, integer_types)
@@ -286,7 +296,7 @@ def execute_binary_op(op, left, right, **kwargs):
         operation = constants.BINARY_OPERATIONS[op_type]
     except KeyError:
         raise NotImplementedError(
-            'Binary operation {} not implemented'.format(op_type.__name__)
+            f'Binary operation {op_type.__name__} not implemented'
         )
     else:
         return operation(left, right)
@@ -399,6 +409,32 @@ def wrap_case_result(raw: np.ndarray, expr: ir.ValueExpr):
     if isinstance(expr, ir.ScalarExpr) and result.size.compute() == 1:
         return result.head().item()
     return result
+
+
+@execute_node.register(ops.SearchedCase, list, list, object)
+def execute_searched_case_dask(op, whens, thens, otherwise, **kwargs):
+    if not isinstance(whens[0], dd.Series):
+        # if we are not dealing with dask specific objects, fallback to the
+        # pandas logic. For example, in the case of ibis literals.
+        # See `test_functions/test_ifelse_returning_bool` or
+        # `test_operations/test_searched_case_scalar` for code that hits this.
+        return execute_searched_case(op, whens, thens, otherwise, **kwargs)
+    if otherwise is None:
+        otherwise = np.nan
+    idx = whens[0].index
+    whens = [w.to_dask_array() for w in whens]
+    if isinstance(thens[0], dd.Series):
+        # some computed column
+        thens = [t.to_dask_array() for t in thens]
+    else:
+        # scalar
+        thens = [da.from_array(np.array([t])) for t in thens]
+    raw = da.select(whens, thens, otherwise)
+    out = dd.from_dask_array(
+        raw,
+        index=idx,
+    )
+    return out
 
 
 @execute_node.register(ops.SimpleCase, dd.Series, list, list, object)

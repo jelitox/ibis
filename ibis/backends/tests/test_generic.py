@@ -5,6 +5,8 @@ import pandas as pd
 import pytest
 
 import ibis
+import ibis.common.exceptions as com
+import ibis.util as util
 from ibis import literal as L
 
 
@@ -17,7 +19,7 @@ from ibis import literal as L
         (L(10).nullif(5), 10),
     ],
 )
-@pytest.mark.xfail_unsupported
+@pytest.mark.xfail_backends(["datafusion"])  # not implemented
 def test_fillna_nullif(backend, con, expr, expected):
     if expected is None:
         # The exact kind of null value used differs per backend (and version).
@@ -28,6 +30,43 @@ def test_fillna_nullif(backend, con, expr, expected):
         assert pd.isna(con.execute(expr))
     else:
         assert con.execute(expr) == expected
+
+
+@pytest.mark.only_on_backends(['pandas', 'dask', 'pyspark'])
+def test_isna(backend, alltypes):
+    table = alltypes.mutate(na_col=np.nan)
+    table = table.mutate(none_col=None)
+    table = table.mutate(none_col=table['none_col'].cast('float64'))
+    table_pandas = table.execute()
+
+    for col in ['na_col', 'none_col']:
+        result = table[table[col].isnan()].execute().reset_index(drop=True)
+
+        expected = table_pandas[table_pandas[col].isna()].reset_index(
+            drop=True
+        )
+        backend.assert_frame_equal(result, expected)
+
+
+@pytest.mark.only_on_backends(['pandas', 'dask', 'pyspark'])
+def test_fillna(backend, alltypes):
+    table = alltypes.mutate(na_col=np.nan)
+    table = table.mutate(none_col=None)
+    table = table.mutate(none_col=table['none_col'].cast('float64'))
+    table_pandas = table.execute()
+
+    for col in ['na_col', 'none_col']:
+        result = (
+            table.mutate(filled=table[col].fillna(0.0))
+            .execute()
+            .reset_index(drop=True)
+        )
+
+        expected = table_pandas.assign(
+            filled=table_pandas[col].fillna(0.0)
+        ).reset_index(drop=True)
+
+        backend.assert_frame_equal(result, expected)
 
 
 @pytest.mark.parametrize(
@@ -127,7 +166,7 @@ def test_notin(backend, alltypes, sorted_df, column, elements):
         (lambda t: ~t['bool_col'], lambda df: ~df['bool_col']),
     ],
 )
-@pytest.mark.skip_backends(['dask'])  # TODO - sorting - #2553
+@pytest.mark.skip_backends(['dask', 'datafusion'])  # TODO - sorting - #2553
 @pytest.mark.xfail_unsupported
 def test_filter(backend, alltypes, sorted_df, predicate_fn, expected_fn):
     sorted_alltypes = alltypes.sort_by('id')
@@ -177,8 +216,8 @@ def test_case_where(backend, alltypes, df):
     mask_1 = expected['int_col'] == 0
 
     expected['new_col'] = 0
-    expected['new_col'][mask_0] = 20
-    expected['new_col'][mask_1] = 10
+    expected.loc[mask_0, 'new_col'] = 20
+    expected.loc[mask_1, 'new_col'] = 10
     expected['new_col'] = expected['new_col']
 
     backend.assert_frame_equal(result, expected)
@@ -217,3 +256,91 @@ def test_select_filter_mutate(backend, alltypes, df):
     expected = expected.assign(float_col=expected['float_col'].astype('int32'))
 
     backend.assert_frame_equal(result, expected)
+
+
+def test_fillna_invalid(alltypes):
+    with pytest.raises(
+        com.IbisTypeError, match=r"value \['invalid_col'\] is not a field in.*"
+    ):
+        alltypes.fillna({'invalid_col': 0.0})
+
+
+def test_dropna_invalid(alltypes):
+    with pytest.raises(
+        com.IbisTypeError, match=r"value 'invalid_col' is not a field in.*"
+    ):
+        alltypes.dropna(subset=['invalid_col'])
+
+    with pytest.raises(ValueError, match=r".*is not in.*"):
+        alltypes.dropna(how='invalid')
+
+
+@pytest.mark.parametrize(
+    'replacements',
+    [
+        0.0,
+        0,
+        1,
+        ({'na_col': 0.0}),
+        ({'na_col': 1}),
+        ({'none_col': 0.0}),
+        ({'none_col': 1}),
+    ],
+)
+@pytest.mark.only_on_backends(['pandas', 'dask', 'pyspark'])
+def test_fillna_table(backend, alltypes, replacements):
+    table = alltypes.mutate(na_col=np.nan)
+    table = table.mutate(none_col=None)
+    table = table.mutate(none_col=table['none_col'].cast('float64'))
+    table_pandas = table.execute()
+
+    result = table.fillna(replacements).execute().reset_index(drop=True)
+    expected = table_pandas.fillna(replacements).reset_index(drop=True)
+
+    # check_dtype is False here because there are dtype diffs between
+    # Pyspark and Pandas on Java 8 - filling the 'none_col' with an int
+    # results in float in Pyspark, and int in Pandas. This diff does
+    # not exist in Java 11.
+    backend.assert_frame_equal(result, expected, check_dtype=False)
+
+
+def test_mutate_rename(alltypes):
+    table = alltypes.select(["bool_col", "string_col"])
+    table = table.mutate(dupe_col=table["bool_col"])
+    result = table.execute()
+    # check_dtype is False here because there are dtype diffs between
+    # Pyspark and Pandas on Java 8 - filling the 'none_col' with an int
+    # results in float in Pyspark, and int in Pandas. This diff does
+    # not exist in Java 11.
+    assert list(result.columns) == ["bool_col", "string_col", "dupe_col"]
+
+
+@pytest.mark.parametrize(
+    ('how', 'subset'),
+    [
+        ('any', None),
+        ('any', []),
+        ('any', ['int_col', 'na_col']),
+        ('all', None),
+        ('all', ['int_col', 'na_col']),
+        ('all', 'none_col'),
+    ],
+)
+@pytest.mark.only_on_backends(['pandas', 'dask', 'pyspark'])
+def test_dropna_table(backend, alltypes, how, subset):
+    table = alltypes.mutate(na_col=np.nan)
+    table = table.mutate(none_col=None)
+    table = table.mutate(none_col=table['none_col'].cast('float64'))
+    table_pandas = table.execute()
+
+    result = table.dropna(subset, how).execute().reset_index(drop=True)
+    subset = util.promote_list(subset) if subset else table_pandas.columns
+    expected = table_pandas.dropna(how=how, subset=subset).reset_index(
+        drop=True
+    )
+
+    # check_dtype is False here because there are dtype diffs between
+    # Pyspark and Pandas on Java 8 - the 'bool_col' of an empty DataFrame
+    # is type object in Pyspark, and type bool in Pandas. This diff does
+    # not exist in Java 11.
+    backend.assert_frame_equal(result, expected, check_dtype=False)

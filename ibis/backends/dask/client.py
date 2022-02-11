@@ -1,38 +1,21 @@
 """The dask client implementation."""
 
-from __future__ import absolute_import
-
-import re
-from functools import partial
-from typing import Dict, List, Mapping
-
-import dask
 import dask.dataframe as dd
-import dateutil.parser
 import numpy as np
 import pandas as pd
-import toolz
-from dask.base import DaskMethodsMixin
 from pandas.api.types import DatetimeTZDtype
-from pkg_resources import parse_version
 
-import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.schema as sch
-import ibis.expr.types as ir
-from ibis.backends.base import Client, Database
+from ibis.backends.base import Database
 from ibis.backends.pandas.client import (
     PANDAS_DATE_TYPES,
     PANDAS_STRING_TYPES,
     _inferable_pandas_dtypes,
-    convert,
-    convert_timezone,
     ibis_dtype_to_pandas,
     ibis_schema_to_pandas,
 )
-
-from .core import execute_and_reset
 
 infer_dask_dtype = pd.api.types.infer_dtype
 
@@ -86,7 +69,7 @@ ibis_dtype_to_dask = ibis_dtype_to_pandas
 ibis_schema_to_dask = ibis_schema_to_pandas
 
 
-@convert.register(DatetimeTZDtype, dt.Timestamp, dd.Series)
+@sch.convert.register(DatetimeTZDtype, dt.Timestamp, dd.Series)
 def convert_datetimetz_to_timestamp(in_dtype, out_dtype, column):
     output_timezone = out_dtype.timezone
     if output_timezone is not None:
@@ -98,45 +81,18 @@ DASK_STRING_TYPES = PANDAS_STRING_TYPES
 DASK_DATE_TYPES = PANDAS_DATE_TYPES
 
 
-@convert.register(np.dtype, dt.Timestamp, dd.Series)
-def convert_datetime64_to_timestamp(in_dtype, out_dtype, column):
-    if in_dtype.type == np.datetime64:
-        return column.astype(out_dtype.to_dask())
-    try:
-        # TODO - check this?
-        series = pd.to_datetime(column, utc=True)
-    except pd.errors.OutOfBoundsDatetime:
-        inferred_dtype = infer_dask_dtype(column, skipna=True)
-        if inferred_dtype in DASK_DATE_TYPES:
-            # not great, but not really any other option
-            return column.map(
-                partial(convert_timezone, timezone=out_dtype.timezone)
-            )
-        if inferred_dtype not in DASK_STRING_TYPES:
-            raise TypeError(
-                (
-                    'Conversion to timestamp not supported for Series of type '
-                    '{!r}'
-                ).format(inferred_dtype)
-            )
-        return column.map(dateutil.parser.parse)
-    else:
-        utc_dtype = DatetimeTZDtype('ns', 'UTC')
-        return series.astype(utc_dtype).dt.tz_convert(out_dtype.timezone)
-
-
-@convert.register(np.dtype, dt.Interval, dd.Series)
+@sch.convert.register(np.dtype, dt.Interval, dd.Series)
 def convert_any_to_interval(_, out_dtype, column):
     return column.values.astype(out_dtype.to_dask())
 
 
-@convert.register(np.dtype, dt.String, dd.Series)
+@sch.convert.register(np.dtype, dt.String, dd.Series)
 def convert_any_to_string(_, out_dtype, column):
     result = column.astype(out_dtype.to_dask())
     return result
 
 
-@convert.register(np.dtype, dt.Boolean, dd.Series)
+@sch.convert.register(np.dtype, dt.Boolean, dd.Series)
 def convert_boolean_to_series(in_dtype, out_dtype, column):
     # XXX: this is a workaround until #1595 can be addressed
     in_dtype_type = in_dtype.type
@@ -146,7 +102,7 @@ def convert_boolean_to_series(in_dtype, out_dtype, column):
     return column
 
 
-@convert.register(object, dt.DataType, dd.Series)
+@sch.convert.register(object, dt.DataType, dd.Series)
 def convert_any_to_any(_, out_dtype, column):
     return column.astype(out_dtype.to_dask())
 
@@ -161,137 +117,3 @@ class DaskTable(ops.DatabaseTable):
 
 class DaskDatabase(Database):
     pass
-
-
-class DaskClient(Client):
-    def __init__(self, backend, dictionary: Dict[str, dd.DataFrame]):
-        self.database_class = backend.database_class
-        self.table_class = backend.table_class
-        self.dictionary = dictionary
-
-    def table(self, name: str, schema: sch.Schema = None) -> DaskTable:
-        df = self.dictionary[name]
-        schema = sch.infer(df, schema=schema)
-        return self.table_class(name, schema, self).to_expr()
-
-    def execute(
-        self,
-        query: ir.Expr,
-        params: Mapping[ir.Expr, object] = None,
-        limit: str = 'default',
-        **kwargs,
-    ):
-        if limit != 'default':
-            raise ValueError(
-                'limit parameter to execute is not yet implemented in the '
-                'dask backend'
-            )
-
-        if not isinstance(query, ir.Expr):
-            raise TypeError(
-                "`query` has type {!r}, expected ibis.expr.types.Expr".format(
-                    type(query).__name__
-                )
-            )
-
-        result = self.compile(query, params, **kwargs)
-        if isinstance(result, DaskMethodsMixin):
-            return result.compute()
-        else:
-            return result
-
-    def compile(
-        self, query: ir.Expr, params: Mapping[ir.Expr, object] = None, **kwargs
-    ):
-        """Compile `expr`.
-
-        Notes
-        -----
-        For the dask backend returns a dask graph that you can run ``.compute``
-        on to get a pandas object.
-
-        """
-        return execute_and_reset(query, params=params, **kwargs)
-
-    def database(self, name: str = None) -> DaskDatabase:
-        """Construct a database called `name`."""
-        return self.database_class(name, self)
-
-    def list_tables(self, like: str = None) -> List[str]:
-        """List the available tables."""
-        tables = list(self.dictionary.keys())
-        if like is not None:
-            pattern = re.compile(like)
-            return list(filter(lambda t: pattern.findall(t), tables))
-        return tables
-
-    def load_data(self, table_name: str, obj: dd.DataFrame, **kwargs):
-        """Load data from `obj` into `table_name`.
-
-        Parameters
-        ----------
-        table_name : str
-        obj : dask.dataframe.DataFrame
-
-        """
-        # kwargs is a catch all for any options required by other backends.
-        self.dictionary[table_name] = obj
-
-    def create_table(
-        self,
-        table_name: str,
-        obj: dd.DataFrame = None,
-        schema: sch.Schema = None,
-    ):
-        """Create a table."""
-        if obj is None and schema is None:
-            raise com.IbisError('Must pass expr or schema')
-
-        if obj is not None:
-            df = obj
-        else:
-            dtypes = ibis_schema_to_dask(schema)
-            df = schema.apply_to(
-                dd.from_pandas(
-                    pd.DataFrame(columns=list(map(toolz.first, dtypes))),
-                    npartitions=1,
-                )
-            )
-
-        self.dictionary[table_name] = df
-
-    def get_schema(self, table_name: str, database: str = None) -> sch.Schema:
-        """Return a Schema object for the indicated table and database.
-
-        Parameters
-        ----------
-        table_name : str
-            May be fully qualified
-        database : str
-
-        Returns
-        -------
-        ibis.expr.schema.Schema
-
-        """
-        return sch.infer(self.dictionary[table_name])
-
-    def exists_table(self, name: str) -> bool:
-        """Determine if the indicated table or view exists.
-
-        Parameters
-        ----------
-        name : str
-        database : str
-
-        Returns
-        -------
-        bool
-
-        """
-        return bool(self.list_tables(like=name))
-
-    @property
-    def version(self) -> str:
-        """Return the version of the underlying backend library."""
-        return parse_version(dask.__version__)

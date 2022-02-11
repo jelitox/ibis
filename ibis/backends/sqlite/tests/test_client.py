@@ -8,13 +8,12 @@ import pytest
 import ibis
 import ibis.config as config
 import ibis.expr.types as ir
+from ibis.backends.sqlite import Backend
 from ibis.util import guid
-
-pytestmark = pytest.mark.sqlite
 
 
 def test_file_not_exist_and_create():
-    path = '__ibis_tmp_{}.db'.format(guid())
+    path = f'__ibis_tmp_{guid()}.db'
 
     with pytest.raises(FileNotFoundError):
         ibis.sqlite.connect(path)
@@ -57,16 +56,8 @@ def test_list_tables(con):
     assert len(con.list_tables(like='functional')) == 1
 
 
-def test_compile_verify(alltypes):
-    unsupported_expr = alltypes.string_col.approx_nunique()
-    assert not unsupported_expr.verify()
-
-    supported_expr = alltypes.double_col.sum()
-    assert supported_expr.verify()
-
-
 def test_attach_file(dbpath):
-    client = ibis.sqlite.connect()
+    client = Backend().connect(None)
 
     client.attach('foo', dbpath)
     client.attach('bar', dbpath)
@@ -75,10 +66,6 @@ def test_attach_file(dbpath):
     bar_tables = client.list_tables(database='bar')
 
     assert foo_tables == bar_tables
-
-
-def test_database_layer(con, db):
-    assert db.list_tables() == con.list_tables()
 
 
 def test_compile_toplevel():
@@ -116,3 +103,24 @@ def test_verbose_log_queries(con):
     expected += 'FROM base.functional_alltypes AS t0\n'
     expected += ' LIMIT ? OFFSET ?'
     assert query == expected
+
+
+def test_table_equality(dbpath):
+    con1 = ibis.sqlite.connect(dbpath)
+    batting1 = con1.table("batting")
+
+    con2 = ibis.sqlite.connect(dbpath)
+    batting2 = con2.table("batting")
+
+    assert batting1.op() == batting2.op()
+    assert batting1.equals(batting2)
+
+
+def test_table_inequality(dbpath):
+    con = ibis.sqlite.connect(dbpath)
+
+    batting = con.table("batting")
+    functional_alltypes = con.table("functional_alltypes")
+
+    assert batting.op() != functional_alltypes.op()
+    assert not batting.equals(functional_alltypes)

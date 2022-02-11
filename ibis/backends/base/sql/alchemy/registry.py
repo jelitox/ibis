@@ -1,4 +1,5 @@
 import operator
+from typing import Any, Dict
 
 import sqlalchemy as sa
 import sqlalchemy.sql as sql
@@ -76,12 +77,12 @@ def _varargs_call(sa_func, t, expr):
 
 
 def get_sqla_table(ctx, table):
-    if ctx.has_ref(table):
+    if ctx.has_ref(table, parent_contexts=True):
         ctx_level = ctx
-        sa_table = ctx_level.get_table(table)
+        sa_table = ctx_level.get_ref(table)
         while sa_table is None and ctx_level.parent is not ctx_level:
             ctx_level = ctx_level.parent
-            sa_table = ctx_level.get_table(table)
+            sa_table = ctx_level.get_ref(table)
     else:
         op = table.op()
         if isinstance(op, AlchemyTable):
@@ -98,7 +99,24 @@ def _table_column(t, expr):
     table = op.table
 
     sa_table = get_sqla_table(ctx, table)
-    out_expr = getattr(sa_table.c, op.name)
+    colname = op.name
+
+    try:
+        out_expr = sa_table.c[colname]
+    except KeyError:
+        # Here we create a "deferred" column
+        #
+        # This is to handle the case when selecting a column from a join, which
+        # happens when a join expression is cached during join traversal
+        #
+        # We'd like to avoid generating a subquery just for selection but in
+        # sqlalchemy the Join object is not selectable. However, at this point
+        # know that the column can be referred to unambiguously
+        #
+        # Later the expression is assembled into
+        # `sa.select([sa.column(colname)]).select_from(table_set)` (roughly)
+        # where `table_set` is `sa_table` above.
+        out_expr = sa.column(colname)
 
     # If the column does not originate from the table set in the current SELECT
     # context, we should format as a subquery
@@ -121,7 +139,7 @@ def _exists_subquery(t, expr):
     ctx = t.context
 
     filtered = op.foreign_table.filter(op.predicates).projection(
-        [ir.literal(1).name(ir.unnamed)]
+        [ir.literal(1).name(ir.core.unnamed)]
     )
 
     sub_ctx = ctx.subcontext()
@@ -148,7 +166,7 @@ def _cast(t, expr):
 def _contains(t, expr):
     op = expr.op()
 
-    left, right = [t.translate(arg) for arg in op.args]
+    left, right = (t.translate(arg) for arg in op.args)
 
     return left.in_(right)
 
@@ -160,20 +178,23 @@ def _not_contains(t, expr):
 def reduction(sa_func):
     def formatter(t, expr):
         op = expr.op()
-        *args, where = op.args
-
-        return _reduction_format(t, sa_func, where, *args)
+        if op.where is not None:
+            arg = t.translate(op.where.ifelse(op.arg, ibis.NA))
+        else:
+            arg = t.translate(op.arg)
+        return sa_func(arg)
 
     return formatter
 
 
-def _reduction_format(t, sa_func, where, arg, *args):
-    if where is not None:
-        arg = t.translate(where.ifelse(arg, ibis.NA))
+def _group_concat(t, expr):
+    op = expr.op()
+    sep = t.translate(op.sep)
+    if op.where is not None:
+        arg = t.translate(op.where.ifelse(op.arg, ibis.NA))
     else:
-        arg = t.translate(arg)
-
-    return sa_func(arg, *map(t.translate, args))
+        arg = t.translate(op.arg)
+    return sa.func.group_concat(arg, sep)
 
 
 def _literal(t, expr):
@@ -405,7 +426,7 @@ def _sort_key(t, expr):
     return sort_direction(t.translate(by))
 
 
-sqlalchemy_operation_registry = {
+sqlalchemy_operation_registry: Dict[Any, Any] = {
     ops.And: fixed_arity(sql.and_, 2),
     ops.Or: fixed_arity(sql.or_, 2),
     ops.Not: unary(sa.not_),
@@ -421,7 +442,7 @@ sqlalchemy_operation_registry = {
     ops.Min: reduction(sa.func.min),
     ops.Max: reduction(sa.func.max),
     ops.CountDistinct: _count_distinct,
-    ops.GroupConcat: reduction(sa.func.group_concat),
+    ops.GroupConcat: _group_concat,
     ops.Between: fixed_arity(sa.between, 3),
     ops.IsNull: _is_null,
     ops.NotNull: _not_null,

@@ -1,0 +1,11 @@
+.benchmarks
+.direnv
+.mypy_cache
+.pytest_cache
+nix/sources.json
+result
+result-*
+docs/release_notes.md
+docs/overrides/*.html
+site
+ci/udf/CMakeFiles

@@ -6,7 +6,7 @@ from pandas.core.groupby import SeriesGroupBy
 
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-from ibis.backends.base import Client
+from ibis.backends.base import BaseBackend
 from ibis.expr.scope import Scope
 
 from ..core import (
@@ -38,6 +38,8 @@ def execute_extract_timestamp_field_timestamp(op, data, **kwargs):
 @execute_node.register(ops.ExtractTemporalField, pd.Series)
 def execute_extract_timestamp_field_series(op, data, **kwargs):
     field_name = type(op).__name__.lower().replace('extract', '')
+    if field_name == 'weekofyear':
+        return data.dt.isocalendar().week.astype(np.int32)
     return getattr(data.dt, field_name).astype(np.int32)
 
 
@@ -76,7 +78,7 @@ def execute_timestamp_date(op, data, **kwargs):
 
 @execute_node.register((ops.TimestampTruncate, ops.DateTruncate), pd.Series)
 def execute_timestamp_truncate(op, data, **kwargs):
-    dtype = 'datetime64[{}]'.format(op.unit)
+    dtype = f'datetime64[{op.unit}]'
     array = data.values.astype(dtype)
     return pd.Series(array, name=data.name)
 
@@ -93,12 +95,12 @@ OFFSET_CLASS = {
 @execute_node.register(ops.IntervalFromInteger, pd.Series)
 def execute_interval_from_integer_series(op, data, **kwargs):
     unit = op.unit
-    resolution = "{}s".format(op.resolution)
+    resolution = f"{op.resolution}s"
     cls = OFFSET_CLASS.get(unit, None)
 
     # fast path for timedelta conversion
     if cls is None:
-        return data.astype("timedelta64[{}]".format(unit))
+        return data.astype(f"timedelta64[{unit}]")
     return data.apply(
         lambda n, cls=cls, resolution=resolution: cls(**{resolution: n})
     )
@@ -107,7 +109,7 @@ def execute_interval_from_integer_series(op, data, **kwargs):
 @execute_node.register(ops.IntervalFromInteger, integer_types)
 def execute_interval_from_integer_integer_types(op, data, **kwargs):
     unit = op.unit
-    resolution = "{}s".format(op.resolution)
+    resolution = f"{op.resolution}s"
     cls = OFFSET_CLASS.get(unit, None)
 
     if cls is None:
@@ -119,11 +121,11 @@ def execute_interval_from_integer_integer_types(op, data, **kwargs):
 def execute_cast_integer_to_interval_series(op, data, type, **kwargs):
     to = op.to
     unit = to.unit
-    resolution = "{}s".format(to.resolution)
+    resolution = f"{to.resolution}s"
     cls = OFFSET_CLASS.get(unit, None)
 
     if cls is None:
-        return data.astype("timedelta64[{}]".format(unit))
+        return data.astype(f"timedelta64[{unit}]")
     return data.apply(
         lambda n, cls=cls, resolution=resolution: cls(**{resolution: n})
     )
@@ -133,7 +135,7 @@ def execute_cast_integer_to_interval_series(op, data, type, **kwargs):
 def execute_cast_integer_to_interval_integer_types(op, data, type, **kwargs):
     to = op.to
     unit = to.unit
-    resolution = "{}s".format(to.resolution)
+    resolution = f"{to.resolution}s"
     cls = OFFSET_CLASS.get(unit, None)
 
     if cls is None:
@@ -232,7 +234,7 @@ def execute_timestamp_from_unix(op, data, **kwargs):
 
 
 @pre_execute.register(ops.TimestampNow)
-@pre_execute.register(ops.TimestampNow, Client)
+@pre_execute.register(ops.TimestampNow, BaseBackend)
 def pre_execute_timestamp_now(op, *args, **kwargs):
     timecontext = kwargs.get('timecontext', None)
     return Scope({op: pd.Timestamp('now')}, timecontext)

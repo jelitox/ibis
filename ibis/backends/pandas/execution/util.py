@@ -9,10 +9,20 @@ import ibis.common.exceptions as com
 import ibis.util
 from ibis.expr import operations as ops
 from ibis.expr import types as ir
-from ibis.expr.schema import coerce_to_dataframe
 from ibis.expr.scope import Scope
+from ibis.udf.vectorized import coerce_to_dataframe
 
 from ..core import execute
+from ..execution import constants
+
+
+def get_join_suffix_for_op(op: ops.TableColumn, join_op: ops.Join):
+    (root_table,) = op.root_tables()
+    left_root, right_root = ops.distinct_roots(join_op.left, join_op.right)
+    return {
+        left_root: constants.LEFT_JOIN_SUFFIX,
+        right_root: constants.RIGHT_JOIN_SUFFIX,
+    }[root_table]
 
 
 def compute_sort_key(key, data, timecontext, scope=None, **kwargs):
@@ -67,7 +77,7 @@ def compute_sorted_frame(
 def coerce_to_output(
     result: Any, expr: ir.Expr, index: Optional[pd.Index] = None
 ) -> Union[pd.Series, pd.DataFrame]:
-    """ Cast the result to either a Series or DataFrame.
+    """Cast the result to either a Series or DataFrame.
 
     This method casts result of an execution to a Series or DataFrame,
     depending on the type of the expression and shape of the result.
@@ -124,7 +134,9 @@ def coerce_to_output(
             # Broadcast `result` to a multi-element Series according to the
             # given `index`.
             return pd.Series(
-                np.repeat(result, len(index)), index=index, name=result_name,
+                np.repeat(result, len(index)),
+                index=index,
+                name=result_name,
             )
     elif isinstance(result, np.ndarray):
         return pd.Series(result, name=result_name)

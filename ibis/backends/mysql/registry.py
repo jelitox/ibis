@@ -86,7 +86,7 @@ def _truncate(t, expr):
         fmt = _truncate_formats[unit]
     except KeyError:
         raise com.UnsupportedOperationError(
-            'Unsupported truncate unit {}'.format(unit)
+            f'Unsupported truncate unit {unit}'
         )
     return sa.func.date_format(sa_arg, fmt)
 
@@ -165,10 +165,10 @@ def _interval_from_integer(t, expr):
     # the existing bind parameter produced by translate and reuse its name in
     # the string passed to sa.text?
     if isinstance(sa_arg, sa.sql.elements.BindParameter):
-        return sa.text('INTERVAL :arg {}'.format(text_unit)).bindparams(
+        return sa.text(f'INTERVAL :arg {text_unit}').bindparams(
             arg=sa_arg.value
         )
-    return sa.text('INTERVAL {} {}'.format(sa_arg, text_unit))
+    return sa.text(f'INTERVAL {sa_arg} {text_unit}')
 
 
 def _timestamp_diff(t, expr):
@@ -187,9 +187,7 @@ def _literal(t, expr):
             )
         text_unit = expr.type().resolution.upper()
         value = expr.op().value
-        return sa.text('INTERVAL :value {}'.format(text_unit)).bindparams(
-            value=value
-        )
+        return sa.text(f'INTERVAL :value {text_unit}').bindparams(value=value)
     elif isinstance(expr, ir.SetScalar):
         return list(map(sa.literal, expr.op().value))
     else:
@@ -214,9 +212,22 @@ def _group_concat(t, expr):
     return sa.func.group_concat(arg.op('SEPARATOR')(t.translate(sep)))
 
 
+def _day_of_week_index(t, expr):
+    (arg,) = expr.op().args
+    left = sa.func.dayofweek(t.translate(arg)) - 2
+    right = 7
+    return ((left % right) + right) % right
+
+
+def _day_of_week_name(t, expr):
+    (arg,) = expr.op().args
+    return sa.func.dayname(t.translate(arg))
+
+
 operation_registry.update(
     {
         ops.Literal: _literal,
+        ops.IfNull: fixed_arity(sa.func.ifnull, 2),
         # strings
         ops.Substring: _substr,
         ops.StringFind: _string_find,
@@ -261,5 +272,7 @@ operation_registry.update(
         ops.TimestampNow: fixed_arity(sa.func.now, 0),
         # others
         ops.GroupConcat: _group_concat,
+        ops.DayOfWeekIndex: _day_of_week_index,
+        ops.DayOfWeekName: _day_of_week_name,
     }
 )

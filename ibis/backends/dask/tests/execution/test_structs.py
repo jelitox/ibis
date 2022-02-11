@@ -8,7 +8,6 @@ from dask.dataframe.utils import tm
 import ibis
 import ibis.expr.datatypes as dt
 
-from ... import Backend
 from ...execution import execute
 
 
@@ -33,7 +32,7 @@ def struct_client(value, npartitions):
         ),
         npartitions=npartitions,
     )
-    return Backend().connect({"t": df})
+    return ibis.dask.connect({"t": df})
 
 
 @pytest.fixture
@@ -68,7 +67,8 @@ def test_struct_field_series(struct_table):
     expr = t.s['fruit']
     result = expr.compile()
     expected = dd.from_pandas(
-        pd.Series(["apple", "pear", "pear"], name="fruit"), npartitions=1,
+        pd.Series(["apple", "pear", "pear"], name="fruit"),
+        npartitions=1,
     )
     tm.assert_series_equal(result.compute(), expected.compute())
 

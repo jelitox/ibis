@@ -3,14 +3,13 @@ import enum
 from collections import OrderedDict
 
 import pandas as pd
+import parsy
 import pytest
 import pytz
 from multipledispatch.conflict import ambiguities
-from pytest import param
 
 import ibis
 import ibis.expr.datatypes as dt
-from ibis.common.exceptions import IbisTypeError
 
 
 def test_validate_type():
@@ -76,17 +75,17 @@ def test_map_with_string_value_type():
 
 
 def test_map_does_not_allow_non_primitive_keys():
-    with pytest.raises(IbisTypeError):
+    with pytest.raises(parsy.ParseError):
         dt.dtype('map<array<string>, double>')
 
 
 def test_token_error():
-    with pytest.raises(IbisTypeError):
+    with pytest.raises(parsy.ParseError):
         dt.dtype('array<string>>')
 
 
 def test_empty_complex_type():
-    with pytest.raises(IbisTypeError):
+    with pytest.raises(parsy.ParseError):
         dt.dtype('map<>')
 
 
@@ -170,7 +169,7 @@ def test_struct_from_dict():
     ],
 )
 def test_decimal_failure(case):
-    with pytest.raises(IbisTypeError):
+    with pytest.raises(parsy.ParseError):
         dt.dtype(case)
 
 
@@ -185,7 +184,7 @@ def test_char_varchar(spec):
     'spec', ['varchar(', 'varchar)', 'varchar()', 'char(', 'char)', 'char()']
 )
 def test_char_varchar_invalid(spec):
-    with pytest.raises(IbisTypeError):
+    with pytest.raises(parsy.ParseError):
         dt.dtype(spec)
 
 
@@ -298,13 +297,13 @@ def test_timestamp_with_timezone_parser_invalid_timezone():
     ],
 )
 def test_interval(unit):
-    definition = "interval('{}')".format(unit)
+    definition = f"interval('{unit}')"
     dt.Interval(unit, dt.int32) == dt.dtype(definition)
 
-    definition = "interval<uint16>('{}')".format(unit)
+    definition = f"interval<uint16>('{unit}')"
     dt.Interval(unit, dt.uint16) == dt.dtype(definition)
 
-    definition = "interval<int64>('{}')".format(unit)
+    definition = f"interval<int64>('{unit}')"
     dt.Interval(unit, dt.int64) == dt.dtype(definition)
 
 
@@ -318,7 +317,7 @@ def test_interval_invalid_type():
 
 @pytest.mark.parametrize('unit', ['H', 'unsupported'])
 def test_interval_unvalid_unit(unit):
-    definition = "interval('{}')".format(unit)
+    definition = f"interval('{unit}')"
 
     with pytest.raises(ValueError):
         dt.dtype(definition)
@@ -339,7 +338,7 @@ def test_interval_unvalid_unit(unit):
     ],
 )
 def test_string_argument_parsing_failure_mode(case):
-    with pytest.raises(IbisTypeError):
+    with pytest.raises(parsy.ParseError):
         dt.dtype(case)
 
 
@@ -379,6 +378,7 @@ class Foo(enum.Enum):
         (False, dt.boolean),
         (True, dt.boolean),
         ('foo', dt.string),
+        (b'fooblob', dt.binary),
         (datetime.date.today(), dt.date),
         (datetime.datetime.now(), dt.timestamp),
         (datetime.timedelta(days=3), dt.Interval(unit='D')),
@@ -438,51 +438,6 @@ class Foo(enum.Enum):
             ),
         ),
         (Foo.a, dt.Enum(dt.string, dt.int8)),
-        param(
-            datetime.timedelta(hours=5),
-            dt.Interval(unit='h'),
-            id='dateime hours',
-            marks=pytest.mark.xfail(
-                reason='Hour conversion from datetime.timedelta to ibis '
-                'interval not supported'
-            ),
-        ),
-        param(
-            datetime.timedelta(minutes=7),
-            dt.Interval(unit='m'),
-            id='dateime minutes',
-            marks=pytest.mark.xfail(
-                reason='Minute conversion from datetime.timedelta to ibis '
-                'interval not supported'
-            ),
-        ),
-        param(
-            datetime.timedelta(milliseconds=11),
-            dt.Interval(unit='ms'),
-            id='dateime milliseconds',
-            marks=pytest.mark.xfail(
-                reason='Millisecond conversion from datetime.timedelta to '
-                'ibis interval not supported'
-            ),
-        ),
-        param(
-            pd.Timedelta('3W'),
-            dt.Interval(unit='W'),
-            id='weeks',
-            marks=pytest.mark.xfail(
-                reason='Week conversion from Timedelta to ibis interval '
-                'not supported'
-            ),
-        ),
-        param(
-            None,
-            dt.Interval(unit='Y'),
-            id='years',
-            marks=pytest.mark.xfail(
-                reason='Year conversion from Timedelta to ibis interval '
-                'not supported'
-            ),
-        ),
     ],
 )
 def test_infer_dtype(value, expected_dtype):
@@ -496,6 +451,8 @@ def test_infer_dtype(value, expected_dtype):
     ('source', 'target'),
     [
         (dt.any, dt.string),
+        (dt.string, dt.uuid),
+        (dt.uuid, dt.string),
         (dt.null, dt.date),
         (dt.null, dt.any),
         (dt.int8, dt.int64),

@@ -8,9 +8,8 @@ import pytest
 import ibis
 import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
-
-from .. import Backend
-from ..udf import nullable, udf
+from ibis.backends.pandas import Backend
+from ibis.backends.pandas.udf import nullable, udf
 
 
 @pytest.fixture
@@ -95,7 +94,8 @@ def zscore(series):
 
 
 @udf.reduction(
-    input_type=[dt.double], output_type=dt.Array(dt.double),
+    input_type=[dt.double],
+    output_type=dt.Array(dt.double),
 )
 def quantiles(series, *, quantiles):
     return np.array(series.quantile(quantiles))
@@ -109,12 +109,6 @@ def test_udf(t, df):
     result = expr.execute()
     expected = df.a.str.len().mul(2)
     tm.assert_series_equal(result, expected)
-
-
-def test_elementwise_udf_with_non_vectors(con):
-    expr = my_add(1.0, 2.0)
-    result = con.execute(expr)
-    assert result == 3.0
 
 
 def test_multiple_argument_udf(con, t, df):

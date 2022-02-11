@@ -31,7 +31,7 @@ implementation details.
 
 import enum
 import functools
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -40,13 +40,17 @@ import ibis.common.exceptions as com
 import ibis.config as config
 import ibis.expr.api as ir
 import ibis.expr.operations as ops
-from ibis.expr.operations import Node
 from ibis.expr.typing import TimeContext
+
+if TYPE_CHECKING:
+    from ibis.expr.scope import Scope
 
 # In order to use time context feature, there must be a column of Timestamp
 # type, and named as 'time' in TableExpr. This TIME_COL constant will be
 # used in filtering data from a table or columns of a table. It can be changed
-# by ibis.set_option('time_col')
+# by running:
+#
+# ibis.config.options.context_adjustment.time_col = "other_time_col"
 
 
 def get_time_col():
@@ -54,7 +58,7 @@ def get_time_col():
 
 
 class TimeContextRelation(enum.Enum):
-    """ Enum to classify the relationship between two time contexts
+    """Enum to classify the relationship between two time contexts
     Assume that we have two timecontext `c1 (begin1, end1)`,
     `c2(begin2, end2)`:
         - SUBSET means `c1` is a subset of `c2`, `begin1` is greater than or
@@ -105,15 +109,15 @@ def canonicalize_context(
     timecontext: Optional[TimeContext],
 ) -> Optional[TimeContext]:
     """Convert a timecontext to canonical one with type pandas.Timestamp
-       for its begin and end time. Raise Exception for illegal inputs
+    for its begin and end time. Raise Exception for illegal inputs
     """
     SUPPORTS_TIMESTAMP_TYPE = pd.Timestamp
-    try:
-        begin, end = timecontext
-    except (ValueError, TypeError) as e:
+    if not isinstance(timecontext, tuple) or len(timecontext) != 2:
         raise com.IbisError(
             f'Timecontext {timecontext} should specify (begin, end)'
-        ) from e
+        )
+
+    begin, end = timecontext
 
     if not isinstance(begin, SUPPORTS_TIMESTAMP_TYPE):
         raise com.IbisError(
@@ -147,7 +151,7 @@ def localize_context(timecontext: TimeContext, timezone: str) -> TimeContext:
 def construct_time_context_aware_series(
     series: pd.Series, frame: pd.DataFrame
 ) -> pd.Series:
-    """ Construct a Series by adding 'time' in its MultiIndex
+    """Construct a Series by adding 'time' in its MultiIndex
 
     In window execution, the result Series of udf may need
     to be trimmed by timecontext. In order to do so, 'time'
@@ -248,11 +252,14 @@ def construct_time_context_aware_series(
 
 
 @functools.singledispatch
-def adjust_context(op: Any, timecontext: TimeContext) -> TimeContext:
+def adjust_context(
+    op: Any, scope: 'Scope', timecontext: TimeContext
+) -> TimeContext:
     """
     Params
     -------
     op: ibis.expr.operations.Node
+    scope: Scope
     timecontext: TimeContext
         time context associated with the node
 
@@ -267,14 +274,16 @@ def adjust_context(op: Any, timecontext: TimeContext) -> TimeContext:
 
 
 @adjust_context.register(ops.Node)
-def adjust_context_node(op: Node, timecontext: TimeContext) -> TimeContext:
+def adjust_context_node(
+    op: ops.Node, scope: 'Scope', timecontext: TimeContext
+) -> TimeContext:
     # For any node, by default, do not adjust time context
     return timecontext
 
 
 @adjust_context.register(ops.AsOfJoin)
 def adjust_context_asof_join(
-    op: Node, timecontext: TimeContext
+    op: ops.AsOfJoin, scope: 'Scope', timecontext: TimeContext
 ) -> TimeContext:
     begin, end = timecontext
 
@@ -288,7 +297,9 @@ def adjust_context_asof_join(
 
 
 @adjust_context.register(ops.WindowOp)
-def adjust_context_window(op: Node, timecontext: TimeContext) -> TimeContext:
+def adjust_context_window(
+    op: ops.WindowOp, scope: 'Scope', timecontext: TimeContext
+) -> TimeContext:
     # adjust time context by preceding and following
     begin, end = timecontext
 

@@ -1,16 +1,20 @@
-from ibis.backends.base import BaseBackend
+import contextlib
+import warnings
 
-from .client import MySQLClient, MySQLDatabase, MySQLTable
+import sqlalchemy
+import sqlalchemy.dialects.mysql as mysql
+
+import ibis.expr.datatypes as dt
+from ibis.backends.base.sql.alchemy import BaseAlchemyBackend
+
+from .compiler import MySQLCompiler
 
 
-class Backend(BaseBackend):
+class Backend(BaseAlchemyBackend):
     name = 'mysql'
-    kind = 'sqlalchemy'
-    client = MySQLClient
-    database_class = MySQLDatabase
-    table_class = MySQLTable
+    compiler = MySQLCompiler
 
-    def connect(
+    def do_connect(
         self,
         host='localhost',
         user=None,
@@ -21,24 +25,30 @@ class Backend(BaseBackend):
         driver='pymysql',
     ):
 
-        """Create an Ibis client located at `user`:`password`@`host`:`port`
-        connected to a MySQL database named `database`.
+        """Create an Ibis client using the passed connection parameters.
 
         Parameters
         ----------
-        host : string, default 'localhost'
-        user : string, default None
-        password : string, default None
-        port : string or integer, default 3306
-        database : string, default None
-        url : string, default None
+        host
+            Hostname
+        user
+            Username
+        password
+            Password
+        port
+            Port
+        database
+            Database to connect to
+        url
             Complete SQLAlchemy connection string. If passed, the other
             connection arguments are ignored.
-        driver : string, default 'pymysql'
+        driver
+            Python MySQL database driver
 
         Returns
         -------
-        MySQLClient
+        Backend
+            An instance of a MySQL backend
 
         Examples
         --------
@@ -78,13 +88,86 @@ class Backend(BaseBackend):
             year : int32
             month : int32
         """
-        return MySQLClient(
-            backend=self,
+        if driver != 'pymysql':
+            raise NotImplementedError(
+                'pymysql is currently the only supported driver'
+            )
+        alchemy_url = self._build_alchemy_url(
+            url=url,
             host=host,
+            port=port,
             user=user,
             password=password,
-            port=port,
             database=database,
-            url=url,
-            driver=driver,
+            driver=f'mysql+{driver}',
         )
+
+        self.database_name = alchemy_url.database
+        super().do_connect(sqlalchemy.create_engine(alchemy_url))
+
+    @contextlib.contextmanager
+    def begin(self):
+        with super().begin() as bind:
+            previous_timezone = bind.execute(
+                'SELECT @@session.time_zone'
+            ).scalar()
+            try:
+                bind.execute("SET @@session.time_zone = 'UTC'")
+            except Exception as e:
+                warnings.warn(f"Couldn't set mysql timezone: {str(e)}")
+
+            try:
+                yield bind
+            finally:
+                query = "SET @@session.time_zone = '{}'"
+                bind.execute(query.format(previous_timezone))
+
+    def table(self, name, database=None, schema=None):
+        """Create a table expression that references a particular a table
+        called `name` in a MySQL database called `database`.
+
+        Parameters
+        ----------
+        name : str
+            The name of the table to retrieve.
+        database : str, optional
+            The database in which the table referred to by `name` resides. If
+            ``None`` then the ``current_database`` is used.
+        schema : str, optional
+            The schema in which the table resides.  If ``None`` then the
+            `public` schema is assumed.
+
+        Returns
+        -------
+        table : TableExpr
+            A table expression.
+        """
+        if database is not None and database != self.current_database:
+            return self.database(name=database).table(name=name, schema=schema)
+        else:
+            alch_table = self._get_sqla_table(name, schema=schema)
+            node = self.table_class(alch_table, self, self._schemas.get(name))
+            return self.table_expr_class(node)
+
+
+# TODO(kszucs): unsigned integers
+
+
+@dt.dtype.register((mysql.DOUBLE, mysql.REAL))
+def mysql_double(satype, nullable=True):
+    return dt.Double(nullable=nullable)
+
+
+@dt.dtype.register(mysql.FLOAT)
+def mysql_float(satype, nullable=True):
+    return dt.Float(nullable=nullable)
+
+
+@dt.dtype.register(mysql.TINYINT)
+def mysql_tinyint(satype, nullable=True):
+    return dt.Int8(nullable=nullable)
+
+
+@dt.dtype.register(mysql.BLOB)
+def mysql_blob(satype, nullable=True):
+    return dt.Binary(nullable=nullable)

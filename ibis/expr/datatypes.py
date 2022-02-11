@@ -1,26 +1,35 @@
+import ast
 import builtins
 import collections
 import datetime
+import decimal
 import enum
 import functools
 import itertools
 import numbers
 import re
 import typing
-from typing import Any as GenericAny
+import uuid as _uuid
 from typing import (
-    Callable,
+    Iterable,
     Iterator,
     List,
     Mapping,
     NamedTuple,
     Optional,
     Sequence,
+    Tuple,
+    TypeVar,
+    Union,
 )
-from typing import Set as GenericSet
-from typing import Tuple, TypeVar, Union
+
+try:
+    from typing import Literal
+except ImportError:
+    from typing_extensions import Literal
 
 import pandas as pd
+import parsy as p
 import toolz
 from multipledispatch import Dispatcher
 
@@ -34,17 +43,21 @@ try:
 
     IS_SHAPELY_AVAILABLE = True
 except ImportError:
-    ...
+    pass
 
 
 class DataType:
+    """Base class for all data types."""
+
+    nullable: bool
+    """Whether the data type can hold `NULL` values."""
 
     __slots__ = ('nullable',)
 
-    def __init__(self, nullable: bool = True) -> None:
+    def __init__(self, nullable: bool = True, **kwargs) -> None:
         self.nullable = nullable
 
-    def __call__(self, nullable: bool = True) -> 'DataType':
+    def __call__(self, nullable: bool = True) -> "DataType":
         if nullable is not True and nullable is not False:
             raise TypeError(
                 "__call__ only accepts the 'nullable' argument. "
@@ -53,7 +66,7 @@ class DataType:
             )
         return self._factory(nullable=nullable)
 
-    def _factory(self, nullable: bool = True) -> 'DataType':
+    def _factory(self, nullable: bool = True) -> "DataType":
         slots = {
             slot: getattr(self, slot)
             for slot in self.__slots__
@@ -78,7 +91,7 @@ class DataType:
         return '{}({})'.format(
             self.name,
             ', '.join(
-                '{}={!r}'.format(slot, getattr(self, slot))
+                f'{slot}={getattr(self, slot)!r}'
                 for slot in toolz.unique(self.__slots__ + ('nullable',))
             ),
         )
@@ -90,13 +103,15 @@ class DataType:
 
     @property
     def name(self) -> str:
+        """Return the name of the data type."""
         return type(self).__name__
 
     def equals(
         self,
-        other: 'DataType',
-        cache: Optional[Mapping[GenericAny, bool]] = None,
+        other: "DataType",
+        cache: Optional[Mapping[typing.Any, bool]] = None,
     ) -> bool:
+        """Return whether this data type equals `other`."""
         if isinstance(other, str):
             raise TypeError(
                 'Comparing datatypes to strings is not allowed. Convert '
@@ -113,37 +128,47 @@ class DataType:
         )
 
     def castable(self, target, **kwargs):
+        """Return whether this data type is castable to `target`."""
         return castable(self, target, **kwargs)
 
     def cast(self, target, **kwargs):
+        """Cast this data type to `target`."""
         return cast(self, target, **kwargs)
 
     def scalar_type(self):
+        """Return a scalar expression with this data type."""
         return functools.partial(self.scalar, dtype=self)
 
     def column_type(self):
+        """Return a column expression with this data type."""
         return functools.partial(self.column, dtype=self)
 
-    def _literal_value_hash_key(self, value) -> int:
+    def _literal_value_hash_key(self, value) -> Tuple["DataType", typing.Any]:
         """Return a hash for `value`."""
         return self, value
 
 
 class Any(DataType):
+    """Values of any type."""
+
     __slots__ = ()
 
 
 class Primitive(DataType):
+    """Values with known size."""
+
     __slots__ = ()
 
     def __repr__(self) -> str:
         name = self.name.lower()
         if not self.nullable:
-            return '{}[non-nullable]'.format(name)
+            return f'{name}[non-nullable]'
         return name
 
 
 class Null(DataType):
+    """Null values."""
+
     scalar = ir.NullScalar
     column = ir.NullColumn
 
@@ -151,20 +176,28 @@ class Null(DataType):
 
 
 class Variadic(DataType):
+    """Values with unknown size."""
+
     __slots__ = ()
 
 
 class Boolean(Primitive):
+    """True or False values."""
+
     scalar = ir.BooleanScalar
     column = ir.BooleanColumn
 
     __slots__ = ()
 
 
-Bounds = NamedTuple('Bounds', [('lower', int), ('upper', int)])
+class Bounds(NamedTuple):
+    lower: int
+    upper: int
 
 
 class Integer(Primitive):
+    """Integer values."""
+
     scalar = ir.IntegerScalar
     column = ir.IntegerColumn
 
@@ -172,6 +205,7 @@ class Integer(Primitive):
 
     @property
     def _nbytes(self) -> int:
+        """Return the number of bytes used to store values of this type."""
         raise TypeError(
             "Cannot determine the size in bytes of an abstract integer type."
         )
@@ -193,14 +227,15 @@ class String(Variadic):
 
 
 class Binary(Variadic):
-    """A type representing a blob of bytes.
+    """A type representing a sequence of bytes.
 
     Notes
     -----
-    Some databases treat strings and blobs of equally, and some do not. For
-    example, Impala doesn't make a distinction between string and binary types
-    but PostgreSQL has a TEXT type and a BYTEA type which are distinct types
-    that behave differently.
+    Some databases treat strings and blobs of equally, and some do not.
+
+    For example, Impala doesn't make a distinction between string and binary
+    types but PostgreSQL has a `TEXT` type and a `BYTEA` type which are
+    distinct types that have different behavior.
     """
 
     scalar = ir.BinaryScalar
@@ -210,6 +245,8 @@ class Binary(Variadic):
 
 
 class Date(Primitive):
+    """Date values."""
+
     scalar = ir.DateScalar
     column = ir.DateColumn
 
@@ -217,6 +254,8 @@ class Date(Primitive):
 
 
 class Time(Primitive):
+    """Time values."""
+
     scalar = ir.TimeScalar
     column = ir.TimeColumn
 
@@ -224,6 +263,11 @@ class Time(Primitive):
 
 
 class Timestamp(DataType):
+    """Timestamp values."""
+
+    timezone: str
+    """The timezone of values of this type."""
+
     scalar = ir.TimestampScalar
     column = ir.TimestampColumn
 
@@ -240,12 +284,15 @@ class Timestamp(DataType):
         typename = self.name.lower()
         if timezone is None:
             return typename
-        return '{}({!r})'.format(typename, timezone)
+        return f'{typename}({timezone!r})'
 
 
 class SignedInteger(Integer):
+    """Signed integer values."""
+
     @property
     def largest(self):
+        """Return the largest type of signed integer."""
         return int64
 
     @property
@@ -256,8 +303,11 @@ class SignedInteger(Integer):
 
 
 class UnsignedInteger(Integer):
+    """Unsigned integer values."""
+
     @property
     def largest(self):
+        """Return the largest type of unsigned integer."""
         return uint64
 
     @property
@@ -268,6 +318,8 @@ class UnsignedInteger(Integer):
 
 
 class Floating(Primitive):
+    """Floating point values."""
+
     scalar = ir.FloatingScalar
     column = ir.FloatingColumn
 
@@ -275,6 +327,7 @@ class Floating(Primitive):
 
     @property
     def largest(self):
+        """Return the largest type of floating point values."""
         return float64
 
     @property
@@ -286,56 +339,78 @@ class Floating(Primitive):
 
 
 class Int8(SignedInteger):
+    """Signed 8-bit integers."""
+
     __slots__ = ()
     _nbytes = 1
 
 
 class Int16(SignedInteger):
+    """Signed 16-bit integers."""
+
     __slots__ = ()
     _nbytes = 2
 
 
 class Int32(SignedInteger):
+    """Signed 32-bit integers."""
+
     __slots__ = ()
     _nbytes = 4
 
 
 class Int64(SignedInteger):
+    """Signed 64-bit integers."""
+
     __slots__ = ()
     _nbytes = 8
 
 
 class UInt8(UnsignedInteger):
+    """Unsigned 8-bit integers."""
+
     __slots__ = ()
     _nbytes = 1
 
 
 class UInt16(UnsignedInteger):
+    """Unsigned 16-bit integers."""
+
     __slots__ = ()
     _nbytes = 2
 
 
 class UInt32(UnsignedInteger):
+    """Unsigned 32-bit integers."""
+
     __slots__ = ()
     _nbytes = 4
 
 
 class UInt64(UnsignedInteger):
+    """Unsigned 64-bit integers."""
+
     __slots__ = ()
     _nbytes = 8
 
 
 class Float16(Floating):
+    """16-bit floating point numbers."""
+
     __slots__ = ()
     _nbytes = 2
 
 
 class Float32(Floating):
+    """32-bit floating point numbers."""
+
     __slots__ = ()
     _nbytes = 4
 
 
 class Float64(Floating):
+    """64-bit floating point numbers."""
+
     __slots__ = ()
     _nbytes = 8
 
@@ -346,6 +421,14 @@ Double = Float64
 
 
 class Decimal(DataType):
+    """Fixed-precision decimal values."""
+
+    precision: int
+    """The number of values after the decimal point."""
+
+    scale: int
+    """The number of decimal places values of this type can hold."""
+
     scalar = ir.DecimalScalar
     column = ir.DecimalColumn
 
@@ -382,11 +465,19 @@ class Decimal(DataType):
         )
 
     @property
-    def largest(self) -> 'Decimal':
+    def largest(self) -> "Decimal":
+        """Return the largest decimal type."""
         return Decimal(38, self.scale)
 
 
 class Interval(DataType):
+    """Interval values."""
+
+    value_type: DataType
+    """The underlying type of the stored values."""
+    unit: str
+    """The time unit of the interval."""
+
     scalar = ir.IntervalScalar
     column = ir.IntervalColumn
 
@@ -433,7 +524,7 @@ class Interval(DataType):
             try:
                 unit = self._convert_timedelta_unit_to_interval_unit(unit)
             except ValueError:
-                raise ValueError('Unsupported interval unit `{}`'.format(unit))
+                raise ValueError(f'Unsupported interval unit `{unit}`')
 
         if value_type is None:
             value_type = int32
@@ -452,14 +543,14 @@ class Interval(DataType):
 
     @property
     def resolution(self):
-        """Unit's name"""
+        """The interval unit's name."""
         return self._units[self.unit]
 
     def __str__(self):
         unit = self.unit
         typename = self.name.lower()
         value_type_name = self.value_type.name.lower()
-        return '{}<{}>(unit={!r})'.format(typename, value_type_name, unit)
+        return f'{typename}<{value_type_name}>(unit={unit!r})'
 
 
 class Category(DataType):
@@ -477,7 +568,7 @@ class Category(DataType):
             cardinality = self.cardinality
         else:
             cardinality = 'unknown'
-        return '{}(cardinality={!r})'.format(self.name, cardinality)
+        return f'{self.name}(cardinality={cardinality!r})'
 
     def to_integer_type(self):
         # TODO: this should be removed I guess
@@ -488,25 +579,35 @@ class Category(DataType):
 
 
 class Struct(DataType):
+    """Structured values."""
+
+    names: List[str]
+    """Field names of the struct."""
+    types: Sequence[DataType]
+    """Types of the fields of the struct."""
+
     scalar = ir.StructScalar
     column = ir.StructColumn
 
     __slots__ = 'names', 'types'
 
     def __init__(
-        self, names: List[str], types: List[DataType], nullable: bool = True
+        self,
+        names: Iterable[str],
+        types: Iterable[DataType],
+        nullable: bool = True,
     ) -> None:
-        """Construct a ``Struct`` type from a `names` and `types`.
+        """Construct a struct type from `names` and `types`.
 
         Parameters
         ----------
-        names : Sequence[str]
+        names
             Sequence of strings indicating the name of each field in the
             struct.
-        types : Sequence[Union[str, DataType]]
+        types
             Sequence of strings or :class:`~ibis.expr.datatypes.DataType`
             instances, one for each field
-        nullable : bool, optional
+        nullable
             Whether the struct can be null
         """
         if not (names and types):
@@ -521,22 +622,24 @@ class Struct(DataType):
     @classmethod
     def from_tuples(
         cls,
-        pairs: Sequence[Tuple[str, Union[str, DataType]]],
+        pairs: Iterable[Tuple[str, Union[str, DataType]]],
         nullable: bool = True,
-    ) -> 'Struct':
+    ) -> "Struct":
         names, types = zip(*pairs)
         return cls(list(names), list(map(dtype, types)), nullable=nullable)
 
     @classmethod
     def from_dict(
-        cls, pairs: Mapping[str, Union[str, DataType]], nullable: bool = True,
-    ) -> 'Struct':
+        cls,
+        pairs: Mapping[str, Union[str, DataType]],
+        nullable: bool = True,
+    ) -> "Struct":
         names, types = pairs.keys(), pairs.values()
         return cls(list(names), list(map(dtype, types)), nullable=nullable)
 
     @property
     def pairs(self) -> Mapping:
-        return collections.OrderedDict(zip(self.names, self.types))
+        return dict(zip(self.names, self.types))
 
     def __getitem__(self, key: str) -> DataType:
         return self.pairs[key]
@@ -574,6 +677,10 @@ def _tuplize(values):
 
 
 class Array(Variadic):
+    """Array values."""
+
+    value_type: DataType
+    """The type of the elements of the array."""
     scalar = ir.ArrayScalar
     column = ir.ArrayColumn
 
@@ -586,13 +693,17 @@ class Array(Variadic):
         self.value_type = dtype(value_type)
 
     def __str__(self) -> str:
-        return '{}<{}>'.format(self.name.lower(), self.value_type)
+        return f'{self.name.lower()}<{self.value_type}>'
 
     def _literal_value_hash_key(self, value):
         return self, _tuplize(value)
 
 
 class Set(Variadic):
+    """Set values."""
+
+    value_type: DataType
+    """The type of the elements of the set."""
     scalar = ir.SetScalar
     column = ir.SetColumn
 
@@ -605,10 +716,17 @@ class Set(Variadic):
         self.value_type = dtype(value_type)
 
     def __str__(self) -> str:
-        return '{}<{}>'.format(self.name.lower(), self.value_type)
+        return f'{self.name.lower()}<{self.value_type}>'
 
 
 class Enum(DataType):
+    """Enumeration values."""
+
+    rep_type: DataType
+    """The type of the key of the enumeration."""
+    value_type: DataType
+    """The type of the elements of the enumeration."""
+
     scalar = ir.EnumScalar
     column = ir.EnumColumn
 
@@ -623,6 +741,12 @@ class Enum(DataType):
 
 
 class Map(Variadic):
+    """Associative array values."""
+
+    key_type: DataType
+    """The type of the key of the map."""
+    value_type: DataType
+    """The type of the values of the map."""
     scalar = ir.MapScalar
     column = ir.MapColumn
 
@@ -645,16 +769,17 @@ class Map(Variadic):
 
 
 class JSON(String):
-    """JSON (JavaScript Object Notation) text format."""
+    """JSON values."""
 
     scalar = ir.JSONScalar
     column = ir.JSONColumn
 
 
 class JSONB(Binary):
-    """JSON (JavaScript Object Notation) data stored as a binary
-    representation, which eliminates whitespace, duplicate keys,
-    and key ordering.
+    """JSON data stored in a binary representation.
+
+    This representation eliminates whitespace, duplicate keys, and does not
+    preserve key ordering.
     """
 
     scalar = ir.JSONBScalar
@@ -662,25 +787,34 @@ class JSONB(Binary):
 
 
 class GeoSpatial(DataType):
+    """Geospatial values."""
+
     __slots__ = 'geotype', 'srid'
 
+    geotype: Optional[Literal['geography', 'geometry']]
+    """The specific geospatial type"""
+    srid: Optional[int]
+    """The spatial reference identifier."""
     column = ir.GeoSpatialColumn
     scalar = ir.GeoSpatialScalar
 
     def __init__(
-        self, geotype: str = None, srid: int = None, nullable: bool = True
-    ):
+        self,
+        geotype: Optional[Literal['geography', 'geometry']] = None,
+        srid: Optional[int] = None,
+        nullable: bool = True,
+    ) -> None:
         """Geospatial data type base class
 
         Parameters
         ----------
-        geotype : str
+        geotype
             Specification of geospatial type which could be `geography` or
             `geometry`.
-        srid : int
+        srid
             Spatial Reference System Identifier
-        nullable : bool, optional
-            Whether the struct can be null
+        nullable
+            Whether the value can be null
         """
         super().__init__(nullable=nullable)
 
@@ -716,7 +850,7 @@ class GeoSpatial(DataType):
 
 
 class Geometry(GeoSpatial):
-    """Geometry is used to cast from geography types."""
+    """Geometry values."""
 
     column = ir.GeoSpatialColumn
     scalar = ir.GeoSpatialScalar
@@ -732,7 +866,7 @@ class Geometry(GeoSpatial):
 
 
 class Geography(GeoSpatial):
-    """Geography is used to cast from geometry types."""
+    """Geography values."""
 
     column = ir.GeoSpatialColumn
     scalar = ir.GeoSpatialScalar
@@ -766,9 +900,10 @@ class LineString(GeoSpatial):
 
 
 class Polygon(GeoSpatial):
-    """A set of one or more rings (closed line strings), with the first
-    representing the shape (external ring) and the rest representing holes in
-    that shape (internal rings).
+    """A set of one or more closed line strings.
+
+    The first line string represents the shape (external ring) and the rest
+    represent holes in that shape (internal rings).
     """
 
     scalar = ir.PolygonScalar
@@ -804,10 +939,8 @@ class MultiPolygon(GeoSpatial):
     __slots__ = ()
 
 
-class UUID(String):
-    """A universally unique identifier (UUID) is a 128-bit number used to
-    identify information in computer systems.
-    """
+class UUID(DataType):
+    """A 128-bit number used to identify information in computer systems."""
 
     scalar = ir.UUIDScalar
     column = ir.UUIDColumn
@@ -816,7 +949,7 @@ class UUID(String):
 
 
 class MACADDR(String):
-    """Media Access Control (MAC) Address of a network interface."""
+    """Media Access Control (MAC) address of a network interface."""
 
     scalar = ir.MACADDRScalar
     column = ir.MACADDRColumn
@@ -825,7 +958,7 @@ class MACADDR(String):
 
 
 class INET(String):
-    """IP address type."""
+    """IP addresses."""
 
     scalar = ir.INETScalar
     column = ir.INETColumn
@@ -877,672 +1010,212 @@ uuid = UUID()
 macaddr = MACADDR()
 inet = INET()
 
-_primitive_types = [
-    ('any', any),
-    ('null', null),
-    ('boolean', boolean),
-    ('bool', boolean),
-    ('int8', int8),
-    ('int16', int16),
-    ('int32', int32),
-    ('int64', int64),
-    ('uint8', uint8),
-    ('uint16', uint16),
-    ('uint32', uint32),
-    ('uint64', uint64),
-    ('float16', float16),
-    ('float32', float32),
-    ('float64', float64),
-    ('float', float),
-    ('halffloat', float16),
-    ('double', double),
-    ('string', string),
-    ('binary', binary),
-    ('date', date),
-    ('time', time),
-    ('timestamp', timestamp),
-    ('interval', interval),
-    ('category', category),
-]  # type: List[Tuple[str, DataType]]
 
-
-class Tokens:
-    """Class to hold tokens for lexing."""
-
-    __slots__ = ()
-
-    ANY = 0
-    NULL = 1
-    PRIMITIVE = 2
-    DECIMAL = 3
-    VARCHAR = 4
-    CHAR = 5
-    ARRAY = 6
-    MAP = 7
-    STRUCT = 8
-    INTEGER = 9
-    FIELD = 10
-    COMMA = 11
-    COLON = 12
-    LPAREN = 13
-    RPAREN = 14
-    LBRACKET = 15
-    RBRACKET = 16
-    STRARG = 17
-    TIMESTAMP = 18
-    TIME = 19
-    INTERVAL = 20
-    SET = 21
-    GEOGRAPHY = 22
-    GEOMETRY = 23
-    POINT = 24
-    LINESTRING = 25
-    POLYGON = 26
-    MULTILINESTRING = 27
-    MULTIPOINT = 28
-    MULTIPOLYGON = 29
-    SEMICOLON = 30
-    JSON = 31
-    JSONB = 32
-    UUID = 33
-    MACADDR = 34
-    INET = 35
-
-    @staticmethod
-    def name(value):
-        return _token_names[value]
-
-
-_token_names = {
-    getattr(Tokens, n): n for n in dir(Tokens) if n.isalpha() and n.isupper()
-}
-
-Token = collections.namedtuple('Token', ('type', 'value'))
-
-
-# Adapted from tokenize.String
 _STRING_REGEX = """('[^\n'\\\\]*(?:\\\\.[^\n'\\\\]*)*'|"[^\n"\\\\"]*(?:\\\\.[^\n"\\\\]*)*")"""  # noqa: E501
 
+_SPACES = p.regex(r'\s*', re.MULTILINE)
 
-Action = Optional[Callable[[str], Token]]
+
+def spaceless(parser):
+    return _SPACES.then(parser).skip(_SPACES)
 
 
-_TYPE_RULES = collections.OrderedDict(
-    [
-        # any, null, bool|boolean
-        ('(?P<ANY>any)', lambda token: Token(Tokens.ANY, any)),
-        ('(?P<NULL>null)', lambda token: Token(Tokens.NULL, null)),
-        (
-            '(?P<BOOLEAN>bool(?:ean)?)',
-            typing.cast(
-                Action, lambda token: Token(Tokens.PRIMITIVE, boolean)
-            ),
-        ),
-    ]
-    + [
-        # primitive types
-        (
-            '(?P<{}>{})'.format(token.upper(), token),
-            typing.cast(
-                Action,
-                lambda token, value=value: Token(Tokens.PRIMITIVE, value),
-            ),
+def spaceless_string(s: str):
+    return spaceless(p.string(s, transform=str.lower))
+
+
+def parse_type(text: str) -> DataType:
+    precision = scale = srid = p.digit.at_least(1).concat().map(int)
+
+    lparen = spaceless_string("(")
+    rparen = spaceless_string(")")
+
+    langle = spaceless_string("<")
+    rangle = spaceless_string(">")
+
+    comma = spaceless_string(",")
+    colon = spaceless_string(":")
+    semicolon = spaceless_string(";")
+
+    raw_string = p.regex(_STRING_REGEX).map(ast.literal_eval)
+
+    geotype = spaceless_string("geography") | spaceless_string("geometry")
+
+    @p.generate
+    def srid_geotype():
+        yield semicolon
+        sr = yield srid
+        yield colon
+        gt = yield geotype
+        return (gt, sr)
+
+    @p.generate
+    def geotype_part():
+        yield colon
+        gt = yield geotype
+        return (gt, None)
+
+    @p.generate
+    def srid_part():
+        yield semicolon
+        sr = yield srid
+        return (None, sr)
+
+    def geotype_parser(name, type):
+        name_parser = spaceless_string(name)
+        geosubtype_parser = srid_geotype | geotype_part | srid_part
+
+        @p.generate
+        def parser():
+            yield name_parser
+            sr_gt = yield geosubtype_parser.optional()
+            return type(*sr_gt) if sr_gt is not None else type()
+
+        return parser
+
+    primitive = (
+        spaceless_string("any").result(any)
+        | spaceless_string("null").result(null)
+        | spaceless_string("boolean").result(boolean)
+        | spaceless_string("bool").result(boolean)
+        | spaceless_string("int8").result(int8)
+        | spaceless_string("int16").result(int16)
+        | spaceless_string("int32").result(int32)
+        | spaceless_string("int64").result(int64)
+        | spaceless_string("uint8").result(uint8)
+        | spaceless_string("uint16").result(uint16)
+        | spaceless_string("uint32").result(uint32)
+        | spaceless_string("uint64").result(uint64)
+        | spaceless_string("halffloat").result(halffloat)
+        | spaceless_string("double").result(double)
+        | spaceless_string("float16").result(float16)
+        | spaceless_string("float32").result(float32)
+        | spaceless_string("float64").result(float64)
+        | spaceless_string("float").result(float)
+        | spaceless_string("string").result(string)
+        | spaceless_string("binary").result(binary)
+        | spaceless_string("timestamp").result(Timestamp())
+        | spaceless_string("time").result(time)
+        | spaceless_string("date").result(date)
+        | spaceless_string("category").result(category)
+        | spaceless_string("geometry").result(GeoSpatial(geotype='geometry'))
+        | spaceless_string("geography").result(GeoSpatial(geotype='geography'))
+        | geotype_parser("linestring", LineString)
+        | geotype_parser("polygon", Polygon)
+        | geotype_parser("point", Point)
+        | geotype_parser("multilinestring", MultiLineString)
+        | geotype_parser("multipolygon", MultiPolygon)
+        | geotype_parser("multipoint", MultiPoint)
+    )
+
+    @p.generate
+    def varchar_or_char():
+        yield p.alt(
+            spaceless_string("varchar"), spaceless_string("char")
+        ).then(
+            lparen.then(p.digit.at_least(1).concat()).skip(rparen).optional()
         )
-        for token, value in _primitive_types
-        if token
-        not in {'any', 'null', 'timestamp', 'time', 'interval', 'boolean'}
-    ]
-    + [
-        # timestamp
-        (
-            r'(?P<TIMESTAMP>timestamp)',
-            lambda token: Token(Tokens.TIMESTAMP, token),
-        )
-    ]
-    + [
-        # interval - should remove?
-        (
-            r'(?P<INTERVAL>interval)',
-            lambda token: Token(Tokens.INTERVAL, token),
-        )
-    ]
-    + [
-        # time
-        (r'(?P<TIME>time)', lambda token: Token(Tokens.TIME, token))
-    ]
-    + [
-        # decimal + complex types
-        (
-            '(?P<{}>{})'.format(token.upper(), token),
-            typing.cast(
-                Action, lambda token, toktype=toktype: Token(toktype, token)
-            ),
-        )
-        for token, toktype in zip(
-            (
-                'decimal',
-                'varchar',
-                'char',
-                'array',
-                'set',
-                'map',
-                'struct',
-                'interval',
-            ),
-            (
-                Tokens.DECIMAL,
-                Tokens.VARCHAR,
-                Tokens.CHAR,
-                Tokens.ARRAY,
-                Tokens.SET,
-                Tokens.MAP,
-                Tokens.STRUCT,
-                Tokens.INTERVAL,
-            ),
-        )
-    ]
-    + [
-        # geo spatial data type
-        (
-            '(?P<{}>{})'.format(token.upper(), token),
-            lambda token, toktype=toktype: Token(toktype, token),
-        )
-        for token, toktype in zip(
-            (
-                'geometry',
-                'geography',
-                'point',
-                'linestring',
-                'polygon',
-                'multilinestring',
-                'multipoint',
-                'multipolygon',
-            ),
-            (
-                Tokens.GEOMETRY,
-                Tokens.GEOGRAPHY,
-                Tokens.POINT,
-                Tokens.LINESTRING,
-                Tokens.POLYGON,
-                Tokens.MULTILINESTRING,
-                Tokens.MULTIPOINT,
-                Tokens.MULTIPOLYGON,
-            ),
-        )
-    ]
-    + [
-        # json data type
-        (
-            '(?P<{}>{})'.format(token.upper(), token),
-            lambda token, toktype=toktype: Token(toktype, token),
-        )
-        for token, toktype in zip(
-            # note: `jsonb` should be first to avoid conflict with `json`
-            ('jsonb', 'json'),
-            (Tokens.JSONB, Tokens.JSON),
-        )
-    ]
-    + [
-        # special string based data types
-        ('(?P<UUID>uuid)', lambda token: Token(Tokens.UUID, token)),
-        ('(?P<MACADDR>macaddr)', lambda token: Token(Tokens.MACADDR, token)),
-        ('(?P<INET>inet)', lambda token: Token(Tokens.INET, token)),
-    ]
-    + [
-        # integers, for decimal spec
-        (r'(?P<INTEGER>\d+)', lambda token: Token(Tokens.INTEGER, int(token))),
-        # struct fields
-        (
-            r'(?P<FIELD>[a-zA-Z_][a-zA-Z_0-9]*)',
-            lambda token: Token(Tokens.FIELD, token),
-        ),
-        # timezones
-        ('(?P<COMMA>,)', lambda token: Token(Tokens.COMMA, token)),
-        ('(?P<COLON>:)', lambda token: Token(Tokens.COLON, token)),
-        ('(?P<SEMICOLON>;)', lambda token: Token(Tokens.SEMICOLON, token)),
-        (r'(?P<LPAREN>\()', lambda token: Token(Tokens.LPAREN, token)),
-        (r'(?P<RPAREN>\))', lambda token: Token(Tokens.RPAREN, token)),
-        ('(?P<LBRACKET><)', lambda token: Token(Tokens.LBRACKET, token)),
-        ('(?P<RBRACKET>>)', lambda token: Token(Tokens.RBRACKET, token)),
-        (r'(?P<WHITESPACE>\s+)', None),
-        (
-            '(?P<STRARG>{})'.format(_STRING_REGEX),
-            lambda token: Token(Tokens.STRARG, token),
-        ),
-    ]
-)
+        return String()
 
-
-_TYPE_KEYS = tuple(_TYPE_RULES.keys())
-_TYPE_PATTERN = re.compile('|'.join(_TYPE_KEYS), flags=re.IGNORECASE)
-
-
-def _generate_tokens(pat: GenericAny, text: str) -> Iterator[Token]:
-    """Generate a sequence of tokens from `text` that match `pat`
-
-    Parameters
-    ----------
-    pat : compiled regex
-        The pattern to use for tokenization
-    text : str
-        The text to tokenize
-
-    """
-    rules = _TYPE_RULES
-    keys = _TYPE_KEYS
-    groupindex = pat.groupindex
-    scanner = pat.scanner(text)
-    for m in iter(scanner.match, None):
-        lastgroup = m.lastgroup
-        func = rules[keys[groupindex[lastgroup] - 1]]
-        if func is not None:
-            yield func(m.group(lastgroup))
-
-
-class TypeParser:
-    """A type parser for complex types.
-
-    Parameters
-    ----------
-    text : str
-        The text to parse
-
-    Notes
-    -----
-    Adapted from David Beazley's and Brian Jones's Python Cookbook
-
-    """
-
-    __slots__ = 'text', 'tokens', 'tok', 'nexttok'
-
-    def __init__(self, text: str) -> None:
-        self.text = text  # type: str
-        self.tokens = _generate_tokens(_TYPE_PATTERN, text)
-        self.tok = None  # type: Optional[Token]
-        self.nexttok = None  # type: Optional[Token]
-
-    def _advance(self) -> None:
-        self.tok, self.nexttok = self.nexttok, next(self.tokens, None)
-
-    def _accept(self, toktype: int) -> bool:
-        if self.nexttok is not None and self.nexttok.type == toktype:
-            self._advance()
-            assert (
-                self.tok is not None
-            ), 'self.tok should not be None when _accept succeeds'
-            return True
-        return False
-
-    def _expect(self, toktype: int) -> None:
-        if not self._accept(toktype):
-            raise SyntaxError(
-                'Expected {} after {!r} in {!r}'.format(
-                    Tokens.name(toktype),
-                    getattr(self.tok, 'value', self.tok),
-                    self.text,
+    @p.generate
+    def decimal():
+        yield spaceless_string("decimal")
+        prec_scale = (
+            yield lparen.then(
+                p.seq(precision.skip(comma), scale).combine(
+                    lambda prec, scale: (prec, scale)
                 )
             )
-
-    def parse(self) -> DataType:
-        self._advance()
-
-        # any and null types cannot be nested
-        if self._accept(Tokens.ANY) or self._accept(Tokens.NULL):
-            assert (
-                self.tok is not None
-            ), 'self.tok was None when parsing ANY or NULL type'
-            return self.tok.value
-
-        t = self.type()
-        if self.nexttok is None:
-            return t
-        else:
-            # additional junk was passed at the end, throw an error
-            additional_tokens = []
-            while self.nexttok is not None:
-                additional_tokens.append(self.nexttok.value)
-                self._advance()
-            raise SyntaxError(
-                'Found additional tokens {}'.format(additional_tokens)
-            )
-
-    def type(self) -> DataType:
-        """
-        type : primitive
-             | decimal
-             | array
-             | set
-             | map
-             | struct
-
-        primitive : "any"
-                  | "null"
-                  | "bool"
-                  | "boolean"
-                  | "int8"
-                  | "int16"
-                  | "int32"
-                  | "int64"
-                  | "uint8"
-                  | "uint16"
-                  | "uint32"
-                  | "uint64"
-                  | "halffloat"
-                  | "float"
-                  | "double"
-                  | "float16"
-                  | "float32"
-                  | "float64"
-                  | "string"
-                  | "time"
-
-        timestamp : "timestamp"
-                  | "timestamp" "(" timezone ")"
-
-        interval : "interval"
-                 | "interval" "(" unit ")"
-                 | "interval" "<" type ">" "(" unit ")"
-
-        decimal : "decimal"
-                | "decimal" "(" integer "," integer ")"
-
-        integer : [0-9]+
-
-        array : "array" "<" type ">"
-
-        set : "set" "<" type ">"
-
-        map : "map" "<" type "," type ">"
-
-        struct : "struct" "<" field ":" type ("," field ":" type)* ">"
-
-        field : [a-zA-Z_][a-zA-Z_0-9]*
-
-        geography: "geography"
-
-        geometry: "geometry"
-
-        point : "point"
-              | "point" ";" srid
-              | "point" ":" geotype
-              | "point" ";" srid ":" geotype
-
-        linestring : "linestring"
-                   | "linestring" ";" srid
-                   | "linestring" ":" geotype
-                   | "linestring" ";" srid ":" geotype
-
-        polygon : "polygon"
-                | "polygon" ";" srid
-                | "polygon" ":" geotype
-                | "polygon" ";" srid ":" geotype
-
-        multilinestring : "multilinestring"
-                   | "multilinestring" ";" srid
-                   | "multilinestring" ":" geotype
-                   | "multilinestring" ";" srid ":" geotype
-
-        multipoint : "multipoint"
-                   | "multipoint" ";" srid
-                   | "multipoint" ":" geotype
-                   | "multipoint" ";" srid ":" geotype
-
-        multipolygon : "multipolygon"
-                     | "multipolygon" ";" srid
-                     | "multipolygon" ":" geotype
-                     | "multipolygon" ";" srid ":" geotype
-
-        json : "json"
-
-        jsonb : "jsonb"
-
-        uuid : "uuid"
-
-        macaddr : "macaddr"
-
-        inet : "inet"
-
-        """
-        if self._accept(Tokens.PRIMITIVE):
-            assert self.tok is not None
-            return self.tok.value
-
-        elif self._accept(Tokens.TIMESTAMP):
-            if self._accept(Tokens.LPAREN):
-                self._expect(Tokens.STRARG)
-                assert self.tok is not None
-                timezone = self.tok.value[1:-1]  # remove surrounding quotes
-                self._expect(Tokens.RPAREN)
-                return Timestamp(timezone=timezone)
-            return timestamp
-
-        elif self._accept(Tokens.TIME):
-            return Time()
-
-        elif self._accept(Tokens.INTERVAL):
-            if self._accept(Tokens.LBRACKET):
-                self._expect(Tokens.PRIMITIVE)
-                assert self.tok is not None
-                value_type = self.tok.value
-                self._expect(Tokens.RBRACKET)
-            else:
-                value_type = int32
-
-            if self._accept(Tokens.LPAREN):
-                self._expect(Tokens.STRARG)
-                assert self.tok is not None
-                unit = self.tok.value[1:-1]  # remove surrounding quotes
-                self._expect(Tokens.RPAREN)
-            else:
-                unit = 's'
-
-            return Interval(unit, value_type)
-
-        elif self._accept(Tokens.DECIMAL):
-            if self._accept(Tokens.LPAREN):
-                self._expect(Tokens.INTEGER)
-                assert self.tok is not None
-                precision = self.tok.value
-
-                self._expect(Tokens.COMMA)
-
-                self._expect(Tokens.INTEGER)
-                scale = self.tok.value
-
-                self._expect(Tokens.RPAREN)
-            else:
-                precision = 9
-                scale = 0
-            return Decimal(precision, scale)
-
-        elif self._accept(Tokens.VARCHAR) or self._accept(Tokens.CHAR):
-            # VARCHAR, VARCHAR(n), CHAR, and CHAR(n) all parse as STRING
-            if self._accept(Tokens.LPAREN):
-                self._expect(Tokens.INTEGER)
-                self._expect(Tokens.RPAREN)
-                return string
-            return string
-
-        elif self._accept(Tokens.ARRAY):
-            self._expect(Tokens.LBRACKET)
-
-            value_type = self.type()
-
-            self._expect(Tokens.RBRACKET)
-            return Array(value_type)
-
-        elif self._accept(Tokens.SET):
-            self._expect(Tokens.LBRACKET)
-
-            value_type = self.type()
-
-            self._expect(Tokens.RBRACKET)
-            return Set(value_type)
-
-        elif self._accept(Tokens.MAP):
-            self._expect(Tokens.LBRACKET)
-
-            self._expect(Tokens.PRIMITIVE)
-            assert self.tok is not None
-            key_type = self.tok.value
-
-            self._expect(Tokens.COMMA)
-
-            value_type = self.type()
-
-            self._expect(Tokens.RBRACKET)
-
-            return Map(key_type, value_type)
-
-        elif self._accept(Tokens.STRUCT):
-            self._expect(Tokens.LBRACKET)
-
-            self._expect(Tokens.FIELD)
-            assert self.tok is not None
-            names = [self.tok.value]
-
-            self._expect(Tokens.COLON)
-
-            types = [self.type()]
-
-            while self._accept(Tokens.COMMA):
-                self._expect(Tokens.FIELD)
-                names.append(self.tok.value)
-
-                self._expect(Tokens.COLON)
-                types.append(self.type())
-
-            self._expect(Tokens.RBRACKET)
-            return Struct(names, types)
-
-        # json data types
-        elif self._accept(Tokens.JSON):
-            return JSON()
-
-        elif self._accept(Tokens.JSONB):
-            return JSONB()
-
-        # geo spatial data type
-        elif self._accept(Tokens.GEOMETRY):
-            return Geometry()
-
-        elif self._accept(Tokens.GEOGRAPHY):
-            return Geography()
-
-        elif self._accept(Tokens.POINT):
-            geotype = None
-            srid = None
-
-            if self._accept(Tokens.SEMICOLON):
-                self._expect(Tokens.INTEGER)
-                assert self.tok is not None
-                srid = self.tok.value
-
-            if self._accept(Tokens.COLON):
-                if self._accept(Tokens.GEOGRAPHY):
-                    geotype = 'geography'
-                elif self._accept(Tokens.GEOMETRY):
-                    geotype = 'geometry'
-
-            return Point(geotype=geotype, srid=srid)
-
-        elif self._accept(Tokens.LINESTRING):
-            geotype = None
-            srid = None
-
-            if self._accept(Tokens.SEMICOLON):
-                self._expect(Tokens.INTEGER)
-                assert self.tok is not None
-                srid = self.tok.value
-
-            if self._accept(Tokens.COLON):
-                if self._accept(Tokens.GEOGRAPHY):
-                    geotype = 'geography'
-                elif self._accept(Tokens.GEOMETRY):
-                    geotype = 'geometry'
-
-            return LineString(geotype=geotype, srid=srid)
-
-        elif self._accept(Tokens.POLYGON):
-            geotype = None
-            srid = None
-
-            if self._accept(Tokens.SEMICOLON):
-                self._expect(Tokens.INTEGER)
-                assert self.tok is not None
-                srid = self.tok.value
-
-            if self._accept(Tokens.COLON):
-                if self._accept(Tokens.GEOGRAPHY):
-                    geotype = 'geography'
-                elif self._accept(Tokens.GEOMETRY):
-                    geotype = 'geometry'
-
-            return Polygon(geotype=geotype, srid=srid)
-
-        elif self._accept(Tokens.MULTILINESTRING):
-            geotype = None
-            srid = None
-
-            if self._accept(Tokens.SEMICOLON):
-                self._expect(Tokens.INTEGER)
-                assert self.tok is not None
-                srid = self.tok.value
-
-            if self._accept(Tokens.COLON):
-                if self._accept(Tokens.GEOGRAPHY):
-                    geotype = 'geography'
-                elif self._accept(Tokens.GEOMETRY):
-                    geotype = 'geometry'
-
-            return MultiLineString(geotype=geotype, srid=srid)
-
-        elif self._accept(Tokens.MULTIPOINT):
-            geotype = None
-            srid = None
-
-            if self._accept(Tokens.SEMICOLON):
-                self._expect(Tokens.INTEGER)
-                assert self.tok is not None
-                srid = self.tok.value
-
-            if self._accept(Tokens.COLON):
-                if self._accept(Tokens.GEOGRAPHY):
-                    geotype = 'geography'
-                elif self._accept(Tokens.GEOMETRY):
-                    geotype = 'geometry'
-
-            return MultiPoint(geotype=geotype, srid=srid)
-
-        elif self._accept(Tokens.MULTIPOLYGON):
-            geotype = None
-            srid = None
-
-            if self._accept(Tokens.SEMICOLON):
-                self._expect(Tokens.INTEGER)
-                assert self.tok is not None
-                srid = self.tok.value
-
-            if self._accept(Tokens.COLON):
-                if self._accept(Tokens.GEOGRAPHY):
-                    geotype = 'geography'
-                elif self._accept(Tokens.GEOMETRY):
-                    geotype = 'geometry'
-
-            return MultiPolygon(geotype=geotype, srid=srid)
-
-        # special string based data types
-        elif self._accept(Tokens.UUID):
-            return UUID()
-
-        elif self._accept(Tokens.MACADDR):
-            return MACADDR()
-
-        elif self._accept(Tokens.INET):
-            return INET()
-
-        else:
-            raise SyntaxError('Type cannot be parsed: {}'.format(self.text))
+            .skip(rparen)
+            .optional()
+        ) or (9, 0)
+        return Decimal(*prec_scale)
+
+    @p.generate
+    def parened_string():
+        yield lparen
+        s = yield raw_string
+        yield rparen
+        return s
+
+    @p.generate
+    def timestamp():
+        yield spaceless_string("timestamp")
+        tz = yield parened_string
+        return Timestamp(tz)
+
+    @p.generate
+    def angle_type():
+        yield langle
+        value_type = yield ty
+        yield rangle
+        return value_type
+
+    @p.generate
+    def interval():
+        yield spaceless_string("interval")
+        value_type = yield angle_type.optional()
+        un = yield parened_string.optional()
+        return Interval(
+            value_type=value_type, unit=un if un is not None else 's'
+        )
+
+    @p.generate
+    def array():
+        yield spaceless_string("array")
+        value_type = yield angle_type
+        return Array(value_type)
+
+    @p.generate
+    def set():
+        yield spaceless_string("set")
+        value_type = yield angle_type
+        return Set(value_type)
+
+    @p.generate
+    def map():
+        yield spaceless_string("map")
+        yield langle
+        key_type = yield primitive
+        yield comma
+        value_type = yield ty
+        yield rangle
+        return Map(key_type, value_type)
+
+    field = spaceless(p.regex("[a-zA-Z_][a-zA-Z_0-9]*"))
+
+    @p.generate
+    def struct():
+        yield spaceless_string("struct")
+        yield langle
+        field_names_types = yield (
+            p.seq(field.skip(colon), ty)
+            .combine(lambda field, ty: (field, ty))
+            .sep_by(comma)
+        )
+        yield rangle
+        return Struct.from_tuples(field_names_types)
+
+    ty = (
+        timestamp
+        | primitive
+        | decimal
+        | varchar_or_char
+        | interval
+        | array
+        | set
+        | map
+        | struct
+        | spaceless_string("jsonb").result(jsonb)
+        | spaceless_string("json").result(json)
+        | spaceless_string("uuid").result(uuid)
+        | spaceless_string("macaddr").result(macaddr)
+        | spaceless_string("inet").result(inet)
+        | spaceless_string("geography").result(geography)
+        | spaceless_string("geometry").result(geometry)
+    )
+
+    return ty.parse(text)
 
 
 dtype = Dispatcher('dtype')
@@ -1550,9 +1223,11 @@ dtype = Dispatcher('dtype')
 validate_type = dtype
 
 
-def _get_timedelta_units(timedelta: datetime.timedelta) -> List[str]:
+def _get_timedelta_units(
+    timedelta: Union[datetime.timedelta, pd.Timedelta],
+) -> List[str]:
     # pandas Timedelta has more granularity
-    if hasattr(timedelta, 'components'):
+    if isinstance(timedelta, pd.Timedelta):
         unit_fields = timedelta.components._fields
         base_object = timedelta.components
     # datetime.timedelta only stores days, seconds, and microseconds internally
@@ -1560,18 +1235,15 @@ def _get_timedelta_units(timedelta: datetime.timedelta) -> List[str]:
         unit_fields = ['days', 'seconds', 'microseconds']
         base_object = timedelta
 
-    time_units = []
-    [
-        time_units.append(field)
-        for field in unit_fields
-        if getattr(base_object, field) > 0
+    time_units = [
+        field for field in unit_fields if getattr(base_object, field) > 0
     ]
     return time_units
 
 
 @dtype.register(object)
 def default(value, **kwargs) -> DataType:
-    raise com.IbisTypeError('Value {!r} is not a valid datatype'.format(value))
+    raise com.IbisTypeError(f'Value {value!r} is not a valid datatype')
 
 
 @dtype.register(DataType)
@@ -1582,22 +1254,20 @@ def from_ibis_dtype(value: DataType) -> DataType:
 @dtype.register(str)
 def from_string(value: str) -> DataType:
     try:
-        return TypeParser(value).parse()
+        return parse_type(value)
     except SyntaxError:
-        raise com.IbisTypeError(
-            '{!r} cannot be parsed as a datatype'.format(value)
-        )
+        raise com.IbisTypeError(f'{value!r} cannot be parsed as a datatype')
 
 
 @dtype.register(list)
-def from_list(values: List[GenericAny]) -> Array:
+def from_list(values: List[typing.Any]) -> Array:
     if not values:
         return Array(null)
     return Array(highest_precedence(map(dtype, values)))
 
 
 @dtype.register(collections.abc.Set)
-def from_set(values: GenericSet) -> Set:
+def from_set(values: set) -> Set:
     if not values:
         return Set(null)
     return Set(highest_precedence(map(dtype, values)))
@@ -1613,7 +1283,7 @@ def higher_precedence(left: DataType, right: DataType) -> DataType:
         return left
 
     raise com.IbisTypeError(
-        'Cannot compute precedence for {} and {} types'.format(left, right)
+        f'Cannot compute precedence for {left} and {right} types'
     )
 
 
@@ -1623,13 +1293,13 @@ def highest_precedence(dtypes: Iterator[DataType]) -> DataType:
 
 
 @infer.register(object)
-def infer_dtype_default(value: GenericAny) -> DataType:
+def infer_dtype_default(value: typing.Any) -> DataType:
     """Default implementation of :func:`~ibis.expr.datatypes.infer`."""
     raise com.InputTypeError(value)
 
 
 @infer.register(collections.OrderedDict)
-def infer_struct(value: Mapping[str, GenericAny]) -> Struct:
+def infer_struct(value: Mapping[str, typing.Any]) -> Struct:
     """Infer the :class:`~ibis.expr.datatypes.Struct` type of `value`."""
     if not value:
         raise TypeError('Empty struct type not supported')
@@ -1637,7 +1307,7 @@ def infer_struct(value: Mapping[str, GenericAny]) -> Struct:
 
 
 @infer.register(collections.abc.Mapping)
-def infer_map(value: Mapping[GenericAny, GenericAny]) -> Map:
+def infer_map(value: Mapping[typing.Any, typing.Any]) -> Map:
     """Infer the :class:`~ibis.expr.datatypes.Map` type of `value`."""
     if not value:
         return Map(null, null)
@@ -1648,7 +1318,7 @@ def infer_map(value: Mapping[GenericAny, GenericAny]) -> Map:
 
 
 @infer.register(list)
-def infer_list(values: List[GenericAny]) -> Array:
+def infer_list(values: List[typing.Any]) -> Array:
     """Infer the :class:`~ibis.expr.datatypes.Array` type of `values`."""
     if not values:
         return Array(null)
@@ -1656,7 +1326,7 @@ def infer_list(values: List[GenericAny]) -> Array:
 
 
 @infer.register((set, frozenset))
-def infer_set(values: GenericSet) -> Set:
+def infer_set(values: set) -> Set:
     """Infer the :class:`~ibis.expr.datatypes.Set` type of `values`."""
     if not values:
         return Set(null)
@@ -1698,6 +1368,11 @@ def infer_string(value: str) -> String:
     return string
 
 
+@infer.register(bytes)
+def infer_bytes(value: bytes) -> Binary:
+    return binary
+
+
 @infer.register(builtins.float)
 def infer_floating(value: builtins.float) -> Double:
     return double
@@ -1717,7 +1392,10 @@ def infer_integer(value: int, allow_overflow: bool = False) -> Integer:
 
 @infer.register(enum.Enum)
 def infer_enum(value: enum.Enum) -> Enum:
-    return Enum(infer(value.name), infer(value.value),)
+    return Enum(
+        infer(value.name),
+        infer(value.value),
+    )
 
 
 @infer.register(bool)
@@ -1870,6 +1548,24 @@ def can_cast_string_to_temporal(
 Collection = TypeVar('Collection', Array, Set)
 
 
+@castable.register(Map, Map)
+def can_cast_map(source, target, **kwargs):
+    return castable(source.key_type, target.key_type) and castable(
+        source.value_type, target.value_type
+    )
+
+
+@castable.register(Struct, Struct)
+def can_cast_struct(source, target, **kwargs):
+    source_pairs = source.pairs
+    target_pairs = target.pairs
+    for name in {*source.names, *target.names}:
+        if name in target_pairs:
+            if not castable(source_pairs[name], target_pairs[name]):
+                return False
+    return True
+
+
 @castable.register(Array, Array)
 @castable.register(Set, Set)
 def can_cast_variadic(
@@ -1908,22 +1604,16 @@ def can_cast_geospatial(source, target, **kwargs):
 
 
 @castable.register(UUID, UUID)
+@castable.register(UUID, String)
+@castable.register(String, UUID)
 @castable.register(MACADDR, MACADDR)
 @castable.register(INET, INET)
 def can_cast_special_string(source, target, **kwargs):
     return True
 
 
-# @castable.register(Map, Map)
-# def can_cast_maps(source, target):
-#     return (source.equals(target) or
-#             source.equals(Map(null, null)) or
-#             source.equals(Map(any, any)))
-# TODO cast category
-
-
 def cast(
-    source: Union[DataType, str], target: Union[DataType, str], **kwargs
+    source: Union[str, DataType], target: Union[str, DataType], **kwargs
 ) -> DataType:
     """Attempts to implicitly cast from source dtype to target dtype"""
     source, result_target = dtype(source), dtype(target)
@@ -1988,3 +1678,48 @@ def same_kind_left_null(_: Null, b: DataType) -> bool:
 def same_kind_both_null(a: Null, b: Null) -> bool:
     """Return ``True``."""
     return True
+
+
+_normalize = Dispatcher(
+    "_normalize",
+    doc="""\
+Ensure that the Python type underlying an
+:class:`~ibis.expr.operations.generic.Literal` resolves to a single acceptable
+type regardless of the input value.
+
+Parameters
+----------
+typ : DataType
+value :
+
+Returns
+-------
+value
+    the input ``value`` normalized to the expected type
+""",
+)
+
+
+@_normalize.register(DataType, object)
+def _normalize_default(typ: DataType, value: object) -> object:
+    return value
+
+
+@_normalize.register(Floating, (int, builtins.float))
+def _float(typ: Floating, value: builtins.float) -> builtins.float:
+    return builtins.float(value)
+
+
+@_normalize.register(UUID, str)
+def _str_to_uuid(typ: UUID, value: str) -> _uuid.UUID:
+    return _uuid.UUID(value)
+
+
+@_normalize.register(String, _uuid.UUID)
+def _uuid_to_str(typ: String, value: _uuid.UUID) -> str:
+    return str(value)
+
+
+@_normalize.register(Decimal, int)
+def _int_to_decimal(typ: Decimal, value: int) -> decimal.Decimal:
+    return decimal.Decimal(value).scaleb(-typ.scale)

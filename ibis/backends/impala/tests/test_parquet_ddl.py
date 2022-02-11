@@ -1,3 +1,4 @@
+import gc
 from posixpath import join as pjoin
 
 import pytest
@@ -6,23 +7,17 @@ import ibis
 from ibis.backends.impala.compat import HS2Error
 from ibis.tests.util import assert_equal
 
-pytestmark = pytest.mark.impala
-
 
 def test_cleanup_tmp_table_on_gc(con, test_data_dir):
-    import gc
-
     hdfs_path = pjoin(test_data_dir, 'parquet/tpch_region')
     table = con.parquet_file(hdfs_path)
     name = table.op().name
     table = None
     gc.collect()
-    assert not con.exists_table(name)
+    assert name not in con.list_tables()
 
 
 def test_persist_parquet_file_with_name(con, test_data_dir, temp_table_db):
-    import gc
-
     hdfs_path = pjoin(test_data_dir, 'parquet/tpch_region')
 
     tmp_db, name = temp_table_db

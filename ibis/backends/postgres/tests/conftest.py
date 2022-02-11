@@ -15,12 +15,11 @@
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Generator
 
 import pytest
 
 import ibis
-import ibis.expr.types as ir
 from ibis.backends.tests.base import BackendTest, RoundHalfToEven
 
 PG_USER = os.environ.get(
@@ -72,14 +71,9 @@ class TestConf(BackendTest, RoundHalfToEven):
             database=database,
         )
 
-    @property
-    def geo(self) -> Optional[ir.TableExpr]:
-        if 'geo' in self.db.list_tables():
-            return self.db.geo
-
 
 def _random_identifier(suffix):
-    return '__ibis_test_{}_{}'.format(suffix, ibis.util.guid())
+    return f'__ibis_test_{suffix}_{ibis.util.guid()}'
 
 
 @pytest.fixture(scope='session')
@@ -130,16 +124,16 @@ def intervals(con):
 
 @pytest.fixture
 def translate():
-    from ibis.backends.postgres import PostgreSQLClient
+    from ibis.backends.postgres import Backend
 
-    context = PostgreSQLClient.compiler.make_context()
+    context = Backend.compiler.make_context()
     return lambda expr: (
-        PostgreSQLClient.compiler.translator_class(expr, context).get_result()
+        Backend.compiler.translator_class(expr, context).get_result()
     )
 
 
 @pytest.fixture
-def temp_table(con) -> str:
+def temp_table(con) -> Generator[str, None, None]:
     """
     Return a temporary table name.
 

@@ -4,8 +4,6 @@ import pytest
 from dask.dataframe.utils import tm  # noqa: E402
 from pytest import param
 
-pytestmark = pytest.mark.dask
-
 
 @pytest.mark.parametrize(
     ('case_func', 'expected_func'),
@@ -95,11 +93,7 @@ pytestmark = pytest.mark.dask
             lambda s: s.split(' '),
             lambda s: s.str.split(' '),
             id='split_spaces',
-            marks=pytest.mark.xfail(
-                raises=NotImplementedError,
-                reason='TODO - arrays - #2553'
-                # Need ops.StringSplit exec func that dispatches on dd.Series
-            ),
+            marks=pytest.mark.notimpl(["dask"], reason='arrays - #2553'),
         ),
     ],
 )

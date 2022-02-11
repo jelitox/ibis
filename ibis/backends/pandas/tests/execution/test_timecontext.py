@@ -4,15 +4,21 @@ import pytest
 
 import ibis
 import ibis.common.exceptions as com
+import ibis.expr.operations as ops
+from ibis.backends.pandas.execution import execute
 from ibis.backends.pandas.execution.window import trim_window_result
+from ibis.expr.scope import Scope
 from ibis.expr.timecontext import (
     TimeContextRelation,
     adjust_context,
     compare_timecontext,
     construct_time_context_aware_series,
 )
+from ibis.expr.typing import TimeContext
 
-pytestmark = pytest.mark.pandas
+
+class CustomAsOfJoin(ops.AsOfJoin):
+    pass
 
 
 def test_execute_with_timecontext(time_table):
@@ -61,10 +67,11 @@ def test_bad_timecontext(time_table, t):
 def test_bad_call_to_adjust_context():
     op = "not_a_node"
     context = (pd.Timestamp('20170101'), pd.Timestamp('20170103'))
+    scope = Scope()
     with pytest.raises(
         com.IbisError, match=r".*Unsupported input type for adjust context.*"
     ):
-        adjust_context(op, context)
+        adjust_context(op, scope, context)
 
 
 def test_compare_timecontext():
@@ -135,7 +142,7 @@ def test_context_adjustment_window(
 
 
 def test_trim_window_result(time_df3):
-    """ Unit test `trim_window_result` in Window execution"""
+    """Unit test `trim_window_result` in Window execution"""
     df = time_df3.copy()
     context = pd.Timestamp('20170105'), pd.Timestamp('20170111')
 
@@ -143,7 +150,8 @@ def test_trim_window_result(time_df3):
     series = df['value']
     time_index = df.set_index('time').index
     series.index = pd.MultiIndex.from_arrays(
-        [series.index, time_index], names=series.index.names + ['time'],
+        [series.index, time_index],
+        names=series.index.names + ['time'],
     )
     result = trim_window_result(series, context)
     expected = df['time'][df['time'] >= pd.Timestamp('20170105')].reset_index(
@@ -235,9 +243,9 @@ def test_context_adjustment_multi_window(time_table, time_df3):
 
 
 def test_context_adjustment_window_groupby_id(time_table, time_df3):
-    """ This test case is meant to test trim_window_result method
-        in pandas/execution/window.py to see if it could trim Series
-        correctly with groupby params
+    """This test case is meant to test trim_window_result method
+    in pandas/execution/window.py to see if it could trim Series
+    correctly with groupby params
     """
     expected = (
         time_df3.set_index('time')
@@ -263,15 +271,101 @@ def test_context_adjustment_window_groupby_id(time_table, time_df3):
     tm.assert_series_equal(result, expected)
 
 
-def test_construct_time_context_aware_series(time_df3):
-    """Unit test for `construct_time_context_aware_series`
+def test_adjust_context_scope(time_keyed_left, time_keyed_right):
+    """Test that `adjust_context` has access to `scope` by default."""
+
+    @adjust_context.register(CustomAsOfJoin)
+    def adjust_context_custom_asof_join(
+        op: ops.AsOfJoin,
+        scope: Scope,
+        timecontext: TimeContext,
+    ) -> TimeContext:
+        """Confirms that `scope` is passed in."""
+        assert scope is not None
+        return timecontext
+
+    expr = CustomAsOfJoin(
+        left=time_keyed_left,
+        right=time_keyed_right,
+        predicates='time',
+        by='key',
+        tolerance=ibis.interval(days=4),
+    ).to_expr()
+    expr = expr[time_keyed_left, time_keyed_right.other_value]
+    context = (pd.Timestamp('20170105'), pd.Timestamp('20170111'))
+    expr.execute(timecontext=context)
+
+
+def test_adjust_context_complete_shift(
+    time_keyed_left,
+    time_keyed_right,
+    time_keyed_df1,
+    time_keyed_df2,
+):
+    """Test `adjust_context` function that completely shifts the context.
+
+    This results in an adjusted context that is NOT a subset of the
+    original context. This is unlike an `adjust_context` function
+    that only expands the context.
+
+    See #3104
     """
+
+    # Create a contrived `adjust_context` function for
+    # CustomAsOfJoin to mock this.
+
+    @adjust_context.register(CustomAsOfJoin)
+    def adjust_context_custom_asof_join(
+        op: ops.AsOfJoin,
+        scope: Scope,
+        timecontext: TimeContext,
+    ) -> TimeContext:
+        """Shifts both the begin and end in the same direction."""
+
+        begin, end = timecontext
+        timedelta = execute(op.tolerance)
+        return (begin - timedelta, end - timedelta)
+
+    expr = CustomAsOfJoin(
+        left=time_keyed_left,
+        right=time_keyed_right,
+        predicates='time',
+        by='key',
+        tolerance=ibis.interval(days=4),
+    ).to_expr()
+    expr = expr[time_keyed_left, time_keyed_right.other_value]
+    context = (pd.Timestamp('20170101'), pd.Timestamp('20170111'))
+    result = expr.execute(timecontext=context)
+
+    # Compare with asof_join of manually trimmed tables
+    # Left table: No shift for context
+    # Right table: Shift both begin and end of context by 4 days
+    trimmed_df1 = time_keyed_df1[time_keyed_df1['time'] >= context[0]][
+        time_keyed_df1['time'] < context[1]
+    ]
+    trimmed_df2 = time_keyed_df2[
+        time_keyed_df2['time'] >= context[0] - pd.Timedelta(days=4)
+    ][time_keyed_df2['time'] < context[1] - pd.Timedelta(days=4)]
+    expected = pd.merge_asof(
+        trimmed_df1,
+        trimmed_df2,
+        on='time',
+        by='key',
+        tolerance=pd.Timedelta('4D'),
+    )
+
+    tm.assert_frame_equal(result, expected)
+
+
+def test_construct_time_context_aware_series(time_df3):
+    """Unit test for `construct_time_context_aware_series`"""
     # Series without 'time' index will result in a MultiIndex with 'time'
     df = time_df3
     expected = df['value']
     time_index = pd.Index(df['time'])
     expected.index = pd.MultiIndex.from_arrays(
-        [expected.index, time_index], names=expected.index.names + ['time'],
+        [expected.index, time_index],
+        names=expected.index.names + ['time'],
     )
     result = construct_time_context_aware_series(df['value'], df)
     tm.assert_series_equal(result, expected)

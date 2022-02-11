@@ -51,8 +51,7 @@ def calc_zscore(s):
             lambda t: t.id.rank(pct=True),
             id='percent_rank',
             marks=pytest.mark.xpass_backends(
-                ['csv', 'pandas', 'parquet', 'pyspark', 'omniscidb'],
-                raises=AssertionError,
+                ['pandas', 'pyspark'], raises=AssertionError
             ),
         ),
         param(
@@ -76,7 +75,7 @@ def calc_zscore(s):
             lambda t: t.cumcount(),
             id='row_number',
             marks=pytest.mark.xfail_backends(
-                ('pandas', 'dask', 'csv', 'parquet'),
+                ('pandas', 'dask'),
                 raises=(IndexError, com.UnboundExpressionError),
             ),
         ),
@@ -113,8 +112,6 @@ def calc_zscore(s):
             id='cumany',
         ),
         param(
-            # notany() over window not supported in Impala, Postgres,
-            # Spark, MySQL and SQLite backends
             lambda t, win: (t.double_col == 0).notany().over(win),
             lambda t: (
                 t.double_col.expanding()
@@ -124,7 +121,8 @@ def calc_zscore(s):
             ),
             id='cumnotany',
             marks=pytest.mark.xfail_backends(
-                ('impala', 'postgres', 'spark', 'mysql', 'sqlite')
+                ('impala', 'postgres', 'mysql', 'sqlite'),
+                reason="notany() over window not supported",
             ),
         ),
         param(
@@ -138,8 +136,6 @@ def calc_zscore(s):
             id='cumall',
         ),
         param(
-            # notall() over window not supported in Impala, Postgres,
-            # Spark, MySQL and SQLite backends
             lambda t, win: (t.double_col == 0).notall().over(win),
             lambda t: (
                 t.double_col.expanding()
@@ -149,7 +145,8 @@ def calc_zscore(s):
             ),
             id='cumnotall',
             marks=pytest.mark.xfail_backends(
-                ('impala', 'postgres', 'spark', 'mysql', 'sqlite')
+                ('impala', 'postgres', 'mysql', 'sqlite'),
+                reason="notall() over window not supported",
             ),
         ),
         param(
@@ -190,9 +187,7 @@ def test_grouped_bounded_expanding_window(
     backend, alltypes, df, con, result_fn, expected_fn
 ):
     if not backend.supports_window_operations:
-        pytest.skip(
-            'Backend {} does not support window operations'.format(backend)
-        )
+        pytest.skip(f'Backend {backend} does not support window operations')
 
     expr = alltypes.mutate(
         val=result_fn(
@@ -230,25 +225,23 @@ def test_grouped_bounded_expanding_window(
             id='mean_udf',
             marks=[
                 pytest.mark.udf,
-                pytest.mark.skip_backends(['pyspark', 'spark']),
+                pytest.mark.skip_backends(['pyspark']),
             ],
         ),
     ],
 )
 # Some backends do not support non-grouped window specs
-@pytest.mark.xfail_backends(['omniscidb'])
 @pytest.mark.xfail_unsupported
 def test_ungrouped_bounded_expanding_window(
     backend, alltypes, df, con, result_fn, expected_fn
 ):
     if not backend.supports_window_operations:
-        pytest.skip(
-            'Backend {} does not support window operations'.format(backend)
-        )
+        pytest.skip(f'Backend {backend} does not support window operations')
 
     expr = alltypes.mutate(
         val=result_fn(
-            alltypes, win=ibis.window(following=0, order_by=[alltypes.id]),
+            alltypes,
+            win=ibis.window(following=0, order_by=[alltypes.id]),
         )
     )
     result = expr.execute().set_index('id').sort_index()
@@ -264,9 +257,7 @@ def test_ungrouped_bounded_expanding_window(
 @pytest.mark.xfail_unsupported
 def test_grouped_bounded_following_window(backend, alltypes, df, con):
     if not backend.supports_window_operations:
-        pytest.skip(
-            'Backend {} does not support window operations'.format(backend)
-        )
+        pytest.skip(f'Backend {backend} does not support window operations')
 
     window = ibis.window(
         preceding=0,
@@ -326,9 +317,7 @@ def test_grouped_bounded_preceding_windows(
     backend, alltypes, df, con, window_fn
 ):
     if not backend.supports_window_operations:
-        pytest.skip(
-            'Backend {} does not support window operations'.format(backend)
-        )
+        pytest.skip(f'Backend {backend} does not support window operations')
 
     window = window_fn(alltypes)
 
@@ -369,16 +358,15 @@ def test_grouped_bounded_preceding_windows(
     ],
 )
 @pytest.mark.parametrize(
-    ('ordered'), [param(True, id='orderered'), param(False, id='unordered')],
+    ('ordered'),
+    [param(True, id='orderered'), param(False, id='unordered')],
 )
 @pytest.mark.xfail_unsupported
 def test_grouped_unbounded_window(
     backend, alltypes, df, con, result_fn, expected_fn, ordered
 ):
     if not backend.supports_window_operations:
-        pytest.skip(
-            'Backend {} does not support window operations'.format(backend)
-        )
+        pytest.skip(f'Backend {backend} does not support window operations')
 
     # Define a window that is
     # 1) Grouped
@@ -386,7 +374,12 @@ def test_grouped_unbounded_window(
     # 3) Unbounded
     order_by = [alltypes.id] if ordered else None
     window = ibis.window(group_by=[alltypes.string_col], order_by=order_by)
-    expr = alltypes.mutate(val=result_fn(alltypes, win=window,))
+    expr = alltypes.mutate(
+        val=result_fn(
+            alltypes,
+            win=window,
+        )
+    )
     result = expr.execute()
     result = result.set_index('id').sort_index()
 
@@ -440,33 +433,33 @@ def test_grouped_unbounded_window(
     ('ordered'),
     [
         param(
-            # Temporarily disabled on Spark and Imapala because their behavior
-            # is currently inconsistent with the other backends (see #2378).
             True,
             id='orderered',
-            marks=pytest.mark.skip_backends(['spark', 'impala']),
+            marks=pytest.mark.skip_backends(
+                ['pyspark', 'impala'],
+                reason="Behavior inconsistent with other backends (see #2378)",
+            ),
         ),
         param(
-            # Disabled on MySQL and PySpark because they require a defined
-            # ordering for analytic ops like lag and lead.
-            # Disabled on Spark because its behavior is inconsistent with other
-            # backends (see #2381).
             False,
             id='unordered',
-            marks=pytest.mark.skip_backends(['mysql', 'pyspark', 'spark']),
+            marks=pytest.mark.skip_backends(
+                [
+                    'mysql',
+                    'pyspark',
+                ],
+                reason="requires a defined ordering for ops like lag and lead",
+            ),
         ),
     ],
 )
 # Some backends do not support non-grouped window specs
-@pytest.mark.xfail_backends(['omniscidb'])
 @pytest.mark.xfail_unsupported
 def test_ungrouped_unbounded_window(
     backend, alltypes, df, con, result_fn, expected_fn, ordered
 ):
     if not backend.supports_window_operations:
-        pytest.skip(
-            'Backend {} does not support window operations'.format(backend)
-        )
+        pytest.skip(f'Backend {backend} does not support window operations')
 
     # Define a window that is
     # 1) Ungrouped
@@ -474,7 +467,12 @@ def test_ungrouped_unbounded_window(
     # 3) Unbounded
     order_by = [alltypes.id] if ordered else None
     window = ibis.window(order_by=order_by)
-    expr = alltypes.mutate(val=result_fn(alltypes, win=window,))
+    expr = alltypes.mutate(
+        val=result_fn(
+            alltypes,
+            win=window,
+        )
+    )
     result = expr.execute()
     result = result.set_index('id').sort_index()
 
@@ -491,16 +489,18 @@ def test_ungrouped_unbounded_window(
 
 
 @pytest.mark.xfail_unsupported
-# Postgres and Impala do not support range window bounded on both sides
-@pytest.mark.xfail_backends(['postgres', 'impala'])
-@pytest.mark.skip_backends(
-    ['pandas', 'csv', 'parquet', 'pyspark'], reason='Issue #2709'
+@pytest.mark.xfail_backends(
+    [
+        (
+            'impala',
+            'Impala does not support range window bounded on both sides',
+        ),
+    ]
 )
+@pytest.mark.skip_backends(['pandas', 'pyspark'], reason='Issue #2709')
 def test_grouped_bounded_range_window(backend, alltypes, df, con):
     if not backend.supports_window_operations:
-        pytest.skip(
-            'Backend {} does not support window operations'.format(backend)
-        )
+        pytest.skip(f'Backend {backend} does not support window operations')
 
     # Explanation of the range window spec below:
     #
@@ -512,7 +512,10 @@ def test_grouped_bounded_range_window(backend, alltypes, df, con):
     #     have the same 'string_col' value.
     #
     window = ibis.range_window(
-        preceding=10, following=0, order_by='id', group_by='string_col',
+        preceding=10,
+        following=0,
+        order_by='id',
+        group_by='string_col',
     )
     expr = alltypes.mutate(val=alltypes.double_col.sum().over(window))
     result = expr.execute().set_index('id').sort_index()

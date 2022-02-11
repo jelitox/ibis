@@ -18,7 +18,7 @@ import pytest
 
 import ibis
 import ibis.common.exceptions as com
-from ibis.tests.expr.mocks import MockConnection
+from ibis.tests.expr.mocks import MockBackend
 
 
 @pytest.fixture
@@ -53,11 +53,6 @@ def int_col(request):
     return request.param
 
 
-@pytest.fixture(params=list('h'))
-def bool_col(request):
-    return request.param
-
-
 @pytest.fixture(params=list('ef'))
 def float_col(request):
     return request.param
@@ -73,14 +68,9 @@ def string_col(request):
     return request.param
 
 
-@pytest.fixture(params=list('abcdefgh'))
-def col(request):
-    return request.param
-
-
 @pytest.fixture
 def con():
-    return MockConnection()
+    return MockBackend()
 
 
 @pytest.fixture
@@ -111,6 +101,8 @@ def pytest_pyfunc_call(pyfuncitem):
         NotImplementedError,
     ) as e:
         markers = list(pyfuncitem.iter_markers(name="xfail_unsupported"))
+        if not markers:
+            raise
         assert (
             len(markers) == 1
         ), "More than one xfail_unsupported marker found on test {}".format(

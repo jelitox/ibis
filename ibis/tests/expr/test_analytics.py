@@ -12,83 +12,111 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import unittest
+import pytest
 
 import ibis
 import ibis.expr.types as ir
-from ibis.tests.expr.mocks import MockConnection
+from ibis.tests.expr.mocks import MockBackend
 from ibis.tests.util import assert_equal
 
 
-class TestAnalytics(unittest.TestCase):
-    def setUp(self):
-        self.con = MockConnection()
-        self.alltypes = self.con.table('functional_alltypes')
+def test_warns_on_deprecated_import():
+    with pytest.warns(FutureWarning, match=r"ibis\.expr\.analytics"):
+        import ibis.expr.analytics  # noqa: F401
 
-    def test_category_project(self):
-        t = self.alltypes
 
-        tier = t.double_col.bucket([0, 50, 100]).name('tier')
-        expr = t[tier, t]
+@pytest.fixture
+def con():
+    return MockBackend()
 
-        assert isinstance(expr.tier, ir.CategoryColumn)
 
-    def test_bucket(self):
-        d = self.alltypes.double_col
-        bins = [0, 10, 50, 100]
+@pytest.fixture
+def alltypes(con):
+    return con.table('functional_alltypes')
 
-        expr = d.bucket(bins)
-        assert isinstance(expr, ir.CategoryColumn)
-        assert expr.op().nbuckets == 3
 
-        expr = d.bucket(bins, include_over=True)
-        assert expr.op().nbuckets == 4
+@pytest.fixture
+def airlines():
+    return ibis.table(
+        [('dest', 'string'), ('origin', 'string'), ('arrdelay', 'int32')],
+        'airlines',
+    )
 
-        expr = d.bucket(bins, include_over=True, include_under=True)
-        assert expr.op().nbuckets == 5
 
-    def test_bucket_error_cases(self):
-        d = self.alltypes.double_col
+def test_category_project(alltypes):
+    t = alltypes
 
-        self.assertRaises(ValueError, d.bucket, [])
-        self.assertRaises(ValueError, d.bucket, [1, 2], closed='foo')
+    tier = t.double_col.bucket([0, 50, 100]).name('tier')
+    expr = t[tier, t]
 
-        # it works!
-        d.bucket([10], include_under=True, include_over=True)
+    assert isinstance(expr.tier, ir.CategoryColumn)
 
-        self.assertRaises(ValueError, d.bucket, [10])
-        self.assertRaises(ValueError, d.bucket, [10], include_under=True)
-        self.assertRaises(ValueError, d.bucket, [10], include_over=True)
 
-    def test_histogram(self):
-        d = self.alltypes.double_col
+def test_bucket(alltypes):
+    d = alltypes.double_col
+    bins = [0, 10, 50, 100]
 
-        self.assertRaises(ValueError, d.histogram, nbins=10, binwidth=5)
-        self.assertRaises(ValueError, d.histogram)
-        self.assertRaises(ValueError, d.histogram, 10, closed='foo')
+    expr = d.bucket(bins)
+    assert isinstance(expr, ir.CategoryColumn)
+    assert expr.op().nbuckets == 3
 
-    def test_topk_analysis_bug(self):
-        # GH #398
-        airlines = ibis.table(
-            [('dest', 'string'), ('origin', 'string'), ('arrdelay', 'int32')],
-            'airlines',
-        )
-        dests = ['ORD', 'JFK', 'SFO']
-        t = airlines[airlines.dest.isin(dests)]
-        delay_filter = t.origin.topk(10, by=t.arrdelay.mean())
+    expr = d.bucket(bins, include_over=True)
+    assert expr.op().nbuckets == 4
 
-        filtered = t.filter([delay_filter])
+    expr = d.bucket(bins, include_over=True, include_under=True)
+    assert expr.op().nbuckets == 5
 
-        post_pred = filtered.op().predicates[0]
-        assert delay_filter.to_filter().equals(post_pred)
 
-    def test_topk_function_late_bind(self):
-        # GH #520
-        airlines = ibis.table(
-            [('dest', 'string'), ('origin', 'string'), ('arrdelay', 'int32')],
-            'airlines',
-        )
-        expr1 = airlines.dest.topk(5, by=lambda x: x.arrdelay.mean())
-        expr2 = airlines.dest.topk(5, by=airlines.arrdelay.mean())
+def test_bucket_error_cases(alltypes):
+    d = alltypes.double_col
 
-        assert_equal(expr1.to_aggregation(), expr2.to_aggregation())
+    with pytest.raises(ValueError):
+        d.bucket([])
+
+    with pytest.raises(ValueError):
+        d.bucket([1, 2], closed="foo")
+
+    # it works!
+    d.bucket([10], include_under=True, include_over=True)
+
+    with pytest.raises(ValueError):
+        d.bucket([10])
+
+    with pytest.raises(ValueError):
+        d.bucket([10], include_under=True)
+
+    with pytest.raises(ValueError):
+        d.bucket([10], include_over=True)
+
+
+def test_histogram(alltypes):
+    d = alltypes.double_col
+
+    with pytest.raises(ValueError):
+        d.histogram(nbins=10, binwidth=5)
+
+    with pytest.raises(ValueError):
+        d.histogram()
+
+    with pytest.raises(ValueError):
+        d.histogram(10, closed="foo")
+
+
+def test_topk_analysis_bug(airlines):
+    # GH #398
+    dests = ['ORD', 'JFK', 'SFO']
+    t = airlines[airlines.dest.isin(dests)]
+    delay_filter = t.origin.topk(10, by=t.arrdelay.mean())
+
+    filtered = t.filter([delay_filter])
+
+    post_pred = filtered.op().predicates[0]
+    assert delay_filter.to_filter().equals(post_pred)
+
+
+def test_topk_function_late_bind(airlines):
+    # GH #520
+    expr1 = airlines.dest.topk(5, by=lambda x: x.arrdelay.mean())
+    expr2 = airlines.dest.topk(5, by=airlines.arrdelay.mean())
+
+    assert_equal(expr1.to_aggregation(), expr2.to_aggregation())

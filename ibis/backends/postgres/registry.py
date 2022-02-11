@@ -8,7 +8,7 @@ import warnings
 
 import numpy as np
 import sqlalchemy as sa
-import sqlalchemy.dialects.postgresql as pg
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql import expression
 from sqlalchemy.sql.functions import GenericFunction
@@ -112,7 +112,7 @@ def _timestamp_truncate(t, expr):
         precision = _truncate_precisions[unit]
     except KeyError:
         raise com.UnsupportedOperationError(
-            'Unsupported truncate unit {!r}'.format(unit)
+            f'Unsupported truncate unit {unit!r}'
         )
     return sa.func.date_trunc(precision, sa_arg)
 
@@ -120,7 +120,7 @@ def _timestamp_truncate(t, expr):
 def _interval_from_integer(t, expr):
     arg, unit = expr.op().args
     sa_arg = t.translate(arg)
-    interval = sa.text("INTERVAL '1 {}'".format(expr.type().resolution))
+    interval = sa.text(f"INTERVAL '1 {expr.type().resolution}'")
     return sa_arg * interval
 
 
@@ -239,7 +239,7 @@ except AttributeError:
 
 
 # translate strftime spec into mostly equivalent PostgreSQL spec
-_scanner = re.Scanner(
+_scanner = re.Scanner(  # type: ignore # re does have a Scanner attribute
     # double quotes need to be escaped
     [('"', lambda scanner, token: r'\"')]
     + [
@@ -256,8 +256,8 @@ _scanner = re.Scanner(
                             # need to special case it in the scanner
                             '%e',
                             r'\s+',
-                            r'[{}]'.format(re.escape(string.punctuation)),
-                            r'[^{}\s]+'.format(re.escape(string.punctuation)),
+                            fr'[{re.escape(string.punctuation)}]',
+                            fr'[^{re.escape(string.punctuation)}\s]+',
                         ],
                     ),
                 )
@@ -293,7 +293,7 @@ def _reduce_tokens(tokens, arg):
         # we have a string like DD, to escape this we
         # surround it with double quotes
         elif token in _lexicon_values:
-            curtokens.append('"{}"'.format(token))
+            curtokens.append(f'"{token}"')
 
         # we have a token that needs special treatment
         elif token in _strftime_blacklist:
@@ -380,7 +380,7 @@ def _find_in_set(t, expr):
     #       itself also have this property?
     needle, haystack = expr.op().args
     return _array_search(
-        t.translate(needle), pg.array(list(map(t.translate, haystack)))
+        t.translate(needle), postgresql.array(list(map(t.translate, haystack)))
     )
 
 
@@ -439,7 +439,7 @@ def _compile_regex_extract(element, compiler, **kw):
     return result
 
 
-def _regex_extract(t, expr):
+def _regex_extract_(t, expr):
     string, pattern, index = map(t.translate, expr.op().args)
     result = sa.case(
         [
@@ -574,6 +574,16 @@ def _mod(t, expr):
         return result
 
 
+def _neg_idx_to_pos(array, idx):
+    return sa.case(
+        [
+            (array.is_(None), None),
+            (idx < 0, sa.func.array_length(array, 1) + idx),
+        ],
+        else_=idx,
+    )
+
+
 def _array_slice(t, expr):
     arg, start, stop = expr.op().args
     sa_arg = t.translate(arg)
@@ -583,6 +593,9 @@ def _array_slice(t, expr):
         sa_stop = _cardinality(sa_arg)
     else:
         sa_stop = t.translate(stop)
+
+    sa_start = _neg_idx_to_pos(sa_arg, sa_start)
+    sa_stop = _neg_idx_to_pos(sa_arg, sa_stop)
     return sa_arg[sa_start + 1 : sa_stop]
 
 
@@ -597,7 +610,7 @@ def _literal(t, expr):
     value = op.value
 
     if isinstance(dtype, dt.Interval):
-        return sa.text("INTERVAL '{} {}'".format(value, dtype.resolution))
+        return sa.text(f"INTERVAL '{value} {dtype.resolution}'")
     elif isinstance(dtype, dt.Set):
         return list(map(sa.literal, value))
     # geo spatial data type
@@ -652,7 +665,7 @@ operation_registry.update(
         ops.RegexSearch: infix_op('~'),
         ops.RegexReplace: _regex_replace,
         ops.Translate: fixed_arity('translate', 3),
-        ops.RegexExtract: _regex_extract,
+        ops.RegexExtract: _regex_extract_,
         ops.StringSplit: fixed_arity(sa.func.string_to_array, 2),
         ops.StringJoin: _string_join,
         ops.FindInSet: _find_in_set,
@@ -702,7 +715,9 @@ operation_registry.update(
         ops.ArrayLength: unary(_cardinality),
         ops.ArrayCollect: unary(sa.func.array_agg),
         ops.ArraySlice: _array_slice,
-        ops.ArrayIndex: fixed_arity(lambda array, index: array[index + 1], 2),
+        ops.ArrayIndex: fixed_arity(
+            lambda array, index: array[_neg_idx_to_pos(array, index) + 1], 2
+        ),
         ops.ArrayConcat: fixed_arity(
             sa.sql.expression.ColumnElement.concat, 2
         ),

@@ -1,3 +1,4 @@
+import concurrent.futures
 from posixpath import join as pjoin
 
 import pytest
@@ -7,20 +8,19 @@ import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
 import ibis.util as util
+from ibis.backends.base.sql.ddl import fully_qualified_re
 from ibis.backends.impala.compat import HS2Error
 from ibis.tests.util import assert_equal
-
-pytestmark = pytest.mark.impala
 
 
 def test_create_exists_view(con, temp_view):
     tmp_name = temp_view
-    assert not con.exists_table(tmp_name)
+    assert tmp_name not in con.list_tables()
 
     expr = con.table('functional_alltypes').group_by('string_col').size()
 
     con.create_view(tmp_name, expr)
-    assert con.exists_table(tmp_name)
+    assert tmp_name in con.list_tables()
 
     # just check it works for now
     expr2 = con.table(tmp_name)
@@ -30,7 +30,7 @@ def test_create_exists_view(con, temp_view):
 def test_drop_non_empty_database(con, alltypes, temp_table_db):
     temp_database, temp_table = temp_table_db
     con.create_table(temp_table, alltypes, database=temp_database)
-    assert con.exists_table(temp_table, database=temp_database)
+    assert temp_table in con.list_tables(database=temp_database)
 
     with pytest.raises(com.IntegrityError):
         con.drop_database(temp_database)
@@ -38,7 +38,7 @@ def test_drop_non_empty_database(con, alltypes, temp_table_db):
 
 def test_create_database_with_location(con, tmp_dir, hdfs):
     base = pjoin(tmp_dir, util.guid())
-    name = '__ibis_test_{}'.format(util.guid())
+    name = f'__ibis_test_{util.guid()}'
     tmp_path = pjoin(base, name)
 
     con.create_database(name, path=tmp_path)
@@ -55,7 +55,7 @@ def test_create_table_with_location_execute(
     con, hdfs, tmp_dir, alltypes, test_data_db, temp_table
 ):
     base = pjoin(tmp_dir, util.guid())
-    name = 'test_{}'.format(util.guid())
+    name = f'test_{util.guid()}'
     tmp_path = pjoin(base, name)
 
     expr = alltypes
@@ -68,7 +68,7 @@ def test_create_table_with_location_execute(
 
 
 def test_drop_table_not_exist(con):
-    non_existent_table = 'ibis_table_{}'.format(util.guid())
+    non_existent_table = f'ibis_table_{util.guid()}'
     with pytest.raises(Exception):
         con.drop_table(non_existent_table)
     con.drop_table(non_existent_table, force=True)
@@ -203,7 +203,7 @@ def created_view(con, alltypes):
 
 def test_drop_view(con, alltypes, created_view):
     con.drop_view(created_view)
-    assert not con.exists_table(created_view)
+    assert created_view not in con.list_tables()
 
 
 def test_rename_table(con, temp_database):
@@ -227,12 +227,12 @@ def test_rename_table(con, temp_database):
 
 @pytest.fixture
 def path_uuid():
-    return 'change-location-{0}'.format(util.guid())
+    return f'change-location-{util.guid()}'
 
 
 @pytest.fixture
 def table(con, tmp_db, tmp_dir, path_uuid):
-    table_name = 'table_{}'.format(util.guid())
+    table_name = f'table_{util.guid()}'
     fake_path = pjoin(tmp_dir, path_uuid)
     schema = ibis.schema([('foo', 'string'), ('bar', 'int64')])
     con.create_table(
@@ -295,11 +295,11 @@ def test_query_avro(con, test_data_dir, tmp_db):
 
     table = con.avro_file(hdfs_path, avro_schema, database=tmp_db)
 
-    name = table.op().name
-    assert name.startswith('{}.'.format(tmp_db))
+    qualified_name = table.op().name
+    _, name, _ = fully_qualified_re.match(qualified_name).groups()
 
     # table exists
-    assert con.exists_table(name, database=tmp_db)
+    assert name in con.list_tables(database=tmp_db)
 
     expr = table.r_name.value_counts()
     expr.execute()
@@ -323,11 +323,6 @@ def test_create_table_reserved_identifier(con):
         assert result == expected
     finally:
         con.drop_table(table_name)
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_query_text_file_regex():
-    assert False
 
 
 def test_query_delimited_file_directory(con, test_data_dir, tmp_db):
@@ -360,11 +355,6 @@ def test_varchar_char_support(temp_char_table):
 
 
 def test_temp_table_concurrency(con, test_data_dir):
-    # we don't install futures on windows in CI and we can't run this test
-    # there anyway so we import here
-    import concurrent.futures
-    from concurrent.futures import as_completed
-
     def limit_10(i, hdfs_path):
         t = con.parquet_file(hdfs_path)
         return t.sort_by(t.r_regionkey).limit(1, offset=i).execute()
@@ -374,9 +364,17 @@ def test_temp_table_concurrency(con, test_data_dir):
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=nthreads) as e:
         futures = [e.submit(limit_10, i, hdfs_path) for i in range(nthreads)]
-    assert all(map(len, (future.result() for future in as_completed(futures))))
+    assert all(len(future.result()) for future in futures)
 
 
 def test_access_kudu_table(kudu_table):
     assert kudu_table.columns == ['a']
     assert kudu_table['a'].type() == dt.string
+
+
+def test_kudu_property_raises_useful_error(con):
+    with pytest.raises(
+        NotImplementedError,
+        match="kudu support using kudu-python",
+    ):
+        con.kudu

@@ -11,7 +11,6 @@ import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
 from ibis.udf.vectorized import analytic, elementwise, reduction
 
-from .. import Backend
 from ..udf import nullable
 
 # --------
@@ -63,12 +62,15 @@ def df_timestamp(npartitions):
         }
     )
     df["a"] = df.a.astype(pd.DatetimeTZDtype(tz='UTC'))
-    return dd.from_pandas(df, npartitions=npartitions,)
+    return dd.from_pandas(
+        df,
+        npartitions=npartitions,
+    )
 
 
 @pytest.fixture
 def con(df, df2, df_timestamp):
-    return Backend().connect(
+    return ibis.dask.connect(
         {'df': df, 'df2': df2, 'df_timestamp': df_timestamp}
     )
 
@@ -150,7 +152,8 @@ def zscore(series):
 
 
 @reduction(
-    input_type=[dt.double], output_type=dt.Array(dt.double),
+    input_type=[dt.double],
+    output_type=dt.Array(dt.double),
 )
 def quantiles(series, *, quantiles):
     return list(series.quantile(quantiles))
@@ -170,12 +173,6 @@ def test_udf(t, df):
     expected = df.a.str.len().mul(2).compute()
 
     tm.assert_series_equal(result, expected, check_names=False)
-
-
-def test_elementwise_udf_with_non_vectors(con):
-    expr = my_add(1.0, 2.0)
-    result = con.execute(expr)
-    assert result == 3.0
 
 
 def test_multiple_argument_udf(con, t, df):
@@ -247,9 +244,6 @@ def test_udaf_analytic(con, t, df):
     tm.assert_series_equal(result, expected)
 
 
-@pytest.mark.xfail(
-    raises=NotImplementedError, reason='TODO - windowing - #2553'
-)
 def test_udaf_analytic_groupby(con, t, df):
     expr = zscore(t.c).over(ibis.window(group_by=t.key))
 
@@ -260,8 +254,11 @@ def test_udaf_analytic_groupby(con, t, df):
     def f(s):
         return s.sub(s.mean()).div(s.std())
 
-    expected = df.groupby('key').c.transform(f)
-    tm.assert_series_equal(result, expected)
+    expected = df.groupby('key').c.transform(f).compute()
+    # We don't check names here because the udf is used "directly".
+    # We could potentially special case this and set the name directly
+    # if the udf is only being run on one column.
+    tm.assert_series_equal(result, expected, check_names=False)
 
 
 def test_udaf_groupby(t2, df2):
@@ -371,7 +368,7 @@ def test_udaf_window_interval(npartitions):
     )
     df = dd.from_pandas(df, npartitions=npartitions)
 
-    con = Backend().connect({'df': df})
+    con = ibis.dask.connect({'df': df})
     t = con.table('df')
     window = ibis.trailing_range_window(
         ibis.interval(days=2), order_by='time', group_by='key'
@@ -416,7 +413,7 @@ def test_multiple_argument_udaf_window(npartitions):
     )
     df = dd.from_pandas(df, npartitions=npartitions)
 
-    con = Backend().connect({'df': df})
+    con = ibis.dask.connect({'df': df})
     t = con.table('df')
     window = ibis.trailing_window(2, order_by='a', group_by='key')
     window2 = ibis.trailing_window(1, order_by='b', group_by='key')
@@ -465,7 +462,7 @@ def test_udaf_window_nan(npartitions):
     )
     df = dd.from_pandas(df, npartitions=npartitions)
 
-    con = Backend().connect({'df': df})
+    con = ibis.dask.connect({'df': df})
     t = con.table('df')
     window = ibis.trailing_window(2, order_by='a', group_by='key')
     expr = t.mutate(rolled=my_mean(t.b).over(window))
@@ -492,14 +489,11 @@ def test_array_return_type_reduction(con, t, df, qs):
     assert list(result) == expected.tolist()
 
 
-@pytest.mark.xfail(
-    raises=NotImplementedError, reason='TODO - windowing - #2553'
-)
 def test_array_return_type_reduction_window(con, t, df, qs):
     """Tests reduction UDF returning an array, used over a window."""
     expr = quantiles(t.b, quantiles=qs).over(ibis.window())
     result = expr.execute()
-    expected_raw = df.b.quantile(qs).tolist()
+    expected_raw = df.b.quantile(qs).compute().tolist()
     expected = pd.Series([expected_raw] * len(df))
     tm.assert_series_equal(result, expected)
 

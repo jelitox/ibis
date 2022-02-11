@@ -2,6 +2,7 @@
 """
 
 import operator
+from typing import Dict, Type, Union
 
 import numpy as np
 import pandas as pd
@@ -18,8 +19,8 @@ JOIN_TYPES = {
 }
 
 
-LEFT_JOIN_SUFFIX = '_ibis_left_{}'.format(ibis.util.guid())
-RIGHT_JOIN_SUFFIX = '_ibis_right_{}'.format(ibis.util.guid())
+LEFT_JOIN_SUFFIX = f'_ibis_left_{ibis.util.guid()}'
+RIGHT_JOIN_SUFFIX = f'_ibis_right_{ibis.util.guid()}'
 JOIN_SUFFIXES = LEFT_JOIN_SUFFIX, RIGHT_JOIN_SUFFIX
 ALTERNATE_SUFFIXES = {
     LEFT_JOIN_SUFFIX: RIGHT_JOIN_SUFFIX,
@@ -27,7 +28,7 @@ ALTERNATE_SUFFIXES = {
 }
 
 
-IBIS_TYPE_TO_PANDAS_TYPE = {
+IBIS_TYPE_TO_PANDAS_TYPE: Dict[dt.DataType, Union[Type, str]] = {
     dt.float16: np.float16,
     dt.float32: np.float32,
     dt.float64: np.float64,

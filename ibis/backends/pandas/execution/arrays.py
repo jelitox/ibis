@@ -1,5 +1,5 @@
 import operator
-from typing import Any, Iterable
+from typing import Any, Collection
 
 import numpy as np
 import pandas as pd
@@ -54,10 +54,11 @@ def execute_array_index_scalar(op, data, index, **kwargs):
 
 
 def _concat_iterables_to_series(
-    iter1: Iterable[Any], iter2: Iterable[Any],
+    iter1: Collection[Any],
+    iter2: Collection[Any],
 ) -> pd.Series:
-    """Concatenate two iterables elementwise ("horizontally") to create a
-    Series. The two iterables are assumed to have the same length.
+    """Concatenate two collections elementwise ("horizontally") to create a
+    Series. The two collections are assumed to have the same length.
 
     Used for ArrayConcat implementation.
     """
@@ -96,7 +97,12 @@ def execute_array_concat_scalar(op, left, right, **kwargs):
 def execute_array_repeat(op, data, n, **kwargs):
     # Negative n will be treated as 0 (repeat will produce empty array)
     n = max(n, 0)
-    return pd.Series(map(lambda arr: np.tile(arr, n), data,))
+    return pd.Series(
+        map(
+            lambda arr: np.tile(arr, n),
+            data,
+        )
+    )
 
 
 @execute_node.register(ops.ArrayRepeat, np.ndarray, int)

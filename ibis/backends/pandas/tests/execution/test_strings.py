@@ -5,9 +5,7 @@ import pandas.testing as tm
 import pytest
 from pytest import param
 
-from ...execution.strings import sql_like_to_regex
-
-pytestmark = pytest.mark.pandas
+from ibis.backends.pandas.execution.strings import sql_like_to_regex
 
 
 @pytest.mark.parametrize(
@@ -131,4 +129,4 @@ def test_string_ops(t, df, case_func, expected_func):
 )
 def test_sql_like_to_regex(pattern, expected):
     result = sql_like_to_regex(pattern, escape='^')
-    assert result == '^{}$'.format(expected)
+    assert result == f'^{expected}$'

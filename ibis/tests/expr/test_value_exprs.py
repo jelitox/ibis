@@ -1,8 +1,9 @@
 import functools
 import operator
-import os
+import uuid
 from collections import OrderedDict
 from datetime import date, datetime, time
+from decimal import Decimal
 from operator import methodcaller
 
 import numpy as np
@@ -20,7 +21,6 @@ import ibis.expr.rules as rlz
 import ibis.expr.types as ir
 from ibis import literal
 from ibis.common.exceptions import IbisTypeError
-from ibis.expr.signature import Argument as Arg
 from ibis.tests.util import assert_equal
 
 
@@ -34,16 +34,8 @@ def test_null():
     assert_equal(expr, expr2)
 
     assert expr is expr2
-    assert expr.type() is dt.null
-    assert expr2.type() is dt.null
-
-
-@pytest.mark.xfail(
-    raises=AssertionError,
-    reason='UTF-8 support in Impala non-existent at the moment?',
-)
-def test_unicode():
-    assert False
+    assert expr.type().equals(dt.null)
+    assert expr2.type().equals(dt.null)
 
 
 @pytest.mark.parametrize(
@@ -63,6 +55,7 @@ def test_unicode():
         (-2147483649, 'int64'),
         (1.5, 'double'),
         ('foo', 'string'),
+        (b'fooblob', 'binary'),
         ([1, 2, 3], 'array<int8>'),
     ],
 )
@@ -117,11 +110,34 @@ multipolygon1 = [polygon1, polygon2]
         (tuple(multipoint), 'multipoint'),
         (list(multipolygon1), 'multipolygon'),
         (tuple(multipolygon1), 'multipolygon'),
+        pytest.param(uuid.uuid4(), 'uuid', id='uuid'),
+        pytest.param(str(uuid.uuid4()), 'uuid', id='uuid_str'),
+        pytest.param(Decimal("234.234"), "decimal(6, 3)", id="decimal_native"),
+        pytest.param(234234, "decimal(6, 3)", id="decimal_int"),
     ],
 )
 def test_literal_with_explicit_type(value, expected_type):
     expr = ibis.literal(value, type=expected_type)
     assert expr.type().equals(dt.validate_type(expected_type))
+
+
+@pytest.mark.parametrize(
+    ("value", "expected", "dtype"),
+    [
+        # precision > scale
+        (Decimal("234.234"), Decimal("234.234"), "decimal(6, 3)"),
+        (234234, Decimal("234.234"), "decimal(6, 3)"),
+        # scale == 0
+        (Decimal("234"), Decimal("234"), "decimal(6, 0)"),
+        (234, Decimal("234"), "decimal(6, 0)"),
+        # precision == scale
+        (Decimal(".234"), Decimal(".234"), "decimal(3, 3)"),
+        (234, Decimal(".234"), "decimal(3, 3)"),
+    ],
+)
+def test_normalize_decimal_literal(value, expected, dtype):
+    expr = ibis.literal(value, type=dtype)
+    assert expr.op().value == expected
 
 
 @pytest.mark.parametrize(
@@ -234,7 +250,7 @@ def test_literal_array():
 
 def test_mixed_arity(table):
     what = ["bar", table.g, "foo"]
-    expr = api.as_value_expr(what)
+    expr = api.sequence(what)
 
     values = expr.op().values
     assert isinstance(values[1], ir.StringColumn)
@@ -263,42 +279,14 @@ def test_value_counts(table, string_col):
     assert isinstance(expr, ir.TableExpr)
 
 
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_isin_not_comparable():
-    assert False
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_isin_array_expr():
-    assert False
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_isin_invalid_cases():
-    # For example, array expression in a list of values, where the inner
-    # array values originate from some other table
-    assert False
-
-
 def test_isin_notin_scalars():
-    a, b, c = [ibis.literal(x) for x in [1, 1, 2]]
+    a, b, c = (ibis.literal(x) for x in [1, 1, 2])
 
     result = a.isin([1, 2])
     assert isinstance(result, ir.BooleanScalar)
 
     result = a.notin([b, c, 3])
     assert isinstance(result, ir.BooleanScalar)
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_isin_null():
-    assert False
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_negate_isin():
-    # Should yield a NotContains
-    assert False
 
 
 def test_scalar_isin_list_with_array(table):
@@ -382,11 +370,6 @@ def test_nunique(functional_alltypes):
     assert isinstance(expr.op(), ops.CountDistinct)
 
 
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_project_with_distinct():
-    assert False
-
-
 def test_isnull(table):
     expr = table['g'].isnull()
     assert isinstance(expr, ir.BooleanColumn)
@@ -427,11 +410,6 @@ def test_isnan_isinf_scalar(value):
     expr = ibis.literal(value).isinf()
     assert isinstance(expr, ir.BooleanScalar)
     assert isinstance(expr.op(), ops.IsInf)
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_null_literal():
-    assert False
 
 
 @pytest.mark.parametrize(
@@ -491,26 +469,6 @@ def test_log_literal(log):
     assert isinstance(log(ibis.literal(5.5)), ir.FloatingScalar)
 
 
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_exp():
-    assert False
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_sqrt():
-    assert False
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_trig_functions():
-    assert False
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_round():
-    assert False
-
-
 def test_cast_same_type_noop(table):
     c = table.g
     assert c.cast('string') is c
@@ -552,11 +510,6 @@ def test_casted_exprs_are_named(table):
     expr.value_counts()
 
 
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_nonzero():
-    assert False
-
-
 @pytest.mark.parametrize('col', list('abcdefh'))
 def test_negate(table, col):
     c = table[col]
@@ -569,11 +522,6 @@ def test_negate_boolean_scalar():
     result = -(ibis.literal(False))
     assert isinstance(result, ir.BooleanScalar)
     assert isinstance(result.op(), ops.Negate)
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_isnull_notnull():
-    assert False
 
 
 @pytest.mark.parametrize('column', ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'])
@@ -616,7 +564,7 @@ def test_any_all_notany(table, column, operation):
     ],
 )
 @pytest.mark.parametrize('column', list('abcdef'))
-@pytest.mark.parametrize('case', [2, 2 ** 9, 2 ** 17, 2 ** 33, 1.5])
+@pytest.mark.parametrize('case', [2, 2**9, 2**17, 2**33, 1.5])
 def test_numbers_compare_numeric_literal(table, operation, column, case):
     ex_op_class = {
         operator.eq: ops.Equals,
@@ -778,8 +726,8 @@ def test_binop_string_type_error(table, operation):
         (operator.add, 'd', 5, 'int64'),
         (operator.mul, 'a', 0, 'int8'),
         (operator.mul, 'a', 5, 'int16'),
-        (operator.mul, 'a', 2 ** 24, 'int32'),
-        (operator.mul, 'a', -(2 ** 24) + 1, 'int32'),
+        (operator.mul, 'a', 2**24, 'int32'),
+        (operator.mul, 'a', -(2**24) + 1, 'int32'),
         (operator.mul, 'a', 1.5, 'double'),
         (operator.mul, 'b', 0, 'int16'),
         (operator.mul, 'b', 5, 'int32'),
@@ -857,72 +805,6 @@ def test_zero_subtract_literal_promotions(
     result = op(left, right)
 
     assert result.type() == dt.dtype(ex_type)
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_add_array_promotions():
-    assert False
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_subtract_array_promotions():
-    assert False
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_multiply_array_promotions():
-    assert False
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_divide_array_promotions():
-    assert False
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_string_add_concat():
-    assert False
-
-
-@pytest.fixture
-def expr():
-    exprs = [ibis.literal(1).name('a'), ibis.literal(2).name('b')]
-
-    return ibis.expr_list(exprs)
-
-
-def test_names(expr):
-    assert expr.names() == ['a', 'b']
-
-
-def test_prefix(expr):
-    prefixed = expr.prefix('foo_')
-    result = prefixed.names()
-    assert result == ['foo_a', 'foo_b']
-
-
-def test_rename(expr):
-    renamed = expr.rename(lambda x: 'foo({0})'.format(x))
-    result = renamed.names()
-    assert result == ['foo(a)', 'foo(b)']
-
-
-def test_suffix(expr):
-    suffixed = expr.suffix('.x')
-    result = suffixed.names()
-    assert result == ['a.x', 'b.x']
-
-
-def test_concat():
-    exprs = [ibis.literal(1).name('a'), ibis.literal(2).name('b')]
-    exprs2 = [ibis.literal(3).name('c'), ibis.literal(4).name('d')]
-
-    list1 = ibis.expr_list(exprs)
-    list2 = ibis.expr_list(exprs2)
-
-    result = list1.concat(list2)
-    expected = ibis.expr_list(exprs + exprs2)
-    assert_equal(result, expected)
 
 
 def test_substitute_dict():
@@ -1100,14 +982,6 @@ def test_scalar_parameter_set():
     assert value.type().equals(dt.Set(dt.int64))
 
 
-def test_scalar_parameter_repr():
-    value = ibis.param(dt.timestamp).name('value')
-    assert repr(value) == 'value = ScalarParameter[timestamp]'
-
-    value_op = value.op()
-    assert repr(value_op) == "ScalarParameter(type=timestamp)"
-
-
 @pytest.mark.parametrize(
     ('left', 'right', 'expected'),
     [
@@ -1180,7 +1054,7 @@ def test_custom_type_binary_operations():
         __radd__ = __add__
 
     class FooNode(ops.ValueOp):
-        value = Arg(rlz.integer)
+        value = rlz.integer
 
         def output_type(self):
             return functools.partial(Foo, dtype=dt.int64)
@@ -1203,7 +1077,7 @@ def test_empty_array_as_argument():
         pass
 
     class FooNode(ops.ValueOp):
-        value = Arg(rlz.value(dt.Array(dt.int64)))
+        value = rlz.value(dt.Array(dt.int64))
 
         def output_type(self):
             return Foo
@@ -1410,20 +1284,7 @@ def test_invalid_negate(value, expected_type):
     ],
 )
 def test_valid_negate(type):
-    value = type(1)
-    expr = ibis.literal(value)
-    assert -expr is not None
-
-
-@pytest.mark.xfail(
-    reason='Type not supported in most backends', raises=TypeError
-)
-@pytest.mark.skipif(
-    os.name == 'nt', reason='np.float128 not appear to exist on windows'
-)
-def test_valid_negate_float128():
-    value = np.float128(1)
-    expr = ibis.literal(value)
+    expr = ibis.literal(1)
     assert -expr is not None
 
 
@@ -1456,8 +1317,8 @@ def test_window_unbounded_invalid(kind, begin, end):
         (ibis.literal(1.0), ibis.literal(1), dt.float64),
         (ibis.literal(1), ibis.literal(1), dt.int8),
         (ibis.literal(1), ibis.literal(1000), dt.int16),
-        (ibis.literal(2 ** 16), ibis.literal(2 ** 17), dt.int32),
-        (ibis.literal(2 ** 50), ibis.literal(1000), dt.int64),
+        (ibis.literal(2**16), ibis.literal(2**17), dt.int32),
+        (ibis.literal(2**50), ibis.literal(1000), dt.int64),
         (ibis.literal([1, 2]), ibis.literal([1, 2]), dt.Array(dt.int8)),
         (ibis.literal(['a']), ibis.literal([]), dt.Array(dt.string)),
         (ibis.literal([]), ibis.literal(['a']), dt.Array(dt.string)),
@@ -1482,30 +1343,11 @@ def test_nullif_fail(left, right):
     "join_method",
     [
         "left_join",
-        pytest.param(
-            "right_join",
-            marks=pytest.mark.xfail(
-                raises=AttributeError, reason="right_join is not an ibis API"
-            ),
-        ),
+        "right_join",
         "inner_join",
         "outer_join",
         "asof_join",
-        pytest.param(
-            "semi_join",
-            marks=pytest.mark.xfail(
-                raises=com.IbisTypeError,
-                reason=(
-                    "semi_join only gives access to the left table's "
-                    "columns"
-                ),
-            ),
-        ),
     ],
-)
-@pytest.mark.xfail(
-    raises=(com.IbisError, AttributeError),
-    reason="Select from unambiguous joins not implemented",
 )
 def test_select_on_unambiguous_join(join_method):
     t = ibis.table([("a0", dt.int64), ("b1", dt.string)], name="t")
@@ -1530,30 +1372,11 @@ def test_chained_select_on_join():
 
 def test_repr_list_of_lists():
     lit = ibis.literal([[1]])
-    result = repr(lit)
-    expected = """\
-Literal[array<array<int8>>]
-  [[1]]"""
-    assert result == expected
+    repr(lit)
 
 
 def test_repr_list_of_lists_in_table():
     t = ibis.table([('a', 'int64')], name='t')
     lit = ibis.literal([[1]])
     expr = t[t, lit.name('array_of_array')]
-    result = repr(expr)
-    expected = """\
-ref_0
-UnboundTable[table]
-  name: t
-  schema:
-    a : int64
-
-Selection[table]
-  table:
-    Table: ref_0
-  selections:
-    Table: ref_0
-    array_of_array = Literal[array<array<int8>>]
-      [[1]]"""
-    assert result == expected
+    repr(expr)

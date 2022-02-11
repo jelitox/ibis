@@ -1,3 +1,4 @@
+import itertools
 import warnings
 
 import numpy as np
@@ -7,6 +8,7 @@ import pytest
 from pytest import param
 
 import ibis
+import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 from ibis.backends.pandas.execution.temporal import day_name
 
@@ -36,19 +38,22 @@ def test_date_extract(backend, alltypes, df, attr):
         'hour',
         'minute',
         'second',
-        'millisecond',
+        param(
+            'millisecond',
+            marks=pytest.mark.xfail_backends(
+                [('sqlite', "#2156"), ('pyspark', '#2159')]
+            ),
+        ),
     ],
 )
 @pytest.mark.xfail_unsupported
 def test_timestamp_extract(backend, alltypes, df, attr):
     if attr == 'millisecond':
-        if backend.name() == 'sqlite':
-            pytest.xfail(reason=('Issue #2156'))
-        if backend.name() == 'spark':
-            pytest.xfail(reason='Issue #2159')
         expected = (df.timestamp_col.dt.microsecond // 1000).astype('int32')
     elif attr == 'epoch_seconds':
         expected = df.timestamp_col.astype('int64') // int(1e9)
+    elif attr == 'week_of_year':
+        expected = df.timestamp_col.dt.isocalendar().week.astype('int32')
     else:
         expected = getattr(df.timestamp_col.dt, attr.replace('_', '')).astype(
             'int32'
@@ -59,7 +64,7 @@ def test_timestamp_extract(backend, alltypes, df, attr):
     if attr == 'epoch_seconds' and backend.name() in [
         'bigquery',
         'postgres',
-        'spark',
+        'pyspark',
     ]:
         # note: these backends cast to bigint are not changing the result
         result = result.astype('int64')
@@ -76,12 +81,7 @@ def test_timestamp_extract(backend, alltypes, df, attr):
         'D',
         # Spark truncation to week truncates to different days than Pandas
         # Pandas backend is probably doing this wrong
-        param(
-            'W',
-            marks=pytest.mark.xpass_backends(
-                ('csv', 'pandas', 'dask', 'parquet')
-            ),
-        ),
+        param('W', marks=pytest.mark.xpass_backends(('pandas', 'dask'))),
         'h',
         'm',
         's',
@@ -94,7 +94,7 @@ def test_timestamp_extract(backend, alltypes, df, attr):
 def test_timestamp_truncate(backend, alltypes, df, unit):
     expr = alltypes.timestamp_col.truncate(unit)
 
-    dtype = 'datetime64[{}]'.format(unit)
+    dtype = f'datetime64[{unit}]'
     expected = pd.Series(df.timestamp_col.values.astype(dtype))
 
     result = expr.execute()
@@ -109,19 +109,14 @@ def test_timestamp_truncate(backend, alltypes, df, unit):
         'Y',
         'M',
         'D',
-        param(
-            'W',
-            marks=pytest.mark.xpass_backends(
-                ('csv', 'pandas', 'dask', 'parquet')
-            ),
-        ),
+        param('W', marks=pytest.mark.xpass_backends(('pandas', 'dask'))),
     ],
 )
 @pytest.mark.xfail_unsupported
 def test_date_truncate(backend, alltypes, df, unit):
     expr = alltypes.timestamp_col.date().truncate(unit)
 
-    dtype = 'datetime64[{}]'.format(unit)
+    dtype = f'datetime64[{unit}]'
     expected = pd.Series(df.timestamp_col.values.astype(dtype))
 
     result = expr.execute()
@@ -161,9 +156,7 @@ def test_date_truncate(backend, alltypes, df, unit):
             pd.Timedelta,
             marks=pytest.mark.xpass_backends(
                 (
-                    'csv',
                     'pandas',
-                    'parquet',
                     'bigquery',
                     'impala',
                     'postgres',
@@ -179,7 +172,7 @@ def test_date_truncate(backend, alltypes, df, unit):
     ],
 )
 @pytest.mark.xfail_unsupported
-@pytest.mark.skip_backends(['spark'])
+@pytest.mark.skip_backends(['pyspark'])
 def test_integer_to_interval_timestamp(
     backend, con, alltypes, df, unit, displacement_type
 ):
@@ -187,7 +180,7 @@ def test_integer_to_interval_timestamp(
     expr = alltypes.timestamp_col + interval
 
     def convert_to_offset(offset, displacement_type=displacement_type):
-        resolution = '{}s'.format(interval.type().resolution)
+        resolution = f'{interval.type().resolution}s'
         return displacement_type(**{resolution: offset})
 
     with warnings.catch_warnings():
@@ -207,7 +200,7 @@ def test_integer_to_interval_timestamp(
 )
 @pytest.mark.xfail_unsupported
 # TODO - DateOffset - #2553
-@pytest.mark.skip_backends(['dask', 'spark'])
+@pytest.mark.skip_backends(['dask', 'pyspark'])
 def test_integer_to_interval_date(backend, con, alltypes, df, unit):
     interval = alltypes.int_col.to_interval(unit=unit)
     array = alltypes.date_string_col.split('/')
@@ -216,10 +209,12 @@ def test_integer_to_interval_date(backend, con, alltypes, df, unit):
         ibis.literal('-').join(['20' + year, month, day]).cast('date')
     )
     expr = date_col + interval
-    result = con.execute(expr)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=pd.errors.PerformanceWarning)
+        result = con.execute(expr)
 
     def convert_to_offset(x):
-        resolution = '{}s'.format(interval.type().resolution)
+        resolution = f'{interval.type().resolution}s'
         return pd.offsets.DateOffset(**{resolution: x})
 
     offset = df.int_col.apply(convert_to_offset)
@@ -281,11 +276,11 @@ timestamp_value = pd.Timestamp('2018-01-01 18:18:18')
             lambda t, be: t.timestamp_col - ibis.timestamp(timestamp_value),
             lambda t, be: pd.Series(
                 t.timestamp_col.sub(timestamp_value).values.astype(
-                    'timedelta64[{}]'.format(be.returned_timestamp_unit)
+                    f'timedelta64[{be.returned_timestamp_unit}]'
                 )
             ),
             id='timestamp-subtract-timestamp',
-            marks=pytest.mark.xfail_backends(['spark']),
+            marks=pytest.mark.xfail_backends(['pyspark']),
         ),
         param(
             lambda t, be: t.timestamp_col.date() - ibis.date(date_value),
@@ -295,7 +290,7 @@ timestamp_value = pd.Timestamp('2018-01-01 18:18:18')
     ],
 )
 @pytest.mark.xfail_unsupported
-@pytest.mark.skip_backends(['spark'])
+@pytest.mark.skip_backends(['pyspark'])
 def test_temporal_binop(backend, con, alltypes, df, expr_fn, expected_fn):
     expr = expr_fn(alltypes, backend)
     expected = expected_fn(df, backend)
@@ -304,6 +299,39 @@ def test_temporal_binop(backend, con, alltypes, df, expr_fn, expected_fn):
     expected = backend.default_series_rename(expected)
 
     backend.assert_series_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    ('timedelta', 'temporal_fn'),
+    itertools.product(
+        ['36500d', '5W', '3d', '1.5d', '2h', '3m', '10s'],
+        [
+            lambda t, td: t.timestamp_col + pd.Timedelta(td),
+            lambda t, td: t.timestamp_col - pd.Timedelta(td),
+        ],
+    ),
+)
+@pytest.mark.only_on_backends(['dask', 'pandas'])
+def test_temporal_binop_pandas_timedelta(
+    backend, con, alltypes, df, timedelta, temporal_fn
+):
+    expr = temporal_fn(alltypes, timedelta)
+    expected = temporal_fn(df, timedelta)
+
+    result = con.execute(expr)
+    expected = backend.default_series_rename(expected)
+
+    backend.assert_series_equal(result, expected)
+
+
+@pytest.mark.only_on_backends(['pyspark'])
+def test_temporal_binop_invalid_interval_unit(con, alltypes):
+    expr = alltypes.timestamp_col + pd.Timedelta('1ns')
+    with pytest.raises(
+        com.UnsupportedArgumentError,
+        match='Interval unit "ns" is not allowed*',
+    ):
+        con.execute(expr)
 
 
 @pytest.mark.parametrize(
@@ -318,7 +346,7 @@ def test_temporal_binop(backend, con, alltypes, df, expr_fn, expected_fn):
     ],
 )
 @pytest.mark.xfail_unsupported
-@pytest.mark.skip_backends(['spark', 'sqlite'])
+@pytest.mark.skip_backends(['pyspark', 'sqlite', 'datafusion'])
 def test_timestamp_comparison_filter(
     backend, con, alltypes, df, comparison_fn
 ):
@@ -329,7 +357,7 @@ def test_timestamp_comparison_filter(
 
 
 @pytest.mark.xfail_unsupported
-@pytest.mark.skip_backends(['spark'])
+@pytest.mark.skip_backends(['pyspark'])
 def test_interval_add_cast_scalar(backend, alltypes):
     timestamp_date = alltypes.timestamp_col.date()
     delta = ibis.literal(10).cast("interval('D')")
@@ -340,9 +368,9 @@ def test_interval_add_cast_scalar(backend, alltypes):
 
 
 @pytest.mark.xfail_unsupported
-# PySpark does not support casting columns to intervals
-@pytest.mark.xfail_backends(['pyspark'])
-@pytest.mark.skip_backends(['spark'])
+@pytest.mark.xfail_backends(
+    ['pyspark'], reason="PySpark does not support casting columns to intervals"
+)
 def test_interval_add_cast_column(backend, alltypes, df):
     timestamp_date = alltypes.timestamp_col.date()
     delta = alltypes.bigint_col.cast("interval('D')")
@@ -362,8 +390,6 @@ def test_interval_add_cast_column(backend, alltypes, df):
     ('ibis_pattern', 'pandas_pattern'), [('%Y%m%d', '%Y%m%d')]
 )
 @pytest.mark.xfail_unsupported
-# Spark takes Java SimpleDateFormat instead of strftime
-@pytest.mark.skip_backends(['spark'])
 def test_strftime(backend, con, alltypes, df, ibis_pattern, pandas_pattern):
     expr = alltypes.timestamp_col.strftime(ibis_pattern)
     expected = df.timestamp_col.dt.strftime(pandas_pattern)
@@ -386,29 +412,20 @@ unit_factors = {'s': int(1e9), 'ms': int(1e6), 'us': int(1e3), 'ns': 1}
             marks=pytest.mark.xpass_backends(
                 (
                     'bigquery',
-                    'csv',
                     'impala',
                     'pandas',
-                    'parquet',
-                    'spark',
+                    'pyspark',
                     'dask',
                 )
             ),
         ),
-        param(
-            'ns',
-            marks=pytest.mark.xpass_backends(
-                ('csv', 'pandas', 'parquet', 'dask')
-            ),
-        ),
+        param('ns', marks=pytest.mark.xpass_backends(('pandas', 'dask'))),
     ],
 )
 @pytest.mark.xfail_unsupported
 def test_to_timestamp(backend, con, unit):
     if unit not in backend.supported_to_timestamp_units:
-        pytest.skip(
-            'Unit {!r} not supported by {} to_timestamp'.format(unit, backend)
-        )
+        pytest.skip(f'Unit {unit!r} not supported by {backend} to_timestamp')
 
     backend_unit = backend.returned_timestamp_unit
     factor = unit_factors[unit]

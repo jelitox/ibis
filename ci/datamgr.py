@@ -8,8 +8,6 @@ from pathlib import Path
 import click
 import pandas as pd
 import sqlalchemy as sa
-from plumbum import local
-from toolz import dissoc
 
 SCRIPT_DIR = Path(__file__).parent.absolute()
 DATA_DIR_NAME = 'ibis-testing-data'
@@ -47,37 +45,34 @@ logger = get_logger(Path(__file__).with_suffix('').name)
 
 
 def recreate_database(driver, params, **kwargs):
-    url = sa.engine.url.URL(driver, **dissoc(params, 'database'))
+    database = params.pop("database", None)
+    url = sa.engine.url.URL(driver, **params)
     engine = sa.create_engine(url, **kwargs)
 
-    with engine.connect() as conn:
-        conn.execute('DROP DATABASE IF EXISTS {}'.format(params['database']))
-        conn.execute('CREATE DATABASE {}'.format(params['database']))
+    if database is not None:
+        with engine.connect() as conn:
+            conn.execute(f'DROP DATABASE IF EXISTS {database}')
+            conn.execute(f'CREATE DATABASE {database}')
 
 
 def init_database(driver, params, schema=None, recreate=True, **kwargs):
-    new_params = params.copy()
-    new_params['username'] = new_params.pop('user', None)
-
     if recreate:
-        recreate_database(driver, new_params, **kwargs)
+        recreate_database(driver, params.copy(), **kwargs)
 
-    url = sa.engine.url.URL(driver, **new_params)
+    url = sa.engine.url.URL(driver, **params)
     engine = sa.create_engine(url, **kwargs)
 
     if schema:
         with engine.connect() as conn:
-            # clickhouse doesn't support multi-statements
-            for stmt in schema.read().split(';'):
-                if len(stmt.strip()):
-                    conn.execute(stmt)
+            for stmt in filter(None, map(str.strip, schema.read().split(';'))):
+                conn.execute(stmt)
 
     return engine
 
 
 def read_tables(names, data_directory):
     for name in names:
-        path = data_directory / '{}.csv'.format(name)
+        path = data_directory / f'{name}.csv'
 
         params = {}
 
@@ -88,7 +83,7 @@ def read_tables(names, data_directory):
 
         if name == 'functional_alltypes':
             df['bool_col'] = df['bool_col'].astype(bool)
-            # string_col is actually dt.int64
+            # string_col is read in as dt.int64, but it's a string for tests
             df['string_col'] = df['string_col'].astype(str)
             df['date_string_col'] = df['date_string_col'].astype(str)
             # timestamp_col has object dtype
@@ -97,34 +92,10 @@ def read_tables(names, data_directory):
         yield name, df
 
 
-def convert_to_database_compatible_value(value):
-    """Pandas 0.23 broke DataFrame.to_sql, so we workaround it by rolling our
-    own extremely low-tech conversion routine
-    """
-    if pd.isnull(value):
-        return None
-    if isinstance(value, pd.Timestamp):
-        return value.to_pydatetime()
-    try:
-        return value.item()
-    except AttributeError:
-        return value
-
-
-def insert(engine, tablename, df):
-    keys = df.columns
-    rows = [
-        dict(zip(keys, map(convert_to_database_compatible_value, row)))
-        for row in df.itertuples(index=False, name=None)
-    ]
-    t = sa.Table(tablename, sa.MetaData(bind=engine), autoload=True)
-    engine.execute(t.insert(), rows)
-
-
 def insert_tables(engine, names, data_directory):
     for table, df in read_tables(names, data_directory):
-        with engine.begin() as connection:
-            insert(connection, table, df)
+        with engine.begin() as con:
+            df.to_sql(table, con, if_exists="replace", index=False)
 
 
 @click.group()
@@ -153,7 +124,7 @@ def download(repo_url, directory):
     path = directory.with_suffix('.zip')
 
     if not path.exists():
-        logger.info('Downloading {} to {}...'.format(url, path))
+        logger.info(f'Downloading {url} to {path}...')
         path.parent.mkdir(parents=True, exist_ok=True)
         download = curl[url, '-o', path, '-L']
         download(
@@ -161,9 +132,9 @@ def download(repo_url, directory):
             stderr=click.get_binary_stream('stderr'),
         )
     else:
-        logger.info('Skipping download: {} already exists'.format(path))
+        logger.info(f'Skipping download: {path} already exists')
 
-    logger.info('Extracting archive to {}'.format(directory))
+    logger.info(f'Extracting archive to {directory}')
 
     # extract all files
     extract_to = directory.with_name(directory.name + '_extracted')
@@ -182,58 +153,44 @@ def download(repo_url, directory):
 
 
 @cli.command()
-@click.option('-t', '--tables', multiple=True, default=TEST_TABLES)
-@click.option('-d', '--data-directory', default=DATA_DIR)
-@click.option('-i', '--ignore-missing-dependency', is_flag=True, default=True)
-def parquet(tables, data_directory, ignore_missing_dependency, **params):
-    try:
-        import pyarrow as pa  # noqa: F401
-        import pyarrow.parquet as pq  # noqa: F401
-    except ImportError:
-        msg = 'PyArrow dependency is missing'
-        if ignore_missing_dependency:
-            logger.warning('Ignored: %s', msg)
-            return 0
-        else:
-            raise click.ClickException(msg)
-
-    data_directory = Path(data_directory)
-    for table, df in read_tables(tables, data_directory):
-        arrow_table = pa.Table.from_pandas(df)
-        target_path = data_directory / '{}.parquet'.format(table)
-        pq.write_table(arrow_table, str(target_path))
-
-
-@cli.command()
 @click.option('-h', '--host', default='localhost')
-@click.option('-P', '--port', default=5432, type=int)
-@click.option('-u', '--user', default='postgres')
+@click.option(
+    '-P',
+    '--port',
+    default=5432,
+    envvar=["PGPORT", "IBIS_TEST_POSTGRES_PORT"],
+    type=int,
+)
+@click.option('-u', '--username', default='postgres')
 @click.option('-p', '--password', default='postgres')
 @click.option('-D', '--database', default='ibis_testing')
 @click.option(
     '-S',
     '--schema',
     type=click.File('rt'),
-    default=str(SCRIPT_DIR / 'schema' / 'postgresql.sql'),
+    default=SCRIPT_DIR / 'schema' / 'postgresql.sql',
     help='Path to SQL file that initializes the database via DDL.',
 )
 @click.option('-t', '--tables', multiple=True, default=TEST_TABLES + ['geo'])
-@click.option('-d', '--data-directory', default=DATA_DIR)
 @click.option(
-    '-l',
-    '--psql-path',
-    type=click.Path(exists=True),
-    required=os.name == 'nt',
-    default=None if os.name == 'nt' else '/usr/bin/psql',
+    '-d',
+    '--data-directory',
+    default=DATA_DIR,
+    type=click.Path(
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        writable=True,
+        readable=True,
+        path_type=Path,
+    ),
 )
 @click.option(
     '--plpython/--no-plpython',
     help='Create PL/Python extension in database',
     default=True,
 )
-def postgres(schema, tables, data_directory, psql_path, plpython, **params):
-    psql = local[psql_path]
-    data_directory = Path(data_directory)
+def postgres(schema, tables, data_directory, plpython, **params):
     logger.info('Initializing PostgreSQL...')
     engine = init_database(
         'postgresql', params, schema, isolation_level='AUTOCOMMIT'
@@ -243,15 +200,13 @@ def postgres(schema, tables, data_directory, psql_path, plpython, **params):
 
     use_postgis = 'geo' in tables
     if use_postgis:
-        engine.execute("CREATE EXTENSION IF NOT EXISTS POSTGIS")
+        engine.execute("CREATE EXTENSION IF NOT EXISTS postgis")
 
     if plpython:
-        engine.execute("CREATE EXTENSION IF NOT EXISTS PLPYTHONU")
+        engine.execute("CREATE EXTENSION IF NOT EXISTS plpython3u")
 
-    query = "COPY {} FROM STDIN WITH (FORMAT CSV, HEADER TRUE, DELIMITER ',')"
-    database = params['database']
     for table in tables:
-        src = data_directory / '{}.csv'.format(table)
+        src = data_directory / f'{table}.csv'
 
         # If we are loading the geo sample data, handle the data types
         # specifically so that PostGIS understands them as geometries.
@@ -276,41 +231,54 @@ def postgres(schema, tables, data_directory, psql_path, plpython, **params):
                     "geo_multipolygon": Geometry("MULTIPOLYGON", srid=srid),
                 },
             )
-            continue
-
-        load = psql[
-            '--host',
-            params['host'],
-            '--port',
-            params['port'],
-            '--username',
-            params['user'],
-            '--dbname',
-            database,
-            '--command',
-            query.format(table),
-        ]
-        with local.env(PGPASSWORD=params['password']):
-            with src.open('r') as f:
-                load(stdin=f)
+        else:
+            # Here we insert rows using COPY table FROM STDIN, by way of
+            # psycopg2's `copy_expert` API.
+            #
+            # We could use DataFrame.to_sql(method=callable), but that incurs
+            # an unnecessary round trip and requires more code: the `data_iter`
+            # argument would have to be turned back into a CSV before being
+            # passed to `copy_expert`.
+            sql = (
+                f"COPY {table} FROM STDIN "
+                "WITH (FORMAT CSV, HEADER TRUE, DELIMITER ',')"
+            )
+            with src.open('r') as file:
+                with engine.begin() as con, con.connection.cursor() as cur:
+                    cur.copy_expert(sql=sql, file=file)
 
     engine.execute('VACUUM FULL ANALYZE')
 
 
 @cli.command()
-@click.option('-D', '--database', default=SCRIPT_DIR / 'ibis_testing.db')
+@click.option(
+    '-D',
+    '--database',
+    default=SCRIPT_DIR / 'ibis_testing.db',
+    type=click.Path(path_type=Path),
+)
 @click.option(
     '-S',
     '--schema',
     type=click.File('rt'),
-    default=str(SCRIPT_DIR / 'schema' / 'sqlite.sql'),
+    default=SCRIPT_DIR / 'schema' / 'sqlite.sql',
     help='Path to SQL file that initializes the database via DDL.',
 )
 @click.option('-t', '--tables', multiple=True, default=TEST_TABLES)
-@click.option('-d', '--data-directory', default=DATA_DIR)
+@click.option(
+    '-d',
+    '--data-directory',
+    default=DATA_DIR,
+    type=click.Path(
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        writable=True,
+        readable=True,
+        path_type=Path,
+    ),
+)
 def sqlite(database, schema, tables, data_directory, **params):
-    database = Path(database)
-    data_directory = Path(data_directory)
     logger.info('Initializing SQLite...')
 
     try:
@@ -326,20 +294,31 @@ def sqlite(database, schema, tables, data_directory, **params):
 @cli.command()
 @click.option('-h', '--host', default='localhost')
 @click.option('-P', '--port', default=3306, type=int)
-@click.option('-u', '--user', default='ibis')
+@click.option('-u', '--username', default='ibis')
 @click.option('-p', '--password', default='ibis')
 @click.option('-D', '--database', default='ibis_testing')
 @click.option(
     '-S',
     '--schema',
     type=click.File('rt'),
-    default=str(SCRIPT_DIR / 'schema' / 'mysql.sql'),
+    default=SCRIPT_DIR / 'schema' / 'mysql.sql',
     help='Path to SQL file that initializes the database via DDL.',
 )
 @click.option('-t', '--tables', multiple=True, default=TEST_TABLES)
-@click.option('-d', '--data-directory', default=DATA_DIR)
+@click.option(
+    '-d',
+    '--data-directory',
+    default=DATA_DIR,
+    type=click.Path(
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        writable=True,
+        readable=True,
+        path_type=Path,
+    ),
+)
 def mysql(schema, tables, data_directory, **params):
-    data_directory = Path(data_directory)
     logger.info('Initializing MySQL...')
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -359,29 +338,40 @@ def mysql(schema, tables, data_directory, **params):
     '-S',
     '--schema',
     type=click.File('rt'),
-    default=str(SCRIPT_DIR / 'schema' / 'clickhouse.sql'),
+    default=SCRIPT_DIR / 'schema' / 'clickhouse.sql',
     help='Path to SQL file that initializes the database via DDL.',
 )
 @click.option('-t', '--tables', multiple=True, default=TEST_TABLES)
-@click.option('-d', '--data-directory', default=DATA_DIR)
+@click.option(
+    '-d',
+    '--data-directory',
+    default=DATA_DIR,
+    type=click.Path(
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        writable=True,
+        readable=True,
+        path_type=Path,
+    ),
+)
 def clickhouse(schema, tables, data_directory, **params):
-    data_directory = Path(data_directory)
+    import clickhouse_driver
+
     logger.info('Initializing ClickHouse...')
-    engine = init_database('clickhouse+native', params, schema)
+    database = params.pop("database")
+    client = clickhouse_driver.Client(**params)
+
+    client.execute(f"DROP DATABASE IF EXISTS {database}")
+    client.execute(f"CREATE DATABASE {database}")
+    client.execute(f"USE {database}")
+
+    for stmt in filter(None, map(str.strip, schema.read().split(';'))):
+        client.execute(stmt)
 
     for table, df in read_tables(tables, data_directory):
-        if table == 'batting':
-            # float nan problem
-            cols = df.select_dtypes([float]).columns
-            df[cols] = df[cols].fillna(0).astype(int)
-            # string None driver problem
-            cols = df.select_dtypes([object]).columns
-            df[cols] = df[cols].fillna('')
-        elif table == 'awards_players':
-            # string None driver problem
-            cols = df.select_dtypes([object]).columns
-            df[cols] = df[cols].fillna('')
-        insert(engine, table, df)
+        query = f"INSERT INTO {table} VALUES"
+        client.insert_dataframe(query, df, settings={"use_numpy": True})
 
 
 @cli.command()
@@ -391,7 +381,6 @@ def pandas(**params):
     have an option for the backend for consistency, and to not
     have to avoid calling `./datamgr.py pandas` in the CI.
     """
-    pass
 
 
 @cli.command()
@@ -401,47 +390,49 @@ def dask(**params):
     have an option for the backend for consistency, and to not
     have to avoid calling `./datamgr.py dask` in the CI.
     """
-    pass
 
 
 @cli.command()
-def csv(**params):
-    """
-    The csv backend does not need test data, but we still
-    have an option for the backend for consistency, and to not
-    have to avoid calling `./datamgr.py csv` in the CI.
-    """
-    pass
+@click.option('-t', '--tables', multiple=True, default=TEST_TABLES)
+@click.option(
+    '-d',
+    '--data-directory',
+    default=DATA_DIR,
+    type=click.Path(
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        writable=True,
+        readable=True,
+        path_type=Path,
+    ),
+)
+@click.option('-i', '--ignore-missing-dependency', is_flag=True, default=True)
+def datafusion(tables, data_directory, ignore_missing_dependency, **params):
+    try:
+        import pyarrow as pa  # noqa: F401
+        import pyarrow.parquet as pq  # noqa: F401
+    except ImportError:
+        msg = 'PyArrow dependency is missing'
+        if ignore_missing_dependency:
+            logger.warning('Ignored: %s', msg)
+            return 0
+        else:
+            raise click.ClickException(msg)
 
-
-@cli.command()
-def hdf5(**params):
-    """
-    The hdf5 backend does not need test data, but we still
-    have an option for the backend for consistency, and to not
-    have to avoid calling `./datamgr.py hdf5` in the CI.
-    """
-    pass
-
-
-@cli.command()
-def spark(**params):
-    """
-    The spark backend does not need test data, but we still
-    have an option for the backend for consistency, and to not
-    have to avoid calling `./datamgr.py spark` in the CI.
-    """
-    pass
+    for table, df in read_tables(tables, data_directory):
+        arrow_table = pa.Table.from_pandas(df)
+        target_path = data_directory / f'{table}.parquet'
+        pq.write_table(arrow_table, str(target_path))
 
 
 @cli.command()
 def pyspark(**params):
     """
-    The hdf5 backend does not need test data, but we still
+    The pyspark backend does not need test data, but we still
     have an option for the backend for consistency, and to not
     have to avoid calling `./datamgr.py pyspark` in the CI.
     """
-    pass
 
 
 if __name__ == '__main__':

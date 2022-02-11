@@ -6,9 +6,6 @@ from pandas import Timedelta, date_range
 from pytest import param
 
 import ibis
-import ibis.common.exceptions as com
-
-from ... import Backend
 
 # Note - computations in this file use the single threadsed scheduler (instead
 # of the default multithreaded scheduler) in order to avoid a flaky interaction
@@ -16,9 +13,6 @@ from ... import Backend
 # pandas>=1.1.2 (or in other schedulers). For more background see:
 # - https://github.com/dask/dask/issues/6454
 # - https://github.com/dask/dask/issues/5060
-
-
-pytestmark = pytest.mark.dask
 
 
 join_type = pytest.mark.parametrize(
@@ -242,7 +236,7 @@ def test_multi_join_with_post_expression_filter(how, left, df1):
     )
 
 
-@pytest.mark.xfail(reason="TODO - execute_materialized_join - #2553")
+@pytest.mark.xfail(reason="TODO - execute_join - #2553")
 @join_type
 def test_join_with_non_trivial_key(how, left, right, df1, df2):
     # also test that the order of operands in the predicate doesn't matter
@@ -266,7 +260,7 @@ def test_join_with_non_trivial_key(how, left, right, df1, df2):
     )
 
 
-@pytest.mark.xfail(reason="TODO - execute_materialized_join - #2553")
+@pytest.mark.xfail(reason="TODO - execute_join - #2553")
 @join_type
 def test_join_with_non_trivial_key_project_table(how, left, right, df1, df2):
     # also test that the order of operands in the predicate doesn't matter
@@ -311,6 +305,10 @@ def test_join_with_project_right_duplicate_column(client, how, left, df1, df3):
     )
 
 
+@pytest.mark.xfail(
+    raises=NotImplementedError,
+    reason="multi-key sort isn't implemented",
+)
 def test_join_with_window_function(
     players_base, players_df, batting, batting_df
 ):
@@ -413,12 +411,7 @@ def test_keyed_asof_join_with_tolerance(
     "how",
     [
         "left",
-        pytest.param(
-            "right",
-            marks=pytest.mark.xfail(
-                raises=AttributeError, reason="right_join is not an ibis API"
-            ),
-        ),
+        "right",
         "inner",
         "outer",
     ],
@@ -431,10 +424,6 @@ def test_keyed_asof_join_with_tolerance(
         pytest.param(lambda join: join.select(["a0", "a1"]), id="select"),
     ],
 )
-@pytest.mark.xfail(
-    raises=(com.IbisError, AttributeError),
-    reason="Select from unambiguous joins not implemented",
-)
 def test_select_on_unambiguous_join(how, func, npartitions):
     df_t = dd.from_pandas(
         pd.DataFrame({'a0': [1, 2, 3], 'b1': list("aab")}),
@@ -444,10 +433,10 @@ def test_select_on_unambiguous_join(how, func, npartitions):
         pd.DataFrame({'a1': [2, 3, 4], 'b2': list("abc")}),
         npartitions=npartitions,
     )
-    con = Backend().connect({"t": df_t, "s": df_s})
+    con = ibis.dask.connect({"t": df_t, "s": df_s})
     t = con.table("t")
     s = con.table("s")
-    method = getattr(t, "{}_join".format(how))
+    method = getattr(t, f"{how}_join")
     join = method(s, t.b1 == s.b2)
     expected = dd.merge(df_t, df_s, left_on=["b1"], right_on=["b2"], how=how)[
         ["a0", "a1"]
@@ -469,10 +458,6 @@ def test_select_on_unambiguous_join(how, func, npartitions):
         pytest.param(lambda join: join.select(["a0", "a1"]), id="select"),
     ],
 )
-@pytest.mark.xfail(
-    raises=(com.IbisError, AttributeError),
-    reason="Select from unambiguous joins not implemented",
-)
 @merge_asof_minversion
 def test_select_on_unambiguous_asof_join(func, npartitions):
     df_t = dd.from_pandas(
@@ -487,7 +472,7 @@ def test_select_on_unambiguous_asof_join(func, npartitions):
         ),
         npartitions=npartitions,
     )
-    con = Backend().connect({"t": df_t, "s": df_s})
+    con = ibis.dask.connect({"t": df_t, "s": df_s})
     t = con.table("t")
     s = con.table("s")
     join = t.asof_join(s, t.b1 == s.b2)
@@ -497,6 +482,39 @@ def test_select_on_unambiguous_asof_join(func, npartitions):
     assert not expected.compute(scheduler='single-threaded').empty
     expr = func(join)
     result = expr.compile()
+    tm.assert_frame_equal(
+        result.compute(scheduler='single-threaded'),
+        expected.compute(scheduler='single-threaded'),
+    )
+
+
+def test_outer_join(npartitions):
+    df = dd.from_pandas(
+        pd.DataFrame({"test": [1, 2, 3], "name": ["a", "b", "c"]}),
+        npartitions=npartitions,
+    )
+    df_2 = dd.from_pandas(
+        pd.DataFrame({"test_2": [1, 5, 6], "name_2": ["d", "e", "f"]}),
+        npartitions=npartitions,
+    )
+
+    conn = ibis.dask.connect({"df": df, "df_2": df_2})
+
+    ibis_table_1 = conn.table("df")
+    ibis_table_2 = conn.table("df_2")
+
+    joined = ibis_table_1.outer_join(
+        ibis_table_2,
+        predicates=ibis_table_1["test"] == ibis_table_2["test_2"],
+    )
+    result = joined.compile()
+    expected = dd.merge(
+        df,
+        df_2,
+        left_on="test",
+        right_on="test_2",
+        how="outer",
+    )
     tm.assert_frame_equal(
         result.compute(scheduler='single-threaded'),
         expected.compute(scheduler='single-threaded'),

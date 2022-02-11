@@ -4,10 +4,8 @@ import numpy as np
 import pandas as pd
 import pandas._testing as tm
 import pytest
-from pytest import param
 
 import ibis
-from ibis.common.exceptions import IbisTypeError
 
 
 @pytest.mark.parametrize('arr', [[1, 3, 5], np.array([1, 3, 5])])
@@ -84,16 +82,6 @@ def test_array_collect_rolling_partitioned(t, df):
     tm.assert_frame_equal(result, expected)
 
 
-@pytest.mark.xfail(raises=IbisTypeError, reason='Not sure if this should work')
-def test_array_collect_scalar(client):
-    raw_value = 'abcd'
-    value = ibis.literal(raw_value)
-    expr = value.collect()
-    result = client.execute(expr)
-    expected = [raw_value]
-    tm.assert_numpy_array_equal(result, expected)
-
-
 @pytest.mark.parametrize(
     ['start', 'stop'],
     [
@@ -104,28 +92,9 @@ def test_array_collect_scalar(client):
         (None, 3),
         (None, None),
         (3, None),
-        # negative slices are not supported
-        param(
-            -3,
-            None,
-            marks=pytest.mark.xfail(
-                raises=ValueError, reason='Negative slicing not supported'
-            ),
-        ),
-        param(
-            None,
-            -3,
-            marks=pytest.mark.xfail(
-                raises=ValueError, reason='Negative slicing not supported'
-            ),
-        ),
-        param(
-            -3,
-            -1,
-            marks=pytest.mark.xfail(
-                raises=ValueError, reason='Negative slicing not supported'
-            ),
-        ),
+        (-3, None),
+        (None, -3),
+        (-3, -1),
     ],
 )
 def test_array_slice(t, df, start, stop):
@@ -146,28 +115,9 @@ def test_array_slice(t, df, start, stop):
         (None, 3),
         (None, None),
         (3, None),
-        # negative slices are not supported
-        param(
-            -3,
-            None,
-            marks=pytest.mark.xfail(
-                raises=ValueError, reason='Negative slicing not supported'
-            ),
-        ),
-        param(
-            None,
-            -3,
-            marks=pytest.mark.xfail(
-                raises=ValueError, reason='Negative slicing not supported'
-            ),
-        ),
-        param(
-            -3,
-            -1,
-            marks=pytest.mark.xfail(
-                raises=ValueError, reason='Negative slicing not supported'
-            ),
-        ),
+        (-3, None),
+        (None, -3),
+        (-3, -1),
     ],
 )
 def test_array_slice_scalar(client, start, stop):
@@ -209,7 +159,8 @@ def test_array_repeat(t, df, n, mul):
     expr = mul(t.array_of_strings, n)
     result = expr.execute()
     expected = df.apply(
-        lambda row: np.tile(row.array_of_strings, max(n, 0)), axis=1,
+        lambda row: np.tile(row.array_of_strings, max(n, 0)),
+        axis=1,
     )
     tm.assert_series_equal(result, expected)
 

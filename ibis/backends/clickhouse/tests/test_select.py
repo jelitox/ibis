@@ -1,3 +1,5 @@
+from itertools import product
+
 import clickhouse_driver
 import pandas as pd
 import pandas.testing as tm
@@ -5,8 +7,6 @@ import pytest
 
 import ibis
 import ibis.common.exceptions as com
-
-pytestmark = pytest.mark.clickhouse
 
 
 @pytest.fixture(scope='module')
@@ -48,20 +48,20 @@ FROM {0}.`functional_alltypes`"""
 
 
 def test_isin_notin_in_select(con, db, alltypes, translate):
-    values = ['foo', 'bar']
+    values = {'foo', 'bar'}
     filtered = alltypes[alltypes.string_col.isin(values)]
     result = ibis.clickhouse.compile(filtered)
     expected = """SELECT *
 FROM {}.`functional_alltypes`
 WHERE `string_col` IN {}"""
-    assert result == expected.format(db.name, tuple(set(values)))
+    assert result == expected.format(db.name, tuple(values))
 
     filtered = alltypes[alltypes.string_col.notin(values)]
     result = ibis.clickhouse.compile(filtered)
     expected = """SELECT *
 FROM {}.`functional_alltypes`
 WHERE `string_col` NOT IN {}"""
-    assert result == expected.format(db.name, tuple(set(values)))
+    assert result == expected.format(db.name, tuple(values))
 
 
 def test_head(alltypes):
@@ -76,8 +76,8 @@ def test_limit_offset(alltypes):
     tm.assert_frame_equal(alltypes.limit(4).execute(), expected.head(4))
     tm.assert_frame_equal(alltypes.limit(8).execute(), expected.head(8))
     tm.assert_frame_equal(
-        alltypes.limit(4, offset=4).execute(),
-        expected.iloc[4:8].reset_index(drop=True),
+        alltypes.limit(4, offset=2).execute(),
+        expected.iloc[2:6].reset_index(drop=True),
     )
 
 
@@ -211,20 +211,6 @@ def test_scalar_exprs_no_table_refs(expr, expected):
     assert ibis.clickhouse.compile(expr) == expected
 
 
-def test_expr_list_no_table_refs():
-    exlist = ibis.api.expr_list(
-        [
-            ibis.literal(1).name('a'),
-            ibis.now().name('b'),
-            ibis.literal(2).log().name('c'),
-        ]
-    )
-    result = ibis.clickhouse.compile(exlist)
-    expected = """\
-SELECT 1 AS `a`, now() AS `b`, log(2) AS `c`"""
-    assert result == expected
-
-
 # TODO: use alltypes
 def test_isnull_case_expr_rewrite_failure(db, alltypes):
     # #172, case expression that was not being properly converted into an
@@ -267,43 +253,39 @@ def test_non_equijoin(alltypes):
         expr.execute()
 
 
-def test_join_with_predicate_on_different_columns_raises(
-    con, batting, awards_players
-):
-    t1 = batting
-    t2 = awards_players
-
-    pred = t1['playerID'] == t2['awardID']
-    expr = t1.inner_join(t2, [pred])[[t1]]
-
-    with pytest.raises(com.TranslationError):
-        ibis.clickhouse.compile(expr)
-
-
 @pytest.mark.parametrize(
-    ('join_type', 'join_clause'),
-    [
-        ('any_inner_join', 'ANY INNER JOIN'),
-        ('inner_join', 'ALL INNER JOIN'),
-        ('any_left_join', 'ANY LEFT JOIN'),
-        ('left_join', 'ALL LEFT JOIN'),
-    ],
+    ('join_type_and_clause', 'join_keys'),
+    product(
+        [
+            ('any_inner_join', 'ANY INNER JOIN'),
+            ('inner_join', 'ALL INNER JOIN'),
+            ('any_left_join', 'ANY LEFT JOIN'),
+            ('left_join', 'ALL LEFT JOIN'),
+        ],
+        [
+            ('playerID', 'playerID'),
+            ('playerID', 'awardID'),
+        ],  # noqa: E231
+    ),
 )
 def test_simple_joins(
-    con, db, batting, awards_players, join_type, join_clause
+    con, db, batting, awards_players, join_type_and_clause, join_keys
 ):
+    join_type, join_clause = join_type_and_clause
     t1, t2 = batting, awards_players
-    expr = getattr(t1, join_type)(t2, ['playerID'])[[t1]]
+    pred = [t1[join_keys[0]] == t2[join_keys[1]]]
+    join_keys_str = f'    ON t0.`{join_keys[0]}` = t1.`{join_keys[1]}`'
+    expr = getattr(t1, join_type)(t2, pred)[[t1]]
 
-    expected = """SELECT t0.*
-FROM {0}.`batting` t0
-  {join_clause} {0}.`awards_players` t1
-    USING `playerID`""".format(
-        db.name, join_clause=join_clause
+    expected = (
+        'SELECT t0.*\n'
+        f'FROM {db.name}.`batting` t0\n'
+        f'  {join_clause} {db.name}.`awards_players` t1\n'
+        f'{join_keys_str}'
     )
 
     assert ibis.clickhouse.compile(expr) == expected
-    assert len(con.execute(expr))
+    con.execute(expr)
 
 
 def test_self_reference_simple(con, db, alltypes):
@@ -320,11 +302,13 @@ def test_join_self_reference(con, db, alltypes):
     expr = t1.any_inner_join(t2, ['id'])[[t1]]
 
     result_sql = ibis.clickhouse.compile(expr)
-    expected_sql = """SELECT t0.*
-FROM {0}.`functional_alltypes` t0
-  ANY INNER JOIN {0}.`functional_alltypes` t1
-    USING `id`"""
-    assert result_sql == expected_sql.format(db.name)
+    expected_sql = (
+        'SELECT t0.*\n'
+        f'FROM {db.name}.`functional_alltypes` t0\n'
+        f'  ANY INNER JOIN {db.name}.`functional_alltypes` t1\n'
+        '    ON t0.`id` = t1.`id`'
+    )
+    assert result_sql == expected_sql
     assert len(con.execute(expr))
 
 
@@ -363,38 +347,6 @@ def test_where_use_if(con, alltypes, translate):
     expected = "if(`float_col` > 0, `int_col`, `bigint_col`)"
     assert result == expected
     con.execute(expr)
-
-
-# def test_union(alltypes):
-#     t = alltypes
-
-#     expr = (t.group_by('string_col')
-#             .aggregate(t.double_col.sum().name('foo'))
-#             .sort_by('string_col'))
-
-#     t1 = expr.limit(4)
-#     t2 = expr.limit(4, offset=4)
-#     t3 = expr.limit(8)
-
-#     result = t1.union(t2).execute()
-#     expected = t3.execute()
-#     tm.assert_frame_equal(result, expected)
-
-
-# def test_unions_with_ctes(con, alltypes):
-#     t = alltypes
-
-#     expr1 = (t.group_by(['tinyint_col', 'string_col'])
-#              .aggregate(t.double_col.sum().name('metric')))
-#     expr2 = expr1.view()
-
-#     join1 = (expr1.join(expr2, expr1.string_col == expr2.string_col)
-#              [[expr1]])
-#     join2 = join1.view()
-
-#     expr = join1.union(join2)
-#     con.execute(expr)
-#     con.explain(expr)
 
 
 @pytest.mark.xfail(

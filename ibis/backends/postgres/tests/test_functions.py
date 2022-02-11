@@ -10,6 +10,7 @@ import pandas.testing as tm
 import pytest
 import sqlalchemy as sa
 from pytest import param
+from sqlalchemy.dialects import postgresql
 
 import ibis
 import ibis.config as config
@@ -17,8 +18,6 @@ import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
 from ibis import literal as L
 from ibis.expr.window import rows_with_max_lookback
-
-pytestmark = pytest.mark.postgres
 
 
 @pytest.fixture
@@ -54,9 +53,7 @@ def guid2(con):
         ),
         param(
             lambda t: t.string_col.cast('double'),
-            lambda at: sa.cast(
-                at.c.string_col, sa.dialects.postgresql.DOUBLE_PRECISION
-            ),
+            lambda at: sa.cast(at.c.string_col, postgresql.DOUBLE_PRECISION),
             id='string_to_double',
         ),
         param(
@@ -952,7 +949,7 @@ def test_cumulative_partitioned_ordered_window(alltypes, func, df):
     f = getattr(t.double_col, func)
     expr = t.projection([(t.double_col - f().over(window)).name('double_col')])
     result = expr.execute().double_col
-    method = operator.methodcaller('cum{}'.format(func))
+    method = operator.methodcaller(f'cum{func}')
     expected = df.groupby(df.string_col).double_col.transform(
         lambda c: c - method(c)
     )
@@ -1095,35 +1092,9 @@ def test_array_collect(array_types):
         (None, 3),
         (None, None),
         (3, None),
-        # negative slices are not supported
-        param(
-            -3,
-            None,
-            marks=pytest.mark.xfail(
-                raises=ValueError, reason='Negative slicing not supported'
-            ),
-        ),
-        param(
-            None,
-            -3,
-            marks=pytest.mark.xfail(
-                raises=ValueError, reason='Negative slicing not supported'
-            ),
-        ),
-        param(
-            -3,
-            -1,
-            marks=pytest.mark.xfail(
-                raises=ValueError, reason='Negative slicing not supported'
-            ),
-        ),
-        param(
-            -3,
-            -1,
-            marks=pytest.mark.xfail(
-                raises=ValueError, reason='Negative slicing not supported'
-            ),
-        ),
+        (-3, None),
+        (None, -3),
+        (-3, -1),
     ],
 )
 def test_array_slice(array_types, start, stop):
@@ -1135,14 +1106,14 @@ def test_array_slice(array_types, start, stop):
     tm.assert_frame_equal(result, expected)
 
 
-@pytest.mark.parametrize('index', [1, 3, 4, 11])
+@pytest.mark.parametrize('index', [0, 1, 3, 4, 11, -1, -3, -4, -11])
 def test_array_index(array_types, index):
     expr = array_types[array_types.y[index].name('indexed')]
     result = expr.execute()
     expected = pd.DataFrame(
         {
             'indexed': array_types.y.execute().map(
-                lambda x: x[index] if index < len(x) else None
+                lambda x: x[index] if -len(x) <= index < len(x) else None
             )
         }
     )
@@ -1234,9 +1205,7 @@ def trunc(con, guid):
             guid
         )
     )
-    con.raw_sql(
-        """INSERT INTO "{}" (name) VALUES ('a'), ('b'), ('c')""".format(guid)
-    )
+    con.raw_sql(f"""INSERT INTO "{guid}" (name) VALUES ('a'), ('b'), ('c')""")
     return con.table(guid)
 
 
@@ -1394,7 +1363,9 @@ def test_boolean_reduction(alltypes, opname, df):
 
 
 def test_boolean_summary(alltypes):
-    expr = alltypes.bool_col.summary()
+    bool_col_summary = alltypes.bool_col.summary()
+    expr = alltypes.aggregate(bool_col_summary)
+
     result = expr.execute()
     expected = pd.DataFrame(
         [[7300, 0, 0, 1, 3650, 0.5, 2]],

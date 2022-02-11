@@ -13,8 +13,6 @@ import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
 from ibis import literal as L
 
-pytestmark = pytest.mark.clickhouse
-
 
 @pytest.mark.parametrize(
     ('to_type', 'expected'),
@@ -46,13 +44,6 @@ def test_cast_string_col(alltypes, translate, to_type, expected):
     assert translate(expr) == expected
 
 
-@pytest.mark.xfail(
-    raises=AssertionError, reason='Clickhouse doesn\'t have decimal type'
-)
-def test_decimal_cast():
-    assert False
-
-
 @pytest.mark.parametrize(
     'column',
     [
@@ -77,7 +68,7 @@ def test_noop_cast(alltypes, translate, column):
     col = alltypes[column]
     result = col.cast(col.type())
     assert result.equals(col)
-    assert translate(result) == '`{}`'.format(column)
+    assert translate(result) == f'`{column}`'
 
 
 def test_timestamp_cast_noop(alltypes, translate):
@@ -400,21 +391,34 @@ def test_translate_math_functions(con, alltypes, translate, call, expected):
 @pytest.mark.parametrize(
     ('expr', 'expected'),
     [
-        (L(-5).abs(), 5),
-        (L(5).abs(), 5),
-        (L(5.5).round(), 6.0),
-        (L(5.556).round(2), 5.56),
-        (L(5.556).ceil(), 6.0),
-        (L(5.556).floor(), 5.0),
-        (L(5.556).exp(), math.exp(5.556)),
-        (L(5.556).sign(), 1),
-        (L(-5.556).sign(), -1),
-        (L(0).sign(), 0),
-        (L(5.556).sqrt(), math.sqrt(5.556)),
-        (L(5.556).log(2), math.log(5.556, 2)),
-        (L(5.556).ln(), math.log(5.556)),
-        (L(5.556).log2(), math.log(5.556, 2)),
-        (L(5.556).log10(), math.log10(5.556)),
+        pytest.param(L(-5).abs(), 5, id="abs_neg"),
+        pytest.param(L(5).abs(), 5, id="abs"),
+        pytest.param(L(5.5).round(), 6.0, id="round"),
+        pytest.param(L(5.556).round(2), 5.56, id="round_places"),
+        pytest.param(L(5.556).ceil(), 6.0, id="ceil"),
+        pytest.param(L(5.556).floor(), 5.0, id="floor"),
+        pytest.param(L(5.556).sign(), 1, id="sign"),
+        pytest.param(L(-5.556).sign(), -1, id="sign_neg"),
+        pytest.param(L(0).sign(), 0, id="sign_zero"),
+        pytest.param(L(5.556).sqrt(), math.sqrt(5.556), id="sqrt"),
+        pytest.param(L(5.556).log(2), math.log(5.556, 2), id="log2_arg"),
+        pytest.param(L(5.556).log2(), math.log(5.556, 2), id="log2"),
+        pytest.param(L(5.556).log10(), math.log10(5.556), id="log10"),
+        # clickhouse has different functions for exp/ln that are faster
+        # than the defaults, but less precise
+        #
+        # we can't use the e() function as it still gives different results
+        # from `math.exp`
+        pytest.param(
+            L(5.556).exp().round(8),
+            round(math.exp(5.556), 8),
+            id="exp",
+        ),
+        pytest.param(
+            L(5.556).ln().round(7),
+            round(math.log(5.556), 7),
+            id="ln",
+        ),
     ],
 )
 def test_math_functions(con, expr, expected, translate):
@@ -502,6 +506,20 @@ def test_null_column(alltypes, translate):
     tm.assert_series_equal(result, expected)
 
 
+def test_literal_none_to_nullable_colum(alltypes):
+    # GH: 2985
+    t = alltypes
+    nrows = t.count().execute()
+    expr = t.mutate(
+        ibis.literal(None, dt.String(nullable=True)).name(
+            'nullable_string_column'
+        )
+    )
+    result = expr['nullable_string_column'].execute()
+    expected = pd.Series([None] * nrows, name='nullable_string_column')
+    tm.assert_series_equal(result, expected)
+
+
 @pytest.mark.parametrize(
     ('attr', 'expected'),
     [
@@ -532,3 +550,32 @@ def test_count_distinct_with_filter(alltypes):
     expected = alltypes.string_col.execute()
     expected = expected[expected.astype('int64') > 1].nunique()
     assert result == expected
+
+
+@pytest.mark.parametrize(
+    ('sep', 'where_case', 'expected'),
+    [
+        (',', None, "arrayStringConcat(groupArray(`string_col`), ',')"),
+        ('-', None, "arrayStringConcat(groupArray(`string_col`), '-')"),
+        pytest.param(
+            ',',
+            0,
+            (
+                "arrayStringConcat(groupArray("
+                "CASE WHEN `bool_col` = 0 THEN "
+                "`string_col` ELSE Null END), ',')"
+            ),
+            marks=pytest.mark.xfail(
+                reason=(
+                    '`where` param needs `Nullable` column '
+                    'but the all in testing data is not.'
+                    'See also issue #2891'
+                )
+            ),
+        ),
+    ],
+)
+def test_group_concat(alltypes, sep, where_case, expected, translate):
+    where = None if where_case is None else alltypes.bool_col == where_case
+    expr = alltypes.string_col.group_concat(sep, where)
+    assert translate(expr) == expected

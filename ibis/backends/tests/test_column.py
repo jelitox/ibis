@@ -2,8 +2,6 @@ import numpy as np
 import pandas as pd
 import pytest
 
-ROWID_ZERO_INDEXED_BACKENDS = ('omniscidb',)
-
 
 @pytest.mark.parametrize(
     'column',
@@ -14,7 +12,7 @@ ROWID_ZERO_INDEXED_BACKENDS = ('omniscidb',)
         pytest.param('timestamp_col', marks=pytest.mark.skip(reason='hangs')),
     ],
 )
-@pytest.mark.xfail_unsupported
+@pytest.mark.notimpl(["datafusion"])
 def test_distinct_column(backend, alltypes, df, column):
     expr = alltypes[column].distinct()
     result = expr.execute()
@@ -22,11 +20,25 @@ def test_distinct_column(backend, alltypes, df, column):
     assert set(result) == set(expected)
 
 
-@pytest.mark.xfail_unsupported
+@pytest.mark.notimpl(
+    [
+        "postgres",
+        "mysql",
+        "hdf5",
+        "pandas",
+        "csv",
+        "parquet",
+        "dask",
+        "datafusion",
+        "clickhouse",
+        "pyspark",
+        "impala",
+    ]
+)
 def test_rowid(con, backend):
     t = con.table('functional_alltypes')
     result = t[t.rowid()].execute()
-    first_value = 0 if backend.name() in ROWID_ZERO_INDEXED_BACKENDS else 1
+    first_value = 1
     expected = pd.Series(
         range(first_value, first_value + len(result)),
         dtype=np.int64,
@@ -35,11 +47,25 @@ def test_rowid(con, backend):
     pd.testing.assert_series_equal(result.iloc[:, 0], expected)
 
 
-@pytest.mark.xfail_unsupported
+@pytest.mark.notimpl(
+    [
+        "postgres",
+        "mysql",
+        "hdf5",
+        "pandas",
+        "csv",
+        "parquet",
+        "dask",
+        "datafusion",
+        "clickhouse",
+        "pyspark",
+        "impala",
+    ]
+)
 def test_named_rowid(con, backend):
     t = con.table('functional_alltypes')
     result = t[t.rowid().name('number')].execute()
-    first_value = 0 if backend.name() in ROWID_ZERO_INDEXED_BACKENDS else 1
+    first_value = 1
     expected = pd.Series(
         range(first_value, first_value + len(result)),
         dtype=np.int64,

@@ -15,7 +15,8 @@ import ibis.expr.operations as ops
 import ibis.expr.types as ir
 from ibis.common.exceptions import ExpressionError, RelationError
 from ibis.expr.types import ColumnExpr, TableExpr
-from ibis.tests.util import assert_equal
+from ibis.tests.expr.mocks import MockAlchemyBackend, MockBackend
+from ibis.tests.util import assert_equal, assert_pickle_roundtrip
 
 
 @pytest.fixture
@@ -69,7 +70,7 @@ def test_view_new_relation(table):
     # meaning when it comes to execution
     tview = table.view()
 
-    roots = tview._root_tables()
+    roots = tview.op().root_tables()
     assert len(roots) == 1
     assert roots[0] is tview.op()
 
@@ -159,20 +160,13 @@ def test_projection_invalid_root(table):
 def test_projection_unnamed_literal_interactive_blowup(con):
     # #147 and #153 alike
     table = con.table('functional_alltypes')
+    exprs = [table.bigint_col, ibis.literal(5)]
 
     with config.option_context('interactive', True):
         try:
-            table.select([table.bigint_col, ibis.literal(5)])
+            table.select(exprs)
         except Exception as e:
             assert 'named' in e.args[0]
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_projection_of_aggregated(table):
-    # Fully-formed aggregations "block"; in a projection, column
-    # expressions referencing table expressions below the aggregation are
-    # invalid.
-    assert False
 
 
 def test_projection_with_star_expr(table):
@@ -224,20 +218,6 @@ def test_projection_array_expr(table):
     result = table[table.a]
     expected = table[[table.a]]
     assert_equal(result, expected)
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_add_column_aggregate_crossjoin(table):
-    # A new column that depends on a scalar value produced by this or some
-    # other table.
-    #
-    # For example:
-    # SELECT *, b - VAL
-    # FROM table1
-    #
-    # Here, VAL could be something produced by aggregating table1 or any
-    # other table for that matter.
-    assert False
 
 
 def test_mutate(table):
@@ -528,14 +508,48 @@ def test_summary_expand_list(table):
 
     metric = table.g.group_concat().name('bar')
     result = table.aggregate([metric, summ])
-    expected = table.aggregate([metric] + summ.exprs())
+    expected = table.aggregate([metric] + summ)
     assert_equal(result, expected)
 
 
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_aggregate_invalid(table):
-    # Pass a non-aggregation or non-scalar expr
-    assert False
+def test_summary_prefix_suffix(table):
+    def get_names(exprs):
+        return [e.get_name() for e in exprs]
+
+    assert get_names(table.g.summary(prefix="string_")) == [
+        'string_count',
+        'string_nulls',
+        'string_uniques',
+    ]
+    assert get_names(table.g.summary(suffix="_string")) == [
+        'count_string',
+        'nulls_string',
+        'uniques_string',
+    ]
+    assert get_names(table.g.summary(prefix="pre_", suffix="_post")) == [
+        'pre_count_post',
+        'pre_nulls_post',
+        'pre_uniques_post',
+    ]
+
+    assert get_names(table.f.summary(prefix="float_")) == [
+        "float_count",
+        "float_nulls",
+        "float_min",
+        "float_max",
+        "float_sum",
+        "float_mean",
+        "float_approx_nunique",
+    ]
+    assert get_names(table.f.summary(suffix="_numeric")) == [
+        "count_numeric",
+        "nulls_numeric",
+        "min_numeric",
+        "max_numeric",
+        "sum_numeric",
+        "mean_numeric",
+        "approx_nunique_numeric",
+    ]
 
 
 def test_filter_aggregate_pushdown_predicate(table):
@@ -556,20 +570,21 @@ def test_filter_aggregate_pushdown_predicate(table):
     assert_equal(filtered, expected)
 
 
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_filter_aggregate_partial_pushdown(table):
-    assert False
-
-
-def test_aggregate_post_predicate(table):
+@pytest.mark.parametrize(
+    "case_fn",
+    [
+        pytest.param(lambda t: t.f.sum(), id="non_boolean"),
+        pytest.param(lambda t: t.f > 2, id="non_scalar"),
+    ],
+)
+def test_aggregate_post_predicate(table, case_fn):
     # Test invalid having clause
     metrics = [table.f.sum().name('total')]
     by = ['g']
+    having = [case_fn(table)]
 
-    invalid_having_cases = [table.f.sum(), table.f > 2]
-    for case in invalid_having_cases:
-        with pytest.raises(com.ExpressionError):
-            table.aggregate(metrics, by=by, having=[case])
+    with pytest.raises(com.IbisTypeError):
+        table.aggregate(metrics, by=by, having=having)
 
 
 def test_group_by_having_api(table):
@@ -592,11 +607,6 @@ def test_group_by_kwargs(table):
         t.d.mean().name('foo')
     )
     assert_equal(expr, expected)
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_aggregate_root_table_internal(table):
-    assert False
 
 
 def test_compound_aggregate_expr(table):
@@ -711,7 +721,14 @@ def test_asof_join():
     left = ibis.table([('time', 'int32'), ('value', 'double')])
     right = ibis.table([('time', 'int32'), ('value2', 'double')])
     joined = api.asof_join(left, right, 'time')
-    pred = joined.op().predicates[0].op()
+
+    assert joined.columns == [
+        "time_x",
+        "value",
+        "time_y",
+        "value2",
+    ]
+    pred = joined.op().table.op().predicates[0].op()
     assert pred.left.op().name == pred.right.op().name == 'time'
 
 
@@ -723,7 +740,15 @@ def test_asof_join_with_by():
         [('time', 'int32'), ('key', 'int32'), ('value2', 'double')]
     )
     joined = api.asof_join(left, right, 'time', by='key')
-    by = joined.op().by[0].op()
+    assert joined.columns == [
+        "time_x",
+        "key_x",
+        "value",
+        "time_y",
+        "key_y",
+        "value2",
+    ]
+    by = joined.op().table.op().by[0].op()
     assert by.left.op().name == by.right.op().name == 'key'
 
 
@@ -754,11 +779,11 @@ def test_asof_join_with_tolerance(ibis_interval, timedelta_interval):
     )
 
     joined = api.asof_join(left, right, 'time', tolerance=ibis_interval)
-    tolerance = joined.op().tolerance
+    tolerance = joined.op().table.op().tolerance
     assert_equal(tolerance, ibis_interval)
 
     joined = api.asof_join(left, right, 'time', tolerance=timedelta_interval)
-    tolerance = joined.op().tolerance
+    tolerance = joined.op().table.op().tolerance
     assert isinstance(tolerance, ir.IntervalScalar)
     assert isinstance(tolerance.op(), ops.Literal)
 
@@ -777,7 +802,7 @@ def test_equijoin_schema_merge():
 
     for fname in join_types:
         f = getattr(table1, fname)
-        joined = f(table2, [pred]).materialize()
+        joined = f(table2, [pred])
         assert_equal(joined.schema(), ex_schema)
 
 
@@ -827,14 +852,6 @@ def test_self_join(table):
     metric = (left['a'] - right['b']).mean().name('metric')
 
     joined = left.inner_join(right, [right['g'] == left['g']])
-    # basic check there's no referential problems
-    result_repr = repr(joined)
-    assert 'ref_0' in result_repr
-    assert 'ref_1' in result_repr
-
-    # Cannot be immediately materialized because of the schema overlap
-    with pytest.raises(RelationError):
-        joined.materialize()
 
     # Project out left table schema
     proj = joined[[left]]
@@ -852,24 +869,20 @@ def test_self_join_no_view_convenience(table):
 
     result = table.join(table, [('g', 'g')])
 
-    t2 = table.view()
-    expected = table.join(t2, table.g == t2.g)
-    assert_equal(result, expected)
+    assert result.columns == [f"{column}_x" for column in table.columns] + [
+        f"{column}_y" for column in table.columns
+    ]
 
 
-def test_materialized_join_reference_bug(con):
+def test_join_reference_bug(con):
     # GH#403
     orders = con.table('tpch_orders')
     customer = con.table('tpch_customer')
     lineitem = con.table('tpch_lineitem')
 
-    items = (
-        orders.join(lineitem, orders.o_orderkey == lineitem.l_orderkey)[
-            lineitem, orders.o_custkey, orders.o_orderpriority
-        ]
-        .join(customer, [('o_custkey', 'c_custkey')])
-        .materialize()
-    )
+    items = orders.join(lineitem, orders.o_orderkey == lineitem.l_orderkey)[
+        lineitem, orders.o_custkey, orders.o_orderpriority
+    ].join(customer, [('o_custkey', 'c_custkey')])
     items['o_orderpriority'].value_counts()
 
 
@@ -906,7 +919,7 @@ def test_semi_join_schema(table):
     table2 = ibis.table([('key2', 'string'), ('stuff', 'double')])
 
     pred = table1['key1'] == table2['key2']
-    semi_joined = table1.semi_join(table2, [pred]).materialize()
+    semi_joined = table1.semi_join(table2, [pred])
 
     result_schema = semi_joined.schema()
     assert_equal(result_schema, table1.schema())
@@ -919,7 +932,7 @@ def test_cross_join(table):
     ]
     scalar_aggs = table.aggregate(metrics)
 
-    joined = table.cross_join(scalar_aggs).materialize()
+    joined = table.cross_join(scalar_aggs)
     agg_schema = api.Schema(['sum_a', 'mean_b'], ['int64', 'double'])
     ex_schema = table.schema().append(agg_schema)
     assert_equal(joined.schema(), ex_schema)
@@ -935,13 +948,7 @@ def test_cross_join_multiple(table):
     assert joined.equals(expected)
 
 
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_join_compound_boolean_predicate(table):
-    # The user might have composed predicates through logical operations
-    assert False
-
-
-def test_filter_join_unmaterialized(table):
+def test_filter_join(table):
     table1 = ibis.table(
         {'key1': 'string', 'key2': 'string', 'value1': 'double'}
     )
@@ -1006,7 +1013,7 @@ def test_join_invalid_expr_type(con):
     invalid_right = left.foo_id
     join_key = ['bar_id']
 
-    with pytest.raises(TypeError, match=type(invalid_right).__name__):
+    with pytest.raises(NotImplementedError, match="string __getitem__"):
         left.inner_join(invalid_right, join_key)
 
 
@@ -1048,16 +1055,6 @@ def test_unravel_compound_equijoin(table):
     joined = t1.inner_join(t2, [p1 & p2 & p3])
     expected = t1.inner_join(t2, [p1, p2, p3])
     assert_equal(joined, expected)
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_join_add_prefixes(table):
-    assert False
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_join_nontrivial_exprs(table):
-    assert False
 
 
 def test_union(
@@ -1147,12 +1144,6 @@ def test_simple_existence_predicate(t1, t2):
     # it works!
     expr = t1[cond]
     assert isinstance(expr.op(), ops.Selection)
-
-
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_cannot_use_existence_expression_in_join(table):
-    # Join predicates must consist only of comparisons
-    assert False
 
 
 def test_not_exists_predicate(t1, t2):
@@ -1298,6 +1289,39 @@ def test_pickle_table_expr():
     assert t1.equals(t0)
 
 
+def test_pickle_table_node(table):
+    n0 = table.op()
+    assert_pickle_roundtrip(n0)
+
+
+def test_pickle_projection_node(table):
+    m = table.mutate(foo=table.f * 2)
+
+    def f(x):
+        return (x.foo * 2).name('bar')
+
+    node = m.projection([f, 'f']).op()
+
+    assert_pickle_roundtrip(node)
+
+
+def test_pickle_group_by(table):
+    m = table.mutate(foo=table.f * 2, bar=table.e / 2)
+    expr = m.group_by(lambda x: x.foo).size()
+    node = expr.op()
+
+    assert_pickle_roundtrip(node)
+
+
+def test_pickle_asof_join():
+    left = ibis.table([('time', 'int32'), ('value', 'double')])
+    right = ibis.table([('time', 'int32'), ('value2', 'double')])
+    joined = api.asof_join(left, right, 'time')
+    node = joined.op()
+
+    assert_pickle_roundtrip(node)
+
+
 def test_group_by_key_function():
     t = ibis.table([('a', 'timestamp'), ('b', 'string'), ('c', 'double')])
     expr = t.groupby(new_key=lambda t: t.b.length()).aggregate(foo=t.c.mean())
@@ -1321,3 +1345,89 @@ def test_mutate_chain():
     assert isinstance(a.op(), ops.IfNull)
     assert isinstance(b.op(), ops.TableColumn)
     assert isinstance(b.op().table.op().selections[1].op(), ops.IfNull)
+
+
+def test_multiple_dbcon():
+    """
+    Expr from multiple connections to same DB should be compatible.
+    """
+    con1 = MockBackend()
+    con2 = MockBackend()
+
+    con1.table('alltypes').union(con2.table('alltypes')).execute()
+
+
+def test_multiple_db_different_backends():
+    con1 = MockBackend()
+    con2 = MockAlchemyBackend()
+
+    backend1_table = con1.table('alltypes')
+    backend2_table = con2.table('alltypes')
+
+    with pytest.raises(RelationError):
+        backend1_table.union(backend2_table)
+
+
+def test_merge_as_of_allows_overlapping_columns():
+    # GH3295
+    table = ibis.table(
+        [
+            ("field", "string"),
+            ("value", "float64"),
+            ("timestamp_received", "timestamp"),
+        ],
+        name="t",
+    )
+
+    signal_one = table[
+        table['field'].contains('signal_one')
+        & table['field'].contains('current')
+    ]
+    signal_one = signal_one[
+        'value', 'timestamp_received', 'field'
+    ]  # select columns we care about
+    signal_one = signal_one.relabel(
+        {'value': 'current', 'field': 'signal_one'}
+    )
+
+    signal_two = table[
+        table['field'].contains('signal_two')
+        & table['field'].contains('voltage')
+    ]
+    signal_two = signal_two[
+        'value', 'timestamp_received', 'field'
+    ]  # select columns we care about
+    signal_two = signal_two.relabel(
+        {'value': 'voltage', 'field': 'signal_two'}
+    )
+
+    merged = ibis.api.asof_join(signal_one, signal_two, 'timestamp_received')
+    assert merged.columns == [
+        'current',
+        'timestamp_received_x',
+        'signal_one',
+        'voltage',
+        'timestamp_received_y',
+        'signal_two',
+    ]
+
+
+def test_select_from_unambiguous_join_with_strings():
+    # GH1387
+    t = ibis.table([('a', 'int64'), ('b', 'string')])
+    s = ibis.table([('b', 'int64'), ('c', 'string')])
+    joined = t.left_join(s, [t.b == s.c])
+    expr = joined[t, 'c']
+    assert expr.columns == ["a", "b", "c"]
+
+
+def test_filter_applied_to_join():
+    # GH2437
+    countries = ibis.table([("iso_alpha3", "string")])
+    gdp = ibis.table([("country_code", "string"), ("year", "int64")])
+
+    expr = countries.inner_join(
+        gdp,
+        predicates=[countries["iso_alpha3"] == gdp["country_code"]],
+    ).filter(gdp["year"] == 2017)
+    assert expr.columns == ["iso_alpha3", "country_code", "year"]

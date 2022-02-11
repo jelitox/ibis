@@ -8,7 +8,7 @@ import math
 import numbers
 import operator
 from collections.abc import Sized
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -16,7 +16,6 @@ import toolz
 from pandas.api.types import DatetimeTZDtype
 from pandas.core.groupby import DataFrameGroupBy, SeriesGroupBy
 
-import ibis
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
@@ -25,8 +24,9 @@ from ibis.expr.scope import Scope
 from ibis.expr.timecontext import get_time_col
 from ibis.expr.typing import TimeContext
 
+from .. import Backend as PandasBackend
 from .. import aggcontext as agg_ctx
-from ..client import PandasClient, PandasTable
+from ..client import PandasTable
 from ..core import (
     boolean_types,
     execute,
@@ -141,7 +141,7 @@ def execute_cast_series_timestamp(op, data, type, **kwargs):
         timestamps = method(tz)
         return pd.Series(timestamps, index=data.index, name=data.name)
 
-    raise TypeError("Don't know how to cast {} to {}".format(from_type, type))
+    raise TypeError(f"Don't know how to cast {from_type} to {type}")
 
 
 def _normalize(values, original_index, name, timezone=None):
@@ -179,7 +179,7 @@ def execute_cast_series_date(op, data, type, **kwargs):
             name=data.name,
         )
 
-    raise TypeError("Don't know how to cast {} to {}".format(from_type, type))
+    raise TypeError(f"Don't know how to cast {from_type} to {type}")
 
 
 @execute_node.register(ops.SortKey, pd.Series, bool)
@@ -363,9 +363,7 @@ def execute_cast_string_literal(op, data, type, **kwargs):
     try:
         cast_function = constants.IBIS_TO_PYTHON_LITERAL_TYPES[type]
     except KeyError:
-        raise TypeError(
-            "Don't know how to cast {!r} to type {}".format(data, type)
-        )
+        raise TypeError(f"Don't know how to cast {data!r} to type {type}")
     else:
         return cast_function(data)
 
@@ -412,7 +410,7 @@ def execute_aggregation_dataframe(
         )
         data = data.loc[predicate]
 
-    columns = {}
+    columns: Dict[str, str] = {}
 
     if op.by:
         grouping_key_pairs = list(
@@ -518,7 +516,7 @@ def execute_arbitrary_series_groupby(op, data, _, aggcontext=None, **kwargs):
 
     if how not in {'first', 'last'}:
         raise com.OperationNotDefinedError(
-            'Arbitrary {!r} is not supported'.format(how)
+            f'Arbitrary {how!r} is not supported'
         )
     return aggcontext.agg(data, how)
 
@@ -600,7 +598,7 @@ def execute_arbitrary_series_mask(op, data, mask, aggcontext=None, **kwargs):
         index = -1
     else:
         raise com.OperationNotDefinedError(
-            'Arbitrary {!r} is not supported'.format(op.how)
+            f'Arbitrary {op.how!r} is not supported'
         )
 
     data = data[mask] if mask is not None else data
@@ -702,7 +700,7 @@ def execute_binary_op(op, left, right, **kwargs):
         operation = constants.BINARY_OPERATIONS[op_type]
     except KeyError:
         raise NotImplementedError(
-            'Binary operation {} not implemented'.format(op_type.__name__)
+            f'Binary operation {op_type.__name__} not implemented'
         )
     else:
         return operation(left, right)
@@ -810,7 +808,7 @@ def execute_difference_dataframe_dataframe(
     merged = left.merge(
         right, on=list(left.columns), how='outer', indicator=True
     )
-    result = merged[merged["_merge"] != "both"].drop("_merge", 1)
+    result = merged[merged["_merge"] != "both"].drop("_merge", axis=1)
     return result
 
 
@@ -921,7 +919,7 @@ def execute_node_where_scalar_scalar_series(op, cond, true, false, **kwargs):
     return pd.Series(np.repeat(true, len(false))) if cond else false
 
 
-@execute_node.register(PandasTable, PandasClient)
+@execute_node.register(PandasTable, PandasBackend)
 def execute_database_table_client(
     op, client, timecontext: Optional[TimeContext], **kwargs
 ):
@@ -963,6 +961,22 @@ def execute_node_math_function_number(op, value, **kwargs):
 @execute_node.register(ops.Log, numeric_types, numeric_types)
 def execute_node_log_number_number(op, value, base, **kwargs):
     return math.log(value, base)
+
+
+@execute_node.register(ops.DropNa, pd.DataFrame)
+def execute_node_dropna_dataframe(op, df, **kwargs):
+    subset = [col.get_name() for col in op.subset] if op.subset else None
+    return df.dropna(how=op.how, subset=subset)
+
+
+@execute_node.register(ops.FillNa, pd.DataFrame, simple_types)
+def execute_node_fillna_dataframe_scalar(op, df, replacements, **kwargs):
+    return df.fillna(replacements)
+
+
+@execute_node.register(ops.FillNa, pd.DataFrame)
+def execute_node_fillna_dataframe_dict(op, df, **kwargs):
+    return df.fillna(op.replacements)
 
 
 @execute_node.register(ops.IfNull, pd.Series, simple_types)
@@ -1039,15 +1053,6 @@ def execute_node_least_list(op, value, **kwargs):
 def execute_node_coalesce(op, values, **kwargs):
     # TODO: this is slow
     return compute_row_reduction(coalesce, values)
-
-
-@execute_node.register(ops.ExpressionList, collections.abc.Sequence)
-def execute_node_expr_list(op, sequence, **kwargs):
-    # TODO: no true approx count distinct for pandas, so we use exact for now
-    columns = [e.get_name() for e in op.exprs]
-    schema = ibis.schema(list(zip(columns, (e.type() for e in op.exprs))))
-    data = {col: [execute(el, **kwargs)] for col, el in zip(columns, sequence)}
-    return schema.apply_to(pd.DataFrame(data, columns=columns))
 
 
 def wrap_case_result(raw, expr):

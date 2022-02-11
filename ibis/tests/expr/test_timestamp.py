@@ -3,7 +3,6 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import pytest
-from pkg_resources import parse_version
 
 import ibis
 import ibis.expr.api as api
@@ -69,12 +68,6 @@ def test_invalid_timestamp_literal():
         ibis.timestamp('2015-01-01 00:71')
 
 
-@pytest.mark.xfail(raises=AssertionError, reason='NYT')
-def test_integer_to_timestamp():
-    # #246
-    assert False
-
-
 def test_comparison_timestamp(alltypes):
     expr = alltypes.i > alltypes.i.min() + ibis.interval(days=3)
     assert isinstance(expr, ir.BooleanColumn)
@@ -99,11 +92,6 @@ def test_comparisons_pandas_timestamp(alltypes):
     assert isinstance(op.right, ir.TimestampScalar)
 
 
-@pytest.mark.xfail(
-    condition=parse_version(pd.__version__) < parse_version('0.25'),
-    raises=TypeError,
-    reason='Upstream pandas bug',
-)
 def test_greater_comparison_pandas_timestamp(alltypes):
     val = pd.Timestamp('2015-01-01 00:00:00')
     expr2 = val < alltypes.i

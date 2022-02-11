@@ -1,0 +1,38 @@
+{
+    "gitignore.nix": {
+        "branch": "master",
+        "description": "Nix functions for filtering local git sources",
+        "homepage": "",
+        "owner": "hercules-ci",
+        "repo": "gitignore.nix",
+        "rev": "5b9e0ff9d3b551234b4f3eb3983744fa354b17f1",
+        "sha256": "01l4phiqgw9xgaxr6jr456qmww6kzghqrnbc7aiiww3h6db5vw53",
+        "type": "tarball",
+        "url": "https://github.com/hercules-ci/gitignore.nix/archive/5b9e0ff9d3b551234b4f3eb3983744fa354b17f1.tar.gz",
+        "url_template": "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
+    },
+    "nixpkgs": {
+        "branch": "nixos-unstable-small",
+        "description": "Nix Packages collection",
+        "homepage": "",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "7fbfdff50892d8976a076a1bb8b591973df70a0e",
+        "sha256": "09l71352yi2rj5n0hkq6m9vddks7px9fakkay2n2r6csxcl1kmhw",
+        "type": "tarball",
+        "url": "https://github.com/NixOS/nixpkgs/archive/7fbfdff50892d8976a076a1bb8b591973df70a0e.tar.gz",
+        "url_template": "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
+    },
+    "poetry2nix": {
+        "branch": "master",
+        "description": "Convert poetry projects to nix automagically [maintainer=@adisbladis] ",
+        "homepage": "",
+        "owner": "nix-community",
+        "repo": "poetry2nix",
+        "rev": "d3dc8d28f29cb56ed861585ed3ec393b7d859261",
+        "sha256": "107qpl1plw52bacr5ap0a9apnjw97x9kc6gbdwi1rjxjhfvw4wgr",
+        "type": "tarball",
+        "url": "https://github.com/nix-community/poetry2nix/archive/d3dc8d28f29cb56ed861585ed3ec393b7d859261.tar.gz",
+        "url_template": "https://github.com/<owner>/<repo>/archive/<rev>.tar.gz"
+    }
+}

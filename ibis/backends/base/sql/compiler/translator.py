@@ -1,10 +1,12 @@
+from __future__ import annotations
+
+import itertools
 import operator
+from typing import Callable, Iterable, Iterator
 
 import ibis
 import ibis.common.exceptions as com
-import ibis.expr.analytics as analytics
 import ibis.expr.datatypes as dt
-import ibis.expr.format as fmt
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
 from ibis.backends.base.sql.registry import (
@@ -14,29 +16,21 @@ from ibis.backends.base.sql.registry import (
 
 
 class QueryContext:
-
     """Records bits of information used during ibis AST to SQL translation.
 
     Notably, table aliases (for subquery construction) and scalar query
     parameters are tracked here.
     """
 
-    def __init__(
-        self, compiler, indent=2, parent=None, memo=None, params=None
-    ):
+    def __init__(self, compiler, indent=2, parent=None, params=None):
         self.compiler = compiler
-        self._table_refs = {}
+        self.table_refs = {}
         self.extracted_subexprs = set()
         self.subquery_memo = {}
         self.indent = indent
         self.parent = parent
-
         self.always_alias = False
-
         self.query = None
-
-        self._table_key_memo = {}
-        self.memo = memo or fmt.FormatMemo()
         self.params = params if params is not None else {}
 
     def _compile_subquery(self, expr):
@@ -46,16 +40,18 @@ class QueryContext:
     def _to_sql(self, expr, ctx):
         return self.compiler.to_sql(expr, ctx)
 
-    def collapse(self, queries):
-        """Turn a sequence of queries into something executable.
+    def collapse(self, queries: Iterable[str]) -> str:
+        """Turn an iterable of queries into something executable.
 
         Parameters
         ----------
-        queries : List[str]
+        queries
+            Iterable of query strings
 
         Returns
         -------
-        query : str
+        query
+            A single query string
         """
         return '\n\n'.join(queries)
 
@@ -73,8 +69,10 @@ class QueryContext:
         this = self.top_context
 
         key = self._get_table_key(expr)
-        if key in this.subquery_memo:
+        try:
             return this.subquery_memo[key]
+        except KeyError:
+            pass
 
         op = expr.op()
         if isinstance(op, ops.SQLQueryResult):
@@ -86,46 +84,61 @@ class QueryContext:
         return result
 
     def make_alias(self, expr):
-        i = len(self._table_refs)
+        i = len(self.table_refs)
 
         key = self._get_table_key(expr)
 
         # Get total number of aliases up and down the tree at this point; if we
         # find the table prior-aliased along the way, however, we reuse that
         # alias
-        ctx = self
-        while ctx.parent is not None:
-            ctx = ctx.parent
-
-            if key in ctx._table_refs:
-                alias = ctx._table_refs[key]
+        for ctx in itertools.islice(self._contexts(), 1, None):
+            try:
+                alias = ctx.table_refs[key]
+            except KeyError:
+                pass
+            else:
                 self.set_ref(expr, alias)
                 return
 
-            i += len(ctx._table_refs)
+            i += len(ctx.table_refs)
 
-        alias = 't{:d}'.format(i)
+        alias = f't{i:d}'
         self.set_ref(expr, alias)
 
     def need_aliases(self, expr=None):
-        return self.always_alias or len(self._table_refs) > 1
+        return self.always_alias or len(self.table_refs) > 1
+
+    def _contexts(
+        self,
+        *,
+        parents: bool = True,
+    ) -> Iterator[QueryContext]:
+        ctx = self
+        yield ctx
+        while parents and ctx.parent is not None:
+            ctx = ctx.parent
+            yield ctx
 
     def has_ref(self, expr, parent_contexts=False):
         key = self._get_table_key(expr)
-        return self._key_in(
-            key, '_table_refs', parent_contexts=parent_contexts
+        return any(
+            key in ctx.table_refs
+            for ctx in self._contexts(parents=parent_contexts)
         )
 
     def set_ref(self, expr, alias):
         key = self._get_table_key(expr)
-        self._table_refs[key] = alias
+        self.table_refs[key] = alias
 
     def get_ref(self, expr):
-        """
-        Get the alias being used throughout a query to refer to a particular
-        table or inline view
-        """
-        return self._get_table_item('_table_refs', expr)
+        """Return the alias used to refer to an expression."""
+        key = self._get_table_key(expr)
+        top = self.top_context
+
+        if self.is_extracted(expr):
+            return top.table_refs.get(key)
+
+        return self.table_refs.get(key)
 
     def is_extracted(self, expr):
         key = self._get_table_key(expr)
@@ -137,7 +150,7 @@ class QueryContext:
         self.make_alias(expr)
 
     def subcontext(self):
-        return type(self)(
+        return self.__class__(
             compiler=self.compiler,
             indent=self.indent,
             parent=self,
@@ -161,47 +174,19 @@ class QueryContext:
         validator = ExprValidator(exprs)
         return not validator.validate(expr)
 
-    def _get_table_item(self, item, expr):
-        key = self._get_table_key(expr)
-        top = self.top_context
-
-        if self.is_extracted(expr):
-            return getattr(top, item).get(key)
-
-        return getattr(self, item).get(key)
-
     def _get_table_key(self, table):
         if isinstance(table, ir.TableExpr):
-            table = table.op()
-
-        try:
-            return self._table_key_memo[table]
-        except KeyError:
-            val = table._repr()
-            self._table_key_memo[table] = val
-            return val
-
-    def _key_in(self, key, memo_attr, parent_contexts=False):
-        if key in getattr(self, memo_attr):
-            return True
-
-        ctx = self
-        while parent_contexts and ctx.parent is not None:
-            ctx = ctx.parent
-            if key in getattr(ctx, memo_attr):
-                return True
-
-        return False
+            return table.op()
+        elif isinstance(table, ops.TableNode):
+            return table
+        raise TypeError(f"invalid table expression: {type(table)}")
 
 
 class ExprTranslator:
-
-    """Class that performs translation of ibis expressions into executable
-    SQL.
-    """
+    """Translates ibis expressions into a compilation target."""
 
     _registry = operation_registry
-    _rewrites = {}
+    _rewrites: dict[ops.Node, Callable] = {}
 
     def __init__(self, expr, context, named=False, permit_subquery=False):
         self.expr = expr
@@ -216,9 +201,7 @@ class ExprTranslator:
         self.named = named
 
     def get_result(self):
-        """
-        Build compiled SQL expression from the bottom up and return as a string
-        """
+        """Compile SQL expression into a string."""
         translated = self.translate(self.expr)
         if self._needs_name(self.expr):
             # TODO: this could fail in various ways
@@ -228,12 +211,13 @@ class ExprTranslator:
 
     @classmethod
     def add_operation(cls, operation, translate_function):
-        """
-        Adds an operation to the operation registry. In general, operations
-        should be defined directly in the registry, in `registry.py`. But
-        there are couple of exceptions why this is needed. Operations defined
-        by Ibis users (not Ibis or backend developers). and UDF, which are
-        added dynamically.
+        """Add an operation to the operation registry.
+
+        In general, operations should be defined directly in the registry, in
+        `registry.py`. There are couple of exceptions why this is needed.
+
+        Operations defined by Ibis users (not Ibis or backend developers), and
+        UDFs which are added dynamically.
         """
         cls._registry[operation] = translate_function
 
@@ -248,12 +232,12 @@ class ExprTranslator:
                 return True
             return False
 
-        if expr.get_name() is ir.unnamed:
+        if expr.get_name() is ir.core.unnamed:
             return False
 
         return True
 
-    def name(self, translated, name, force=True):
+    def name(self, translated: str, name: str, force: bool = True) -> str:
         return '{} AS {}'.format(
             translated, quote_identifier(name, force=force)
         )
@@ -277,7 +261,7 @@ class ExprTranslator:
             return formatter(self, expr)
         else:
             raise com.OperationNotDefinedError(
-                'No translation rule for {}'.format(type(op))
+                f'No translation rule for {type(op)}'
             )
 
     def _trans_param(self, expr):
@@ -297,7 +281,7 @@ class ExprTranslator:
 rewrites = ExprTranslator.rewrites
 
 
-@rewrites(analytics.Bucket)
+@rewrites(ops.Bucket)
 def _bucket(expr):
     op = expr.op()
     stmt = ibis.case()
@@ -344,7 +328,7 @@ def _bucket(expr):
     return stmt.end().name(expr._name)
 
 
-@rewrites(analytics.CategoryLabel)
+@rewrites(ops.CategoryLabel)
 def _category_label(expr):
     op = expr.op()
 

@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 import operator
-from typing import List
 
 import toolz
 
@@ -383,7 +384,7 @@ class ExprSimplifier:
                     lifted_root = self.lift(value_op.table)
 
             if can_lift and not block:
-                lifted_node = ops.TableColumn(node.name, lifted_root)
+                lifted_node = ops.TableColumn(lifted_root, node.name)
                 result = expr._factory(lifted_node, name=expr._name)
 
         return result
@@ -531,8 +532,8 @@ def has_reduction(expr):
 
 
 def get_mutation_exprs(
-    exprs: List[ir.Expr], table: ir.TableExpr
-) -> List[ir.Expr]:
+    exprs: list[ir.Expr], table: ir.TableExpr
+) -> list[ir.Expr | None]:
     """Given the list of exprs and the underlying table of a mutation op,
     return the exprs to use to instantiate the mutation."""
     # The below logic computes the mutation node exprs by splitting the
@@ -558,8 +559,8 @@ def get_mutation_exprs(
     # correspond with the column ordering we want (i.e. all new columns
     # should appear at the end, but currently they are materialized
     # directly after those overwritten columns).
-    overwriting_cols_to_expr = {}
-    non_overwriting_exprs = []
+    overwriting_cols_to_expr: dict[str, ir.Expr | None] = {}
+    non_overwriting_exprs: list[ir.Expr] = []
     table_schema = table.schema()
     for expr in exprs:
         is_first_overwrite = True
@@ -596,14 +597,14 @@ def get_mutation_exprs(
 
     columns = table.columns
     if overwriting_cols_to_expr:
-        proj_exprs = [
+        return [
             overwriting_cols_to_expr.get(column, table[column])
             for column in columns
             if overwriting_cols_to_expr.get(column, table[column]) is not None
         ] + non_overwriting_exprs
-    else:
-        proj_exprs = [table] + exprs
-    return proj_exprs
+
+    table_expr: ir.Expr = table
+    return [table_expr] + exprs
 
 
 def apply_filter(expr, predicates):
@@ -619,7 +620,12 @@ def apply_filter(expr, predicates):
         # Potential fusion opportunity
         # GH1344: We can't sub in things with correlated subqueries
         simplified_predicates = [
-            sub_for(predicate, [(expr, op.table)])
+            # Originally this line tried substituting op.table in for expr, but
+            # that is too aggressive in the presence of filters that occur
+            # after aggregations.
+            #
+            # See https://github.com/ibis-project/ibis/pull/3341 for details
+            sub_for(predicate, [(op.table, expr)])
             if not has_reduction(predicate)
             else predicate
             for predicate in predicates
@@ -636,8 +642,6 @@ def apply_filter(expr, predicates):
             )
 
             return ir.TableExpr(result)
-    elif isinstance(op, ops.Join):
-        expr = expr.materialize()
 
     result = ops.Selection(expr, [], predicates)
     return ir.TableExpr(result)
@@ -765,7 +769,10 @@ class _PushdownValidate:
                 # Aliased table columns are no good
                 col_table = val.op().table.op()
 
-                lifted_node = substitute_parents(expr).op()
+                lifted_node = substitute_parents(
+                    expr,
+                    past_projection=False,
+                ).op()
 
                 is_valid = col_table.equals(
                     node.table.op()
@@ -800,7 +807,7 @@ def windowize_function(expr, w=None):
             return walked.over(w)
         elif isinstance(op, ops.WindowOp):
             if w is not None:
-                return walked.over(w)
+                return walked.over(w.combine(op.window))
             else:
                 return walked
         else:
@@ -864,7 +871,7 @@ class Projector:
         assert self.parent.op() == root
 
         root_table = root.table
-        roots = root_table._root_tables()
+        roots = root_table.op().root_tables()
         validator = ExprValidator([root_table])
         fused_exprs = []
         can_fuse = False
@@ -888,8 +895,7 @@ class Projector:
         root_selections = root.selections
         parent_op = self.parent.op()
         for val in resolved:
-            # XXX
-            lifted_val = substitute_parents(val)
+            lifted_val = substitute_parents(val, past_projection=False)
 
             # a * projection
             if isinstance(val, ir.TableExpr) and (
@@ -897,7 +903,7 @@ class Projector:
                 # gross we share the same table root. Better way to
                 # detect?
                 or len(roots) == 1
-                and val._root_tables()[0] is roots[0]
+                and val.op().root_tables()[0] is roots[0]
             ):
                 can_fuse = True
                 have_root = False
@@ -937,7 +943,7 @@ class ExprValidator:
 
         self.roots = []
         for expr in self.parent_exprs:
-            self.roots.extend(expr._root_tables())
+            self.roots.extend(expr.op().root_tables())
 
     def has_common_roots(self, expr):
         return self.validate(expr)
@@ -951,7 +957,7 @@ class ExprValidator:
             if self._among_roots(op):
                 return True
 
-        expr_roots = expr._root_tables()
+        expr_roots = expr.op().root_tables()
         for root in expr_roots:
             if not self._among_roots(root):
                 return False
@@ -961,19 +967,22 @@ class ExprValidator:
         return self.roots_shared(node) > 0
 
     def roots_shared(self, node):
-        return sum(root.is_ancestor(node) for root in self.roots)
+        return sum(
+            root.is_ancestor(node) or node.compatible_with(root)
+            for root in self.roots
+        )
 
     def shares_some_roots(self, expr):
-        expr_roots = expr._root_tables()
+        expr_roots = expr.op().root_tables()
         return any(self._among_roots(root) for root in expr_roots)
 
     def shares_one_root(self, expr):
-        expr_roots = expr._root_tables()
+        expr_roots = expr.op().root_tables()
         total = sum(self.roots_shared(root) for root in expr_roots)
         return total == 1
 
     def shares_multiple_roots(self, expr):
-        expr_roots = expr._root_tables()
+        expr_roots = expr.op().root_tables()
         total = sum(self.roots_shared(expr_roots) for root in expr_roots)
         return total > 1
 
@@ -988,7 +997,7 @@ class ExprValidator:
 
     def _error_message(self, expr):
         return (
-            'The expression %s does not fully originate from '
+            'The expression "%s" does not fully originate from '
             'dependencies of the table expression.' % repr(expr)
         )
 

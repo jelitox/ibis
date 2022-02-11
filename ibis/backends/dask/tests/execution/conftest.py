@@ -1,15 +1,11 @@
-from __future__ import absolute_import
-
 import decimal
-import os
 
 import dask.dataframe as dd
 import pandas as pd
 import pytest
 
+import ibis
 import ibis.expr.datatypes as dt
-
-from ... import Backend
 
 
 @pytest.fixture(scope='module')
@@ -75,31 +71,21 @@ def df(npartitions):
 
 
 @pytest.fixture(scope='module')
-def batting_df():
-    path = os.path.join(
-        os.environ.get('IBIS_TEST_DATA_DIRECTORY', ''), 'batting.csv'
+def batting_df(data_directory):
+    df = dd.read_csv(
+        data_directory / 'batting.csv',
+        assume_missing=True,
+        dtype={"lgID": "object"},
     )
-    if not os.path.exists(path):
-        pytest.skip('{} not found'.format(path))
-    elif not os.path.isfile(path):
-        pytest.skip('{} is not a file'.format(path))
-
-    df = dd.read_csv(path, assume_missing=True)
-    num_rows = int(0.01 * len(df))
-    return df.iloc[30 : 30 + num_rows].reset_index(drop=True)
+    return df.sample(frac=0.01).reset_index(drop=True)
 
 
 @pytest.fixture(scope='module')
-def awards_players_df():
-    path = os.path.join(
-        os.environ.get('IBIS_TEST_DATA_DIRECTORY', ''), 'awards_players.csv'
+def awards_players_df(data_directory):
+    return dd.read_csv(
+        data_directory / 'awards_players.csv',
+        assume_missing=True,
     )
-    if not os.path.exists(path):
-        pytest.skip('{} not found'.format(path))
-    elif not os.path.isfile(path):
-        pytest.skip('{} is not a file'.format(path))
-
-    return dd.read_csv(path, assume_missing=True)
 
 
 @pytest.fixture(scope='module')
@@ -203,7 +189,7 @@ def client(
     time_keyed_df2,
     intersect_df2,
 ):
-    return Backend().connect(
+    return ibis.dask.connect(
         {
             'df': df,
             'df1': df1,
@@ -252,7 +238,7 @@ def t(client):
 
 @pytest.fixture(scope='module')
 def lahman(batting_df, awards_players_df):
-    return Backend().connect(
+    return ibis.dask.connect(
         {'batting': batting_df, 'awards_players': awards_players_df}
     )
 
@@ -298,11 +284,6 @@ def batting(lahman):
 
 
 @pytest.fixture(scope='module')
-def awards_players(lahman):
-    return lahman.table('awards_players')
-
-
-@pytest.fixture(scope='module')
 def sel_cols(batting):
     cols = batting.columns
     start, end = cols.index('AB'), cols.index('H') + 1
@@ -312,11 +293,6 @@ def sel_cols(batting):
 @pytest.fixture(scope='module')
 def players_base(batting, sel_cols):
     return batting[sel_cols].sort_by(sel_cols[:3])
-
-
-@pytest.fixture(scope='module')
-def players(players_base):
-    return players_base.groupby('playerID')
 
 
 @pytest.fixture(scope='module')

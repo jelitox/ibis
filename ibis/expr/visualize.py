@@ -33,10 +33,10 @@ def get_type(expr):
         )
         right_schema = op.right.schema()
         pairs = [
-            ('{}.{}'.format(left_table_name, left_column), type)
+            (f'{left_table_name}.{left_column}', type)
             for left_column, type in left_schema.items()
         ] + [
-            ('{}.{}'.format(right_table_name, right_column), type)
+            (f'{right_table_name}.{right_column}', type)
             for right_column, type in right_schema.items()
         ]
         schema = ibis.schema(pairs)
@@ -97,9 +97,8 @@ def to_graph(expr, node_attr=None, edge_attr=None):
             vhash = str(hash(vkey))
             g.node(vhash, label=vlabel)
 
-            node = e.op()
-            args = node.args
-            for arg, name in zip(args, node.signature.names()):
+            op = e.op()
+            for name, arg in zip(op.argnames, op.args):
                 if isinstance(arg, ir.Expr):
                     u = arg, name
                     ukey = arg._key, name
@@ -116,7 +115,7 @@ def draw(graph, path=None, format='png'):
 
     if path is None:
         with tempfile.NamedTemporaryFile(
-            delete=False, suffix='.{}'.format(format), mode='wb'
+            delete=False, suffix=f'.{format}', mode='wb'
         ) as f:
             f.write(piped_source)
         return f.name
@@ -136,7 +135,7 @@ if __name__ == '__main__':
     df = joined[left.a, right.c.name('b'), right.d.name('c')]
     a = df.a
     b = df.b
-    filt = df[(a + b * 2 * b / b ** 3 > 4) & (b > 5)]
+    filt = df[(a + b * 2 * b / b**3 > 4) & (b > 5)]
     expr = filt.groupby(filt.c).aggregate(
         amean=filt.a.mean(), bsum=filt.b.sum()
     )

@@ -22,28 +22,23 @@ class TestConf(BackendTest, RoundAwayFromZero):
                 'IBIS_TEST_SQLITE_DATABASE', data_directory / 'ibis_testing.db'
             )
         )
-        return ibis.sqlite.connect(str(path))
+        return ibis.sqlite.connect(str(path))  # type: ignore
 
     @property
     def functional_alltypes(self) -> ir.TableExpr:
-        t = self.db.functional_alltypes
+        t = super().functional_alltypes
         return t.mutate(timestamp_col=t.timestamp_col.cast('timestamp'))
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture
 def dbpath(data_directory):
     default = str(data_directory / 'ibis_testing.db')
     return os.environ.get('IBIS_TEST_SQLITE_DATABASE', default)
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture
 def con(dbpath):
     return ibis.sqlite.connect(dbpath)
-
-
-@pytest.fixture(scope='module')
-def db(con):
-    return con.database()
 
 
 @pytest.fixture
@@ -55,12 +50,11 @@ def dialect():
 
 @pytest.fixture
 def translate(dialect):
-    from ibis.backends.sqlite import SQLiteClient
+    from ibis.backends.sqlite import Backend
 
-    client = SQLiteClient
-    context = client.compiler.make_context()
+    context = Backend.compiler.make_context()
     return lambda expr: str(
-        client.compiler.translator_class(expr, context)
+        Backend.compiler.translator_class(expr, context)
         .get_result()
         .compile(dialect=dialect, compile_kwargs={'literal_binds': True})
     )
@@ -73,16 +67,16 @@ def sqla_compile(dialect):
     )
 
 
-@pytest.fixture(scope='module')
-def alltypes(db):
-    return db.functional_alltypes
+@pytest.fixture
+def alltypes(con):
+    return con.table("functional_alltypes")
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture
 def alltypes_sqla(alltypes):
     return alltypes.op().sqla_table
 
 
-@pytest.fixture(scope='module')
+@pytest.fixture
 def df(alltypes):
     return alltypes.execute()

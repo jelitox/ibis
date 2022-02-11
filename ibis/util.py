@@ -6,9 +6,11 @@ import logging
 import operator
 import os
 import types
+import warnings
 from numbers import Real
 from typing import (
     Any,
+    Iterable,
     Iterator,
     List,
     Optional,
@@ -73,7 +75,7 @@ any_of = toolz.compose(any, is_one_of)
 all_of = toolz.compose(all, is_one_of)
 
 
-def promote_list(val: Union[V, List[V]]) -> List[V]:
+def promote_list(val: Union[V, Sequence[V]]) -> List[V]:
     """Ensure that the value is a list.
 
     Parameters
@@ -99,11 +101,12 @@ def is_function(v: Any) -> bool:
     Returns
     -------
     bool
+        Whether `v` is a function
     """
     return isinstance(v, (types.FunctionType, types.LambdaType))
 
 
-def adjoin(space: int, *lists: Sequence[str]) -> str:
+def adjoin(space: int, *lists: Iterable[str]) -> str:
     """Glue together two sets of strings using `space`.
 
     Parameters
@@ -113,7 +116,7 @@ def adjoin(space: int, *lists: Sequence[str]) -> str:
 
     Returns
     -------
-    string
+    str
     """
     lengths = [max(map(len, x)) + space for x in lists[:-1]]
 
@@ -157,7 +160,7 @@ def approx_equal(a: Real, b: Real, eps: Real):
     assert abs(a - b) < eps
 
 
-def safe_index(elements: Sequence[T], value: T) -> int:
+def safe_index(elements: Sequence[int], value: int) -> int:
     """Find the location of `value` in `elements`.
 
     Return -1 if `value` is not found instead of raising ``ValueError``.
@@ -343,3 +346,46 @@ def consume(iterator: Iterator[T], n: Optional[int] = None) -> None:
     else:
         # advance to the empty slice starting at position n
         next(itertools.islice(iterator, n, n), None)
+
+
+def flatten_iterable(iterable):
+    """Recursively flatten the iterable `iterable`."""
+    if not is_iterable(iterable):
+        raise TypeError("flatten is only defined for non-str iterables")
+
+    for item in iterable:
+        if is_iterable(item):
+            yield from flatten_iterable(item)
+        else:
+            yield item
+
+
+def warn_deprecated(name, *, instead, version='', stacklevel=1):
+    """Warn about deprecated usage.
+
+    The message includes a stacktrace and what to do instead.
+    """
+    msg = f'"{name}" is deprecated'
+    if version:
+        msg += f' since v{version}'
+
+    msg += f'; use {instead}.'
+
+    warnings.warn(msg, FutureWarning, stacklevel=stacklevel + 1)
+
+
+def deprecated(*, instead, version=''):
+    """Decorate deprecated function to warn of usage, with stacktrace, and
+    what to do instead."""
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            warn_deprecated(
+                func.__name__, instead=instead, version=version, stacklevel=2
+            )
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator

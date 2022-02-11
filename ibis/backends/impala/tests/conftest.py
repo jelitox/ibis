@@ -10,12 +10,13 @@ import ibis
 import ibis.expr.types as ir
 import ibis.util as util
 from ibis import options
+from ibis.backends.impala.compiler import ImpalaCompiler, ImpalaExprTranslator
 from ibis.backends.tests.base import (
     BackendTest,
     RoundAwayFromZero,
     UnorderedComparator,
 )
-from ibis.tests.expr.mocks import MockConnection
+from ibis.tests.expr.mocks import MockBackend
 
 
 class TestConf(UnorderedComparator, BackendTest, RoundAwayFromZero):
@@ -62,6 +63,10 @@ def isproperty(obj):
 
 
 class IbisTestEnv:
+    def __init__(self):
+        if options.impala is None:
+            ibis.backends.impala.Backend.register_options()
+
     def items(self):
         return [
             (name, getattr(self, name))
@@ -89,9 +94,12 @@ class IbisTestEnv:
         )
         return tmp_db
 
-    options.impala.temp_hdfs_path = tmp_dir = os.environ.get(
-        'IBIS_TEST_TMP_HDFS_DIR', '/tmp/__ibis_test_{}'.format(util.guid())
-    )
+    @property
+    def tmp_dir(self):
+        options.impala.temp_hdfs_path = tmp_dir = os.environ.get(
+            'IBIS_TEST_TMP_HDFS_DIR', f'/tmp/__ibis_test_{util.guid()}'
+        )
+        return tmp_dir
 
     @property
     def test_data_db(self):
@@ -131,34 +139,28 @@ class IbisTestEnv:
         return os.environ.get('IBIS_TEST_WEBHDFS_USER', 'hdfs')
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture
 def env():
     return IbisTestEnv()
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture
 def tmp_dir(env):
     options.impala.temp_hdfs_path = tmp_dir = env.tmp_dir
     return tmp_dir
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture
 def test_data_db(env):
     return env.test_data_db
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture
 def test_data_dir(env):
     return env.test_data_dir
 
 
-@pytest.fixture(scope='session')
-def hdfs_superuser(env):
-    return env.hdfs_superuser
-    return os.environ.get('IBIS_TEST_HDFS_SUPERUSER', 'hdfs')
-
-
-@pytest.fixture(scope='session')
+@pytest.fixture
 def hdfs(env, tmp_dir):
     if env.auth_mechanism in {'GSSAPI', 'LDAP'}:
         warnings.warn("Ignoring invalid Certificate Authority errors")
@@ -177,7 +179,7 @@ def hdfs(env, tmp_dir):
     return client
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture
 def con_no_hdfs(env, test_data_db):
     con = ibis.impala.connect(
         host=env.impala_host,
@@ -194,7 +196,7 @@ def con_no_hdfs(env, test_data_db):
         con.set_database(test_data_db)
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture
 def con(env, hdfs, test_data_db):
     con = ibis.impala.connect(
         host=env.impala_host,
@@ -212,7 +214,7 @@ def con(env, hdfs, test_data_db):
         con.set_database(test_data_db)
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture
 def temp_char_table(con):
     statement = """\
 CREATE TABLE IF NOT EXISTS {} (
@@ -225,15 +227,15 @@ CREATE TABLE IF NOT EXISTS {} (
     try:
         yield con.table(name)
     finally:
-        assert con.exists_table(name), name
+        assert name in con.list_tables(), name
         con.drop_table(name)
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture
 def tmp_db(env, con, test_data_db):
     tmp_db = env.tmp_db
 
-    if not con.exists_database(tmp_db):
+    if tmp_db not in con.list_databases():
         con.create_database(tmp_db)
     try:
         yield tmp_db
@@ -251,7 +253,7 @@ def tmp_db(env, con, test_data_db):
             pass
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture
 def con_no_db(env, hdfs):
     con = ibis.impala.connect(
         host=env.impala_host,
@@ -269,18 +271,18 @@ def con_no_db(env, hdfs):
         con.set_database(None)
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture
 def alltypes(con, test_data_db):
-    return con.database(test_data_db).functional_alltypes
+    return con.table("functional_alltypes")
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture
 def alltypes_df(alltypes):
     return alltypes.execute()
 
 
 def _random_identifier(suffix):
-    return '__ibis_test_{}_{}'.format(suffix, util.guid())
+    return f'__ibis_test_{suffix}_{util.guid()}'
 
 
 @pytest.fixture
@@ -300,7 +302,7 @@ def temp_table(con):
     try:
         yield name
     finally:
-        assert con.exists_table(name), name
+        assert name in con.list_tables(), name
         con.drop_table(name)
 
 
@@ -310,7 +312,7 @@ def temp_table_db(con, temp_database):
     try:
         yield temp_database, name
     finally:
-        assert con.exists_table(name, database=temp_database), name
+        assert name in con.list_tables(database=temp_database), name
         con.drop_table(name, database=temp_database)
 
 
@@ -320,18 +322,8 @@ def temp_view(con):
     try:
         yield name
     finally:
-        assert con.exists_table(name), name
+        assert name in con.list_tables(), name
         con.drop_view(name)
-
-
-@pytest.fixture
-def temp_view_db(con, temp_database):
-    name = _random_identifier('view')
-    try:
-        yield temp_database, name
-    finally:
-        assert con.exists_table(name, database=temp_database), name
-        con.drop_view(name, database=temp_database)
 
 
 @pytest.fixture
@@ -363,17 +355,17 @@ def temp_parquet_table2(con, tmp_db, temp_parquet_table_schema):
         db.client.drop_table(name, database=tmp_db)
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def mockcon():
-    return MockConnection()
+    return MockBackend()
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture
 def kudu_table(con, test_data_db):
     name = 'kudu_backed_table'
     con.raw_sql(
-        """\
-CREATE TABLE {database}.{name} (
+        f"""
+CREATE TABLE {test_data_db}.{name} (
   a STRING,
   PRIMARY KEY(a)
 )
@@ -382,14 +374,17 @@ STORED AS KUDU
 TBLPROPERTIES (
   'kudu.master_addresses' = 'kudu',
   'kudu.num_tablet_replicas' = '1'
-)""".format(
-            database=test_data_db, name=name
-        )
+)"""
     )
-    drop_sql = 'DROP TABLE {database}.{name}'.format(
-        database=test_data_db, name=name
-    )
+    drop_sql = f'DROP TABLE {test_data_db}.{name}'
     try:
         yield con.table(name)
     finally:
         con.raw_sql(drop_sql)
+
+
+def translate(expr, context=None, named=False):
+    if context is None:
+        context = ImpalaCompiler.make_context()
+    translator = ImpalaExprTranslator(expr, context=context, named=named)
+    return translator.get_result()

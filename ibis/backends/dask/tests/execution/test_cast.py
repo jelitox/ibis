@@ -10,8 +10,6 @@ import ibis.expr.datatypes as dt  # noqa: E402
 
 from ...execution import execute
 
-pytestmark = pytest.mark.dask
-
 
 @pytest.mark.parametrize('from_', ['plain_float64', 'plain_int64'])
 @pytest.mark.parametrize(
@@ -79,7 +77,7 @@ def test_cast_timestamp_column(t, df, column, to, expected):
         param(
             'double',
             float,
-            marks=pytest.mark.xfail(raises=NotImplementedError),
+            marks=pytest.mark.notimpl(["dask"]),
         ),
         (
             dt.Timestamp('America/Los_Angeles'),
@@ -100,11 +98,7 @@ def test_cast_timestamp_scalar_naive(to, expected):
     [
         ('string', str),
         ('int64', lambda x: x.value),
-        param(
-            'double',
-            float,
-            marks=pytest.mark.xfail(raises=NotImplementedError),
-        ),
+        param('double', float, marks=pytest.mark.notimpl(["dask"])),
         (
             dt.Timestamp('America/Los_Angeles'),
             lambda x: x.tz_convert('America/Los_Angeles'),
@@ -164,7 +158,8 @@ def test_cast_to_decimal(t, df, type):
 
 
 @pytest.mark.parametrize(
-    'column', ['plain_int64', 'dup_strings', 'dup_ints', 'strings_with_nulls'],
+    'column',
+    ['plain_int64', 'dup_strings', 'dup_ints', 'strings_with_nulls'],
 )
 def test_cast_to_category(t, df, column):
     test = t[column].cast('category').compile()

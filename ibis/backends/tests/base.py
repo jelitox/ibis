@@ -6,9 +6,7 @@ from typing import Any, Callable, Mapping, Optional
 import numpy as np
 import pandas as pd
 import pandas.testing as tm
-import pytest
 
-import ibis
 import ibis.expr.types as ir
 
 
@@ -70,9 +68,9 @@ class BackendTest(abc.ABC):
     returned_timestamp_unit = 'us'
     supported_to_timestamp_units = {'s', 'ms', 'us'}
     supports_floating_modulus = True
+    bool_is_int = False
 
     def __init__(self, data_directory: Path) -> None:
-        self.api  # skips if we can't access the backend
         self.connection = self.connect(data_directory)
 
     def __str__(self):
@@ -123,226 +121,31 @@ class BackendTest(abc.ABC):
         return f(*args)
 
     @property
-    def db(self):
-        return self.connection.database()
-
-    @property
     def functional_alltypes(self) -> ir.TableExpr:
-        return self.db.functional_alltypes
+        t = self.connection.table('functional_alltypes')
+        if self.bool_is_int:
+            return t.mutate(bool_col=t.bool_col == 1)
+        return t
 
     @property
     def batting(self) -> ir.TableExpr:
-        return self.db.batting
+        return self.connection.table('batting')
 
     @property
     def awards_players(self) -> ir.TableExpr:
-        return self.db.awards_players
+        return self.connection.table('awards_players')
 
     @property
     def geo(self) -> Optional[ir.TableExpr]:
+        if 'geo' in self.connection.list_tables():
+            return self.connection.table('geo')
         return None
 
     @property
     def api(self):
-        return getattr(ibis.backends, self.name()).Backend()
+        return self.connection
 
     def make_context(
         self, params: Optional[Mapping[ir.ValueExpr, Any]] = None
     ):
-        return self.api.client.compiler.make_context(params=params)
-
-
-# TODO move to the spark/pyspark backends, #2565
-_spark_testing_client = None
-_pyspark_testing_client = None
-
-
-# TODO move to the sparn/pyspark backends, #2565
-def get_spark_testing_client(data_directory):
-    global _spark_testing_client
-    if _spark_testing_client is None:
-        _spark_testing_client = get_common_spark_testing_client(
-            data_directory,
-            lambda session: ibis.backends.spark.Backend().connect(session),
-        )
-    return _spark_testing_client
-
-
-# TODO move to the spark/pyspark backends, #2565
-def get_pyspark_testing_client(data_directory):
-    global _pyspark_testing_client
-    if _pyspark_testing_client is None:
-        _pyspark_testing_client = get_common_spark_testing_client(
-            data_directory,
-            lambda session: ibis.backends.pyspark.Backend().connect(session),
-        )
-    return _pyspark_testing_client
-
-
-# TODO move to the spark/pyspark backends, #2565
-def get_common_spark_testing_client(data_directory, connect):
-    pytest.importorskip('pyspark')
-    import pyspark.sql.types as pt
-    from pyspark.sql import SparkSession
-
-    spark = (
-        SparkSession.builder.config('spark.default.parallelism', 4)
-        .config('spark.driver.bindAddress', '127.0.0.1')
-        .getOrCreate()
-    )
-    _spark_testing_client = connect(spark)
-    s = _spark_testing_client._session
-    num_partitions = 4
-
-    df_functional_alltypes = (
-        s.read.csv(
-            path=str(data_directory / 'functional_alltypes.csv'),
-            schema=pt.StructType(
-                [
-                    pt.StructField('index', pt.IntegerType(), True),
-                    pt.StructField('Unnamed: 0', pt.IntegerType(), True),
-                    pt.StructField('id', pt.IntegerType(), True),
-                    # cast below, Spark can't read 0/1 as bool
-                    pt.StructField('bool_col', pt.ByteType(), True),
-                    pt.StructField('tinyint_col', pt.ByteType(), True),
-                    pt.StructField('smallint_col', pt.ShortType(), True),
-                    pt.StructField('int_col', pt.IntegerType(), True),
-                    pt.StructField('bigint_col', pt.LongType(), True),
-                    pt.StructField('float_col', pt.FloatType(), True),
-                    pt.StructField('double_col', pt.DoubleType(), True),
-                    pt.StructField('date_string_col', pt.StringType(), True),
-                    pt.StructField('string_col', pt.StringType(), True),
-                    pt.StructField('timestamp_col', pt.TimestampType(), True),
-                    pt.StructField('year', pt.IntegerType(), True),
-                    pt.StructField('month', pt.IntegerType(), True),
-                ]
-            ),
-            mode='FAILFAST',
-            header=True,
-        )
-        .repartition(num_partitions)
-        .sort('index')
-    )
-
-    df_functional_alltypes = df_functional_alltypes.withColumn(
-        "bool_col", df_functional_alltypes["bool_col"].cast("boolean")
-    )
-    df_functional_alltypes.createOrReplaceTempView('functional_alltypes')
-
-    df_batting = (
-        s.read.csv(
-            path=str(data_directory / 'batting.csv'),
-            schema=pt.StructType(
-                [
-                    pt.StructField('playerID', pt.StringType(), True),
-                    pt.StructField('yearID', pt.IntegerType(), True),
-                    pt.StructField('stint', pt.IntegerType(), True),
-                    pt.StructField('teamID', pt.StringType(), True),
-                    pt.StructField('lgID', pt.StringType(), True),
-                    pt.StructField('G', pt.IntegerType(), True),
-                    pt.StructField('AB', pt.DoubleType(), True),
-                    pt.StructField('R', pt.DoubleType(), True),
-                    pt.StructField('H', pt.DoubleType(), True),
-                    pt.StructField('X2B', pt.DoubleType(), True),
-                    pt.StructField('X3B', pt.DoubleType(), True),
-                    pt.StructField('HR', pt.DoubleType(), True),
-                    pt.StructField('RBI', pt.DoubleType(), True),
-                    pt.StructField('SB', pt.DoubleType(), True),
-                    pt.StructField('CS', pt.DoubleType(), True),
-                    pt.StructField('BB', pt.DoubleType(), True),
-                    pt.StructField('SO', pt.DoubleType(), True),
-                    pt.StructField('IBB', pt.DoubleType(), True),
-                    pt.StructField('HBP', pt.DoubleType(), True),
-                    pt.StructField('SH', pt.DoubleType(), True),
-                    pt.StructField('SF', pt.DoubleType(), True),
-                    pt.StructField('GIDP', pt.DoubleType(), True),
-                ]
-            ),
-            header=True,
-        )
-        .repartition(num_partitions)
-        .sort('playerID')
-    )
-    df_batting.createOrReplaceTempView('batting')
-
-    df_awards_players = (
-        s.read.csv(
-            path=str(data_directory / 'awards_players.csv'),
-            schema=pt.StructType(
-                [
-                    pt.StructField('playerID', pt.StringType(), True),
-                    pt.StructField('awardID', pt.StringType(), True),
-                    pt.StructField('yearID', pt.IntegerType(), True),
-                    pt.StructField('lgID', pt.StringType(), True),
-                    pt.StructField('tie', pt.StringType(), True),
-                    pt.StructField('notes', pt.StringType(), True),
-                ]
-            ),
-            header=True,
-        )
-        .repartition(num_partitions)
-        .sort('playerID')
-    )
-    df_awards_players.createOrReplaceTempView('awards_players')
-
-    df_simple = s.createDataFrame([(1, 'a')], ['foo', 'bar'])
-    df_simple.createOrReplaceTempView('simple')
-
-    df_struct = s.createDataFrame([((1, 2, 'a'),)], ['struct_col'])
-    df_struct.createOrReplaceTempView('struct')
-
-    df_nested_types = s.createDataFrame(
-        [([1, 2], [[3, 4], [5, 6]], {'a': [[2, 4], [3, 5]]})],
-        [
-            'list_of_ints',
-            'list_of_list_of_ints',
-            'map_string_list_of_list_of_ints',
-        ],
-    )
-    df_nested_types.createOrReplaceTempView('nested_types')
-
-    df_complicated = s.createDataFrame(
-        [({(1, 3): [[2, 4], [3, 5]]},)], ['map_tuple_list_of_list_of_ints']
-    )
-    df_complicated.createOrReplaceTempView('complicated')
-
-    df_udf = s.createDataFrame(
-        [('a', 1, 4.0, 'a'), ('b', 2, 5.0, 'a'), ('c', 3, 6.0, 'b')],
-        ['a', 'b', 'c', 'key'],
-    )
-    df_udf.createOrReplaceTempView('udf')
-
-    df_udf_nan = s.createDataFrame(
-        pd.DataFrame(
-            {
-                'a': np.arange(10, dtype=float),
-                'b': [3.0, np.NaN] * 5,
-                'key': list('ddeefffggh'),
-            }
-        )
-    )
-    df_udf_nan.createOrReplaceTempView('udf_nan')
-
-    df_udf_null = s.createDataFrame(
-        [
-            (float(i), None if i % 2 else 3.0, 'ddeefffggh'[i])
-            for i in range(10)
-        ],
-        ['a', 'b', 'key'],
-    )
-    df_udf_null.createOrReplaceTempView('udf_null')
-
-    df_udf_random = s.createDataFrame(
-        pd.DataFrame(
-            {
-                'a': np.arange(4, dtype=float).tolist()
-                + np.random.rand(3).tolist(),
-                'b': np.arange(4, dtype=float).tolist()
-                + np.random.rand(3).tolist(),
-                'key': list('ddeefff'),
-            }
-        )
-    )
-    df_udf_random.createOrReplaceTempView('udf_random')
-
-    return _spark_testing_client
+        return self.api.compiler.make_context(params=params)

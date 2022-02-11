@@ -21,7 +21,7 @@ class _AnyToExistsTransform:
         self.context = context
         self.expr = expr
         self.parent_table = parent_table
-        self.query_roots = frozenset(self.parent_table._root_tables())
+        self.query_roots = frozenset(self.parent_table.op().root_tables())
 
     def get_result(self):
         self.foreign_table = None
@@ -93,7 +93,7 @@ class _CorrelatedRefCheck:
         self.query = query
         self.ctx = query.context
         self.expr = expr
-        self.query_roots = frozenset(self.query.table_set._root_tables())
+        self.query_roots = frozenset(self.query.table_set.op().root_tables())
 
         # aliasing required
         self.foreign_refs = []
@@ -140,7 +140,11 @@ class _CorrelatedRefCheck:
         # XXX
         if isinstance(
             node,
-            (ops.TableArrayView, ops.ExistsSubquery, ops.NotExistsSubquery,),
+            (
+                ops.TableArrayView,
+                ops.ExistsSubquery,
+                ops.NotExistsSubquery,
+            ),
         ):
             return True
 
@@ -280,7 +284,7 @@ class SelectBuilder:
                 )
                 return table_expr, _get_scalar(name)
             else:
-                base_table = ir.find_base_table(expr)
+                base_table = ir.relations.find_base_table(expr)
                 if base_table is None:
                     # exprs with no table refs
                     # TODO(phillipc): remove ScalarParameter hack
@@ -288,7 +292,7 @@ class SelectBuilder:
                         name = expr.get_name()
                         assert (
                             name is not None
-                        ), 'scalar parameter {} has no name'.format(expr)
+                        ), f'scalar parameter {expr} has no name'
                         return expr, _get_scalar(name)
                     return expr.name('tmp'), _get_scalar('tmp')
 
@@ -296,26 +300,6 @@ class SelectBuilder:
 
         elif isinstance(expr, ir.AnalyticExpr):
             return expr.to_aggregation(), toolz.identity
-
-        elif isinstance(expr, ir.ExprList):
-            exprs = expr.exprs()
-
-            is_aggregation = True
-            any_aggregation = False
-
-            for x in exprs:
-                if not L.is_scalar_reduction(x):
-                    is_aggregation = False
-                else:
-                    any_aggregation = True
-
-            if is_aggregation:
-                table = ir.find_base_table(exprs[0])
-                return table.aggregate(exprs), toolz.identity
-            elif not any_aggregation:
-                return expr, toolz.identity
-            else:
-                raise NotImplementedError(expr._repr())
 
         elif isinstance(expr, ir.ColumnExpr):
             op = expr.op()
@@ -351,7 +335,7 @@ class SelectBuilder:
             return table_expr, result_handler
         else:
             raise com.TranslationError(
-                'Do not know how to execute: {0}'.format(type(expr))
+                f'Do not know how to execute: {type(expr)}'
             )
 
     @staticmethod
@@ -476,7 +460,7 @@ class SelectBuilder:
     def _visit_select_expr(self, expr):
         op = expr.op()
 
-        method = '_visit_select_{0}'.format(type(op).__name__)
+        method = f'_visit_select_{type(op).__name__}'
         if hasattr(self, method):
             f = getattr(self, method)
             return f(expr)
@@ -557,7 +541,7 @@ class SelectBuilder:
 
         op = expr.op()
 
-        method = '_visit_filter_{0}'.format(type(op).__name__)
+        method = f'_visit_filter_{type(op).__name__}'
         if hasattr(self, method):
             f = getattr(self, method)
             return f(expr)
@@ -575,9 +559,7 @@ class SelectBuilder:
                 return expr._factory(type(op)(left, right))
             else:
                 return expr
-        elif isinstance(
-            op, (ops.Any, ops.BooleanValueOp, ops.TableColumn, ops.Literal)
-        ):
+        elif isinstance(op, (ops.Any, ops.TableColumn, ops.Literal)):
             return expr
         elif isinstance(op, ops.ValueOp):
             visited = [
@@ -648,26 +630,17 @@ class SelectBuilder:
 
         # hm, is this the best place for this?
         root_op = source_expr.op()
-        if isinstance(root_op, ops.Join) and not isinstance(
-            root_op, ops.MaterializedJoin
-        ):
-            # Unmaterialized join
-            source_expr = source_expr.materialize()
 
         if isinstance(root_op, ops.TableNode):
             self._collect(source_expr, toplevel=True)
             if self.table_set is None:
                 raise com.InternalError('no table set')
         else:
-            # Expressions not depending on any table
-            if isinstance(root_op, ops.ExpressionList):
-                self.select_set = source_expr.exprs()
-            else:
-                self.select_set = [source_expr]
+            self.select_set = [source_expr]
 
     def _collect(self, expr, toplevel=False):
         op = expr.op()
-        method = '_collect_{0}'.format(type(op).__name__)
+        method = f'_collect_{type(op).__name__}'
 
         # Do not visit nodes twice
         if op in self.op_memo:
@@ -705,6 +678,14 @@ class SelectBuilder:
         self._collect(op.table, toplevel=toplevel)
 
     def _collect_Union(self, expr, toplevel=False):
+        if toplevel:
+            raise NotImplementedError()
+
+    def _collect_Difference(self, expr, toplevel=False):
+        if toplevel:
+            raise NotImplementedError()
+
+    def _collect_Intersection(self, expr, toplevel=False):
         if toplevel:
             raise NotImplementedError()
 

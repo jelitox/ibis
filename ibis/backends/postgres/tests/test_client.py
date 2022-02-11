@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 import ibis
 import ibis.expr.datatypes as dt
@@ -25,12 +26,11 @@ import ibis.expr.types as ir
 from ibis.backends.base.sql.alchemy import schema_from_table
 from ibis.tests.util import assert_equal
 
-pytestmark = pytest.mark.postgres
-
 POSTGRES_TEST_DB = os.environ.get(
     'IBIS_TEST_POSTGRES_DATABASE', 'ibis_testing'
 )
 IBIS_POSTGRES_HOST = os.environ.get('IBIS_TEST_POSTGRES_HOST', 'localhost')
+IBIS_POSTGRES_PORT = os.environ.get('IBIS_TEST_POSTGRES_PORT', '5432')
 IBIS_POSTGRES_USER = os.environ.get('IBIS_TEST_POSTGRES_USER', 'postgres')
 IBIS_POSTGRES_PASS = os.environ.get('IBIS_TEST_POSTGRES_PASSWORD', 'postgres')
 
@@ -63,25 +63,14 @@ def test_list_tables(con):
     assert len(con.list_tables(like='functional')) == 1
 
 
-def test_compile_verify(alltypes):
-    unsupported_expr = alltypes.double_col.approx_median()
-    assert not unsupported_expr.verify()
-
-    supported_expr = alltypes.double_col.sum()
-    assert supported_expr.verify()
-
-
 def test_database_layer(con, alltypes):
     db = con.database()
     t = db.functional_alltypes
 
-    assert_equal(t, alltypes)
-
+    # TODO: we can't use assert_equal here because of #2973
+    assert t.schema() == alltypes.schema()
+    assert t.op().name == alltypes.op().name
     assert db.list_tables() == con.list_tables()
-
-    db_schema = con.schema("information_schema")
-
-    assert db_schema.list_tables() != con.list_tables()
 
 
 def test_compile_toplevel():
@@ -111,6 +100,7 @@ def test_metadata_is_per_table():
         database=POSTGRES_TEST_DB,
         user=IBIS_POSTGRES_USER,
         password=IBIS_POSTGRES_PASS,
+        port=IBIS_POSTGRES_PORT,
     )
     assert len(con.meta.tables) == 0
 
@@ -120,29 +110,14 @@ def test_metadata_is_per_table():
     assert len(con.meta.tables) == 1
 
 
-def test_schema_table():
-    con = ibis.postgres.connect(
-        host=IBIS_POSTGRES_HOST,
-        database=POSTGRES_TEST_DB,
-        user=IBIS_POSTGRES_USER,
-        password=IBIS_POSTGRES_PASS,
-    )
-
-    # ensure that we can reflect the information schema (which is guaranteed
-    # to exist)
-    schema = con.schema('information_schema')
-
-    assert isinstance(schema['tables'], ir.TableExpr)
-
-
 def test_schema_type_conversion():
     typespec = [
         # name, type, nullable
-        ('json', sa.dialects.postgresql.JSON, True, dt.JSON),
-        ('jsonb', sa.dialects.postgresql.JSONB, True, dt.JSONB),
-        ('uuid', sa.dialects.postgresql.UUID, True, dt.UUID),
-        ('macaddr', sa.dialects.postgresql.MACADDR, True, dt.MACADDR),
-        ('inet', sa.dialects.postgresql.INET, True, dt.INET),
+        ('json', postgresql.JSON, True, dt.JSON),
+        ('jsonb', postgresql.JSONB, True, dt.JSONB),
+        ('uuid', postgresql.UUID, True, dt.UUID),
+        ('macaddr', postgresql.MACADDR, True, dt.MACADDR),
+        ('inet', postgresql.INET, True, dt.INET),
     ]
 
     sqla_types = []
@@ -173,13 +148,11 @@ def test_interval_films_schema(con):
 @pytest.mark.parametrize(
     ("column", "expected_dtype"),
     [
-        # ("a", dt.Interval("Y")),
-        # ("b", dt.Interval("M")),
+        # a, b and g are variable length intervals, like YEAR TO MONTH
         ("c", dt.Interval("D")),
         ("d", dt.Interval("h")),
         ("e", dt.Interval("m")),
         ("f", dt.Interval("s")),
-        # ("g", dt.Interval("M")),
         ("h", dt.Interval("h")),
         ("i", dt.Interval("m")),
         ("j", dt.Interval("s")),
@@ -195,13 +168,11 @@ def test_all_interval_types_schema(intervals, column, expected_dtype):
 @pytest.mark.parametrize(
     ("column", "expected_dtype"),
     [
-        # ("a", dt.Interval("Y")),
-        # ("b", dt.Interval("M")),
+        # a, b and g are variable length intervals, like YEAR TO MONTH
         ("c", dt.Interval("D")),
         ("d", dt.Interval("h")),
         ("e", dt.Interval("m")),
         ("f", dt.Interval("s")),
-        # ("g", dt.Interval("M")),
         ("h", dt.Interval("h")),
         ("i", dt.Interval("m")),
         ("j", dt.Interval("s")),

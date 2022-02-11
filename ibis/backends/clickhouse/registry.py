@@ -1,6 +1,7 @@
 from datetime import date, datetime
 from io import StringIO
 
+import ibis
 import ibis.common.exceptions as com
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
@@ -17,23 +18,23 @@ def _cast(translator, expr):
     arg_ = translator.translate(arg)
     type_ = str(ClickhouseDataType.from_ibis(target, nullable=False))
 
-    return 'CAST({0!s} AS {1!s})'.format(arg_, type_)
+    return f'CAST({arg_!s} AS {type_!s})'
 
 
 def _between(translator, expr):
     op = expr.op()
     arg_, lower_, upper_ = map(translator.translate, op.args)
-    return '{0!s} BETWEEN {1!s} AND {2!s}'.format(arg_, lower_, upper_)
+    return f'{arg_!s} BETWEEN {lower_!s} AND {upper_!s}'
 
 
 def _negate(translator, expr):
     arg = expr.op().args[0]
     if isinstance(expr, ir.BooleanValue):
         arg_ = translator.translate(arg)
-        return 'NOT {0!s}'.format(arg_)
+        return f'NOT {arg_!s}'
     else:
         arg_ = _parenthesize(translator, arg)
-        return '-{0!s}'.format(arg_)
+        return f'-{arg_!s}'
 
 
 def _not(translator, expr):
@@ -47,7 +48,7 @@ def _parenthesize(translator, expr):
     # function calls don't need parens
     what_ = translator.translate(expr)
     if (op_klass in _binary_infix_ops) or (op_klass in _unary_ops):
-        return '({0!s})'.format(what_)
+        return f'({what_!s})'
     else:
         return what_
 
@@ -73,6 +74,58 @@ def _fixed_arity(func_name, arity):
     return formatter
 
 
+def _array_index_op(translator, expr):
+    op = expr.op()
+
+    arr = op.args[0]
+    idx = op.args[1]
+
+    arr_ = translator.translate(arr)
+    idx_ = _parenthesize(translator, idx)
+
+    correct_idx = f'if({idx_} >= 0, {idx_} + 1, {idx_})'
+
+    return f'arrayElement({arr_}, {correct_idx})'
+
+
+def _array_repeat_op(translator, expr):
+    op = expr.op()
+    arr, times = op.args
+
+    arr_ = _parenthesize(translator, arr)
+    times_ = _parenthesize(translator, times)
+
+    select = 'arrayFlatten(groupArray(arr))'
+    from_ = f'(select {arr_} as arr from system.numbers limit {times_})'
+    return f'(select {select} from {from_})'
+
+
+def _array_slice_op(translator, expr):
+    op = expr.op()
+    arg, start, stop = op.args
+
+    start_ = _parenthesize(translator, start)
+    arg_ = translator.translate(arg)
+
+    start_correct_ = f'if({start_} < 0, {start_}, {start_} + 1)'
+
+    if stop is not None:
+        stop_ = _parenthesize(translator, stop)
+
+        cast_arg_ = f'if({arg_} = [], CAST({arg_} AS Array(UInt8)), {arg_})'
+        neg_start_ = f'(arrayCount({cast_arg_}) + {start_})'
+        diff_fmt = f'greatest(-0, {stop_} - {{}})'.format
+
+        length_ = (
+            f'if({stop_} < 0, {stop_}, '
+            + f'if({start_} < 0, {diff_fmt(neg_start_)}, {diff_fmt(start_)}))'
+        )
+
+        return f'arraySlice({arg_}, {start_correct_}, {length_})'
+
+    return f'arraySlice({arg_}, {start_correct_})'
+
+
 def _agg(func):
     def formatter(translator, expr):
         return _aggregate(translator, func, *expr.op().args)
@@ -81,7 +134,7 @@ def _agg(func):
 
 
 def _agg_variance_like(func):
-    variants = {'sample': '{0}Samp'.format(func), 'pop': '{0}Pop'.format(func)}
+    variants = {'sample': f'{func}Samp', 'pop': f'{func}Pop'}
 
     def formatter(translator, expr):
         arg, how, where = expr.op().args
@@ -98,14 +151,14 @@ def _binary_infix_op(infix_sym):
         left_ = _parenthesize(translator, left)
         right_ = _parenthesize(translator, right)
 
-        return '{0!s} {1!s} {2!s}'.format(left_, infix_sym, right_)
+        return f'{left_!s} {infix_sym!s} {right_!s}'
 
     return formatter
 
 
 def _call(translator, func, *args):
     args_ = ', '.join(map(translator.translate, args))
-    return '{0!s}({1!s})'.format(func, args_)
+    return f'{func!s}({args_!s})'
 
 
 def _aggregate(translator, func, arg, where=None):
@@ -119,7 +172,7 @@ def _xor(translator, expr):
     op = expr.op()
     left_ = _parenthesize(translator, op.left)
     right_ = _parenthesize(translator, op.right)
-    return 'xor({0}, {1})'.format(left_, right_)
+    return f'xor({left_}, {right_})'
 
 
 def _varargs(func_name):
@@ -131,14 +184,14 @@ def _varargs(func_name):
 
 
 def _arbitrary(translator, expr):
-    arg, how, where = expr.op().args
+    op = expr.op()
     functions = {
         None: 'any',
         'first': 'any',
         'last': 'anyLast',
         'heavy': 'anyHeavy',
     }
-    return _aggregate(translator, functions[how], arg, where=where)
+    return _aggregate(translator, functions[op.how], op.arg, where=op.where)
 
 
 def _substring(translator, expr):
@@ -151,12 +204,12 @@ def _substring(translator, expr):
     if length is None or isinstance(length.op(), ops.Literal):
         if length is not None:
             length_ = length.op().value
-            return 'substring({0}, {1} + 1, {2})'.format(arg_, start_, length_)
+            return f'substring({arg_}, {start_} + 1, {length_})'
         else:
-            return 'substring({0}, {1} + 1)'.format(arg_, start_)
+            return f'substring({arg_}, {start_} + 1)'
     else:
         length_ = translator.translate(length)
-        return 'substring({0}, {1} + 1, {2})'.format(arg_, start_, length_)
+        return f'substring({arg_}, {start_} + 1, {length_})'
 
 
 def _string_find(translator, expr):
@@ -177,9 +230,9 @@ def _regex_extract(translator, expr):
 
     if index is not None:
         index_ = translator.translate(index)
-        return 'extractAll({0}, {1})[{2} + 1]'.format(arg_, pattern_, index_)
+        return f'extractAll({arg_}, {pattern_})[{index_} + 1]'
 
-    return 'extractAll({0}, {1})'.format(arg_, pattern_)
+    return f'extractAll({arg_}, {pattern_})'
 
 
 def _parse_url(translator, expr):
@@ -199,7 +252,7 @@ def _parse_url(translator, expr):
             return _call(translator, 'queryString', arg)
     else:
         raise com.UnsupportedOperationError(
-            'Parse url with extract {0} is not supported'.format(extract)
+            f'Parse url with extract {extract} is not supported'
         )
 
 
@@ -209,7 +262,7 @@ def _index_of(translator, expr):
     arg, arr = op.args
     arg_formatted = translator.translate(arg)
     arr_formatted = ','.join(map(translator.translate, arr))
-    return "indexOf([{0}], {1}) - 1".format(arr_formatted, arg_formatted)
+    return f"indexOf([{arr_formatted}], {arg_formatted}) - 1"
 
 
 def _sign(translator, expr):
@@ -249,7 +302,7 @@ def _hash(translator, expr):
 
     if how not in algorithms:
         raise com.UnsupportedOperationError(
-            'Unsupported hash algorithm {0}'.format(how)
+            f'Unsupported hash algorithm {how}'
         )
 
     return _call(translator, how, arg)
@@ -266,7 +319,7 @@ def _log(translator, expr):
     elif base._arg.value == 10:
         func = 'log10'
     else:
-        raise ValueError('Base {} for logarithm not supported!'.format(base))
+        raise ValueError(f'Base {base} for logarithm not supported!')
 
     return _call(translator, func, arg)
 
@@ -274,7 +327,7 @@ def _log(translator, expr):
 def _value_list(translator, expr):
     op = expr.op()
     values_ = map(translator.translate, op.values)
-    return '({0})'.format(', '.join(values_))
+    return '({})'.format(', '.join(values_))
 
 
 def _interval_format(translator, expr):
@@ -284,7 +337,7 @@ def _interval_format(translator, expr):
             "Clickhouse doesn't support subsecond interval resolutions"
         )
 
-    return 'INTERVAL {} {}'.format(expr.op().value, dtype.resolution.upper())
+    return f'INTERVAL {expr.op().value} {dtype.resolution.upper()}'
 
 
 def _interval_from_integer(translator, expr):
@@ -298,15 +351,17 @@ def _interval_from_integer(translator, expr):
         )
 
     arg_ = translator.translate(arg)
-    return 'INTERVAL {} {}'.format(arg_, dtype.resolution.upper())
+    return f'INTERVAL {arg_} {dtype.resolution.upper()}'
 
 
 def _literal(translator, expr):
     value = expr.op().value
+    if value is None and expr.type().nullable:
+        return _null_literal(translator, expr)
     if isinstance(expr, ir.BooleanValue):
         return '1' if value else '0'
     elif isinstance(expr, ir.StringValue):
-        return "'{0!s}'".format(value.replace("'", "\\'"))
+        return "'{!s}'".format(value.replace("'", "\\'"))
     elif isinstance(expr, ir.NumericValue):
         return repr(value)
     elif isinstance(expr, ir.IntervalValue):
@@ -317,11 +372,11 @@ def _literal(translator, expr):
                 msg = 'Unsupported subsecond accuracy {}'
                 raise ValueError(msg.format(value))
             value = value.strftime('%Y-%m-%d %H:%M:%S')
-        return "toDateTime('{0!s}')".format(value)
+        return f"toDateTime('{value!s}')"
     elif isinstance(expr, ir.DateValue):
         if isinstance(value, date):
             value = value.strftime('%Y-%m-%d')
-        return "toDate('{0!s}')".format(value)
+        return f"toDate('{value!s}')"
     elif isinstance(expr, ir.ArrayValue):
         return str(list(value))
     elif isinstance(expr, ir.SetScalar):
@@ -352,18 +407,18 @@ class _CaseFormatter:
         self.buf.write('CASE')
         if self.base is not None:
             base_str = self._trans(self.base)
-            self.buf.write(' {0}'.format(base_str))
+            self.buf.write(f' {base_str}')
 
         for case, result in zip(self.cases, self.results):
             self._next_case()
             case_str = self._trans(case)
             result_str = self._trans(result)
-            self.buf.write('WHEN {0} THEN {1}'.format(case_str, result_str))
+            self.buf.write(f'WHEN {case_str} THEN {result_str}')
 
         if self.default is not None:
             self._next_case()
             default_str = self._trans(self.default)
-            self.buf.write('ELSE {0}'.format(default_str))
+            self.buf.write(f'ELSE {default_str}')
 
         if self.multiline:
             self.buf.write('\nEND')
@@ -374,7 +429,7 @@ class _CaseFormatter:
 
     def _next_case(self):
         if self.multiline:
-            self.buf.write('\n{0}'.format(' ' * self.indent))
+            self.buf.write('\n{}'.format(' ' * self.indent))
         else:
             self.buf.write(' ')
 
@@ -399,7 +454,7 @@ def _table_array_view(translator, expr):
     ctx = translator.context
     table = expr.op().table
     query = ctx.get_compiled_expr(table)
-    return '(\n{0}\n)'.format(util.indent(query, ctx.indent))
+    return f'(\n{util.indent(query, ctx.indent)}\n)'
 
 
 def _timestamp_from_unix(translator, expr):
@@ -407,7 +462,7 @@ def _timestamp_from_unix(translator, expr):
     arg, unit = op.args
 
     if unit in {'ms', 'us', 'ns'}:
-        raise ValueError('`{}` unit is not supported!'.format(unit))
+        raise ValueError(f'`{unit}` unit is not supported!')
 
     return _call(translator, 'toDateTime', arg)
 
@@ -430,7 +485,7 @@ def _truncate(translator, expr):
         converter = converters[unit]
     except KeyError:
         raise com.UnsupportedOperationError(
-            'Unsupported truncate unit {}'.format(unit)
+            f'Unsupported truncate unit {unit}'
         )
 
     return _call(translator, converter, arg)
@@ -440,7 +495,7 @@ def _exists_subquery(translator, expr):
     op = expr.op()
     ctx = translator.context
 
-    dummy = ir.literal(1).name(ir.unnamed)
+    dummy = ir.literal(1).name(ir.core.unnamed)
 
     filtered = op.foreign_table.filter(op.predicates)
     expr = filtered.projection([dummy])
@@ -454,7 +509,7 @@ def _exists_subquery(translator, expr):
     else:
         raise NotImplementedError
 
-    return '{0} (\n{1}\n)'.format(key, util.indent(subquery, ctx.indent))
+    return f'{key} (\n{util.indent(subquery, ctx.indent)}\n)'
 
 
 def _table_column(translator, expr):
@@ -470,11 +525,10 @@ def _table_column(translator, expr):
         proj_expr = table.projection([field_name]).to_array()
         return _table_array_view(translator, proj_expr)
 
-    # TODO(kszucs): table aliasing is partially supported
-    # if ctx.need_aliases():
-    #     alias = ctx.get_ref(table)
-    #     if alias is not None:
-    #         quoted_name = '{0}.{1}'.format(alias, quoted_name)
+    if ctx.need_aliases():
+        alias = ctx.get_ref(table)
+        if alias is not None:
+            quoted_name = f'{alias}.{quoted_name}'
 
     return quoted_name
 
@@ -490,7 +544,7 @@ def _string_join(translator, expr):
     sep, elements = expr.op().args
     assert isinstance(
         elements.op(), ops.ValueList
-    ), 'elements must be a ValueList, got {}'.format(type(elements.op()))
+    ), f'elements must be a ValueList, got {type(elements.op())}'
     return 'arrayStringConcat([{}], {})'.format(
         ', '.join(map(translator.translate, elements)),
         translator.translate(sep),
@@ -509,6 +563,15 @@ def _string_like(translator, expr):
     value, pattern = expr.op().args[:2]
     return '{} LIKE {}'.format(
         translator.translate(value), translator.translate(pattern)
+    )
+
+
+def _group_concat(translator, expr):
+    arg, sep, where = expr.op().args
+    if where is not None:
+        arg = where.ifelse(arg, ibis.NA)
+    return 'arrayStringConcat(groupArray({}), {})'.format(
+        *map(translator.translate, (arg, sep))
     )
 
 
@@ -567,7 +630,7 @@ operation_registry = {
     ops.Min: _agg('min'),
     ops.StandardDev: _agg_variance_like('stddev'),
     ops.Variance: _agg_variance_like('var'),
-    # ops.GroupConcat: fixed_arity('group_concat', 2),
+    ops.GroupConcat: _group_concat,
     ops.Count: _agg('count'),
     ops.CountDistinct: _agg('uniq'),
     ops.Arbitrary: _arbitrary,
@@ -633,6 +696,10 @@ operation_registry = {
     ops.ExistsSubquery: _exists_subquery,
     ops.NotExistsSubquery: _exists_subquery,
     ops.ArrayLength: _unary('length'),
+    ops.ArrayIndex: _array_index_op,
+    ops.ArrayConcat: _fixed_arity('arrayConcat', 2),
+    ops.ArrayRepeat: _array_repeat_op,
+    ops.ArraySlice: _array_slice_op,
 }
 
 
@@ -650,14 +717,21 @@ def _null_if_zero(translator, expr):
     op = expr.op()
     arg = op.args[0]
     arg_ = translator.translate(arg)
-    return 'nullIf({0}, 0)'.format(arg_)
+    return f'nullIf({arg_}, 0)'
 
 
 def _zero_if_null(translator, expr):
     op = expr.op()
     arg = op.args[0]
     arg_ = translator.translate(arg)
-    return 'ifNull({0}, 0)'.format(arg_)
+    return f'ifNull({arg_}, 0)'
+
+
+def _day_of_week_index(translator, expr):
+    (arg,) = expr.op().args
+    weekdays = 7
+    offset = f"toDayOfWeek({translator.translate(arg)})"
+    return f"((({offset} - 1) % {weekdays:d}) + {weekdays:d}) % {weekdays:d}"
 
 
 _undocumented_operations = {
@@ -669,10 +743,11 @@ _undocumented_operations = {
     ops.Coalesce: _varargs('coalesce'),
     ops.NullIfZero: _null_if_zero,
     ops.ZeroIfNull: _zero_if_null,
+    ops.DayOfWeekIndex: _day_of_week_index,
 }
 
 
-_unsupported_ops = [
+_unsupported_ops_list = [
     ops.WindowOp,
     ops.DecimalPrecision,
     ops.DecimalScale,
@@ -695,7 +770,7 @@ _unsupported_ops = [
     ops.Lead,
     ops.NTile,
 ]
-_unsupported_ops = {k: _raise_error for k in _unsupported_ops}
+_unsupported_ops = {k: _raise_error for k in _unsupported_ops_list}
 
 
 operation_registry.update(_undocumented_operations)

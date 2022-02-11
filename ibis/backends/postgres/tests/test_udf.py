@@ -8,18 +8,7 @@ import ibis
 import ibis.expr.datatypes as dt
 from ibis.backends.postgres.udf import PostgresUDFError, existing_udf, udf
 
-# mark test module as postgresql (for ability to easily exclude,
-# e.g. in conda build tests)
-# (Temporarily adding `postgis` marker so Azure Windows pipeline will exclude
-#     pl/python tests.
-#     TODO: update Windows pipeline to exclude postgres_extensions
-#     TODO: remove postgis marker below once Windows pipeline updated
-pytestmark = [
-    pytest.mark.postgres,
-    pytest.mark.udf,
-    pytest.mark.postgis,
-    pytest.mark.postgres_extensions,
-]
+pytestmark = pytest.mark.udf
 
 # Database setup (tables and UDFs)
 
@@ -36,8 +25,8 @@ def next_serial(con):
 
 @pytest.fixture(scope='session')
 def test_schema(con, next_serial):
-    schema_name = 'udf_test_{}'.format(next_serial)
-    con.con.execute("CREATE SCHEMA IF NOT EXISTS {};".format(schema_name))
+    schema_name = f'udf_test_{next_serial}'
+    con.con.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_name};")
     return schema_name
 
 
@@ -68,7 +57,7 @@ INSERT INTO {schema}.{table_name} VALUES
 def sql_define_py_udf(test_schema):
     return """CREATE OR REPLACE FUNCTION {schema}.pylen(x varchar)
 RETURNS integer
-LANGUAGE plpythonu
+LANGUAGE plpython3u
 AS
 $$
 return len(x)
@@ -94,14 +83,15 @@ $$;""".format(
 def con_for_udf(
     con, test_schema, sql_table_setup, sql_define_udf, sql_define_py_udf
 ):
-    con.con.execute(sql_table_setup)
-    con.con.execute(sql_define_udf)
-    con.con.execute(sql_define_py_udf)
+    with con.con.begin() as c:
+        c.execute(sql_table_setup)
+        c.execute(sql_define_udf)
+        c.execute(sql_define_py_udf)
     try:
         yield con
     finally:
         # teardown
-        con.con.execute("DROP SCHEMA IF EXISTS {} CASCADE".format(test_schema))
+        con.con.execute(f"DROP SCHEMA IF EXISTS {test_schema} CASCADE")
 
 
 @pytest.fixture
@@ -159,6 +149,7 @@ def test_udf(con_for_udf, test_schema, table):
         dt.int32,
         schema=test_schema,
         replace=True,
+        language="plpython3u",
     )
     table_filt = table.filter(table['user_id'] == 2)
     expr = table_filt[
@@ -188,6 +179,7 @@ def test_array_type(con_for_udf, test_schema, table):
         dt.Array(dt.string),
         schema=test_schema,
         replace=True,
+        language="plpython3u",
     )
     splitter = ibis.literal(' ', dt.string)
     result = pysplit_udf(table['user_name'], splitter).name('split_name')
@@ -207,6 +199,7 @@ def test_client_udf_api(con_for_udf, test_schema, table):
         dt.int32,
         schema=test_schema,
         replace=True,
+        language="plpython3u",
     )
 
     table_filt = table.filter(table['user_id'] == 2)
@@ -243,4 +236,5 @@ def test_client_udf_decorator_fails(con_for_udf, test_schema):
             dt.int32,
             schema=test_schema,
             replace=True,
+            language="plpython3u",
         )

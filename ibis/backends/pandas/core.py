@@ -103,7 +103,6 @@ stored in value
 See ibis.common.scope for details about the implementaion.
 """
 
-from __future__ import absolute_import
 
 import datetime
 import functools
@@ -120,7 +119,7 @@ import ibis.expr.operations as ops
 import ibis.expr.types as ir
 import ibis.expr.window as win
 import ibis.util
-from ibis.backends.base import Client
+from ibis.backends.base import BaseBackend
 from ibis.expr.scope import Scope
 from ibis.expr.timecontext import canonicalize_context
 from ibis.expr.typing import TimeContext
@@ -149,7 +148,7 @@ def is_computable_input(arg):
     return False
 
 
-@is_computable_input.register(Client)
+@is_computable_input.register(BaseBackend)
 @is_computable_input.register(ir.Expr)
 @is_computable_input.register(dt.DataType)
 @is_computable_input.register(type(None))
@@ -256,7 +255,7 @@ def execute_until_in_scope(
     scope : Scope
     timecontext : Optional[TimeContext]
     aggcontext : Optional[AggregationContext]
-    clients : List[ibis.backends.base.Client]
+    clients : List[ibis.backends.base.BaseBackend]
     kwargs : Mapping
     """
     # these should never be None
@@ -294,6 +293,7 @@ def execute_until_in_scope(
             num_args=len(computable_args),
             timecontext=timecontext,
             clients=clients,
+            scope=scope,
         )
     else:
         arg_timecontexts = [None] * len(computable_args)
@@ -342,7 +342,7 @@ def execute_until_in_scope(
     # if we're unable to find data then raise an exception
     if not scopes and computable_args:
         raise com.UnboundExpressionError(
-            'Unable to find data for expression:\n{}'.format(repr(expr))
+            f'Unable to find data for expression:\n{repr(expr)}'
         )
 
     # there should be exactly one dictionary per computable argument
@@ -354,7 +354,7 @@ def execute_until_in_scope(
         new_scope.get_value(arg.op(), timecontext)
         if hasattr(arg, 'op')
         else arg
-        for arg in computable_args
+        for (arg, timecontext) in zip(computable_args, arg_timecontexts)
     ]
     result = execute_node(
         op,
@@ -430,7 +430,11 @@ def main_execute(
     params = {k.op() if hasattr(k, 'op') else k: v for k, v in params.items()}
     scope = scope.merge_scope(Scope(params, timecontext))
     return execute_with_scope(
-        expr, scope, timecontext=timecontext, aggcontext=aggcontext, **kwargs,
+        expr,
+        scope,
+        timecontext=timecontext,
+        aggcontext=aggcontext,
+        **kwargs,
     )
 
 
@@ -518,7 +522,7 @@ are going to be used in executeion and passes these attributes to children
 nodes.
 
 Param:
-clients: List[ibis.backends.base.Client]
+clients: List[ibis.backends.base.BaseBackend]
     backends for execution
 timecontext : Optional[TimeContext]
     begin and end time context needed for execution
@@ -535,6 +539,9 @@ See ``computable_args`` in ``execute_until_in_scope``
 
 @compute_time_context.register(ops.Node)
 def compute_time_context_default(
-    node, timecontext: Optional[TimeContext] = None, **kwargs
+    node: ops.Node,
+    scope: Scope,
+    timecontext: Optional[TimeContext] = None,
+    **kwargs,
 ):
     return [timecontext for arg in node.inputs if is_computable_input(arg)]
