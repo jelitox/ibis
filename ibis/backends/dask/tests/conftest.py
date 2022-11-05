@@ -1,13 +1,14 @@
 from pathlib import Path
 from typing import Any
 
-import dask.dataframe as dd
 import pandas as pd
 import pandas.testing as tm
 import pytest
 
 import ibis
 from ibis.backends.pandas.tests.conftest import TestConf as PandasTest
+
+dd = pytest.importorskip("dask.dataframe")
 
 NPARTITIONS = 2
 
@@ -18,6 +19,8 @@ def npartitions():
 
 
 class TestConf(PandasTest):
+    supports_structs = False
+
     @staticmethod
     def connect(data_directory: Path):
         # Note - we use `dd.from_pandas(pd.read_csv(...))` instead of
@@ -42,6 +45,18 @@ class TestConf(PandasTest):
                 'awards_players': dd.from_pandas(
                     pd.read_csv(str(data_directory / 'awards_players.csv')),
                     npartitions=NPARTITIONS,
+                ),
+                'json_t': pd.DataFrame(
+                    {
+                        "js": [
+                            '{"a": [1,2,3,4], "b": 1}',
+                            '{"a":null,"b":2}',
+                            '{"a":"foo", "c":null}',
+                            "null",
+                            "[42,47,55]",
+                            "[]",
+                        ]
+                    }
                 ),
             }
         )

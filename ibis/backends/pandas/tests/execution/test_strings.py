@@ -74,8 +74,7 @@ from ibis.backends.pandas.execution.strings import sql_like_to_regex
         param(
             lambda s: s.re_search('(ab)+') | s.re_search('d{1,2}ee'),
             lambda s: (
-                s.str.contains('(ab)+', regex=True)
-                | s.str.contains('d{1,2}ee')
+                s.str.contains('(ab)+', regex=True) | s.str.contains('d{1,2}ee')
             ),
             id='re_search_or',
         ),
@@ -92,7 +91,6 @@ from ibis.backends.pandas.execution.strings import sql_like_to_regex
     ],
 )
 def test_string_ops(t, df, case_func, expected_func):
-
     # ignore matching UserWarnings
     with catch_warnings(record=True):
         expr = case_func(t.strings_with_space)

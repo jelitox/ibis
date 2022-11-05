@@ -4,11 +4,14 @@ import pytest
 
 import ibis
 import ibis.expr.operations as ops
-from ibis.backends.pyspark.compiler import compile_window_op, compiles
-from ibis.backends.pyspark.timecontext import combine_time_context
 from ibis.expr.scope import Scope
 from ibis.expr.timecontext import adjust_context
 from ibis.expr.typing import TimeContext
+
+pytest.importorskip("pyspark")
+
+from ibis.backends.pyspark.compiler import compile_window_op, compiles  # noqa: E402
+from ibis.backends.pyspark.timecontext import combine_time_context  # noqa: E402
 
 
 def test_table_with_timecontext(client):
@@ -67,25 +70,25 @@ def test_adjust_context_scope(client):
     """Test that `adjust_context` has access to `scope` by default."""
     table = client.table('time_indexed_table')
 
-    # WindowOp is the only context-adjusted node that the PySpark backend
+    # Window is the only context-adjusted node that the PySpark backend
     # can compile. Ideally we would test the context adjustment logic for
-    # WindowOp itself, but building this test like that would unfortunately
-    # affect other tests that involve WindowOp.
-    # To avoid that, we'll create a dummy subclass of WindowOp and build the
+    # Window itself, but building this test like that would unfortunately
+    # affect other tests that involve Window.
+    # To avoid that, we'll create a dummy subclass of Window and build the
     # test around that.
 
-    class CustomWindowOp(ops.WindowOp):
+    class CustomWindow(ops.Window):
         pass
 
-    # Tell the Spark backend compiler it should compile CustomWindowOp just
-    # like WindowOp
-    compiles(CustomWindowOp)(compile_window_op)
+    # Tell the Spark backend compiler it should compile CustomWindow just
+    # like Window
+    compiles(CustomWindow)(compile_window_op)
 
     # Create an `adjust_context` function for this subclass that simply checks
     # that `scope` is passed in.
-    @adjust_context.register(CustomWindowOp)
+    @adjust_context.register(CustomWindow)
     def adjust_context_window_check_scope(
-        op: CustomWindowOp,
+        op: CustomWindow,
         scope: Scope,
         timecontext: TimeContext,
     ) -> TimeContext:
@@ -94,7 +97,7 @@ def test_adjust_context_scope(client):
         return timecontext
 
     # Do an operation that will trigger context adjustment
-    # on a CustomWindowOp
+    # on a CustomWindow
     value_count = table['value'].count()
     win = ibis.window(
         ibis.interval(hours=1),
@@ -102,7 +105,9 @@ def test_adjust_context_scope(client):
         order_by='time',
         group_by='key',
     )
-    value_count_over_win = CustomWindowOp(value_count, win).to_expr()
+    # the argument needs to be pull out from the alias
+    # any extensions must do the same
+    value_count_over_win = CustomWindow(value_count.op().arg, win).to_expr()
 
     expr = table.mutate(value_count_over_win.name('value_count_over_win'))
 

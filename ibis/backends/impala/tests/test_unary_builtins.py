@@ -2,8 +2,7 @@ import pytest
 
 import ibis.expr.types as ir
 from ibis import literal as L
-
-from .conftest import translate
+from ibis.backends.impala.tests.conftest import translate
 
 
 @pytest.fixture(scope="module")
@@ -162,11 +161,7 @@ def test_hash(table):
 def test_reduction_where(table, expr_fn, func_name):
     expr = expr_fn(table)
     result = translate(expr)
-    expected = (
-        f'{func_name}'
-        '(CASE WHEN `bigint_col` < 70 THEN `double_col` '
-        'ELSE NULL END)'
-    )
+    expected = f'{func_name}(if(`bigint_col` < 70, `double_col`, NULL))'
     assert result == expected
 
 

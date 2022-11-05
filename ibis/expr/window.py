@@ -9,9 +9,12 @@ import numpy as np
 import pandas as pd
 import toolz
 
-import ibis.common.exceptions as com
+import ibis.expr.operations as ops
+import ibis.expr.rules as rlz
 import ibis.expr.types as ir
 import ibis.util as util
+from ibis.common.exceptions import IbisInputError
+from ibis.common.grounds import Comparable
 
 
 def _sequence_to_tuple(x):
@@ -77,13 +80,12 @@ def get_preceding_value_mlb(preceding: RowsWithMaxLookback):
     preceding_value = preceding.rows
     if not isinstance(preceding_value, (int, np.integer)):
         raise TypeError(
-            "'Rows with max look-back' only supports integer "
-            "row-based indexing."
+            "'Rows with max look-back' only supports integer " "row-based indexing."
         )
     return preceding_value
 
 
-class Window:
+class Window(Comparable):
     """A window frame.
 
     Notes
@@ -95,6 +97,16 @@ class Window:
     Use 0 for `CURRENT ROW`.
     """
 
+    __slots__ = (
+        '_group_by',
+        '_order_by',
+        '_hash',
+        'preceding',
+        'following',
+        'max_lookback',
+        'how',
+    )
+
     def __init__(
         self,
         group_by=None,
@@ -104,24 +116,16 @@ class Window:
         max_lookback=None,
         how='rows',
     ):
-        import ibis.expr.operations as ops
-
-        self._group_by = list(
+        self._group_by = tuple(
             toolz.unique(
-                util.promote_list([] if group_by is None else group_by),
-                key=lambda value: getattr(value, "_key", value),
+                arg.op() if isinstance(arg, ir.Expr) else arg
+                for arg in util.promote_list(group_by)
             )
         )
-
-        _order_by = []
-        for expr in util.promote_list([] if order_by is None else order_by):
-            if isinstance(expr, ir.Expr) and not isinstance(expr, ir.SortExpr):
-                expr = ops.SortKey(expr).to_expr()
-            _order_by.append(expr)
-
-        self._order_by = list(
+        self._order_by = tuple(
             toolz.unique(
-                _order_by, key=lambda value: getattr(value, "_key", value)
+                arg.op() if isinstance(arg, ir.Expr) else arg
+                for arg in util.promote_list(order_by)
             )
         )
 
@@ -138,17 +142,30 @@ class Window:
         self.how = how
 
         self._validate_frame()
+        self._hash = self._compute_hash()
 
-    def __hash__(self) -> int:
+    def _compute_hash(self) -> int:
         return hash(
             (
-                tuple(gb.op() for gb in self._group_by),
-                tuple(ob.op() for ob in self._order_by),
-                self.preceding,
-                self.following,
+                *self._group_by,
+                *self._order_by,
+                (
+                    self.preceding.op()
+                    if isinstance(self.preceding, ir.Expr)
+                    else self.preceding
+                ),
+                (
+                    self.following.op()
+                    if isinstance(self.following, ir.Expr)
+                    else self.following
+                ),
                 self.how,
+                self.max_lookback,
             )
         )
+
+    def __hash__(self) -> int:
+        return self._hash
 
     def _validate_frame(self):
         preceding_tuple = has_preceding = False
@@ -161,114 +178,88 @@ class Window:
             following_tuple = isinstance(self.following, tuple)
             has_following = True
 
-        if (preceding_tuple and has_following) or (
-            following_tuple and has_preceding
-        ):
-            raise com.IbisInputError(
-                'Can only specify one window side when you want an '
-                'off-center window'
+        if (preceding_tuple and has_following) or (following_tuple and has_preceding):
+            raise IbisInputError(
+                'Can only specify one window side when you want an ' 'off-center window'
             )
         elif preceding_tuple:
             start, end = self.preceding
             if end is None:
-                raise com.IbisInputError("preceding end point cannot be None")
+                raise IbisInputError("preceding end point cannot be None")
             if end < 0:
-                raise com.IbisInputError(
-                    "preceding end point must be non-negative"
-                )
+                raise IbisInputError("preceding end point must be non-negative")
             if start is not None:
                 if start < 0:
-                    raise com.IbisInputError(
-                        "preceding start point must be non-negative"
-                    )
+                    raise IbisInputError("preceding start point must be non-negative")
                 if start <= end:
-                    raise com.IbisInputError(
+                    raise IbisInputError(
                         "preceding start must be greater than preceding end"
                     )
         elif following_tuple:
             start, end = self.following
             if start is None:
-                raise com.IbisInputError(
-                    "following start point cannot be None"
-                )
+                raise IbisInputError("following start point cannot be None")
             if start < 0:
-                raise com.IbisInputError(
-                    "following start point must be non-negative"
-                )
+                raise IbisInputError("following start point must be non-negative")
             if end is not None:
                 if end < 0:
-                    raise com.IbisInputError(
-                        "following end point must be non-negative"
-                    )
+                    raise IbisInputError("following end point must be non-negative")
                 if start >= end:
-                    raise com.IbisInputError(
+                    raise IbisInputError(
                         "following start must be less than following end"
                     )
         else:
             if not isinstance(self.preceding, ir.Expr):
                 if has_preceding and self.preceding < 0:
-                    raise com.IbisInputError(
-                        "'preceding' must be positive, got {}".format(
-                            self.preceding
-                        )
+                    raise IbisInputError(
+                        f"'preceding' must be positive, got {self.preceding}"
                     )
 
             if not isinstance(self.following, ir.Expr):
                 if has_following and self.following < 0:
-                    raise com.IbisInputError(
-                        "'following' must be positive, got {}".format(
-                            self.following
-                        )
+                    raise IbisInputError(
+                        f"'following' must be positive, got {self.following}"
                     )
         if self.how not in {'rows', 'range'}:
-            raise com.IbisInputError(
-                f"'how' must be 'rows' or 'range', got {self.how}"
-            )
+            raise IbisInputError(f"'how' must be 'rows' or 'range', got {self.how}")
 
         if self.max_lookback is not None:
-            if not isinstance(
-                self.preceding, (ir.IntervalValue, pd.Timedelta)
-            ):
-                raise com.IbisInputError(
+            if not isinstance(self.preceding, (ir.IntervalValue, pd.Timedelta)):
+                raise IbisInputError(
                     "'max_lookback' must be specified as an interval "
                     "or pandas.Timedelta object"
                 )
 
     def bind(self, table):
-        import ibis.expr.operations as ops
-
         # Internal API, ensure that any unresolved expr references (as strings,
         # say) are bound to the table being windowed
-        groups = table._resolve(self._group_by)
-        sorts = [
-            ops.sortkeys._to_sort_key(k, table=table) for k in self._order_by
-        ]
+
+        groups = rlz.tuple_of(
+            rlz.one_of((rlz.column_from(rlz.just(table)), rlz.any)),
+            self._group_by,
+        )
+        sorts = rlz.tuple_of(rlz.sort_key_from(rlz.just(table)), self._order_by)
+
         return self._replace(group_by=groups, order_by=sorts)
 
     def combine(self, window):
         if self.how != window.how:
-            raise com.IbisInputError(
-                (
-                    "Window types must match. "
-                    "Expecting '{}' Window, got '{}'"
-                ).format(self.how.upper(), window.how.upper())
+            raise IbisInputError(
+                "Window types must match. "
+                f"Expecting {self.how!r} window, got {window.how!r}"
             )
 
-        kwds = {
-            'preceding': _choose_non_empty_val(
-                self.preceding, window.preceding
-            ),
-            'following': _choose_non_empty_val(
-                self.following, window.following
-            ),
-            'max_lookback': self.max_lookback or window.max_lookback,
-            'group_by': self._group_by + window._group_by,
-            'order_by': self._order_by + window._order_by,
-        }
-        return Window(**kwds)
+        return Window(
+            preceding=_choose_non_empty_val(self.preceding, window.preceding),
+            following=_choose_non_empty_val(self.following, window.following),
+            group_by=self._group_by + window._group_by,
+            order_by=self._order_by + window._order_by,
+            max_lookback=self.max_lookback or window.max_lookback,
+            how=self.how,
+        )
 
     def group_by(self, expr):
-        new_groups = self._group_by + util.promote_list(expr)
+        new_groups = self._group_by + tuple(util.promote_list(expr))
         return self._replace(group_by=new_groups)
 
     def _replace(self, **kwds):
@@ -283,49 +274,32 @@ class Window:
         return Window(**new_kwds)
 
     def order_by(self, expr):
-        new_sorts = self._order_by + util.promote_list(expr)
+        new_sorts = self._order_by + tuple(util.promote_list(expr))
         return self._replace(order_by=new_sorts)
 
-    def equals(self, other, cache=None):
-        import ibis.expr.operations as ops
-
-        if cache is None:
-            cache = {}
-
-        if self is other:
-            cache[self, other] = True
-            return True
-
-        if not isinstance(other, Window):
-            cache[self, other] = False
-            return False
-
-        try:
-            return cache[self, other]
-        except KeyError:
-            pass
-
-        if len(self._group_by) != len(other._group_by) or not ops.all_equal(
-            self._group_by, other._group_by, cache=cache
-        ):
-            cache[self, other] = False
-            return False
-
-        if len(self._order_by) != len(other._order_by) or not ops.all_equal(
-            self._order_by, other._order_by, cache=cache
-        ):
-            cache[self, other] = False
-            return False
-
-        equal = (
-            ops.all_equal(self.preceding, other.preceding, cache=cache)
-            and ops.all_equal(self.following, other.following, cache=cache)
-            and ops.all_equal(
-                self.max_lookback, other.max_lookback, cache=cache
+    def __equals__(self, other):
+        return (
+            self.max_lookback == other.max_lookback
+            and (
+                self.preceding.equals(other.preceding)
+                if isinstance(self.preceding, ir.Expr)
+                else self.preceding == other.preceding
             )
+            and (
+                self.following.equals(other.following)
+                if isinstance(self.following, ir.Expr)
+                else self.following == other.following
+            )
+            and self._group_by == other._group_by
+            and self._order_by == other._order_by
         )
-        cache[self, other] = equal
-        return equal
+
+    def equals(self, other):
+        if not isinstance(other, Window):
+            raise TypeError(
+                "invalid equality comparison between Window and " f"{type(other)}"
+            )
+        return self.__cached_equals__(other)
 
 
 def rows_with_max_lookback(
@@ -433,9 +407,7 @@ def cumulative_window(group_by=None, order_by=None) -> Window:
     Window
         A window frame
     """
-    return Window(
-        preceding=None, following=0, group_by=group_by, order_by=order_by
-    )
+    return Window(preceding=None, following=0, group_by=group_by, order_by=order_by)
 
 
 def trailing_window(preceding, group_by=None, order_by=None):
@@ -481,7 +453,6 @@ def trailing_range_window(preceding, order_by, group_by=None) -> Window:
     -------
     Window
         A window frame
-
     """
     return Window(
         preceding=preceding,
@@ -492,18 +463,17 @@ def trailing_range_window(preceding, order_by, group_by=None) -> Window:
     )
 
 
-def propagate_down_window(expr: ir.ValueExpr, window: Window):
+# TODO(kszucs): use ibis.expr.analysis.substitute instead
+def propagate_down_window(node: ops.Node, window: Window):
     import ibis.expr.operations as ops
-
-    op = expr.op()
 
     clean_args = []
     unchanged = True
-    for arg in op.args:
-        if isinstance(arg, ir.Expr) and not isinstance(op, ops.WindowOp):
+    for arg in node.args:
+        if isinstance(arg, ops.Value) and not isinstance(node, ops.Window):
             new_arg = propagate_down_window(arg, window)
-            if isinstance(new_arg.op(), ops.AnalyticOp):
-                new_arg = ops.WindowOp(new_arg, window).to_expr()
+            if isinstance(new_arg, ops.Analytic):
+                new_arg = ops.Window(new_arg, window)
             if arg is not new_arg:
                 unchanged = False
             arg = new_arg
@@ -511,6 +481,6 @@ def propagate_down_window(expr: ir.ValueExpr, window: Window):
         clean_args.append(arg)
 
     if unchanged:
-        return expr
+        return node
     else:
-        return type(op)(*clean_args).to_expr()
+        return type(node)(*clean_args)

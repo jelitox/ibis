@@ -1,20 +1,26 @@
 from typing import Any
 
-import dask.dataframe as dd
 import pytest
-from dask.dataframe.utils import tm
 from multipledispatch.conflict import ambiguities
 
 import ibis
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-from ibis.backends.dask import Backend
 from ibis.backends.pandas.dispatch import execute_node as pandas_execute_node
 from ibis.expr.scope import Scope
 
-from ..core import execute, is_computable_input
-from ..dispatch import execute_node, post_execute, pre_execute
+dd = pytest.importorskip("dask.dataframe")
+
+from dask.dataframe.utils import tm  # noqa: E402
+
+from ibis.backends.dask import Backend  # noqa: E402
+from ibis.backends.dask.core import execute, is_computable_input  # noqa: E402
+from ibis.backends.dask.dispatch import (  # noqa: E402
+    execute_node,
+    post_execute,
+    pre_execute,
+)
 
 
 @pytest.mark.parametrize('func', [execute_node, pre_execute, post_execute])
@@ -39,10 +45,8 @@ def test_from_dataframe(dataframe, ibis_table, core_client):
 
 
 def test_pre_execute_basic():
-    """
-    Test that pre_execute has intercepted execution and provided its own
-    scope dict
-    """
+    """Test that pre_execute has intercepted execution and provided its own
+    scope dict."""
 
     @pre_execute.register(ops.Add)
     def pre_execute_test(op, *clients, scope=None, **kwargs):
@@ -50,7 +54,7 @@ def test_pre_execute_basic():
 
     one = ibis.literal(1)
     expr = one + one
-    result = execute(expr)
+    result = execute(expr.op())
     assert result == 4
 
     del pre_execute.funcs[(ops.Add,)]
@@ -60,7 +64,7 @@ def test_pre_execute_basic():
 
 def test_execute_parameter_only():
     param = ibis.param('int64')
-    result = execute(param, params={param: 42})
+    result = execute(param.op(), params={param.op(): 42})
     assert result == 42
 
 
@@ -68,7 +72,7 @@ def test_missing_data_sources():
     t = ibis.table([('a', 'string')])
     expr = t.a.length()
     with pytest.raises(com.UnboundExpressionError):
-        execute(expr)
+        execute(expr.op())
 
 
 def test_missing_data_on_custom_client():
@@ -83,8 +87,7 @@ def test_missing_data_on_custom_client():
     with pytest.raises(
         NotImplementedError,
         match=(
-            'Could not find signature for execute_node: '
-            '<DatabaseTable, MyBackend>'
+            'Could not find signature for execute_node: ' '<DatabaseTable, MyBackend>'
         ),
     ):
         con.execute(t)
@@ -150,7 +153,7 @@ def test_is_computable_input():
 
     three = one + two
     four = three + 1
-    result = execute(four)
+    result = execute(four.op())
     assert result == 4.0
 
     del execute_node[ops.Add, int, MyObject]

@@ -1,35 +1,36 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import Any, Mapping
 
 import pandas as pd
 import pyspark
-import pyspark as ps
-from pyspark.sql import DataFrame
+import sqlalchemy as sa
+from pyspark import SparkConf
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.column import Column
 
-if TYPE_CHECKING:
-    import ibis.expr.types as ir
-
 import ibis.common.exceptions as com
+import ibis.config
+import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 import ibis.expr.types as types
+import ibis.expr.types as ir
 import ibis.util as util
 from ibis.backends.base.sql import BaseSQLBackend
+from ibis.backends.base.sql.compiler import Compiler, TableSetFormatter
 from ibis.backends.base.sql.ddl import (
     CreateDatabase,
     DropTable,
     TruncateTable,
     is_fully_qualified,
 )
+from ibis.backends.pyspark import ddl
+from ibis.backends.pyspark.client import PySparkTable, spark_dataframe_schema
+from ibis.backends.pyspark.compiler import PySparkDatabaseTable, PySparkExprTranslator
+from ibis.backends.pyspark.datatypes import spark_dtype
 from ibis.expr.scope import Scope
 from ibis.expr.timecontext import canonicalize_context, localize_context
-
-from . import ddl
-from .client import PySparkTable, spark_dataframe_schema
-from .compiler import PySparkDatabaseTable, PySparkExprTranslator
-from .datatypes import spark_dtype
 
 _read_csv_defaults = {
     'header': True,
@@ -44,7 +45,6 @@ class _PySparkCursor:
 
     This allows the Spark client to reuse machinery in
     `ibis/backends/base/sql/client.py`.
-
     """
 
     def __init__(self, query: DataFrame) -> None:
@@ -81,13 +81,69 @@ class _PySparkCursor:
         """No-op for compatibility."""
 
 
+class PySparkTableSetFormatter(TableSetFormatter):
+    def _format_in_memory_table(self, op):
+        # we don't need to compile the table to a VALUES statement because the
+        # table has been registered already by createOrReplaceTempView.
+        #
+        # The only place where the SQL API is currently used is DDL operations
+        return op.name
+
+
+class PySparkCompiler(Compiler):
+    cheap_in_memory_tables = True
+    table_set_formatter_class = PySparkTableSetFormatter
+
+
 class Backend(BaseSQLBackend):
+    compiler = PySparkCompiler
     name = 'pyspark'
     table_class = PySparkDatabaseTable
     table_expr_class = PySparkTable
 
-    def do_connect(self, session):
-        """Create a PySpark `Backend` for use with Ibis."""
+    class Options(ibis.config.Config):
+        """PySpark options.
+
+        Attributes
+        ----------
+        treat_nan_as_null : bool
+            Treat NaNs in floating point expressions as NULL.
+        """
+
+        treat_nan_as_null: bool = False
+
+    def _from_url(self, url: str) -> Backend:
+        """Construct a PySpark backend from a URL `url`."""
+        url = sa.engine.make_url(url)
+
+        conf = SparkConf().setAll(url.query.items())
+
+        if database := url.database:
+            conf = conf.set(
+                "spark.sql.warehouse.dir",
+                str(Path(database).absolute()),
+            )
+
+        builder = SparkSession.builder.config(conf=conf)
+        session = builder.getOrCreate()
+        return self.connect(session)
+
+    def do_connect(self, session: SparkSession) -> None:
+        """Create a PySpark `Backend` for use with Ibis.
+
+        Parameters
+        ----------
+        session
+            A SparkSession instance
+
+        Examples
+        --------
+        >>> import ibis
+        >>> from pyspark.sql import SparkSession
+        >>> session = SparkSession.builder.getOrCreate()
+        >>> ibis.pyspark.connect(session)
+        <ibis.backends.pyspark.Backend at 0x...>
+        """
         self._context = session.sparkContext
         self._session = session
         self._catalog = session.catalog
@@ -102,7 +158,10 @@ class Backend(BaseSQLBackend):
     def version(self):
         return pyspark.__version__
 
-    @util.deprecated(version='2.0', instead='a new connection to database')
+    @util.deprecated(
+        version='2.0',
+        instead='use a new connection to the database',
+    )
     def set_database(self, name):
         self._catalog.setCurrentDatabase(name)
 
@@ -117,20 +176,15 @@ class Backend(BaseSQLBackend):
     def list_tables(self, like=None, database=None):
         tables = [
             t.name
-            for t in self._catalog.listTables(
-                dbName=database or self.current_database
-            )
+            for t in self._catalog.listTables(dbName=database or self.current_database)
         ]
         return self._filter_with_like(tables, like)
 
-    #
     def compile(self, expr, timecontext=None, params=None, *args, **kwargs):
         """Compile an ibis expression to a PySpark DataFrame object."""
 
         if timecontext is not None:
-            session_timezone = self._session.conf.get(
-                'spark.sql.session.timeZone'
-            )
+            session_timezone = self._session.conf.get('spark.sql.session.timeZone')
             # Since spark use session timezone for tz-naive timestamps
             # we localize tz-naive context here to match that behavior
             timecontext = localize_context(
@@ -146,27 +200,31 @@ class Backend(BaseSQLBackend):
                 timecontext,
             )
         return PySparkExprTranslator().translate(
-            expr, scope=scope, timecontext=timecontext
+            expr.op(),
+            scope=scope,
+            timecontext=timecontext,
+            session=self._session,
         )
 
     def execute(
         self,
         expr: ir.Expr,
         timecontext: Mapping | None = None,
-        params: Mapping[ir.ScalarExpr, Any] | None = None,
+        params: Mapping[ir.Scalar, Any] | None = None,
         limit: str = 'default',
         **kwargs: Any,
     ) -> Any:
         """Execute an expression."""
-        if isinstance(expr, types.TableExpr):
+        if isinstance(expr, types.Table):
             return self.compile(expr, timecontext, params, **kwargs).toPandas()
-        elif isinstance(expr, types.ColumnExpr):
+        elif isinstance(expr, types.Column):
             # expression must be named for the projection
-            expr = expr.name('tmp')
+            if not expr.has_name():
+                expr = expr.name("tmp")
             return self.compile(
                 expr.to_projection(), timecontext, params, **kwargs
-            ).toPandas()['tmp']
-        elif isinstance(expr, types.ScalarExpr):
+            ).toPandas()[expr.get_name()]
+        elif isinstance(expr, types.Scalar):
             compiled = self.compile(expr, timecontext, params, **kwargs)
             if isinstance(compiled, Column):
                 # attach result column to a fake DataFrame and
@@ -174,9 +232,7 @@ class Backend(BaseSQLBackend):
                 compiled = self._session.range(0, 1).select(compiled)
             return compiled.toPandas().iloc[0, 0]
         else:
-            raise com.IbisError(
-                f"Cannot execute expression of type: {type(expr)}"
-            )
+            raise com.IbisError(f"Cannot execute expression of type: {type(expr)}")
 
     @staticmethod
     def _fully_qualified_name(name, database):
@@ -194,8 +250,8 @@ class Backend(BaseSQLBackend):
         df = cursor.query.toPandas()  # blocks until finished
         return schema.apply_to(df)
 
-    def raw_sql(self, stmt):
-        query = self._session.sql(stmt)
+    def raw_sql(self, query: str) -> _PySparkCursor:
+        query = self._session.sql(query)
         return _PySparkCursor(query)
 
     def _get_schema_using_query(self, query):
@@ -207,11 +263,11 @@ class Backend(BaseSQLBackend):
             jtable = self._catalog._jcatalog.getTable(
                 self._fully_qualified_name(name, database)
             )
-        except ps.sql.utils.AnalysisException as e:
+        except pyspark.sql.utils.AnalysisException as e:
             raise com.IbisInputError(str(e)) from e
         return jtable
 
-    def table(self, name: str, database: str | None = None) -> ir.TableExpr:
+    def table(self, name: str, database: str | None = None) -> ir.Table:
         """Return a table expression from a table or view in the database.
 
         Parameters
@@ -223,7 +279,7 @@ class Backend(BaseSQLBackend):
 
         Returns
         -------
-        TableExpr
+        Table
             Table named `name` from `database`
         """
         jtable = self._get_jtable(name, database)
@@ -289,8 +345,7 @@ class Backend(BaseSQLBackend):
         """
         if database is not None:
             raise com.UnsupportedArgumentError(
-                'Spark does not support the `database` argument for '
-                '`get_schema`'
+                'Spark does not support the `database` argument for ' '`get_schema`'
             )
 
         df = self._session.table(table_name)
@@ -298,9 +353,8 @@ class Backend(BaseSQLBackend):
         return sch.infer(df)
 
     def _schema_from_csv(self, path, **kwargs):
-        """
-        Return a Schema object for the indicated csv file. Spark goes through
-        the file once to determine the schema. See documentation for
+        """Return a Schema object for the indicated csv file. Spark goes
+        through the file once to determine the schema. See documentation for
         `pyspark.sql.DataFrameReader` for kwargs.
 
         Parameters
@@ -359,7 +413,7 @@ class Backend(BaseSQLBackend):
     def create_table(
         self,
         table_name: str,
-        obj: ir.TableExpr | pd.DataFrame | None = None,
+        obj: ir.Table | pd.DataFrame | None = None,
         schema: sch.Schema | None = None,
         database: str | None = None,
         force: bool = False,
@@ -394,10 +448,10 @@ class Backend(BaseSQLBackend):
                 mode = 'error'
                 if force:
                     mode = 'overwrite'
-                spark_df.write.saveAsTable(
-                    table_name, format=format, mode=mode
-                )
+                spark_df.write.saveAsTable(table_name, format=format, mode=mode)
                 return
+            else:
+                self._register_in_memory_tables(obj)
 
             ast = self.compiler.to_ast(obj)
             select = ast.queries[0]
@@ -422,10 +476,14 @@ class Backend(BaseSQLBackend):
 
         return self.raw_sql(statement.compile())
 
+    def _register_in_memory_table(self, table_op):
+        spark_df = self.compile(table_op.to_expr())
+        spark_df.createOrReplaceTempView(table_op.name)
+
     def create_view(
         self,
         name: str,
-        expr: ir.TableExpr,
+        expr: ir.Table,
         database: str | None = None,
         can_exist: bool = False,
         temporary: bool = False,
@@ -520,7 +578,7 @@ class Backend(BaseSQLBackend):
     def insert(
         self,
         table_name: str,
-        obj: ir.TableExpr | pd.DataFrame | None = None,
+        obj: ir.Table | pd.DataFrame | None = None,
         database: str | None = None,
         overwrite: bool = False,
         values: Any | None = None,
@@ -564,3 +622,6 @@ class Backend(BaseSQLBackend):
             self._fully_qualified_name(name, database), maybe_noscan
         )
         return self.raw_sql(stmt)
+
+    def has_operation(cls, operation: type[ops.Value]) -> bool:
+        return operation in PySparkExprTranslator._registry.keys()

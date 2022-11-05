@@ -21,8 +21,7 @@ import ibis.expr.rules as rlz
 import ibis.udf.validate as v
 import ibis.util as util
 from ibis.backends.base.sql.registry import fixed_arity, sql_type_names
-
-from .compiler import ImpalaExprTranslator
+from ibis.backends.impala.compiler import ImpalaExprTranslator
 
 __all__ = [
     'add_operation',
@@ -46,17 +45,14 @@ class Function(metaclass=abc.ABCMeta):
 
     def __repr__(self):
         klass = type(self).__name__
-        return '{}({}, {!r}, {!r})'.format(
-            klass, self.name, self.inputs, self.output
-        )
+        return f'{klass}({self.name}, {self.inputs!r}, {self.output!r})'
 
     def __call__(self, *args):
         return self._klass(*args).to_expr()
 
     def register(self, name, database):
-        """
-        Registers the given operation within the Ibis SQL translation
-        toolchain. Can also use add_operation API
+        """Registers the given operation within the Ibis SQL translation
+        toolchain. Can also use add_operation API.
 
         Parameters
         ----------
@@ -68,21 +64,17 @@ class Function(metaclass=abc.ABCMeta):
 
 class ScalarFunction(Function):
     def _create_operation_class(self):
-        fields = {
-            f'_{i}': rlz.value(dtype) for i, dtype in enumerate(self.inputs)
-        }
-        fields['output_type'] = rlz.shape_like('args', self.output)
-        return type(f"UDF_{self.name}", (ops.ValueOp,), fields)
+        fields = {f'_{i}': rlz.value(dtype) for i, dtype in enumerate(self.inputs)}
+        fields['output_dtype'] = self.output
+        fields['output_shape'] = rlz.shape_like('args')
+        return type(f"UDF_{self.name}", (ops.Value,), fields)
 
 
 class AggregateFunction(Function):
     def _create_operation_class(self):
-        fields = {
-            f'_{i}': rlz.value(dtype) for i, dtype in enumerate(self.inputs)
-        }
-        fields['output_type'] = lambda op: self.output.scalar_type()
-        fields['_reduction'] = True
-        return type(f"UDA_{self.name}", (ops.ValueOp,), fields)
+        fields = {f'_{i}': rlz.value(dtype) for i, dtype in enumerate(self.inputs)}
+        fields['output_dtype'] = self.output
+        return type(f"UDA_{self.name}", (ops.Reduction,), fields)
 
 
 class ImpalaFunction:
@@ -103,13 +95,9 @@ class ImpalaFunction:
 
 
 class ImpalaUDF(ScalarFunction, ImpalaFunction):
-    """
-    Feel free to customize my __doc__ or wrap in a nicer user API
-    """
+    """Feel free to customize my __doc__ or wrap in a nicer user API."""
 
-    def __init__(
-        self, inputs, output, so_symbol=None, lib_path=None, name=None
-    ):
+    def __init__(self, inputs, output, so_symbol=None, lib_path=None, name=None):
         v.validate_output_type(output)
         self.so_symbol = so_symbol
         ImpalaFunction.__init__(self, name=name, lib_path=lib_path)
@@ -170,9 +158,8 @@ def wrap_uda(
     close_fn=None,
     name=None,
 ):
-    """
-    Creates a callable aggregation function object. Must be created in Impala
-    to be used
+    """Creates a callable aggregation function object. Must be created in
+    Impala to be used.
 
     Parameters
     ----------
@@ -213,9 +200,8 @@ def wrap_uda(
 
 
 def wrap_udf(hdfs_file, inputs, output, so_symbol, name=None):
-    """
-    Creates a callable scalar function object. Must be created in Impala to be
-    used
+    """Creates a callable scalar function object. Must be created in Impala to
+    be used.
 
     Parameters
     ----------
@@ -236,8 +222,7 @@ def wrap_udf(hdfs_file, inputs, output, so_symbol, name=None):
 
 
 def scalar_function(inputs, output, name=None):
-    """
-    Creates an operator class that can be passed to add_operation()
+    """Creates an operator class that can be passed to add_operation()
 
     Parameters:
     inputs: list of strings
@@ -255,8 +240,7 @@ def scalar_function(inputs, output, name=None):
 
 
 def aggregate_function(inputs, output, name=None):
-    """
-    Creates an operator class that can be passed to add_operation()
+    """Creates an operator class that can be passed to add_operation()
 
     Parameters:
     inputs: list of strings
@@ -274,8 +258,7 @@ def aggregate_function(inputs, output, name=None):
 
 
 def add_operation(op, func_name, db):
-    """
-    Registers the given operation within the Ibis SQL translation toolchain
+    """Registers the given operation within the Ibis SQL translation toolchain.
 
     Parameters
     ----------
@@ -340,11 +323,13 @@ _impala_to_ibis_type = {
     'smallint': 'int16',
     'int': 'int32',
     'bigint': 'int64',
-    'float': 'float',
-    'double': 'double',
+    'float': 'float32',
+    'double': 'float64',
     'string': 'string',
     'varchar': 'string',
     'char': 'string',
     'timestamp': 'timestamp',
     'decimal': 'decimal',
+    'date': 'date',
+    'void': 'null',
 }

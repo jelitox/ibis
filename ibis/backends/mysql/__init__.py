@@ -1,13 +1,20 @@
+"""The MySQL backend."""
+
+from __future__ import annotations
+
+import atexit
 import contextlib
 import warnings
+from typing import Literal
 
-import sqlalchemy
+import sqlalchemy as sa
 import sqlalchemy.dialects.mysql as mysql
 
 import ibis.expr.datatypes as dt
+import ibis.expr.schema as sch
 from ibis.backends.base.sql.alchemy import BaseAlchemyBackend
-
-from .compiler import MySQLCompiler
+from ibis.backends.mysql.compiler import MySQLCompiler
+from ibis.backends.mysql.datatypes import _type_from_cursor_info
 
 
 class Backend(BaseAlchemyBackend):
@@ -16,15 +23,14 @@ class Backend(BaseAlchemyBackend):
 
     def do_connect(
         self,
-        host='localhost',
-        user=None,
-        password=None,
-        port=3306,
-        database=None,
-        url=None,
-        driver='pymysql',
-    ):
-
+        host: str = "localhost",
+        user: str | None = None,
+        password: str | None = None,
+        port: int = 3306,
+        database: str | None = None,
+        url: str | None = None,
+        driver: Literal["pymysql"] = "pymysql",
+    ) -> None:
         """Create an Ibis client using the passed connection parameters.
 
         Parameters
@@ -44,11 +50,6 @@ class Backend(BaseAlchemyBackend):
             connection arguments are ignored.
         driver
             Python MySQL database driver
-
-        Returns
-        -------
-        Backend
-            An instance of a MySQL backend
 
         Examples
         --------
@@ -89,9 +90,7 @@ class Backend(BaseAlchemyBackend):
             month : int32
         """
         if driver != 'pymysql':
-            raise NotImplementedError(
-                'pymysql is currently the only supported driver'
-            )
+            raise NotImplementedError('pymysql is currently the only supported driver')
         alchemy_url = self._build_alchemy_url(
             url=url,
             host=host,
@@ -103,14 +102,12 @@ class Backend(BaseAlchemyBackend):
         )
 
         self.database_name = alchemy_url.database
-        super().do_connect(sqlalchemy.create_engine(alchemy_url))
+        super().do_connect(sa.create_engine(alchemy_url))
 
     @contextlib.contextmanager
     def begin(self):
         with super().begin() as bind:
-            previous_timezone = bind.execute(
-                'SELECT @@session.time_zone'
-            ).scalar()
+            previous_timezone = bind.execute('SELECT @@session.time_zone').scalar()
             try:
                 bind.execute("SET @@session.time_zone = 'UTC'")
             except Exception as e:
@@ -122,32 +119,31 @@ class Backend(BaseAlchemyBackend):
                 query = "SET @@session.time_zone = '{}'"
                 bind.execute(query.format(previous_timezone))
 
-    def table(self, name, database=None, schema=None):
-        """Create a table expression that references a particular a table
-        called `name` in a MySQL database called `database`.
+    def _get_schema_using_query(self, query: str) -> sch.Schema:
+        """Infer the schema of `query`."""
+        result = self.con.execute(f"SELECT * FROM ({query}) _ LIMIT 0")
+        cursor = result.cursor
+        fields = [
+            (field.name, _type_from_cursor_info(descr, field))
+            for descr, field in zip(cursor.description, cursor._result.fields)
+        ]
+        return sch.Schema.from_tuples(fields)
 
-        Parameters
-        ----------
-        name : str
-            The name of the table to retrieve.
-        database : str, optional
-            The database in which the table referred to by `name` resides. If
-            ``None`` then the ``current_database`` is used.
-        schema : str, optional
-            The schema in which the table resides.  If ``None`` then the
-            `public` schema is assumed.
+    def _get_temp_view_definition(
+        self,
+        name: str,
+        definition: sa.sql.compiler.Compiled,
+    ) -> str:
+        return f"CREATE OR REPLACE VIEW {name} AS {definition}"
 
-        Returns
-        -------
-        table : TableExpr
-            A table expression.
-        """
-        if database is not None and database != self.current_database:
-            return self.database(name=database).table(name=name, schema=schema)
-        else:
-            alch_table = self._get_sqla_table(name, schema=schema)
-            node = self.table_class(alch_table, self, self._schemas.get(name))
-            return self.table_expr_class(node)
+    def _register_temp_view_cleanup(self, name: str, raw_name: str) -> None:
+        query = f"DROP VIEW IF EXISTS {name}"
+
+        def drop(self, raw_name: str, query: str):
+            self.con.execute(query)
+            self._temp_views.discard(raw_name)
+
+        atexit.register(drop, self, raw_name, query)
 
 
 # TODO(kszucs): unsigned integers
@@ -155,12 +151,12 @@ class Backend(BaseAlchemyBackend):
 
 @dt.dtype.register((mysql.DOUBLE, mysql.REAL))
 def mysql_double(satype, nullable=True):
-    return dt.Double(nullable=nullable)
+    return dt.Float64(nullable=nullable)
 
 
 @dt.dtype.register(mysql.FLOAT)
 def mysql_float(satype, nullable=True):
-    return dt.Float(nullable=nullable)
+    return dt.Float32(nullable=nullable)
 
 
 @dt.dtype.register(mysql.TINYINT)

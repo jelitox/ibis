@@ -1,20 +1,32 @@
 from __future__ import annotations
 
 import abc
-from typing import Any, Mapping
+import contextlib
+import os
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
+import sqlalchemy as sa
+
+import ibis.common.graph as graph
 import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
 import ibis.util as util
 from ibis.backends.base import BaseBackend
+from ibis.backends.base.sql.compiler import Compiler
 from ibis.expr.typing import TimeContext
 
-from .compiler import Compiler
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 __all__ = [
     'BaseSQLBackend',
 ]
+
+
+def _find_memtables(op):
+    return graph.proceed, op if isinstance(op, ops.InMemoryTable) else None
 
 
 class BaseSQLBackend(BaseBackend):
@@ -22,9 +34,39 @@ class BaseSQLBackend(BaseBackend):
 
     compiler = Compiler
     table_class = ops.DatabaseTable
-    table_expr_class = ir.TableExpr
+    table_expr_class = ir.Table
 
-    def table(self, name: str, database: str | None = None) -> ir.TableExpr:
+    def _from_url(self, url: str) -> BaseBackend:
+        """Connect to a backend using a URL `url`.
+
+        Parameters
+        ----------
+        url
+            URL with which to connect to a backend.
+
+        Returns
+        -------
+        BaseBackend
+            A backend instance
+        """
+        url = sa.engine.make_url(url)
+
+        kwargs = {}
+
+        for name in ("host", "port", "database", "password"):
+            if value := (
+                getattr(url, name, None)
+                or os.environ.get(f"{self.name.upper()}_{name.upper()}")
+            ):
+                kwargs[name] = value
+        if username := url.username:
+            kwargs["user"] = username
+
+        kwargs.update(url.query)
+        self._convert_kwargs(kwargs)
+        return self.connect(**kwargs)
+
+    def table(self, name: str, database: str | None = None) -> ir.Table:
         """Construct a table expression.
 
         Parameters
@@ -36,7 +78,7 @@ class BaseSQLBackend(BaseBackend):
 
         Returns
         -------
-        TableExpr
+        Table
             Table expression
         """
         qualified_name = self._fully_qualified_name(name, database)
@@ -48,7 +90,7 @@ class BaseSQLBackend(BaseBackend):
         # XXX
         return name
 
-    def sql(self, query: str) -> ir.TableExpr:
+    def sql(self, query: str) -> ir.Table:
         """Convert a SQL query to an Ibis table expression.
 
         Parameters
@@ -58,7 +100,7 @@ class BaseSQLBackend(BaseBackend):
 
         Returns
         -------
-        TableExpr
+        Table
             Table expression
         """
         # Get the schema by adding a LIMIT 0 on to the end of the query. If
@@ -67,7 +109,10 @@ class BaseSQLBackend(BaseBackend):
         schema = self._get_schema_using_query(limited_query)
         return ops.SQLQueryResult(query, schema, self).to_expr()
 
-    def raw_sql(self, query: str, results: bool = False) -> Any:
+    def _get_schema_using_query(self, query):
+        raise NotImplementedError(f"Backend {self.name} does not support .sql()")
+
+    def raw_sql(self, query: str) -> Any:
         """Execute a query string.
 
         Could have unexpected results if the query modifies the behavior of
@@ -83,8 +128,6 @@ class BaseSQLBackend(BaseBackend):
         Any
             Backend cursor
         """
-        # TODO results is unused, it can be removed
-        # (requires updating Impala tests)
         # TODO `self.con` is assumed to be defined in subclasses, but there
         # is nothing that enforces it. We should find a way to make sure
         # `self.con` is always a DBAPI2 connection, or raise an error
@@ -93,10 +136,79 @@ class BaseSQLBackend(BaseBackend):
             return cursor
         cursor.release()
 
+    @contextlib.contextmanager
+    def _safe_raw_sql(self, *args, **kwargs):
+        yield self.raw_sql(*args, **kwargs)
+
+    def _cursor_batches(
+        self,
+        expr: ir.Expr,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        limit: int | str | None = None,
+        chunk_size: int = 1_000_000,
+    ) -> Iterable[list]:
+        query_ast = self.compiler.to_ast_ensure_limit(expr, limit, params=params)
+        sql = query_ast.compile()
+
+        with self._safe_raw_sql(sql) as cursor:
+            while batch := cursor.fetchmany(chunk_size):
+                yield batch
+
+    @util.experimental
+    def to_pyarrow_batches(
+        self,
+        expr: ir.Expr,
+        *,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        limit: int | str | None = None,
+        chunk_size: int = 1_000_000,
+        **kwargs: Any,
+    ) -> pa.RecordBatchReader:
+        """Execute expression and return results in an iterator of pyarrow
+        record batches.
+
+        This method is eager and will execute the associated expression
+        immediately.
+
+        Parameters
+        ----------
+        expr
+            Ibis expression to export to pyarrow
+        limit
+            An integer to effect a specific row limit. A value of `None` means
+            "no limit". The default is in `ibis/config.py`.
+        params
+            Mapping of scalar parameter expressions to value.
+        chunk_size
+            Number of rows in each returned record batch.
+
+        Returns
+        -------
+        record_batches
+            An iterator of pyarrow record batches.
+        """
+        pa = self._import_pyarrow()
+
+        from ibis.backends.pyarrow.datatypes import ibis_to_pyarrow_struct
+
+        schema = self._table_or_column_schema(expr)
+
+        def _batches():
+            for batch in self._cursor_batches(
+                expr, params=params, limit=limit, chunk_size=chunk_size
+            ):
+                struct_array = pa.array(
+                    map(tuple, batch),
+                    type=ibis_to_pyarrow_struct(schema),
+                )
+                yield pa.RecordBatch.from_struct_array(struct_array)
+
+        return pa.RecordBatchReader.from_batches(schema.to_pyarrow(), _batches())
+
     def execute(
         self,
         expr: ir.Expr,
-        params: Mapping[ir.ScalarExpr, Any] | None = None,
+        params: Mapping[ir.Scalar, Any] | None = None,
         limit: str = 'default',
         **kwargs: Any,
     ):
@@ -122,28 +234,40 @@ class BaseSQLBackend(BaseBackend):
         Returns
         -------
         DataFrame | Series | Scalar
-            * `TableExpr`: pandas.DataFrame
-            * `ColumnExpr`: pandas.Series
-            * `ScalarExpr`: Python scalar value
+            * `Table`: pandas.DataFrame
+            * `Column`: pandas.Series
+            * `Scalar`: Python scalar value
         """
         # TODO Reconsider having `kwargs` here. It's needed to support
         # `external_tables` in clickhouse, but better to deprecate that
         # feature than all this magic.
         # we don't want to pass `timecontext` to `raw_sql`
         kwargs.pop('timecontext', None)
-        query_ast = self.compiler.to_ast_ensure_limit(
-            expr, limit, params=params
-        )
+        query_ast = self.compiler.to_ast_ensure_limit(expr, limit, params=params)
         sql = query_ast.compile()
         self._log(sql)
-        cursor = self.raw_sql(sql, **kwargs)
+
         schema = self.ast_schema(query_ast, **kwargs)
-        result = self.fetch_from_cursor(cursor, schema)
+
+        # register all in memory tables if the backend supports cheap access
+        # to them
+        self._register_in_memory_tables(expr)
+
+        with self._safe_raw_sql(sql, **kwargs) as cursor:
+            result = self.fetch_from_cursor(cursor, schema)
 
         if hasattr(getattr(query_ast, 'dml', query_ast), 'result_handler'):
             result = query_ast.dml.result_handler(result)
 
         return result
+
+    def _register_in_memory_table(self, table_op):
+        raise NotImplementedError
+
+    def _register_in_memory_tables(self, expr):
+        if self.compiler.cheap_in_memory_tables:
+            for memtable in graph.traverse(_find_memtables, expr.op()):
+                self._register_in_memory_table(memtable)
 
     @abc.abstractmethod
     def fetch_from_cursor(self, cursor, schema):
@@ -170,12 +294,12 @@ class BaseSQLBackend(BaseBackend):
             if `self.expr` doesn't have a schema.
         """
         dml = getattr(query_ast, 'dml', query_ast)
-        expr = getattr(dml, 'parent_expr', getattr(dml, 'table_set', None))
+        op = getattr(dml, 'parent_op', getattr(dml, 'table_set', None))
 
-        if isinstance(expr, (ir.TableExpr, sch.HasSchema)):
-            return expr.schema()
-        elif isinstance(expr, ir.ValueExpr):
-            return sch.schema([(expr.get_name(), expr.type())])
+        if isinstance(op, ops.TableNode):
+            return op.schema
+        elif isinstance(op, ops.Value):
+            return sch.schema({op.name: op.output_dtype})
         else:
             raise ValueError(
                 'Expression with type {} does not have a '
@@ -185,9 +309,10 @@ class BaseSQLBackend(BaseBackend):
     def _log(self, sql: str) -> None:
         """Log the SQL, usually to the standard output.
 
-        This method can be implemented by subclasses. The logging happens
-        when `ibis.options.verbose` is `True`.
+        This method can be implemented by subclasses. The logging
+        happens when `ibis.options.verbose` is `True`.
         """
+        util.log(sql)
 
     def compile(
         self,
@@ -196,7 +321,7 @@ class BaseSQLBackend(BaseBackend):
         params: Mapping[ir.Expr, Any] | None = None,
         timecontext: TimeContext | None = None,
     ) -> Any:
-        """Compille an Ibis expression.
+        """Compile an Ibis expression.
 
         Parameters
         ----------
@@ -216,9 +341,7 @@ class BaseSQLBackend(BaseBackend):
             The output of compilation. The type of this value depends on the
             backend.
         """
-        return self.compiler.to_ast_ensure_limit(
-            expr, limit, params=params
-        ).compile()
+        return self.compiler.to_ast_ensure_limit(expr, limit, params=params).compile()
 
     def explain(
         self,
@@ -247,8 +370,22 @@ class BaseSQLBackend(BaseBackend):
 
         statement = f'EXPLAIN {query}'
 
-        cur = self.raw_sql(statement)
-        result = self._get_list(cur)
-        cur.release()
+        with self._safe_raw_sql(statement) as cur:
+            result = self._get_list(cur)
 
         return '\n'.join(['Query:', util.indent(query, 2), '', *result])
+
+    @classmethod
+    @lru_cache
+    def _get_operations(cls):
+        translator = cls.compiler.translator_class
+        return translator._registry.keys() | translator._rewrites.keys()
+
+    @classmethod
+    def has_operation(cls, operation: type[ops.Value]) -> bool:
+        return operation in cls._get_operations()
+
+    def _create_temp_view(self, view, definition):
+        raise NotImplementedError(
+            f"The {self.name} backend does not implement temporary view " "creation"
+        )

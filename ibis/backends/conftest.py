@@ -1,22 +1,110 @@
+from __future__ import annotations
+
 import importlib
+import importlib.metadata
 import os
+import platform
 from functools import lru_cache
 from pathlib import Path
-from typing import List
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, TextIO
 
+import _pytest
 import pandas as pd
+import sqlalchemy as sa
+from packaging.version import parse as vparse
+
+if TYPE_CHECKING:
+    import pyarrow as pa
+
 import pytest
 
 import ibis
-import ibis.common.exceptions as com
 import ibis.util as util
+from ibis.backends.base import _get_backend_names
 
-try:
-    import importlib.metadata as importlib_metadata
-except ImportError:
-    import importlib_metadata
+TEST_TABLES = {
+    "functional_alltypes": ibis.schema(
+        {
+            "index": "int64",
+            "Unnamed: 0": "int64",
+            "id": "int32",
+            "bool_col": "boolean",
+            "tinyint_col": "int8",
+            "smallint_col": "int16",
+            "int_col": "int32",
+            "bigint_col": "int64",
+            "float_col": "float32",
+            "double_col": "float64",
+            "date_string_col": "string",
+            "string_col": "string",
+            "timestamp_col": "timestamp",
+            "year": "int32",
+            "month": "int32",
+        }
+    ),
+    "diamonds": ibis.schema(
+        {
+            "carat": "float64",
+            "cut": "string",
+            "color": "string",
+            "clarity": "string",
+            "depth": "float64",
+            "table": "float64",
+            "price": "int64",
+            "x": "float64",
+            "y": "float64",
+            "z": "float64",
+        }
+    ),
+    "batting": ibis.schema(
+        {
+            "playerID": "string",
+            "yearID": "int64",
+            "stint": "int64",
+            "teamID": "string",
+            "lgID": "string",
+            "G": "int64",
+            "AB": "int64",
+            "R": "int64",
+            "H": "int64",
+            "X2B": "int64",
+            "X3B": "int64",
+            "HR": "int64",
+            "RBI": "int64",
+            "SB": "int64",
+            "CS": "int64",
+            "BB": "int64",
+            "SO": "int64",
+            "IBB": "int64",
+            "HBP": "int64",
+            "SH": "int64",
+            "SF": "int64",
+            "GIDP": "int64",
+        }
+    ),
+    "awards_players": ibis.schema(
+        {
+            "playerID": "string",
+            "awardID": "string",
+            "yearID": "int64",
+            "lgID": "string",
+            "tie": "string",
+            "notes": "string",
+        }
+    ),
+}
 
-from .tests.base import BackendTest
+
+@pytest.fixture(scope='session')
+def script_directory() -> Path:
+    """Return the test script directory.
+
+    Returns
+    -------
+    Path
+        Test script directory
+    """
+    return Path(__file__).absolute().parents[2] / "ci"
 
 
 @pytest.fixture(scope='session')
@@ -28,7 +116,7 @@ def data_directory() -> Path:
     Path
         Test data directory
     """
-    root = Path(__file__).absolute().parent.parent.parent
+    root = Path(__file__).absolute().parents[2]
 
     return Path(
         os.environ.get(
@@ -38,72 +126,199 @@ def data_directory() -> Path:
     )
 
 
-def _random_identifier(suffix):
-    return f'__ibis_test_{suffix}_{util.guid()}'
+def recreate_database(
+    url: sa.engine.url.URL,
+    database: str,
+    **kwargs: Any,
+) -> None:
+    """Drop the {database} at {url}, if it exists.
+
+    Create a new, blank database with the same name.
+
+    Parameters
+    ----------
+    url : url.sa.engine.url.URL
+        Connection url to the database
+    database : str
+        Name of the database to be dropped.
+    """
+    engine = sa.create_engine(url, **kwargs)
+
+    if url.database is not None:
+        with engine.connect() as conn:
+            conn.execute(f'DROP DATABASE IF EXISTS {database}')
+            conn.execute(f'CREATE DATABASE {database}')
 
 
-def _get_all_backends() -> List[str]:
-    """
-    Return the list of known backend names.
-    """
-    return [
-        entry_point.name
-        for entry_point in importlib_metadata.entry_points()["ibis.backends"]
-    ]
+def init_database(
+    url: sa.engine.url.URL,
+    database: str,
+    schema: TextIO | None = None,
+    recreate: bool = True,
+    **kwargs: Any,
+) -> sa.engine.Engine:
+    """Initialise {database} at {url} with {schema}.
 
+    If {recreate}, drop the {database} at {url}, if it exists.
 
-def _backend_name_to_class(backend_str: str):
+    Parameters
+    ----------
+    url : url.sa.engine.url.URL
+        Connection url to the database
+    database : str
+        Name of the database to be dropped
+    schema : TextIO
+        File object containing schema to use
+    recreate : bool
+        If true, drop the database if it exists
+
+    Returns
+    -------
+    sa.engine.Engine for the database created
     """
-    Convert a backend string to the test configuration class for the backend.
-    """
+    if recreate:
+        recreate_database(url, database, **kwargs)
+
     try:
-        backend_package = getattr(ibis, backend_str).__module__
+        url.database = database
     except AttributeError:
-        raise ValueError(
-            f'Unknown backend {backend_str}. '
-            f'Known backends: {_get_all_backends()}'
+        url = url.set(database=database)
+
+    engine = sa.create_engine(url, **kwargs)
+
+    if schema:
+        with engine.connect() as conn:
+            for stmt in filter(None, map(str.strip, schema.read().split(';'))):
+                conn.execute(stmt)
+
+    return engine
+
+
+def read_tables(
+    names: Iterable[str],
+    data_dir: Path,
+) -> Iterator[tuple[str, pa.Table]]:
+    """For each csv {names} in {data_dir} return a pyarrow.Table."""
+
+    import pyarrow.csv as pac
+
+    import ibis.backends.pyarrow.datatypes as pa_dt
+
+    for name in names:
+        schema = TEST_TABLES[name]
+        convert_options = pac.ConvertOptions(
+            column_types={
+                name: pa_dt.to_pyarrow_type(type) for name, type in schema.items()
+            }
+        )
+        yield name, pac.read_csv(
+            data_dir / f'{name}.csv',
+            convert_options=convert_options,
         )
 
-    conftest = importlib.import_module(f'{backend_package}.tests.conftest')
+
+def _random_identifier(suffix: str) -> str:
+    return f"__ibis_test_{suffix}_{util.guid()}"
+
+
+def _get_backend_conf(backend_str: str):
+    """Convert a backend string to the test class for the backend."""
+    conftest = importlib.import_module(f"ibis.backends.{backend_str}.tests.conftest")
     return conftest.TestConf
 
 
-@lru_cache(maxsize=None)
-def _get_backends_to_test(keep=None, discard=None):
+def _get_backend_from_parts(parts: tuple[str, ...]) -> str | None:
+    """Return the backend part of a test file's path parts.
+
+    Examples
+    --------
+    >>> _get_backend_from_parts(("/", "ibis", "backends", "sqlite", "tests"))
+    "sqlite"
     """
-    Get a list of `TestConf` classes of the backends to test.
-
-    The list of backends can be specified by the user with the
-    `PYTEST_BACKENDS` environment variable.
-
-    - If the variable is undefined or empty, then no backends are returned
-    - Otherwise the variable must contain a space-separated list of backends to
-      test
-
-    """
-    backends_raw = os.environ.get('PYTEST_BACKENDS')
-
-    if not backends_raw:
-        return []
-
-    if backends_raw == "all":
-        backends = set(_get_all_backends())
-        # spark is just an alias to pyspark so don't re-run all spark tests
-        backends.discard("spark")
+    try:
+        index = parts.index("backends")
+    except ValueError:
+        return None
     else:
-        backends = set(backends_raw.split())
+        return parts[index + 1]
 
-    if discard is not None:
-        backends = backends.difference(discard.split())
 
-    if keep is not None:
-        backends = backends.intersection(keep.split())
+def pytest_ignore_collect(path, config):
+    # get the backend path part
+    #
+    # path is a py.path.local object hence the conversion to Path first
+    backend = _get_backend_from_parts(Path(path).parts)
+    if backend is None or backend not in _get_backend_names():
+        return False
 
-    backends = sorted(list(backends))
+    # we evaluate the marker early so that we don't trigger
+    # an import of conftest files for the backend, which will
+    # import the backend and thus require dependencies that may not
+    # exist
+    #
+    # alternatives include littering library code with pytest.importorskips
+    # and moving all imports close to their use site
+    #
+    # the latter isn't tenable for backends that use multiple dispatch
+    # since the rules are executed at import time
+    mark_expr = config.getoption("-m")
+    # we can't let the empty string pass through, since `'' in s` is `True` for
+    # any `s`; if no marker was passed don't ignore the collection of `path`
+    if not mark_expr:
+        return False
+    expr = _pytest.mark.expression.Expression.compile(mark_expr)
+    # we check the "backend" marker as well since if that's passed
+    # any file matching a backed should be skipped
+    keep = expr.evaluate(lambda s: s in (backend, "backend"))
+    return not keep
+
+
+def pytest_collection_modifyitems(session, config, items):
+    # add the backend marker to any tests are inside "ibis/backends"
+    all_backends = _get_backend_names()
+    xdist_group_markers = []
+
+    for item in items:
+        parts = item.path.parts
+        backend = _get_backend_from_parts(parts)
+        if backend is not None and backend in all_backends:
+            item.add_marker(getattr(pytest.mark, backend))
+            item.add_marker(pytest.mark.backend)
+        elif "backends" not in parts:
+            # anything else is a "core" test and is run by default
+            if not any(item.iter_markers(name="benchmark")):
+                item.add_marker(pytest.mark.core)
+
+        for name in ("duckdb", "sqlite"):
+            # build a list of markers so we're don't invalidate the item's
+            # marker iterator
+            for _ in item.iter_markers(name=name):
+                xdist_group_markers.append((item, pytest.mark.xdist_group(name=name)))
+
+    for item, marker in xdist_group_markers:
+        item.add_marker(marker)
+
+
+@lru_cache(maxsize=None)
+def _get_backends_to_test(
+    keep: tuple[str, ...] = (),
+    discard: tuple[str, ...] = (),
+) -> list[Any]:
+    """Get a list of `TestConf` classes of the backends to test."""
+    backends = _get_backend_names()
+
+    if discard:
+        backends = backends.difference(discard)
+
+    if keep:
+        backends = backends.intersection(keep)
+
+    # spark is an alias for pyspark
+    backends = backends.difference(("spark",))
 
     return [
         pytest.param(
-            _backend_name_to_class(backend),
+            backend,
             marks=[getattr(pytest.mark, backend), pytest.mark.backend],
             id=backend,
         )
@@ -113,7 +328,6 @@ def _get_backends_to_test(keep=None, discard=None):
 
 def pytest_runtest_call(item):
     """Dynamically add various custom markers."""
-    nodeid = item.nodeid
     backend = [
         backend.name()
         for key, backend in item.funcargs.items()
@@ -127,68 +341,60 @@ def pytest_runtest_call(item):
         )
     if not backend:
         # Check item path to see if test is in backend-specific folder
-        backend = set(_get_all_backends()).intersection(item.path.parts)
+        backend = set(_get_backend_names()).intersection(item.path.parts)
 
     if not backend:
         return
 
     backend = next(iter(backend))
 
-    for marker in item.iter_markers(name="only_on_backends"):
-        if backend not in marker.args[0]:
-            pytest.skip(
-                f"only_on_backends: {backend} is not in {marker.args[0]} "
-                f"{nodeid}"
+    for marker in item.iter_markers(name="min_server_version"):
+        kwargs = marker.kwargs
+        if backend not in kwargs:
+            continue
+
+        funcargs = item.funcargs
+        con = funcargs.get(
+            "con",
+            getattr(funcargs.get("backend"), "connection", None),
+        )
+
+        if con is None:
+            continue
+
+        min_server_version = kwargs.pop(backend)
+        server_version = con.version
+        condition = vparse(server_version) < vparse(min_server_version)
+        item.add_marker(
+            pytest.mark.xfail(
+                condition,
+                reason=(
+                    "unsupported functionality for server version " f"{server_version}"
+                ),
+                **kwargs,
             )
+        )
 
-    for marker in item.iter_markers(name="skip_backends"):
-        if backend in marker.args[0]:
-            pytest.skip(f"skip_backends: {backend} {nodeid}")
+    for marker in item.iter_markers(name="min_version"):
+        kwargs = marker.kwargs
+        if backend not in kwargs:
+            continue
 
-    for marker in item.iter_markers(name="xfail_backends"):
-        for entry in marker.args[0]:
-            if isinstance(entry, tuple):
-                name, reason = entry
+        min_version = kwargs.pop(backend)
+        reason = kwargs.pop("reason", None)
+        version = getattr(importlib.import_module(backend), "__version__", None)
+        if condition := version is None:  # pragma: no cover
+            if reason is None:
+                reason = f"{backend} backend module has no __version__ attribute"
+        else:
+            condition = vparse(version) < vparse(min_version)
+            if reason is None:
+                reason = (
+                    f"test requires {backend}>={version}; " f"got version {version}"
+                )
             else:
-                name = entry
-                reason = marker.kwargs.get("reason")
-
-            if backend == name:
-                item.add_marker(
-                    pytest.mark.xfail(
-                        reason=reason or f'{backend} in xfail list: {name}',
-                        **{
-                            k: v
-                            for k, v in marker.kwargs.items()
-                            if k != "reason"
-                        },
-                    )
-                )
-
-    for marker in item.iter_markers(name="xpass_backends"):
-        if backend not in marker.args[0]:
-            item.add_marker(
-                pytest.mark.xfail(
-                    reason=f'{backend} not in xpass list: {marker.args[0]}',
-                    **marker.kwargs,
-                )
-            )
-
-    for marker in item.iter_markers(name='min_spark_version'):
-        min_version = marker.args[0]
-        if backend in ['spark', 'pyspark']:
-            from distutils.version import LooseVersion
-
-            import pyspark
-
-            if LooseVersion(pyspark.__version__) < LooseVersion(min_version):
-                item.add_marker(
-                    pytest.mark.xfail(
-                        reason=f'Require minimal spark version {min_version}, '
-                        f'but is {pyspark.__version__}',
-                        **marker.kwargs,
-                    )
-                )
+                reason = f"{backend}@{version} (<{min_version}): {reason}"
+        item.add_marker(pytest.mark.xfail(condition, reason=reason, **kwargs))
 
     # Ibis hasn't exposed existing functionality
     # This xfails so that you know when it starts to pass
@@ -198,9 +404,7 @@ def pytest_runtest_call(item):
             item.add_marker(
                 pytest.mark.xfail(
                     reason=reason or f'Feature not yet exposed in {backend}',
-                    **{
-                        k: v for k, v in marker.kwargs.items() if k != "reason"
-                    },
+                    **{k: v for k, v in marker.kwargs.items() if k != "reason"},
                 )
             )
 
@@ -211,11 +415,8 @@ def pytest_runtest_call(item):
             reason = marker.kwargs.get("reason")
             item.add_marker(
                 pytest.mark.xfail(
-                    reason=reason
-                    or f'Feature not available upstream for {backend}',
-                    **{
-                        k: v for k, v in marker.kwargs.items() if k != "reason"
-                    },
+                    reason=reason or f'Feature not available upstream for {backend}',
+                    **{k: v for k, v in marker.kwargs.items() if k != "reason"},
                 )
             )
 
@@ -229,124 +430,108 @@ def pytest_runtest_call(item):
                 )
             )
 
-
-@pytest.hookimpl(hookwrapper=True)
-def pytest_pyfunc_call(pyfuncitem):
-    """Dynamically add an xfail marker for specific backends."""
-    outcome = yield
-    try:
-        outcome.get_result()
-    except (
-        com.OperationNotDefinedError,
-        com.UnsupportedOperationError,
-        com.UnsupportedBackendType,
-        NotImplementedError,
-    ) as e:
-        markers = list(pyfuncitem.iter_markers(name="xfail_unsupported"))
-        backend = pyfuncitem.funcargs.get("backend", None)
-        if backend is None:
-            return
-        backend_type = type(backend).__name__
-
-        if len(markers) == 0:
-            # nothing has marked the failure as an expected one
-            raise e
-        elif len(markers) == 1:
-            if not isinstance(backend, BackendTest):
-                pytest.fail(f"Backend has type {backend_type!r}")
-            pytest.xfail(reason=f"{backend_type!r}: {e}")
-        else:
-            pytest.fail(
-                f"More than one xfail_unsupported marker found on test "
-                f"{pyfuncitem}"
+    # Something has been exposed as broken by a new test and it shouldn't be
+    # imperative for a contributor to fix it just because they happened to
+    # bring it to attention  -- USE SPARINGLY
+    for marker in item.iter_markers(name="broken"):
+        if backend in marker.args[0]:
+            reason = marker.kwargs.get("reason")
+            item.add_marker(
+                pytest.mark.xfail(
+                    reason=reason or f"Feature is failing on {backend}",
+                    **{k: v for k, v in marker.kwargs.items() if k != "reason"},
+                )
             )
 
 
-pytestmark = pytest.mark.backend
-
-
 @pytest.fixture(params=_get_backends_to_test(), scope='session')
-def backend(request, data_directory):
-    """
-    Instance of BackendTest.
+def backend(request, data_directory, script_directory, tmp_path_factory, worker_id):
+    """Return an instance of BackendTest, loaded with data."""
 
-    (dask pandas clickhouse sqlite postgres pyspark impala hdf5 csv parquet
-    datafusion mysql)
-    """
-    # See #3021
-    # TODO Remove this to backend_test, since now that a `Backend` class exists
-    return request.param(data_directory)
+    cls = _get_backend_conf(request.param)
+    return cls.load_data(data_directory, script_directory, tmp_path_factory, worker_id)
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def con(backend):
-    """
-    Instance of Client, already connected to the db (if applies).
-    """
-    # See #3021
-    # TODO Rename this to `backend` when the existing `backend` is renamed to
-    # `backend_test`, and when `connect` returns `Backend` and not `Client`
+    """Instance of a backend client."""
     return backend.connection
 
 
+def _setup_backend(
+    request, data_directory, script_directory, tmp_path_factory, worker_id
+):
+    if (backend := request.param) == "duckdb" and platform.system() == "Windows":
+        pytest.xfail(
+            "windows prevents two connections to the same duckdb file "
+            "even in the same process"
+        )
+    else:
+        cls = _get_backend_conf(backend)
+        return cls.load_data(
+            data_directory, script_directory, tmp_path_factory, worker_id
+        )
+
+
 @pytest.fixture(
-    params=_get_backends_to_test(discard="dask csv parquet hdf5 pandas"),
+    params=_get_backends_to_test(discard=("dask", "pandas")),
     scope='session',
 )
-def ddl_backend(request, data_directory):
+def ddl_backend(request, data_directory, script_directory, tmp_path_factory, worker_id):
+    """Set up the backends that are SQL-based.
+
+    (sqlite, postgres, mysql, duckdb, datafusion, clickhouse, pyspark,
+    impala)
     """
-    Runs the SQL-ish backends
-    (sqlite, postgres, mysql, datafusion, clickhouse, pyspark, impala)
-    """
-    return request.param(data_directory)
+    return _setup_backend(
+        request, data_directory, script_directory, tmp_path_factory, worker_id
+    )
 
 
 @pytest.fixture(scope='session')
 def ddl_con(ddl_backend):
-    """
-    Instance of Client, already connected to the db (if applies).
-    """
+    """Instance of Client, already connected to the db (if applies)."""
     return ddl_backend.connection
 
 
 @pytest.fixture(
-    params=_get_backends_to_test(keep="sqlite postgres mysql"),
+    params=_get_backends_to_test(
+        keep=("sqlite", "postgres", "mysql", "duckdb", "snowflake")
+    ),
     scope='session',
 )
-def alchemy_backend(request, data_directory):
+def alchemy_backend(
+    request, data_directory, script_directory, tmp_path_factory, worker_id
+):
+    """Set up the SQLAlchemy-based backends.
+
+    (sqlite, mysql, postgres, duckdb)
     """
-    Runs the SQLAlchemy-based backends
-    (sqlite, mysql, postgres)
-    """
-    return request.param(data_directory)
+    return _setup_backend(
+        request, data_directory, script_directory, tmp_path_factory, worker_id
+    )
 
 
 @pytest.fixture(scope='session')
 def alchemy_con(alchemy_backend):
-    """
-    Instance of Client, already connected to the db (if applies).
-    """
+    """Instance of Client, already connected to the db (if applies)."""
     return alchemy_backend.connection
 
 
 @pytest.fixture(
-    params=_get_backends_to_test(discard="csv parquet hdf5"),
+    params=_get_backends_to_test(keep=("dask", "pandas", "pyspark")),
     scope='session',
 )
-def rw_backend(request, data_directory):
-    """
-    Runs the non-file-based backends
-    (dask pandas clickhouse sqlite postgres pyspark impala datafusion mysql)
-    """
-    return request.param(data_directory)
+def udf_backend(request, data_directory, script_directory, tmp_path_factory, worker_id):
+    """Runs the UDF-supporting backends."""
+    cls = _get_backend_conf(request.param)
+    return cls.load_data(data_directory, script_directory, tmp_path_factory, worker_id)
 
 
 @pytest.fixture(scope='session')
-def rw_con(rw_backend):
-    """
-    Instance of Client, already connected to the db (if applies).
-    """
-    return rw_backend.connection
+def udf_con(udf_backend):
+    """Instance of Client, already connected to the db (if applies)."""
+    return udf_backend.connection
 
 
 @pytest.fixture(scope='session')
@@ -354,9 +539,24 @@ def alltypes(backend):
     return backend.functional_alltypes
 
 
+@pytest.fixture(scope="session")
+def json_t(backend):
+    return backend.json_t
+
+
 @pytest.fixture(scope='session')
-def sorted_alltypes(backend, alltypes):
-    return alltypes.sort_by('id')
+def struct(backend):
+    return backend.struct
+
+
+@pytest.fixture(scope='session')
+def sorted_alltypes(alltypes):
+    return alltypes.order_by('id')
+
+
+@pytest.fixture(scope='session')
+def udf_alltypes(udf_backend):
+    return udf_backend.functional_alltypes
 
 
 @pytest.fixture(scope='session')
@@ -367,13 +567,6 @@ def batting(backend):
 @pytest.fixture(scope='session')
 def awards_players(backend):
     return backend.awards_players
-
-
-@pytest.fixture(scope='session')
-def geo(backend):
-    if backend.geo is None:
-        pytest.skip(f'Geo Spatial type not supported for {backend}.')
-    return backend.geo
 
 
 @pytest.fixture
@@ -387,7 +580,17 @@ def df(alltypes):
 
 
 @pytest.fixture(scope='session')
-def sorted_df(backend, df):
+def struct_df(struct):
+    return struct.execute()
+
+
+@pytest.fixture(scope='session')
+def udf_df(udf_alltypes):
+    return udf_alltypes.execute()
+
+
+@pytest.fixture(scope='session')
+def sorted_df(df):
     return df.sort_values('id').reset_index(drop=True)
 
 
@@ -410,8 +613,7 @@ def geo_df(geo):
 
 @pytest.fixture
 def alchemy_temp_table(alchemy_con) -> str:
-    """
-    Return a temporary table name.
+    """Return a temporary table name.
 
     Parameters
     ----------
@@ -433,13 +635,12 @@ def alchemy_temp_table(alchemy_con) -> str:
 
 
 @pytest.fixture
-def temp_table(rw_con) -> str:
-    """
-    Return a temporary table name.
+def temp_table(con) -> str:
+    """Return a temporary table name.
 
     Parameters
     ----------
-    rw_con : ibis.backends.base.Client
+    con : ibis.backends.base.Client
 
     Yields
     ------
@@ -451,7 +652,7 @@ def temp_table(rw_con) -> str:
         yield name
     finally:
         try:
-            rw_con.drop_table(name, force=True)
+            con.drop_table(name, force=True)
         except NotImplementedError:
             pass
 
@@ -480,17 +681,15 @@ def temp_view(ddl_con) -> str:
 
 
 @pytest.fixture(scope='session')
-def current_data_db(ddl_con, ddl_backend) -> str:
+def current_data_db(ddl_con) -> str:
     """Return current database name."""
     return ddl_con.current_database
 
 
 @pytest.fixture
-def alternate_current_database(
-    ddl_con, ddl_backend, current_data_db: str
-) -> str:
-    """Create a temporary database and yield its name.
-    Drops the created database upon completion.
+def alternate_current_database(ddl_con, ddl_backend, current_data_db: str) -> str:
+    """Create a temporary database and yield its name. Drops the created
+    database upon completion.
 
     Parameters
     ----------
@@ -504,9 +703,7 @@ def alternate_current_database(
     try:
         ddl_con.create_database(name)
     except NotImplementedError:
-        pytest.skip(
-            f"{ddl_backend.name()} doesn't have create_database method."
-        )
+        pytest.skip(f"{ddl_backend.name()} doesn't have create_database method.")
     try:
         yield name
     finally:

@@ -91,6 +91,7 @@ class DelimitedFormat:
         if self.lineterminator is not None:
             yield f"LINES TERMINATED BY '{self.lineterminator}'"
 
+        yield 'STORED AS TEXTFILE'
         yield f"LOCATION '{self.path}'"
 
         if self.na_rep is not None:
@@ -143,9 +144,7 @@ class CreateTableDelimited(CreateTableWithSchema):
             lineterminator=lineterminator,
             na_rep=na_rep,
         )
-        super().__init__(
-            table_name, schema, table_format, external=external, **kwargs
-        )
+        super().__init__(table_name, schema, table_format, external=external, **kwargs)
 
 
 class CreateTableAvro(CreateTable):
@@ -160,8 +159,9 @@ class CreateTableAvro(CreateTable):
 
 class LoadData(BaseDDL):
 
-    """
-    Generate DDL for LOAD DATA command. Cannot be cancelled
+    """Generate DDL for LOAD DATA command.
+
+    Cannot be cancelled
     """
 
     def __init__(
@@ -186,9 +186,7 @@ class LoadData(BaseDDL):
         overwrite = 'OVERWRITE ' if self.overwrite else ''
 
         if self.partition is not None:
-            partition = '\n' + format_partition(
-                self.partition, self.partition_schema
-            )
+            partition = '\n' + format_partition(self.partition, self.partition_schema)
         else:
             partition = ''
 
@@ -258,9 +256,7 @@ class CacheTable(BaseDDL):
 
     def compile(self):
         scoped_name = self._get_scoped_name(self.table_name, self.database)
-        return "ALTER TABLE {} SET CACHED IN '{}'".format(
-            scoped_name, self.pool
-        )
+        return f"ALTER TABLE {scoped_name} SET CACHED IN '{self.pool}'"
 
 
 class CreateFunction(BaseDDL):

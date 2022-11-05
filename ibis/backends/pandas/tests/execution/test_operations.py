@@ -6,6 +6,7 @@ import numpy.testing as npt
 import pandas as pd
 import pandas.testing as tm
 import pytest
+from pytest import param
 
 import ibis
 import ibis.expr.datatypes as dt
@@ -25,14 +26,10 @@ def test_literal(client):
 
 
 def test_selection(t, df):
-    expr = t[
-        ((t.plain_strings == 'a') | (t.plain_int64 == 3))
-        & (t.dup_strings == 'd')
-    ]
+    expr = t[((t.plain_strings == 'a') | (t.plain_int64 == 3)) & (t.dup_strings == 'd')]
     result = expr.execute()
     expected = df[
-        ((df.plain_strings == 'a') | (df.plain_int64 == 3))
-        & (df.dup_strings == 'd')
+        ((df.plain_strings == 'a') | (df.plain_int64 == 3)) & (df.dup_strings == 'd')
     ].reset_index(drop=True)
     tm.assert_frame_equal(result[expected.columns], expected)
 
@@ -49,9 +46,7 @@ def test_project_scope_does_not_override(t, df):
     expr = t[
         [
             col.name('new_col'),
-            col.sum()
-            .over(ibis.window(group_by='dup_strings'))
-            .name('grouped'),
+            col.sum().over(ibis.window(group_by='dup_strings')).name('grouped'),
         ]
     ]
     result = expr.execute()
@@ -73,28 +68,30 @@ def test_project_scope_does_not_override(t, df):
 @pytest.mark.parametrize(
     'where',
     [
-        lambda t: None,
-        lambda t: t.dup_strings == 'd',
-        lambda t: (t.dup_strings == 'd') | (t.plain_int64 < 100),
+        param(lambda _: None, id="none"),
+        param(lambda t: t.dup_strings == 'd', id="simple"),
+        param(lambda t: (t.dup_strings == 'd') | (t.plain_int64 < 100), id="complex"),
     ],
 )
 @pytest.mark.parametrize(
     ('ibis_func', 'pandas_func'),
     [
-        (methodcaller('abs'), np.abs),
-        (methodcaller('ceil'), np.ceil),
-        (methodcaller('exp'), np.exp),
-        (methodcaller('floor'), np.floor),
-        (methodcaller('ln'), np.log),
-        (methodcaller('log10'), np.log10),
-        (methodcaller('log', 2), lambda x: np.log(x) / np.log(2)),
-        (methodcaller('log2'), np.log2),
-        (methodcaller('round', 0), lambda x: x.round(0).astype('int64')),
-        (methodcaller('round', -2), methodcaller('round', -2)),
-        (methodcaller('round', 2), methodcaller('round', 2)),
-        (methodcaller('round'), lambda x: x.round().astype('int64')),
-        (methodcaller('sign'), np.sign),
-        (methodcaller('sqrt'), np.sqrt),
+        param(methodcaller('abs'), np.abs, id="abs"),
+        param(methodcaller('ceil'), np.ceil, id="ceil"),
+        param(methodcaller('exp'), np.exp, id="exp"),
+        param(methodcaller('floor'), np.floor, id="floor"),
+        param(methodcaller('ln'), np.log, id="log"),
+        param(methodcaller('log10'), np.log10, id="log10"),
+        param(methodcaller('log', 2), lambda x: np.log(x) / np.log(2), id="logb"),
+        param(methodcaller('log2'), np.log2, id="log2"),
+        param(
+            methodcaller('round', 0), lambda x: x.round(0).astype('int64'), id="round0"
+        ),
+        param(methodcaller('round', -2), methodcaller('round', -2), id="roundm2"),
+        param(methodcaller('round', 2), methodcaller('round', 2), id="round2"),
+        param(methodcaller('round'), lambda x: x.round().astype('int64'), id="round"),
+        param(methodcaller('sign'), np.sign, id="sign"),
+        param(methodcaller('sqrt'), np.sqrt, id="sqrt"),
     ],
 )
 def test_aggregation_group_by(t, df, where, ibis_func, pandas_func):
@@ -102,9 +99,7 @@ def test_aggregation_group_by(t, df, where, ibis_func, pandas_func):
     expr = t.group_by(t.dup_strings).aggregate(
         avg_plain_int64=t.plain_int64.mean(where=ibis_where),
         sum_plain_float64=t.plain_float64.sum(where=ibis_where),
-        mean_float64_positive=ibis_func(t.float64_positive).mean(
-            where=ibis_where
-        ),
+        mean_float64_positive=ibis_func(t.float64_positive).mean(where=ibis_where),
         neg_mean_int64_with_zeros=(-t.int64_with_zeros).mean(where=ibis_where),
         nunique_dup_ints=t.dup_ints.nunique(),
     )
@@ -139,18 +134,14 @@ def test_aggregation_group_by(t, df, where, ibis_func, pandas_func):
     # TODO(phillipc): Why does pandas not return floating point values here?
     expected['avg_plain_int64'] = expected.avg_plain_int64.astype('float64')
     result['avg_plain_int64'] = result.avg_plain_int64.astype('float64')
-    expected[
-        'neg_mean_int64_with_zeros'
-    ] = expected.neg_mean_int64_with_zeros.astype('float64')
-    result[
-        'neg_mean_int64_with_zeros'
-    ] = result.neg_mean_int64_with_zeros.astype('float64')
-    expected['mean_float64_positive'] = expected.mean_float64_positive.astype(
+    expected['neg_mean_int64_with_zeros'] = expected.neg_mean_int64_with_zeros.astype(
         'float64'
     )
-    result['mean_float64_positive'] = result.mean_float64_positive.astype(
+    result['neg_mean_int64_with_zeros'] = result.neg_mean_int64_with_zeros.astype(
         'float64'
     )
+    expected['mean_float64_positive'] = expected.mean_float64_positive.astype('float64')
+    result['mean_float64_positive'] = result.mean_float64_positive.astype('float64')
     lhs = result[expected.columns]
     rhs = expected
     tm.assert_frame_equal(lhs, rhs)
@@ -197,7 +188,7 @@ def test_group_by_with_having(t, df):
 
 
 def test_group_by_rename_key(t, df):
-    expr = t.groupby(t.dup_strings.name('foo')).aggregate(
+    expr = t.group_by(t.dup_strings.name('foo')).aggregate(
         dup_string_count=t.dup_strings.count()
     )
 
@@ -308,7 +299,7 @@ def test_null_if_zero(t, df, column):
 )
 def test_nullif(t, df, left, right, expected, compare):
     expr = left(t).nullif(right(t))
-    result = execute(expr)
+    result = execute(expr.op())
     compare(result, expected(df))
 
 
@@ -323,9 +314,7 @@ def test_nullif_inf():
 
 
 def test_group_concat(t, df):
-    expr = t.groupby(t.dup_strings).aggregate(
-        foo=t.plain_int64.group_concat(',')
-    )
+    expr = t.group_by(t.dup_strings).aggregate(foo=t.plain_int64.group_concat(','))
     result = expr.execute()
     expected = (
         df.groupby('dup_strings')
@@ -371,8 +360,8 @@ def test_series_limit(t, df, offset):
     'column',
     ['plain_datetimes_naive', 'plain_datetimes_ny', 'plain_datetimes_utc'],
 )
-def test_sort_by(t, df, column, key, pandas_by, pandas_ascending):
-    expr = t.sort_by(key(t, column))
+def test_order_by(t, df, column, key, pandas_by, pandas_ascending):
+    expr = t.order_by(key(t, column))
     result = expr.execute()
     expected = df.sort_values(
         pandas_by(column), ascending=pandas_ascending
@@ -380,10 +369,8 @@ def test_sort_by(t, df, column, key, pandas_by, pandas_ascending):
     tm.assert_frame_equal(result[expected.columns], expected)
 
 
-def test_complex_sort_by(t, df):
-    expr = t.sort_by(
-        [ibis.desc(t.plain_int64 * t.plain_float64), t.plain_float64]
-    )
+def test_complex_order_by(t, df):
+    expr = t.order_by([ibis.desc(t.plain_int64 * t.plain_float64), t.plain_float64])
     result = expr.execute()
     expected = (
         df.assign(foo=df.plain_int64 * df.plain_float64)
@@ -393,13 +380,6 @@ def test_complex_sort_by(t, df):
     )
 
     tm.assert_frame_equal(result[expected.columns], expected)
-
-
-def test_distinct(t, df):
-    expr = t.dup_strings.distinct()
-    result = expr.execute()
-    expected = pd.Series(df.dup_strings.unique(), name='dup_strings')
-    tm.assert_series_equal(result, expected)
 
 
 def test_count_distinct(t, df):
@@ -431,15 +411,14 @@ def test_table_count(t, df):
 
 
 def test_weighted_average(t, df):
-    expr = t.groupby(t.dup_strings).aggregate(
+    expr = t.group_by(t.dup_strings).aggregate(
         avg=(t.plain_float64 * t.plain_int64).sum() / t.plain_int64.sum()
     )
     result = expr.execute()
     expected = (
         df.groupby('dup_strings')
         .apply(
-            lambda df: (df.plain_int64 * df.plain_float64).sum()
-            / df.plain_int64.sum()
+            lambda df: (df.plain_int64 * df.plain_float64).sum() / df.plain_int64.sum()
         )
         .reset_index()
         .rename(columns={0: 'avg'})
@@ -448,7 +427,7 @@ def test_weighted_average(t, df):
 
 
 def test_group_by_multiple_keys(t, df):
-    expr = t.groupby([t.dup_strings, t.dup_ints]).aggregate(
+    expr = t.group_by([t.dup_strings, t.dup_ints]).aggregate(
         avg_plain_float64=t.plain_float64.mean()
     )
     result = expr.execute()
@@ -462,9 +441,7 @@ def test_group_by_multiple_keys(t, df):
 
 
 def test_mutate_after_group_by(t, df):
-    gb = t.groupby(t.dup_strings).aggregate(
-        avg_plain_float64=t.plain_float64.mean()
-    )
+    gb = t.group_by(t.dup_strings).aggregate(avg_plain_float64=t.plain_float64.mean())
     expr = gb.mutate(x=gb.avg_plain_float64)
     result = expr.execute()
     expected = (
@@ -478,21 +455,14 @@ def test_mutate_after_group_by(t, df):
 
 
 def test_groupby_with_unnamed_arithmetic(t, df):
-    expr = t.groupby(t.dup_strings).aggregate(
-        naive_variance=(
-            (t.plain_float64**2).sum() - t.plain_float64.mean() ** 2
-        )
+    expr = t.group_by(t.dup_strings).aggregate(
+        naive_variance=((t.plain_float64**2).sum() - t.plain_float64.mean() ** 2)
         / t.plain_float64.count()
     )
     result = expr.execute()
     expected = (
         df.groupby('dup_strings')
-        .agg(
-            {
-                'plain_float64': lambda x: ((x**2).sum() - x.mean() ** 2)
-                / x.count()
-            }
-        )
+        .agg({'plain_float64': lambda x: ((x**2).sum() - x.mean() ** 2) / x.count()})
         .reset_index()
         .rename(columns={'plain_float64': 'naive_variance'})
     )
@@ -539,7 +509,7 @@ def test_notin(t, df, elements):
 
 
 def test_cast_on_group_by(t, df):
-    expr = t.groupby(t.dup_strings).aggregate(
+    expr = t.group_by(t.dup_strings).aggregate(
         casted=(t.float64_with_zeros == 0).cast('int64').sum()
     )
     result = expr.execute()
@@ -588,7 +558,7 @@ def test_left_binary_op(t, df, op, args):
 )
 @pytest.mark.parametrize('argfunc', [lambda c: (1.0, c), lambda c: (c, 1.0)])
 def test_left_binary_op_gb(t, df, op, argfunc):
-    expr = t.groupby('dup_strings').aggregate(
+    expr = t.group_by('dup_strings').aggregate(
         foo=op(*argfunc(t.float64_with_zeros)).sum()
     )
     result = expr.execute()
@@ -601,12 +571,20 @@ def test_left_binary_op_gb(t, df, op, argfunc):
     tm.assert_frame_equal(result, expected)
 
 
-def test_where_series(t, df):
+@pytest.mark.parametrize("left_f", [lambda e: e - 1, lambda e: 0.0, lambda e: None])
+@pytest.mark.parametrize("right_f", [lambda e: e + 1, lambda e: 1.0, lambda e: None])
+def test_where_series(t, df, left_f, right_f):
     col_expr = t['plain_int64']
-    result = ibis.where(col_expr > col_expr.mean(), col_expr, 0.0).execute()
+    result = ibis.where(
+        col_expr > col_expr.mean(), left_f(col_expr), right_f(col_expr)
+    ).execute()
 
     ser = df['plain_int64']
-    expected = ser.where(ser > ser.mean(), other=0.0)
+    cond = ser > ser.mean()
+    left = left_f(ser)
+    if not isinstance(left, pd.Series):
+        left = pd.Series(np.repeat(left, len(cond)), name=cond.name)
+    expected = left.where(cond, right_f(ser))
 
     tm.assert_series_equal(result, expected)
 
@@ -651,7 +629,7 @@ def test_quantile_groupby(batting, batting_df):
     frac = 0.2
     intp = 'linear'
     result = (
-        batting.groupby('teamID')
+        batting.group_by('teamID')
         .mutate(res=lambda x: x.RBI.quantile([frac, 1 - frac], intp))
         .res.execute()
     )
@@ -695,7 +673,7 @@ def test_summary_numeric(batting, batting_df):
 
 
 def test_summary_numeric_group_by(batting, batting_df):
-    expr = batting.groupby('teamID').G.summary()
+    expr = batting.group_by('teamID').G.summary()
     result = expr.execute()
     expected = (
         batting_df.groupby('teamID')
@@ -736,7 +714,7 @@ def test_summary_non_numeric(batting, batting_df):
 
 
 def test_summary_non_numeric_group_by(batting, batting_df):
-    expr = batting.groupby('teamID').playerID.summary()
+    expr = batting.group_by('teamID').playerID.summary()
     result = expr.execute()
     expected = (
         batting_df.groupby('teamID')
@@ -827,9 +805,7 @@ def test_union(client, df1, distinct):
     t = client.table('df1')
     expr = t.union(t, distinct=distinct)
     result = expr.execute()
-    expected = (
-        df1 if distinct else pd.concat([df1, df1], axis=0, ignore_index=True)
-    )
+    expected = df1 if distinct else pd.concat([df1, df1], axis=0, ignore_index=True)
     tm.assert_frame_equal(result, expected)
 
 
@@ -847,9 +823,7 @@ def test_difference(client, df1, intersect_df2):
     t2 = client.table('intersect_df2')
     expr = t1.difference(t2)
     result = expr.execute()
-    merged = df1.merge(
-        intersect_df2, on=list(df1.columns), how="outer", indicator=True
-    )
+    merged = df1.merge(intersect_df2, on=list(df1.columns), how="outer", indicator=True)
     expected = merged[merged["_merge"] != "both"].drop("_merge", axis=1)
     tm.assert_frame_equal(result, expected)
 
@@ -862,8 +836,7 @@ def test_difference(client, df1, intersect_df2):
             marks=pytest.mark.xfail(
                 raises=TypeError,
                 reason=(
-                    "Pandas cannot compute the distinct element of an "
-                    "array column"
+                    "Pandas cannot compute the distinct element of an " "array column"
                 ),
             ),
         ),
@@ -873,7 +846,69 @@ def test_difference(client, df1, intersect_df2):
 def test_union_with_list_types(t, df, distinct):
     expr = t.union(t, distinct=distinct)
     result = expr.execute()
-    expected = (
-        df if distinct else pd.concat([df, df], axis=0, ignore_index=True)
-    )
+    expected = df if distinct else pd.concat([df, df], axis=0, ignore_index=True)
     tm.assert_frame_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        pytest.param(
+            lambda column: column + column,
+            id="sum",
+        ),
+        pytest.param(
+            lambda column: column + 1,
+            id="sum_scalar",
+        ),
+        pytest.param(
+            lambda column: column - column,
+            id="subtract",
+        ),
+        pytest.param(
+            lambda column: column - 1,
+            id="subtract_scalar",
+        ),
+        pytest.param(
+            lambda column: column * column,
+            id="multiply",
+        ),
+        pytest.param(
+            lambda column: column * 2,
+            id="multiply_scalar",
+        ),
+        pytest.param(
+            lambda column: column % column,
+            id="mod",
+            marks=pytest.mark.xfail(
+                raises=ZeroDivisionError,
+                reason=("Ibis cannot modulo divide two unsigned integer columns."),
+            ),
+        ),
+        pytest.param(
+            lambda column: column % 2,
+            id="mod_scalar",
+        ),
+        pytest.param(
+            lambda column: column / column,
+            id="divide",
+        ),
+        pytest.param(
+            lambda column: column / 2,
+            id="divide_scalar",
+        ),
+        pytest.param(
+            lambda column: column // column,
+            id="floordivide",
+        ),
+        pytest.param(
+            lambda column: column // 2,
+            id="floordivide_scalar",
+        ),
+    ],
+)
+def test_unsigned_integers(t, df, operation):
+    expr = operation(t.plain_uint64)
+    result = expr.execute()
+    expected = operation(df.plain_uint64)
+    tm.assert_series_equal(result, expected)

@@ -4,8 +4,7 @@ import pytest
 import ibis
 from ibis import literal as L
 from ibis.backends.impala.compiler import ImpalaCompiler
-
-from .conftest import translate
+from ibis.backends.impala.tests.conftest import translate
 
 
 @pytest.fixture(scope="module")
@@ -65,8 +64,8 @@ def test_column_ref_table_aliases():
 
     table2 = ibis.table([('key2', 'string'), ('value and2', 'double')])
 
-    context.set_ref(table1, 't0')
-    context.set_ref(table2, 't1')
+    context.set_ref(table1.op(), 't0')
+    context.set_ref(table2.op(), 't1')
 
     expr = table1['value1'] - table2['value and2']
 
@@ -180,9 +179,7 @@ def test_between(table):
     ("expr_fn", "expected"),
     [
         pytest.param(lambda t: t['g'].isnull(), '`g` IS NULL', id="isnull"),
-        pytest.param(
-            lambda t: t['a'].notnull(), '`a` IS NOT NULL', id="notnull"
-        ),
+        pytest.param(lambda t: t['a'].notnull(), '`a` IS NOT NULL', id="notnull"),
         pytest.param(
             lambda t: (t['a'] + t['b']).isnull(),
             '`a` + `b` IS NULL',
@@ -318,11 +315,11 @@ def test_timestamp_deltas(table, unit, compiled_unit):
 
     add_expr = table.i + offset
     result = translate(add_expr)
-    assert result == f'date_add({f}, INTERVAL {K} {compiled_unit})'
+    assert result == f'date_add(cast({f} as timestamp), INTERVAL {K} {compiled_unit})'
 
     sub_expr = table.i - offset
     result = translate(sub_expr)
-    assert result == f'date_sub({f}, INTERVAL {K} {compiled_unit})'
+    assert result == f'date_sub(cast({f} as timestamp), INTERVAL {K} {compiled_unit})'
 
 
 @pytest.mark.parametrize(
@@ -330,17 +327,17 @@ def test_timestamp_deltas(table, unit, compiled_unit):
     [
         pytest.param(
             lambda v: L(pd.Timestamp(v)),
-            "'2015-01-01 12:34:56'",
+            "'2015-01-01T12:34:56'",
             id="literal_pd_timestamp",
         ),
         pytest.param(
             lambda v: L(pd.Timestamp(v).to_pydatetime()),
-            "'2015-01-01 12:34:56'",
+            "'2015-01-01T12:34:56'",
             id="literal_pydatetime",
         ),
         pytest.param(
             lambda v: ibis.timestamp(v),
-            "'2015-01-01 12:34:56'",
+            "'2015-01-01T12:34:56'",
             id="ibis_timestamp_function",
         ),
     ],
@@ -356,18 +353,18 @@ def test_timestamp_literals(expr_fn, expected):
     [
         pytest.param(
             lambda v: v.day_of_week.index(),
-            "pmod(dayofweek('2015-09-01 01:00:23') - 2, 7)",
+            "pmod(dayofweek('2015-09-01T01:00:23') - 2, 7)",
             id="index",
         ),
         pytest.param(
             lambda v: v.day_of_week.full_name(),
-            "dayname('2015-09-01 01:00:23')",
+            "dayname('2015-09-01T01:00:23')",
             id="full_name",
         ),
     ],
 )
 def test_timestamp_day_of_week(expr_fn, expected):
-    expr = expr_fn(ibis.timestamp('2015-09-01 01:00:23'))
+    expr = expr_fn(ibis.timestamp('2015-09-01T01:00:23'))
     result = translate(expr)
     assert result == expected
 
@@ -413,12 +410,12 @@ def test_correlated_predicate_subquery(table):
     expr = t0.g == t1.g
 
     ctx = ImpalaCompiler.make_context()
-    ctx.make_alias(t0)
+    ctx.make_alias(t0.op())
 
     # Grab alias from parent context
     subctx = ctx.subcontext()
-    subctx.make_alias(t1)
-    subctx.make_alias(t0)
+    subctx.make_alias(t1.op())
+    subctx.make_alias(t0.op())
 
     result = translate(expr, context=subctx)
     expected = "t0.`g` = t1.`g`"

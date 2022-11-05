@@ -8,14 +8,14 @@ import ibis.expr.datatypes as dt
 import ibis.expr.schema as sch
 from ibis.backends.impala.pandas_interop import DataFrameWriter  # noqa: E402
 
+pytest.importorskip("impala")
+
 
 @pytest.fixture
 def exhaustive_df():
     return pd.DataFrame(
         {
-            'bigint_col': np.array(
-                [0, 10, 20, 30, 40, 50, 60, 70, 80, 90], dtype='i8'
-            ),
+            'bigint_col': np.array([0, 10, 20, 30, 40, 50, 60, 70, 80, 90], dtype='i8'),
             'bool_col': np.array(
                 [
                     True,
@@ -71,13 +71,11 @@ def exhaustive_df():
                     8.8000001907348633,
                     9.8999996185302734,
                 ],
-                dtype='f4',
+                dtype='f8',
             ),
             'int_col': np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], dtype='i4'),
             'month': [11, 11, 11, 11, 2, 11, 11, 11, 11, 11],
-            'smallint_col': np.array(
-                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], dtype='i2'
-            ),
+            'smallint_col': np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], dtype='i2'),
             'string_col': [
                 '0',
                 '1',
@@ -102,9 +100,7 @@ def exhaustive_df():
                 pd.Timestamp('2010-11-01 00:08:00.280000'),
                 pd.Timestamp('2010-11-01 00:09:00.360000'),
             ],
-            'tinyint_col': np.array(
-                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], dtype='i1'
-            ),
+            'tinyint_col': np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], dtype='i1'),
             'year': [
                 2010,
                 2010,
@@ -125,6 +121,7 @@ def test_alltypes_roundtrip(con, alltypes_df):
     _check_roundtrip(con, alltypes_df)
 
 
+@pytest.mark.hdfs
 def test_writer_cleanup_deletes_hdfs_dir(con, hdfs, alltypes_df):
     writer = DataFrameWriter(con, alltypes_df)
 
@@ -139,6 +136,7 @@ def test_writer_cleanup_deletes_hdfs_dir(con, hdfs, alltypes_df):
     assert not hdfs.exists(path)
 
 
+@pytest.mark.hdfs
 def test_writer_cleanup_context_manager(con, hdfs, alltypes_df):
     with DataFrameWriter(con, alltypes_df) as writer:
         path = writer.write_temp_csv()
@@ -168,9 +166,7 @@ def test_insert(con, temp_table_db, exhaustive_df):
 
     table = con.table(table_name, database=tmp_db)
 
-    result = (
-        table.execute().sort_values(by='tinyint_col').reset_index(drop=True)
-    )
+    result = table.execute().sort_values(by='tinyint_col').reset_index(drop=True)
     tm.assert_frame_equal(result, exhaustive_df)
 
 
@@ -188,9 +184,7 @@ def _check_roundtrip(con, df):
 
 
 def test_timestamp_with_timezone():
-    df = pd.DataFrame(
-        {'A': pd.date_range('20130101', periods=3, tz='US/Eastern')}
-    )
+    df = pd.DataFrame({'A': pd.date_range('20130101', periods=3, tz='US/Eastern')})
     schema = sch.infer(df)
     expected = ibis.schema([('A', "timestamp('US/Eastern')")])
     assert schema.equals(expected)

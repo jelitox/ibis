@@ -2,26 +2,30 @@ from __future__ import annotations
 
 import contextlib
 import getpass
-from typing import Literal
+from operator import methodcaller
+from typing import Any, Literal
 
 import pandas as pd
-import sqlalchemy
+import sqlalchemy as sa
 
 import ibis
 import ibis.expr.datatypes as dt
+import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
 import ibis.util as util
 from ibis.backends.base.sql import BaseSQLBackend
-
-from .database import AlchemyDatabase, AlchemyTable
-from .datatypes import schema_from_table, table_from_schema, to_sqla_type
-from .geospatial import geospatial_supported
-from .query_builder import AlchemyCompiler
-from .registry import (
+from ibis.backends.base.sql.alchemy.database import AlchemyDatabase, AlchemyTable
+from ibis.backends.base.sql.alchemy.datatypes import (
+    schema_from_table,
+    table_from_schema,
+    to_sqla_type,
+)
+from ibis.backends.base.sql.alchemy.geospatial import geospatial_supported
+from ibis.backends.base.sql.alchemy.query_builder import AlchemyCompiler
+from ibis.backends.base.sql.alchemy.registry import (
     fixed_arity,
     get_sqla_table,
-    infix_op,
     reduction,
     sqlalchemy_operation_registry,
     sqlalchemy_window_functions_registry,
@@ -29,7 +33,10 @@ from .registry import (
     varargs,
     variance_reduction,
 )
-from .translator import AlchemyContext, AlchemyExprTranslator
+from ibis.backends.base.sql.alchemy.translator import (
+    AlchemyContext,
+    AlchemyExprTranslator,
+)
 
 __all__ = (
     'BaseAlchemyBackend',
@@ -60,16 +67,13 @@ class BaseAlchemyBackend(BaseSQLBackend):
     database_class = AlchemyDatabase
     table_class = AlchemyTable
     compiler = AlchemyCompiler
-    has_attachment = False
 
-    def _build_alchemy_url(
-        self, url, host, port, user, password, database, driver
-    ):
+    def _build_alchemy_url(self, url, host, port, user, password, database, driver):
         if url is not None:
-            return sqlalchemy.engine.url.make_url(url)
+            return sa.engine.url.make_url(url)
 
         user = user or getpass.getuser()
-        return sqlalchemy.engine.url.URL(
+        return sa.engine.url.URL.create(
             driver,
             host=host,
             port=port,
@@ -78,22 +82,25 @@ class BaseAlchemyBackend(BaseSQLBackend):
             database=database,
         )
 
-    def do_connect(self, con: sqlalchemy.engine.Engine) -> None:
+    @property
+    def _current_schema(self) -> str | None:
+        return None
+
+    def do_connect(self, con: sa.engine.Engine) -> None:
         self.con = con
-        self._inspector = sqlalchemy.inspect(self.con)
-        self.meta = sqlalchemy.MetaData(bind=self.con)
+        self._inspector = sa.inspect(self.con)
+        self.meta = sa.MetaData(bind=self.con)
         self._schemas: dict[str, sch.Schema] = {}
+        self._temp_views: set[str] = set()
 
     @property
     def version(self):
         return '.'.join(map(str, self.con.dialect.server_version_info))
 
     def list_tables(self, like=None, database=None):
-        inspector = sqlalchemy.inspect(self.con)
-        tables = inspector.get_table_names(
-            schema=database
-        ) + inspector.get_view_names(schema=database)
-        return self._filter_with_like(tables, like)
+        tables = self.inspector.get_table_names(schema=database)
+        views = self.inspector.get_view_names(schema=database)
+        return self._filter_with_like(tables + views, like)
 
     def list_databases(self, like=None):
         """List databases in the current server."""
@@ -105,31 +112,36 @@ class BaseAlchemyBackend(BaseSQLBackend):
         self._inspector.info_cache.clear()
         return self._inspector
 
+    @contextlib.contextmanager
+    def _safe_raw_sql(self, *args, **kwargs):
+        with self.begin() as con:
+            yield con.execute(*args, **kwargs)
+
     @staticmethod
     def _to_geodataframe(df, schema):
         """Convert `df` to a `GeoDataFrame`.
 
-        Required libraries for geospatial support must be installed and a
-        geospatial column is present in the dataframe.
+        Required libraries for geospatial support must be installed and
+        a geospatial column is present in the dataframe.
         """
-        import geopandas
+        import geopandas as gpd
         from geoalchemy2 import shape
-
-        def to_shapely(row, name):
-            return shape.to_shape(row[name]) if row[name] is not None else None
 
         geom_col = None
         for name, dtype in schema.items():
             if isinstance(dtype, dt.GeoSpatial):
                 geom_col = geom_col or name
-                df[name] = df.apply(lambda x: to_shapely(x, name), axis=1)
+                df[name] = df[name].map(
+                    lambda row: None if row is None else shape.to_shape(row)
+                )
         if geom_col:
-            df = geopandas.GeoDataFrame(df, geometry=geom_col)
+            df[geom_col] = gpd.array.GeometryArray(df[geom_col].values)
+            df = gpd.GeoDataFrame(df, geometry=geom_col)
         return df
 
-    def fetch_from_cursor(self, cursor, schema):
+    def fetch_from_cursor(self, cursor, schema: sch.Schema) -> pd.DataFrame:
         df = pd.DataFrame.from_records(
-            cursor.fetchall(),
+            cursor,
             columns=cursor.keys(),
             coerce_float=True,
         )
@@ -146,9 +158,10 @@ class BaseAlchemyBackend(BaseSQLBackend):
     def create_table(
         self,
         name: str,
-        expr: pd.DataFrame | ir.TableExpr | None = None,
+        expr: pd.DataFrame | ir.Table | None = None,
         schema: sch.Schema | None = None,
         database: str | None = None,
+        force: bool = False,
     ) -> None:
         """Create a table.
 
@@ -162,15 +175,19 @@ class BaseAlchemyBackend(BaseSQLBackend):
             An ibis schema
         database
             A database
+        force
+            Check whether a table exists before creating it
         """
+        if isinstance(expr, pd.DataFrame):
+            expr = ibis.memtable(expr)
+
         if database == self.current_database:
             # avoid fully qualified name
             database = None
 
         if database is not None:
             raise NotImplementedError(
-                'Creating tables from a different database is not yet '
-                'implemented'
+                'Creating tables from a different database is not yet ' 'implemented'
             )
 
         if expr is None and schema is None:
@@ -186,32 +203,47 @@ class BaseAlchemyBackend(BaseSQLBackend):
             schema = expr.schema()
 
         self._schemas[self._fully_qualified_name(name, database)] = schema
-        t = self._table_from_schema(
+        table = self._table_from_schema(
             name, schema, database=database or self.current_database
         )
 
-        with self.begin() as bind:
-            t.create(bind=bind)
-            if expr is not None:
-                bind.execute(
-                    t.insert().from_select(list(expr.columns), expr.compile())
-                )
+        if has_expr := expr is not None:
+            # this has to happen outside the `begin` block, so that in-memory
+            # tables are visible inside the transaction created by it
+            self._register_in_memory_tables(expr)
 
-    def _columns_from_schema(
-        self, name: str, schema: sch.Schema
-    ) -> list[sqlalchemy.Column]:
+        with self.begin() as bind:
+            table.create(bind=bind, checkfirst=force)
+            if has_expr:
+                method = self._get_insert_method(expr)
+                bind.execute(method(table.insert()))
+
+    def _get_insert_method(self, expr):
+        compiled = self.compile(expr)
+
+        # if in memory tables aren't cheap then try to pull out their data
+        # FIXME: queries that *select* from in memory tables are still broken
+        # for mysql/sqlite/postgres because the generated SQL is wrong
+        if not self.compiler.cheap_in_memory_tables and isinstance(
+            expr.op(), ops.InMemoryTable
+        ):
+            (from_,) = compiled.get_final_froms()
+            (rows,) = from_._data
+            return methodcaller("values", rows)
+
+        return methodcaller("from_select", list(expr.columns), compiled)
+
+    def _columns_from_schema(self, name: str, schema: sch.Schema) -> list[sa.Column]:
         return [
-            sqlalchemy.Column(
-                colname, to_sqla_type(dtype), nullable=dtype.nullable
-            )
+            sa.Column(colname, to_sqla_type(dtype), nullable=dtype.nullable)
             for colname, dtype in zip(schema.names, schema.types)
         ]
 
     def _table_from_schema(
         self, name: str, schema: sch.Schema, database: str | None = None
-    ) -> sqlalchemy.Table:
+    ) -> sa.Table:
         columns = self._columns_from_schema(name, schema)
-        return sqlalchemy.Table(name, self.meta, *columns)
+        return sa.Table(name, self.meta, *columns)
 
     def drop_table(
         self,
@@ -236,16 +268,15 @@ class BaseAlchemyBackend(BaseSQLBackend):
 
         if database is not None:
             raise NotImplementedError(
-                'Dropping tables from a different database is not yet '
-                'implemented'
+                'Dropping tables from a different database is not yet ' 'implemented'
             )
 
         t = self._get_sqla_table(table_name, schema=database, autoload=False)
         t.drop(checkfirst=force)
 
-        assert (
-            not t.exists()
-        ), f'Something went wrong during DROP of table {t.name!r}'
+        assert not self.inspector.has_table(
+            table_name
+        ), f"Something went wrong during DROP of table {table_name!r}"
 
         self.meta.remove(t)
 
@@ -292,18 +323,12 @@ class BaseAlchemyBackend(BaseSQLBackend):
                 'yet implemented'
             )
 
-        params = {}
-        if self.has_attachment:
-            # for database with attachment
-            # see: https://github.com/ibis-project/ibis/issues/1930
-            params['schema'] = self.current_database
-
         data.to_sql(
             table_name,
             con=self.con,
             index=False,
             if_exists=if_exists,
-            **params,
+            schema=self._current_schema,
         )
 
     def truncate_table(
@@ -315,7 +340,7 @@ class BaseAlchemyBackend(BaseSQLBackend):
         t.delete().execute()
 
     def schema(self, name: str) -> sch.Schema:
-        """Get a schema object from the current database for the table `name`.
+        """Get an ibis schema from the current database for the table `name`.
 
         Parameters
         ----------
@@ -325,7 +350,7 @@ class BaseAlchemyBackend(BaseSQLBackend):
         Returns
         -------
         Schema
-            The schema of the object `name`.
+            The ibis schema of `name`
         """
         return self.database().schema(name)
 
@@ -334,31 +359,77 @@ class BaseAlchemyBackend(BaseSQLBackend):
         """The name of the current database this client is connected to."""
         return self.database_name
 
-    @util.deprecated(version='2.0', instead='`list_databases`')
-    def list_schemas(self):
-        return self.list_databases()
-
     def _log(self, sql):
         try:
             query_str = str(sql)
-        except sqlalchemy.exc.UnsupportedCompilationError:
+        except sa.exc.UnsupportedCompilationError:
             pass
         else:
             util.log(query_str)
 
-    def _get_sqla_table(self, name, schema=None, autoload=True):
-        return sqlalchemy.Table(
-            name, self.meta, schema=schema, autoload=autoload
-        )
+    def _get_sqla_table(
+        self,
+        name: str,
+        schema: str | None = None,
+        autoload: bool = True,
+        **kwargs: Any,
+    ) -> sa.Table:
+        return sa.Table(name, self.meta, schema=schema, autoload=autoload)
 
-    def _sqla_table_to_expr(self, table):
-        node = self.table_class(table, self)
+    def _sqla_table_to_expr(self, table: sa.Table) -> ir.Table:
+        schema = self._schemas.get(table.name)
+        node = self.table_class(
+            source=self,
+            sqla_table=table,
+            name=table.name,
+            schema=schema,
+        )
         return self.table_expr_class(node)
+
+    def table(
+        self,
+        name: str,
+        database: str | None = None,
+        schema: str | None = None,
+    ) -> ir.Table:
+        """Create a table expression from a table in the database.
+
+        Parameters
+        ----------
+        name
+            Table name
+        database
+            The database the table resides in
+        schema
+            The schema inside `database` where the table resides.
+
+            !!! warning "`schema` refers to database organization"
+
+                The `schema` parameter does **not** refer to the column names
+                and types of `table`.
+
+        Returns
+        -------
+        Table
+            Table expression
+        """
+        if database is not None and database != self.current_database:
+            return self.database(database=database).table(
+                name=name,
+                database=database,
+                schema=schema,
+            )
+        sqla_table = self._get_sqla_table(
+            name,
+            database=database,
+            schema=schema,
+        )
+        return self._sqla_table_to_expr(sqla_table)
 
     def insert(
         self,
         table_name: str,
-        obj: pd.DataFrame | ir.TableExpr,
+        obj: pd.DataFrame | ir.Table | list | dict,
         database: str | None = None,
         overwrite: bool = False,
     ) -> None:
@@ -393,21 +464,15 @@ class BaseAlchemyBackend(BaseSQLBackend):
                 'yet implemented'
             )
 
-        params = {}
-        if self.has_attachment:
-            # for database with attachment
-            # see: https://github.com/ibis-project/ibis/issues/1930
-            params['schema'] = self.current_database
-
         if isinstance(obj, pd.DataFrame):
             obj.to_sql(
                 table_name,
                 self.con,
                 index=False,
                 if_exists='replace' if overwrite else 'append',
-                **params,
+                schema=self._current_schema,
             )
-        elif isinstance(obj, ir.TableExpr):
+        elif isinstance(obj, ir.Table):
             to_table_expr = self.table(table_name)
             to_table_schema = to_table_expr.schema()
 
@@ -431,9 +496,46 @@ class BaseAlchemyBackend(BaseSQLBackend):
                             from_table_expr.compile(),
                         )
                     )
+        elif isinstance(obj, (list, dict)):
+            to_table = self._get_sqla_table(table_name, schema=database)
+
+            with self.begin() as bind:
+                if overwrite:
+                    bind.execute(to_table.delete())
+                bind.execute(to_table.insert().values(obj))
+
         else:
             raise ValueError(
                 "No operation is being performed. Either the obj parameter "
-                "is not a pandas DataFrame or is not a ibis TableExpr."
+                "is not a pandas DataFrame or is not a ibis Table."
                 f"The given obj is of type {type(obj).__name__} ."
             )
+
+    def _get_temp_view_definition(
+        self,
+        name: str,
+        definition: sa.sql.compiler.Compiled,
+    ) -> str:
+        raise NotImplementedError(
+            f"The {self.name} backend does not implement temporary view " "creation"
+        )
+
+    def _register_temp_view_cleanup(self, name: str, raw_name: str) -> None:
+        pass
+
+    def _create_temp_view(
+        self,
+        view: sa.Table,
+        definition: sa.sql.Selectable,
+    ) -> None:
+        raw_name = view.name
+        if raw_name not in self._temp_views and raw_name in self.list_tables():
+            raise ValueError(f"{raw_name} already exists as a table or view")
+
+        name = self.con.dialect.identifier_preparer.quote_identifier(raw_name)
+        compiled = definition.compile()
+        defn = self._get_temp_view_definition(name, definition=compiled)
+        query = sa.text(defn).bindparams(**compiled.params)
+        self.con.execute(query)
+        self._temp_views.add(raw_name)
+        self._register_temp_view_cleanup(name, raw_name)

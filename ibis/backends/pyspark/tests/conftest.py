@@ -1,24 +1,43 @@
+from __future__ import annotations
+
 import os
 from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
-import pyspark.sql.functions as F
-import pyspark.sql.types as pt
 import pytest
-from pyspark.sql import SparkSession
 
 import ibis
 from ibis import util
 from ibis.backends.tests.base import BackendTest, RoundAwayFromZero
 
-_pyspark_testing_client = None
+pytest.importorskip("pyspark")
+
+import pyspark.sql.functions as F  # noqa: E402
+import pyspark.sql.types as pt  # noqa: E402
+from pyspark.sql import SparkSession  # noqa: E402
 
 
 def get_common_spark_testing_client(data_directory, connect):
     spark = (
-        SparkSession.builder.config('spark.default.parallelism', 4)
-        .config('spark.driver.bindAddress', '127.0.0.1')
+        SparkSession.builder.appName("ibis_testing")
+        .master("local[1]")
+        .config("spark.cores.max", 1)
+        .config("spark.executor.heartbeatInterval", "3600s")
+        .config("spark.executor.instances", 1)
+        .config("spark.network.timeout", "4200s")
+        .config("spark.sql.execution.arrow.pyspark.enabled", False)
+        .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
+        .config("spark.storage.blockManagerSlaveTimeoutMs", "4200s")
+        .config("spark.ui.showConsoleProgress", False)
+        .config('spark.default.parallelism', 1)
+        .config('spark.dynamicAllocation.enabled', False)
+        .config('spark.rdd.compress', False)
+        .config('spark.serializer', 'org.apache.spark.serializer.KryoSerializer')
+        .config('spark.shuffle.compress', False)
+        .config('spark.shuffle.spill.compress', False)
+        .config('spark.sql.shuffle.partitions', 1)
+        .config('spark.ui.enabled', False)
         .getOrCreate()
     )
     _spark_testing_client = connect(spark)
@@ -94,7 +113,7 @@ def get_common_spark_testing_client(data_directory, connect):
         .repartition(num_partitions)
         .sort('playerID')
     )
-    df_batting.createOrReplaceTempView('batting')
+    df_batting.createOrReplaceTempView("batting")
 
     df_awards_players = (
         s.read.csv(
@@ -131,6 +150,39 @@ def get_common_spark_testing_client(data_directory, connect):
         ],
     )
     df_nested_types.createOrReplaceTempView('nested_types')
+    df_array_types = s.createDataFrame(
+        [
+            (
+                [1, 2, 3],
+                ['a', 'b', 'c'],
+                [1.0, 2.0, 3.0],
+                'a',
+                1.0,
+                [[], [1, 2, 3], None],
+            ),
+            ([4, 5], ['d', 'e'], [4.0, 5.0], 'a', 2.0, []),
+            ([6, None], ['f', None], [6.0, None], 'a', 3.0, [None, [], None]),
+            (
+                [None, 1, None],
+                [None, 'a', None],
+                [],
+                'b',
+                4.0,
+                [[1], [2], [], [3, 4, 5]],
+            ),
+            ([2, None, 3], ['b', None, 'c'], None, 'b', 5.0, None),
+            (
+                [4, None, None, 5],
+                ['d', None, None, 'e'],
+                [4.0, None, None, 5.0],
+                'c',
+                6.0,
+                [[1, 2, 3]],
+            ),
+        ],
+        ["x", "y", "z", "grouper", "scalar_column", "multi_dim"],
+    )
+    df_array_types.createOrReplaceTempView("array_types")
 
     df_complicated = s.createDataFrame(
         [({(1, 3): [[2, 4], [3, 5]]},)], ['map_tuple_list_of_list_of_ints']
@@ -155,10 +207,7 @@ def get_common_spark_testing_client(data_directory, connect):
     df_udf_nan.createOrReplaceTempView('udf_nan')
 
     df_udf_null = s.createDataFrame(
-        [
-            (float(i), None if i % 2 else 3.0, 'ddeefffggh'[i])
-            for i in range(10)
-        ],
+        [(float(i), None if i % 2 else 3.0, 'ddeefffggh'[i]) for i in range(10)],
         ['a', 'b', 'key'],
     )
     df_udf_null.createOrReplaceTempView('udf_null')
@@ -166,27 +215,35 @@ def get_common_spark_testing_client(data_directory, connect):
     df_udf_random = s.createDataFrame(
         pd.DataFrame(
             {
-                'a': np.arange(4, dtype=float).tolist()
-                + np.random.rand(3).tolist(),
-                'b': np.arange(4, dtype=float).tolist()
-                + np.random.rand(3).tolist(),
+                'a': np.arange(4, dtype=float).tolist() + np.random.rand(3).tolist(),
+                'b': np.arange(4, dtype=float).tolist() + np.random.rand(3).tolist(),
                 'key': list('ddeefff'),
             }
         )
     )
     df_udf_random.createOrReplaceTempView('udf_random')
 
+    df_json_t = s.createDataFrame(
+        pd.DataFrame(
+            {
+                "js": [
+                    '{"a": [1,2,3,4], "b": 1}',
+                    '{"a":null,"b":2}',
+                    '{"a":"foo", "c":null}',
+                    "null",
+                    "[42,47,55]",
+                    "[]",
+                ]
+            }
+        )
+    )
+    df_json_t.createOrReplaceTempView("json_t")
+
     return _spark_testing_client
 
 
 def get_pyspark_testing_client(data_directory):
-    global _pyspark_testing_client
-    if _pyspark_testing_client is None:
-        _pyspark_testing_client = get_common_spark_testing_client(
-            data_directory,
-            lambda session: ibis.backends.pyspark.Backend().connect(session),
-        )
-    return _pyspark_testing_client
+    return get_common_spark_testing_client(data_directory, ibis.pyspark.connect)
 
 
 class TestConf(BackendTest, RoundAwayFromZero):
@@ -205,15 +262,16 @@ def client(data_directory):
     df = df.withColumn("str_col", F.lit('value'))
     df.createTempView('basic_table')
 
-    df_nans = client._session.createDataFrame(
+    df_nulls = client._session.createDataFrame(
         [
-            [np.NaN, 'Alfred', None],
-            [27.0, 'Batman', 'motocycle'],
-            [3.0, None, 'joker'],
+            ['k1', np.NaN, 'Alfred', None],
+            ['k1', 3.0, None, 'joker'],
+            ['k2', 27.0, 'Batman', 'batmobile'],
+            ['k2', None, 'Catwoman', 'motorcycle'],
         ],
-        ['age', 'user', 'toy'],
+        ['key', 'age', 'user', 'toy'],
     )
-    df_nans.createTempView('nan_table')
+    df_nulls.createTempView('null_table')
 
     df_dates = client._session.createDataFrame(
         [['2018-01-02'], ['2018-01-03'], ['2018-01-04']], ['date_str']
@@ -312,9 +370,7 @@ def temp_table(client):
 
 @pytest.fixture(scope='session')
 def alltypes(client):
-    return client.table('functional_alltypes').relabel(
-        {'Unnamed: 0': 'Unnamed:0'}
-    )
+    return client.table('functional_alltypes').relabel({'Unnamed: 0': 'Unnamed:0'})
 
 
 @pytest.fixture(scope='session')

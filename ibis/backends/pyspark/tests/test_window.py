@@ -1,9 +1,12 @@
 import pandas.testing as tm
-import pyspark.sql.functions as F
 import pytest
-from pyspark.sql.window import Window
 
 import ibis
+
+pyspark = pytest.importorskip("pyspark")
+
+import pyspark.sql.functions as F  # noqa: E402
+from pyspark.sql.window import Window  # noqa: E402
 
 
 @pytest.mark.parametrize(
@@ -20,9 +23,7 @@ import ibis
 )
 def test_time_indexed_window(client, ibis_windows, spark_range):
     table = client.table('time_indexed_table')
-    result = table.mutate(
-        mean=table['value'].mean().over(ibis_windows[0])
-    ).compile()
+    result = table.mutate(mean=table['value'].mean().over(ibis_windows[0])).compile()
     result_pd = result.toPandas()
     spark_table = table.compile()
     spark_window = (

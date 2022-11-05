@@ -2,6 +2,7 @@ import operator
 
 import pytest
 
+import ibis
 import ibis.expr.api as api
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
@@ -27,7 +28,55 @@ def test_decimal_sum_type(lineitem):
     col = lineitem.l_extendedprice
     result = col.sum()
     assert isinstance(result, ir.DecimalScalar)
-    assert result.type() == dt.Decimal(38, col.type().scale)
+    assert result.type() == dt.Decimal(38, 2)
+
+
+def test_promote_decimal_type_mul(lineitem):
+    col_1 = lineitem.l_extendedprice
+    col_2 = lineitem.l_discount
+    result = col_1 * col_2
+    assert result.type().precision == 24
+    assert result.type().scale == 4
+
+
+def test_promote_decimal_type_add(lineitem):
+    col_1 = lineitem.l_extendedprice
+    col_2 = lineitem.l_discount
+    result = col_1 + col_2
+    assert result.type().precision == 13
+    assert result.type().scale == 2
+
+
+def test_promote_decimal_type_mod(lineitem):
+    col_1 = lineitem.l_extendedprice
+    col_2 = lineitem.l_discount
+    result = col_1 % col_2
+    assert result.type().precision == 12
+    assert result.type().scale == 2
+
+
+def test_promote_decimal_type_max():
+    t = ibis.table([("a", "decimal(31, 3)"), ("b", "decimal(31, 3)")], "t")
+    result = t.a * t.b
+    assert result.type().precision == 31
+    assert result.type().scale == 6
+
+
+@pytest.mark.parametrize(
+    "precision, scale, expected",
+    [
+        (None, None, (None, None)),
+        (38, 2, (38, 2)),
+        (16, 2, (38, 2)),
+        (39, 3, (39, 3)),
+    ],
+)
+def test_decimal_sum_type_precision(precision, scale, expected):
+    t = ibis.table([("l_extendedprice", dt.Decimal(precision, scale))], name="t")
+    col = t.l_extendedprice
+    result = col.sum()
+    assert isinstance(result, ir.DecimalScalar)
+    assert result.type() == dt.Decimal(*expected)
 
 
 @pytest.mark.parametrize('func', ['mean', 'max', 'min'])
@@ -47,9 +96,7 @@ def test_where(lineitem):
 
     assert isinstance(expr, ir.DecimalColumn)
 
-    expr = api.where(
-        table.l_discount > 0, (q * table.l_discount).sum(), api.null()
-    )
+    expr = api.where(table.l_discount > 0, (q * table.l_discount).sum(), api.null())
     assert isinstance(expr, ir.DecimalColumn)
 
     expr = api.where(

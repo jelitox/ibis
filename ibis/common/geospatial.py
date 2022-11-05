@@ -1,15 +1,9 @@
 from typing import Iterable, List, TypeVar
 
-import ibis.expr.types as ir
+import ibis.expr.datatypes as dt
 from ibis.common import exceptions as ex
 
-IS_SHAPELY_AVAILABLE = False
-try:
-    import shapely
-
-    IS_SHAPELY_AVAILABLE = True
-except ImportError:
-    ...
+# TODO(kszucs): move this module to the base sql backend
 
 NumberType = TypeVar('NumberType', int, float)
 # Geometry primitives (2D)
@@ -35,9 +29,7 @@ def _format_linestring_value(value: LineStringType, nested=False) -> str:
             'Data' if not nested else 'Inner data'
         )
         raise ex.IbisInputError(msg)
-    return template.format(
-        ', '.join(_format_point_value(point) for point in value)
-    )
+    return template.format(', '.join(_format_point_value(point) for point in value))
 
 
 def _format_polygon_value(value: PolygonType, nested=False) -> str:
@@ -50,9 +42,7 @@ def _format_polygon_value(value: PolygonType, nested=False) -> str:
         raise ex.IbisInputError(msg)
 
     return template.format(
-        ', '.join(
-            _format_linestring_value(line, nested=True) for line in value
-        )
+        ', '.join(_format_linestring_value(line, nested=True) for line in value)
     )
 
 
@@ -74,9 +64,7 @@ def _format_multipolygon_value(value: MultiPolygonType) -> str:
     """Convert a iterable with a multipolygon to text."""
     if not isinstance(value[0][0], (tuple, list)):
         raise ex.IbisInputError('Data structure expected: MultiPolygonType')
-    return ', '.join(
-        _format_polygon_value(polygon, nested=True) for polygon in value
-    )
+    return ', '.join(_format_polygon_value(polygon, nested=True) for polygon in value)
 
 
 def _format_geo_metadata(op, value: str, inline_metadata: bool = False) -> str:
@@ -92,9 +80,7 @@ def _format_geo_metadata(op, value: str, inline_metadata: bool = False) -> str:
         )
         return value
 
-    geofunc = (
-        'ST_GeogFromText' if geotype == 'geography' else 'ST_GeomFromText'
-    )
+    geofunc = 'ST_GeogFromText' if geotype == 'geography' else 'ST_GeomFromText'
 
     value = repr(value)
     if srid:
@@ -133,25 +119,23 @@ def translate_multipolygon(value: List) -> str:
     return f"MULTIPOLYGON ({_format_multipolygon_value(value)})"
 
 
-def translate_literal(expr, inline_metadata: bool = False) -> str:
-    op = expr.op()
+def translate_literal(op, inline_metadata: bool = False) -> str:
     value = op.value
+    dtype = op.output_dtype
 
-    if IS_SHAPELY_AVAILABLE and isinstance(
-        value, shapely.geometry.base.BaseGeometry
-    ):
-        result = value.wkt
-    elif isinstance(expr, ir.PointScalar):
+    if isinstance(value, dt._WellKnownText):
+        result = value.text
+    elif isinstance(dtype, dt.Point):
         result = translate_point(value)
-    elif isinstance(expr, ir.LineStringScalar):
+    elif isinstance(dtype, dt.LineString):
         result = translate_linestring(value)
-    elif isinstance(expr, ir.PolygonScalar):
+    elif isinstance(dtype, dt.Polygon):
         result = translate_polygon(value)
-    elif isinstance(expr, ir.MultiLineStringScalar):
+    elif isinstance(dtype, dt.MultiLineString):
         result = translate_multilinestring(value)
-    elif isinstance(expr, ir.MultiPointScalar):
+    elif isinstance(dtype, dt.MultiPoint):
         result = translate_multipoint(value)
-    elif isinstance(expr, ir.MultiPolygonScalar):
+    elif isinstance(dtype, dt.MultiPolygon):
         result = translate_multipolygon(value)
     else:
         raise ex.UnboundExpressionError('Geo Spatial type not supported.')

@@ -2,6 +2,7 @@ import datetime
 import operator
 
 import pytest
+from pytest import param
 
 import ibis
 import ibis.expr.api as api
@@ -230,73 +231,140 @@ def test_timedelta_generic_api(case, expected):
     assert case.equals(expected)
 
 
-def test_interval_time_expr(table):
-    c = table.k
-    x = api.interval(hours=1)
-
-    expr = x + c
-    assert isinstance(expr, ir.TimeColumn)
-    assert isinstance(expr.op(), ops.TimeAdd)
-
-    # test radd
-    expr = c + x
-    assert isinstance(expr, ir.TimeColumn)
-    assert isinstance(expr.op(), ops.TimeAdd)
-
-    expr = x - c
-    assert isinstance(expr, ir.TimeColumn)
-    assert isinstance(expr.op(), ops.TimeSub)
-
-    # test radd
-    expr = c - x
-    assert isinstance(expr, ir.TimeColumn)
-    assert isinstance(expr.op(), ops.TimeSub)
+ONE_DAY = ibis.interval(days=1)
+ONE_HOUR = ibis.interval(hours=1)
+ONE_SECOND = ibis.interval(seconds=1)
 
 
-def test_interval_date_expr(table):
-    c = table.j
-    x = api.interval(days=1)
-
-    expr = x + c
-    assert isinstance(expr, ir.DateColumn)
-    assert isinstance(expr.op(), ops.DateAdd)
-
-    # test radd
-    expr = c + x
-    assert isinstance(expr, ir.DateColumn)
-    assert isinstance(expr.op(), ops.DateAdd)
-
-    expr = x - c
-    assert isinstance(expr, ir.DateColumn)
-    assert isinstance(expr.op(), ops.DateSub)
-
-    # test radd
-    expr = c - x
-    assert isinstance(expr, ir.DateColumn)
-    assert isinstance(expr.op(), ops.DateSub)
-
-
-def test_interval_timestamp_expr(table):
-    c = table.i
-    x = api.interval(seconds=1)
-
-    expr = x + c
-    assert isinstance(expr, ir.TimestampColumn)
-    assert isinstance(expr.op(), ops.TimestampAdd)
-
-    # test radd
-    expr = c + x
-    assert isinstance(expr, ir.TimestampColumn)
-    assert isinstance(expr.op(), ops.TimestampAdd)
-
-    expr = x - c
-    assert isinstance(expr, ir.TimestampColumn)
-    assert isinstance(expr.op(), ops.TimestampSub)
-
-    # test radd
-    expr = c - x
-    assert isinstance(expr, ir.TimestampColumn)
-    assert isinstance(expr.op(), ops.TimestampSub)
+@pytest.mark.parametrize(
+    ("func", "expected_op", "expected_type", "left", "right"),
+    [
+        # time
+        param(
+            operator.add,
+            ops.TimeAdd,
+            ir.TimeColumn,
+            lambda _: ONE_HOUR,
+            lambda t: t.k,
+            id="time_add_interval_column",
+        ),
+        param(
+            operator.add,
+            ops.TimeAdd,
+            ir.TimeColumn,
+            lambda t: t.k,
+            lambda _: ONE_HOUR,
+            id="time_add_column_interval",
+        ),
+        param(
+            operator.sub,
+            ops.TimeSub,
+            ir.TimeColumn,
+            lambda _: ONE_HOUR,
+            lambda t: t.k,
+            id="time_sub_interval_column",
+            marks=pytest.mark.xfail(
+                raises=TypeError,
+                reason="interval - time is not yet implemented",
+            ),
+        ),
+        param(
+            operator.sub,
+            ops.TimeSub,
+            ir.TimeColumn,
+            lambda t: t.k,
+            lambda _: ONE_HOUR,
+            id="time_sub_column_interval",
+        ),
+        # date
+        param(
+            operator.add,
+            ops.DateAdd,
+            ir.DateColumn,
+            lambda _: ONE_DAY,
+            lambda t: t.j,
+            id="date_add_interval_column",
+        ),
+        param(
+            operator.add,
+            ops.DateAdd,
+            ir.DateColumn,
+            lambda t: t.j,
+            lambda _: ONE_DAY,
+            id="date_add_column_interval",
+        ),
+        param(
+            operator.sub,
+            ops.DateSub,
+            ir.DateColumn,
+            lambda _: ONE_DAY,
+            lambda t: t.j,
+            id="date_sub_interval_column",
+            marks=pytest.mark.xfail(
+                raises=TypeError,
+                reason="interval - date is not yet implemented",
+            ),
+        ),
+        param(
+            operator.sub,
+            ops.DateSub,
+            ir.DateColumn,
+            lambda t: t.j,
+            lambda _: ONE_DAY,
+            id="date_sub_column_interval",
+        ),
+        # timestamp
+        param(
+            operator.add,
+            ops.TimestampAdd,
+            ir.TimestampColumn,
+            lambda _: ONE_SECOND,
+            lambda t: t.i,
+            id="timestamp_add_interval_column",
+        ),
+        param(
+            operator.add,
+            ops.TimestampAdd,
+            ir.TimestampColumn,
+            lambda t: t.i,
+            lambda _: ONE_SECOND,
+            id="timestamp_add_column_interval",
+        ),
+        param(
+            operator.sub,
+            ops.TimestampSub,
+            ir.TimestampColumn,
+            lambda _: ONE_SECOND,
+            lambda t: t.i,
+            id="timestamp_sub_interval_column",
+            marks=pytest.mark.xfail(
+                raises=TypeError,
+                reason="interval - timestamp is not yet implemented",
+            ),
+        ),
+        param(
+            operator.sub,
+            ops.TimestampSub,
+            ir.TimestampColumn,
+            lambda t: t.i,
+            lambda _: ONE_SECOND,
+            id="timestamp_sub_column_interval",
+        ),
+    ],
+)
+def test_interval_arithmetic(
+    table,
+    func,
+    expected_op,
+    expected_type,
+    left,
+    right,
+):
+    lhs = left(table)
+    rhs = right(table)
+    expr = func(lhs, rhs)
+    assert isinstance(expr, expected_type)
+    assert isinstance(expr.op(), expected_op)
 
 
 @pytest.mark.parametrize(
@@ -538,9 +606,7 @@ def test_interval_comparisons(unit, operands, operator, table):
     ],
     ids=lambda op: op.__name__,
 )
-def test_complex_date_comparisons(
-    operands, interval, arithmetic, operator, table
-):
+def test_complex_date_comparisons(operands, interval, arithmetic, operator, table):
     (a, b), i = operands(table), interval(table)
 
     a_ = arithmetic(a, i)
@@ -556,7 +622,7 @@ def test_complex_date_comparisons(
 def test_interval_column_name(table):
     c = table.i
     expr = (c - c).name('foo')
-    assert expr._name == 'foo'
+    assert expr.get_name() == 'foo'
 
 
 @pytest.mark.parametrize(
@@ -619,9 +685,7 @@ def test_timestamp_truncate(table, operand, unit):
     assert isinstance(expr.op(), ops.TimestampTruncate)
 
 
-@pytest.mark.parametrize(
-    'operand', [lambda t: api.date('2018-01-01'), lambda t: t.j]
-)
+@pytest.mark.parametrize('operand', [lambda t: api.date('2018-01-01'), lambda t: t.j])
 @pytest.mark.parametrize('unit', ['Y', 'Q', 'M', 'D', 'W'])
 def test_date_truncate(table, operand, unit):
     expr = operand(table).truncate(unit)
@@ -629,11 +693,15 @@ def test_date_truncate(table, operand, unit):
     assert isinstance(expr.op(), ops.DateTruncate)
 
 
-@pytest.mark.parametrize(
-    'operand', [lambda t: api.time('18:00'), lambda t: t.k]
-)
+@pytest.mark.parametrize('operand', [lambda t: api.time('18:00'), lambda t: t.k])
 @pytest.mark.parametrize('unit', ['h', 'm', 's', 'ms', 'us', 'ns'])
 def test_time_truncate(table, operand, unit):
     expr = operand(table).truncate(unit)
     assert isinstance(expr, ir.TimeValue)
     assert isinstance(expr.op(), ops.TimeTruncate)
+
+
+def test_date_time_literals():
+    assert ibis.date(2022, 2, 4).type() == dt.date
+    assert ibis.time(16, 20, 00).type() == dt.time
+    assert ibis.timestamp(2022, 2, 4, 16, 20, 00).type() == dt.timestamp

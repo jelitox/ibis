@@ -1,4 +1,3 @@
-import dask.dataframe as dd
 import numpy as np
 import pandas as pd
 import pytest
@@ -8,6 +7,8 @@ from pandas.api.types import CategoricalDtype, DatetimeTZDtype
 import ibis
 import ibis.expr.datatypes as dt
 import ibis.expr.schema as sch
+
+dd = pytest.importorskip("dask.dataframe")
 
 
 def test_no_infer_ambiguities():
@@ -27,9 +28,7 @@ def test_no_infer_ambiguities():
         (np.uint32(500), dt.uint32),
         (np.uint64(5000), dt.uint64),
         (np.float32(5.5), dt.float32),
-        (np.float32(5.5), dt.float),
         (np.float64(5.55), dt.float64),
-        (np.float64(5.55), dt.double),
         (np.bool_(True), dt.boolean),
         (np.bool_(False), dt.boolean),
         (np.arange(5, dtype='int32'), dt.Array(dt.int32)),
@@ -103,7 +102,7 @@ def test_series_to_ibis_literal(core_client):
         (np.int16([-5, 0, 12]), 'int16'),
         (np.int32([-12, 3, 25000]), 'int32'),
         (np.int64([102, 67228734, -0]), 'int64'),
-        (np.float32([45e-3, -0.4, 99.0]), 'float'),
+        (np.float32([45e-3, -0.4, 99.0]), 'float32'),
         (np.float64([-3e43, 43.0, 10000000.0]), 'double'),
         (np.uint8([3, 0, 16]), 'uint8'),
         (np.uint16([5569, 1, 33]), 'uint16'),

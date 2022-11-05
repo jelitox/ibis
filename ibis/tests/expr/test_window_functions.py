@@ -18,6 +18,9 @@ import pytest
 
 import ibis
 import ibis.common.exceptions as com
+import ibis.expr.operations as ops
+import ibis.expr.rules as rlz
+import ibis.expr.types as ir
 from ibis.expr.window import _determine_how, rows_with_max_lookback
 from ibis.tests.util import assert_equal
 
@@ -47,9 +50,7 @@ def test_combine_windows(alltypes):
     w2 = ibis.window(preceding=5, following=5)
 
     w3 = w1.combine(w2)
-    expected = ibis.window(
-        group_by=t.g, order_by=t.f, preceding=5, following=5
-    )
+    expected = ibis.window(group_by=t.g, order_by=t.f, preceding=5, following=5)
     assert_equal(w3, expected)
 
     w4 = ibis.window(group_by=t.a, order_by=t.e)
@@ -80,12 +81,8 @@ def test_combine_windows_with_zero_offset():
 
 def test_combine_window_with_interval_offset(alltypes):
     t = alltypes
-    w1 = ibis.trailing_range_window(
-        preceding=ibis.interval(days=3), order_by=t.e
-    )
-    w2 = ibis.trailing_range_window(
-        preceding=ibis.interval(days=4), order_by=t.f
-    )
+    w1 = ibis.trailing_range_window(preceding=ibis.interval(days=3), order_by=t.e)
+    w2 = ibis.trailing_range_window(preceding=ibis.interval(days=4), order_by=t.f)
     w3 = w1.combine(w2)
     expected = ibis.trailing_range_window(
         preceding=ibis.interval(days=3), order_by=[t.e, t.f]
@@ -94,9 +91,7 @@ def test_combine_window_with_interval_offset(alltypes):
 
     w4 = ibis.range_window(following=ibis.interval(days=5), order_by=t.e)
     w5 = ibis.range_window(following=ibis.interval(days=7), order_by=t.f)
-    expected = ibis.range_window(
-        following=ibis.interval(days=5), order_by=[t.e, t.f]
-    )
+    expected = ibis.range_window(following=ibis.interval(days=5), order_by=[t.e, t.f])
     w6 = w4.combine(w5)
     assert_equal(w6, expected)
 
@@ -105,9 +100,7 @@ def test_combine_window_with_max_lookback():
     w1 = ibis.trailing_window(rows_with_max_lookback(3, ibis.interval(days=5)))
     w2 = ibis.trailing_window(rows_with_max_lookback(5, ibis.interval(days=7)))
     w3 = w1.combine(w2)
-    expected = ibis.trailing_window(
-        rows_with_max_lookback(3, ibis.interval(days=5))
-    )
+    expected = ibis.trailing_window(rows_with_max_lookback(3, ibis.interval(days=5)))
     assert_equal(w3, expected)
 
 
@@ -115,20 +108,14 @@ def test_replace_window(alltypes):
     t = alltypes
     w1 = ibis.window(preceding=5, following=1, group_by=t.a, order_by=t.b)
     w2 = w1.group_by(t.c)
-    expected = ibis.window(
-        preceding=5, following=1, group_by=[t.a, t.c], order_by=t.b
-    )
+    expected = ibis.window(preceding=5, following=1, group_by=[t.a, t.c], order_by=t.b)
     assert_equal(w2, expected)
 
     w3 = w1.order_by(t.d)
-    expected = ibis.window(
-        preceding=5, following=1, group_by=t.a, order_by=[t.b, t.d]
-    )
+    expected = ibis.window(preceding=5, following=1, group_by=t.a, order_by=[t.b, t.d])
     assert_equal(w3, expected)
 
-    w4 = ibis.trailing_window(
-        rows_with_max_lookback(3, ibis.interval(months=3))
-    )
+    w4 = ibis.trailing_window(rows_with_max_lookback(3, ibis.interval(months=3)))
     w5 = w4.group_by(t.a)
     expected = ibis.trailing_window(
         rows_with_max_lookback(3, ibis.interval(months=3)), group_by=t.a
@@ -144,8 +131,12 @@ def test_over_auto_bind(alltypes):
 
     expr = t.f.lag().over(w)
 
-    actual_window = expr.op().args[1]
-    expected = ibis.window(group_by=t.g, order_by=t.f)
+    # TODO(kszucs): the window object doesn't apply the rules for the sorting
+    # keys, so need to wrap the expected order key with a SortKey for now
+    # on long term we should refactor the window object to a WindowFrame op
+    actual_window = expr.op().args[1]  # noqa
+    expected = ibis.window(group_by=t.g, order_by=ops.SortKey(t.f))  # noqa
+
     assert_equal(actual_window, expected)
 
 
@@ -157,8 +148,9 @@ def test_window_function_bind(alltypes):
 
     expr = t.f.lag().over(w)
 
-    actual_window = expr.op().args[1]
-    expected = ibis.window(group_by=t.g, order_by=t.f)
+    actual_window = expr.op().args[1]  # noqa
+    expected = ibis.window(group_by=t.g, order_by=ops.SortKey(t.f))  # noqa
+
     assert_equal(actual_window, expected)
 
 
@@ -170,9 +162,7 @@ def test_auto_windowize_analysis_bug(con):
         return x.arrdelay.mean().name('avg_delay')
 
     annual_delay = (
-        t[t.dest.isin(['JFK', 'SFO'])]
-        .group_by(['dest', 'year'])
-        .aggregate(metric)
+        t[t.dest.isin(['JFK', 'SFO'])].group_by(['dest', 'year']).aggregate(metric)
     )
     what = annual_delay.group_by('dest')
     enriched = what.mutate(grand_avg=annual_delay.avg_delay.mean())
@@ -187,33 +177,12 @@ def test_auto_windowize_analysis_bug(con):
     assert_equal(enriched, expected)
 
 
-def test_mutate_sorts_keys(con):
-    t = con.table('airlines')
-    m = t.arrdelay.mean()
-    g = t.group_by('dest')
-
-    result = g.mutate(zzz=m, yyy=m, ddd=m, ccc=m, bbb=m, aaa=m)
-
-    expected = g.mutate(
-        [
-            m.name('aaa'),
-            m.name('bbb'),
-            m.name('ccc'),
-            m.name('ddd'),
-            m.name('yyy'),
-            m.name('zzz'),
-        ]
-    )
-
-    assert_equal(result, expected)
-
-
 def test_window_bind_to_table(alltypes):
     t = alltypes
     w = ibis.window(group_by='g', order_by=ibis.desc('f'))
 
-    w2 = w.bind(alltypes)
-    expected = ibis.window(group_by=t.g, order_by=ibis.desc(t.f))
+    w2 = w.bind(alltypes)  # noqa
+    expected = ibis.window(group_by=t.g, order_by=ibis.desc(t.f))  # noqa
 
     assert_equal(w2, expected)
 
@@ -326,9 +295,7 @@ def test_determine_how():
     how = _determine_how(rows_with_max_lookback(3, pd.Timedelta(days=3)))
     assert how == 'rows'
 
-    how = _determine_how(
-        rows_with_max_lookback(np.int64(7), ibis.interval(months=3))
-    )
+    how = _determine_how(rows_with_max_lookback(np.int64(7), ibis.interval(months=3)))
     assert how == 'rows'
 
     with pytest.raises(TypeError):
@@ -342,9 +309,7 @@ def test_determine_how():
 
     with pytest.raises(TypeError):
         _determine_how(
-            rows_with_max_lookback(
-                ibis.interval(days=3), ibis.interval(months=1)
-            )
+            rows_with_max_lookback(ibis.interval(days=3), ibis.interval(months=1))
         )
 
     with pytest.raises(TypeError):
@@ -358,4 +323,18 @@ def test_combine_preserves_existing_window():
     )
     w = ibis.cumulative_window(order_by=t.one)
     mut = t.group_by(t.three).mutate(four=t.two.sum().over(w))
-    assert mut.op().selections[1].op().window.following == 0
+
+    assert mut.op().selections[1].arg.window.following == 0
+
+
+def test_quantile_shape():
+    t = ibis.table([("a", "float64")])
+
+    b1 = t.a.quantile(0.25).name("br2")
+    assert isinstance(b1, ir.Scalar)
+
+    projs = [b1]
+    expr = t.projection(projs)
+    (b1,) = expr.op().selections
+
+    assert b1.output_shape == rlz.Shape.COLUMNAR

@@ -4,6 +4,7 @@ import collections
 import datetime
 import decimal
 import numbers
+from operator import methodcaller
 
 import dask.array as da
 import dask.dataframe as dd
@@ -17,7 +18,17 @@ import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
+from ibis.backends.dask import Backend as DaskBackend
+from ibis.backends.dask.client import DaskTable
+from ibis.backends.dask.core import execute
+from ibis.backends.dask.dispatch import execute_node
+from ibis.backends.dask.execution.util import (
+    TypeRegistrationDict,
+    make_selected_obj,
+    register_types_to_dispatcher,
+)
 from ibis.backends.pandas.core import (
+    date_types,
     integer_types,
     numeric_types,
     simple_types,
@@ -25,11 +36,13 @@ from ibis.backends.pandas.core import (
 )
 from ibis.backends.pandas.execution import constants
 from ibis.backends.pandas.execution.generic import (
+    _execute_binary_op_impl,
     execute_between,
     execute_cast_series_array,
     execute_cast_series_generic,
-    execute_count_frame,
-    execute_count_frame_groupby,
+    execute_count_star_frame,
+    execute_count_star_frame_filter,
+    execute_count_star_frame_groupby,
     execute_database_table_client,
     execute_difference_dataframe_dataframe,
     execute_distinct_dataframe,
@@ -50,18 +63,9 @@ from ibis.backends.pandas.execution.generic import (
     execute_series_clip,
     execute_series_isnull,
     execute_series_notnnull,
-    execute_sort_key_series_bool,
+    execute_sort_key_series,
     execute_table_column_df_or_df_groupby,
-)
-
-from .. import Backend as DaskBackend
-from ..client import DaskTable
-from ..core import execute
-from ..dispatch import execute_node
-from .util import (
-    TypeRegistrationDict,
-    make_selected_obj,
-    register_types_to_dispatcher,
+    execute_zero_if_null_series,
 )
 
 # Many dask and pandas functions are functionally equivalent, so we just add
@@ -71,7 +75,7 @@ DASK_DISPATCH_TYPES: TypeRegistrationDict = {
         ((dd.Series, dt.DataType), execute_cast_series_generic),
         ((dd.Series, dt.Array), execute_cast_series_array),
     ],
-    ops.SortKey: [((dd.Series, bool), execute_sort_key_series_bool)],
+    ops.SortKey: [((dd.Series, bool), execute_sort_key_series)],
     ops.Clip: [
         (
             (
@@ -88,9 +92,13 @@ DASK_DISPATCH_TYPES: TypeRegistrationDict = {
             execute_table_column_df_or_df_groupby,
         ),
     ],
-    ops.Count: [
-        ((ddgb.DataFrameGroupBy, type(None)), execute_count_frame_groupby),
-        ((dd.DataFrame, type(None)), execute_count_frame),
+    ops.CountStar: [
+        (
+            (ddgb.DataFrameGroupBy, type(None)),
+            execute_count_star_frame_groupby,
+        ),
+        ((dd.DataFrame, type(None)), execute_count_star_frame),
+        ((dd.DataFrame, dd.Series), execute_count_star_frame_filter),
     ],
     ops.NullIfZero: [((dd.Series,), execute_null_if_zero_series)],
     ops.Between: [
@@ -105,12 +113,15 @@ DASK_DISPATCH_TYPES: TypeRegistrationDict = {
     ],
     ops.Intersection: [
         (
-            (dd.DataFrame, dd.DataFrame),
+            (dd.DataFrame, dd.DataFrame, bool),
             execute_intersection_dataframe_dataframe,
         )
     ],
     ops.Difference: [
-        ((dd.DataFrame, dd.DataFrame), execute_difference_dataframe_dataframe)
+        (
+            (dd.DataFrame, dd.DataFrame, bool),
+            execute_difference_dataframe_dataframe,
+        )
     ],
     ops.DropNa: [((dd.DataFrame,), execute_node_dropna_dataframe)],
     ops.FillNa: [
@@ -121,18 +132,22 @@ DASK_DISPATCH_TYPES: TypeRegistrationDict = {
     ops.NotNull: [((dd.Series,), execute_series_notnnull)],
     ops.IsNan: [((dd.Series,), execute_isnan)],
     ops.IsInf: [((dd.Series,), execute_isinf)],
-    ops.SelfReference: [
-        ((dd.DataFrame,), execute_node_self_reference_dataframe)
-    ],
+    ops.SelfReference: [((dd.DataFrame,), execute_node_self_reference_dataframe)],
     ops.Contains: [
         (
-            (dd.Series, (collections.abc.Sequence, collections.abc.Set)),
+            (
+                dd.Series,
+                (collections.abc.Sequence, collections.abc.Set, dd.Series),
+            ),
             execute_node_contains_series_sequence,
         )
     ],
     ops.NotContains: [
         (
-            (dd.Series, (collections.abc.Sequence, collections.abc.Set)),
+            (
+                dd.Series,
+                (collections.abc.Sequence, collections.abc.Set, dd.Series),
+            ),
             execute_node_not_contains_series_sequence,
         )
     ],
@@ -145,6 +160,13 @@ DASK_DISPATCH_TYPES: TypeRegistrationDict = {
         ((dd.Series, simple_types), execute_node_nullif_series_scalar),
     ],
     ops.Distinct: [((dd.DataFrame,), execute_distinct_dataframe)],
+    ops.ZeroIfNull: [
+        ((dd.Series,), execute_zero_if_null_series),
+        (
+            (type(None), type(pd.NA), np.floating, float),
+            execute_zero_if_null_series,
+        ),
+    ],
 }
 
 register_types_to_dispatcher(execute_node, DASK_DISPATCH_TYPES)
@@ -152,9 +174,16 @@ register_types_to_dispatcher(execute_node, DASK_DISPATCH_TYPES)
 execute_node.register(DaskTable, DaskBackend)(execute_database_table_client)
 
 
-@execute_node.register(ops.ValueList, collections.abc.Sequence)
+@execute_node.register(ops.NodeList, collections.abc.Sequence)
 def execute_node_value_list(op, _, **kwargs):
     return [execute(arg, **kwargs) for arg in op.values]
+
+
+@execute_node.register(ops.Alias, object)
+def execute_alias_series(op, _, **kwargs):
+    # just compile the underlying argument because the naming is handled
+    # by the translator for the top level expression
+    return execute(op.arg, **kwargs)
 
 
 @execute_node.register(ops.Arbitrary, dd.Series, (dd.Series, type(None)))
@@ -170,9 +199,7 @@ def execute_arbitrary_series_mask(op, data, mask, aggcontext=None, **kwargs):
     elif op.how == 'last':
         index = len(data) - 1  # TODO - computation
     else:
-        raise com.OperationNotDefinedError(
-            f'Arbitrary {op.how!r} is not supported'
-        )
+        raise com.OperationNotDefinedError(f'Arbitrary {op.how!r} is not supported')
 
     return data.loc[index]
 
@@ -184,24 +211,64 @@ def execute_arbitrary_series_groupby(op, data, _, aggcontext=None, **kwargs):
         how = 'first'
 
     if how not in {'first', 'last'}:
-        raise com.OperationNotDefinedError(
-            f'Arbitrary {how!r} is not supported'
-        )
+        raise com.OperationNotDefinedError(f'Arbitrary {how!r} is not supported')
     return aggcontext.agg(data, how)
+
+
+def _mode_agg(df):
+    return df.sum().sort_values(ascending=False).index[0]
+
+
+@execute_node.register(ops.Mode, dd.Series, (dd.Series, type(None)))
+def execute_mode_series(_, data, mask, **kwargs):
+    if mask is not None:
+        data = data[mask]
+    return data.reduction(
+        chunk=methodcaller("value_counts"),
+        combine=methodcaller("sum"),
+        aggregate=_mode_agg,
+        meta=data.dtype,
+    )
+
+
+def _grouped_mode_agg(gb):
+    return gb.obj.groupby(gb.obj.index.names).sum()
+
+
+def _grouped_mode_finalize(series):
+    counts = "__counts__"
+    values = series.index.names[-1]
+    df = series.reset_index(-1, name=counts)
+    out = df.groupby(df.index.names).apply(
+        lambda g: g.sort_values(counts, ascending=False).iloc[0]
+    )
+    return out[values]
+
+
+@execute_node.register(ops.Mode, ddgb.SeriesGroupBy, (ddgb.SeriesGroupBy, type(None)))
+def execute_mode_series_group_by(_, data, mask, **kwargs):
+    if mask is not None:
+        data = data[mask]
+    return data.agg(
+        dd.Aggregation(
+            name="mode",
+            chunk=methodcaller("value_counts"),
+            agg=_grouped_mode_agg,
+            finalize=_grouped_mode_finalize,
+        )
+    )
 
 
 @execute_node.register(ops.Cast, ddgb.SeriesGroupBy, dt.DataType)
 def execute_cast_series_group_by(op, data, type, **kwargs):
-    result = execute_cast_series_generic(
-        op, make_selected_obj(data), type, **kwargs
-    )
+    result = execute_cast_series_generic(op, make_selected_obj(data), type, **kwargs)
     return result.groupby(data.index)
 
 
 @execute_node.register(ops.Cast, dd.Series, dt.Timestamp)
 def execute_cast_series_timestamp(op, data, type, **kwargs):
     arg = op.arg
-    from_type = arg.type()
+    from_type = arg.output_dtype
 
     if from_type.equals(type):  # noop cast
         return data
@@ -209,9 +276,7 @@ def execute_cast_series_timestamp(op, data, type, **kwargs):
     tz = type.timezone
 
     if isinstance(from_type, (dt.Timestamp, dt.Date)):
-        return data.astype(
-            'M8[ns]' if tz is None else DatetimeTZDtype('ns', tz)
-        )
+        return data.astype('M8[ns]' if tz is None else DatetimeTZDtype('ns', tz))
 
     if isinstance(from_type, (dt.String, dt.Integer)):
         timestamps = data.map_partitions(
@@ -232,7 +297,7 @@ def execute_cast_series_timestamp(op, data, type, **kwargs):
 @execute_node.register(ops.Cast, dd.Series, dt.Date)
 def execute_cast_series_date(op, data, type, **kwargs):
     arg = op.args[0]
-    from_type = arg.type()
+    from_type = arg.output_dtype
 
     if from_type.equals(type):
         return data
@@ -265,7 +330,7 @@ def execute_cast_series_date(op, data, type, **kwargs):
 @execute_node.register(ops.Limit, dd.DataFrame, integer_types, integer_types)
 def execute_limit_frame(op, data, nrows, offset, **kwargs):
     # NOTE: Dask Dataframes do not support iloc row based indexing
-    return data.loc[offset : offset + nrows]
+    return data.loc[offset : (offset + nrows) - 1]
 
 
 @execute_node.register(ops.Not, (dd.core.Scalar, dd.Series))
@@ -273,16 +338,16 @@ def execute_not_scalar_or_series(op, data, **kwargs):
     return ~data
 
 
-@execute_node.register(ops.BinaryOp, dd.Series, dd.Series)
-@execute_node.register(ops.BinaryOp, dd.Series, dd.core.Scalar)
-@execute_node.register(ops.BinaryOp, dd.core.Scalar, dd.Series)
+@execute_node.register(ops.Binary, dd.Series, dd.Series)
+@execute_node.register(ops.Binary, dd.Series, dd.core.Scalar)
+@execute_node.register(ops.Binary, dd.core.Scalar, dd.Series)
 @execute_node.register(
-    (ops.NumericBinaryOp, ops.LogicalBinaryOp, ops.Comparison),
+    (ops.NumericBinary, ops.LogicalBinary, ops.Comparison),
     numeric_types,
     dd.Series,
 )
 @execute_node.register(
-    (ops.NumericBinaryOp, ops.LogicalBinaryOp, ops.Comparison),
+    (ops.NumericBinary, ops.LogicalBinary, ops.Comparison),
     dd.Series,
     numeric_types,
 )
@@ -291,18 +356,17 @@ def execute_not_scalar_or_series(op, data, **kwargs):
 @execute_node.register(ops.Comparison, dd.Series, timestamp_types)
 @execute_node.register(ops.Comparison, timestamp_types, dd.Series)
 def execute_binary_op(op, left, right, **kwargs):
-    op_type = type(op)
-    try:
-        operation = constants.BINARY_OPERATIONS[op_type]
-    except KeyError:
-        raise NotImplementedError(
-            f'Binary operation {op_type.__name__} not implemented'
-        )
-    else:
-        return operation(left, right)
+    return _execute_binary_op_impl(op, left, right, **kwargs)
 
 
-@execute_node.register(ops.BinaryOp, ddgb.SeriesGroupBy, ddgb.SeriesGroupBy)
+@execute_node.register(ops.Comparison, dd.Series, date_types)
+def execute_binary_op_date_right(op, left, right, **kwargs):
+    return _execute_binary_op_impl(
+        op, dd.to_datetime(left), pd.to_datetime(right), **kwargs
+    )
+
+
+@execute_node.register(ops.Binary, ddgb.SeriesGroupBy, ddgb.SeriesGroupBy)
 def execute_binary_op_series_group_by(op, left, right, **kwargs):
     if left.index != right.index:
         raise ValueError(
@@ -315,19 +379,19 @@ def execute_binary_op_series_group_by(op, left, right, **kwargs):
     return result.groupby(left.index)
 
 
-@execute_node.register(ops.BinaryOp, ddgb.SeriesGroupBy, simple_types)
+@execute_node.register(ops.Binary, ddgb.SeriesGroupBy, simple_types)
 def execute_binary_op_series_gb_simple(op, left, right, **kwargs):
     result = execute_binary_op(op, make_selected_obj(left), right, **kwargs)
     return result.groupby(left.index)
 
 
-@execute_node.register(ops.BinaryOp, simple_types, ddgb.SeriesGroupBy)
+@execute_node.register(ops.Binary, simple_types, ddgb.SeriesGroupBy)
 def execute_binary_op_simple_series_gb(op, left, right, **kwargs):
     result = execute_binary_op(op, left, make_selected_obj(right), **kwargs)
     return result.groupby(right.index)
 
 
-@execute_node.register(ops.UnaryOp, ddgb.SeriesGroupBy)
+@execute_node.register(ops.Unary, ddgb.SeriesGroupBy)
 def execute_unary_op_series_gb(op, operand, **kwargs):
     result = execute_node(op, make_selected_obj(operand), **kwargs)
     return result.groupby(operand.index)
@@ -343,19 +407,12 @@ def execute_log_series_gb_others(op, left, right, **kwargs):
     return result.groupby(left.index)
 
 
-@execute_node.register(
-    (ops.Log, ops.Round), ddgb.SeriesGroupBy, ddgb.SeriesGroupBy
-)
+@execute_node.register((ops.Log, ops.Round), ddgb.SeriesGroupBy, ddgb.SeriesGroupBy)
 def execute_log_series_gb_series_gb(op, left, right, **kwargs):
     result = execute_node(
         op, make_selected_obj(left), make_selected_obj(right), **kwargs
     )
     return result.groupby(left.index)
-
-
-@execute_node.register(ops.DistinctColumn, dd.Series)
-def execute_series_distinct(op, data, **kwargs):
-    return data.unique()
 
 
 @execute_node.register(ops.Union, dd.DataFrame, dd.DataFrame, bool)
@@ -384,14 +441,14 @@ def execute_node_nullif_scalar_series(op, value, series, **kwargs):
     return dd.from_array(da.where(series.eq(value).values, np.nan, value))
 
 
-def wrap_case_result(raw: np.ndarray, expr: ir.ValueExpr):
+def wrap_case_result(raw: np.ndarray, expr: ir.Value):
     """Wrap a CASE statement result in a Series and handle returning scalars.
 
     Parameters
     ----------
     raw : ndarray[T]
         The raw results of executing the ``CASE`` expression
-    expr : ValueExpr
+    expr : Value
         The expression from the which `raw` was computed
 
     Returns
@@ -406,7 +463,7 @@ def wrap_case_result(raw: np.ndarray, expr: ir.ValueExpr):
             raw_1d.astype(constants.IBIS_TYPE_TO_PANDAS_TYPE[expr.type()])
         )
     # TODO - we force computation here
-    if isinstance(expr, ir.ScalarExpr) and result.size.compute() == 1:
+    if isinstance(expr, ir.Scalar) and result.size.compute() == 1:
         return result.head().item()
     return result
 

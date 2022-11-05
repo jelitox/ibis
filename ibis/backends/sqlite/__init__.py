@@ -14,21 +14,55 @@
 
 from __future__ import annotations
 
-import errno
-import os
+import datetime
+import sqlite3
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import sqlalchemy
+import pandas as pd
+import sqlalchemy as sa
+from sqlalchemy.dialects.sqlite import DATETIME, TIMESTAMP
 
 if TYPE_CHECKING:
     import ibis.expr.types as ir
+    import ibis.expr.datatypes as dt
 
 from ibis.backends.base import Database
-from ibis.backends.base.sql.alchemy import BaseAlchemyBackend
+from ibis.backends.base.sql.alchemy import BaseAlchemyBackend, to_sqla_type
+from ibis.backends.sqlite import udf
+from ibis.backends.sqlite.compiler import SQLiteCompiler
+from ibis.expr.schema import datatype
 
-from . import udf
-from .compiler import SQLiteCompiler
+
+def to_datetime(value: str | None) -> datetime.datetime | None:
+    """Convert a str to a datetime according to SQLite's rules, ignoring `None`
+    values."""
+    if value is None:
+        return None
+    if value.endswith("Z"):
+        # Parse and set the timezone as UTC
+        o = datetime.datetime.fromisoformat(value[:-1]).replace(
+            tzinfo=datetime.timezone.utc
+        )
+    else:
+        o = datetime.datetime.fromisoformat(value)
+        if o.tzinfo:
+            # Convert any aware datetime to UTC
+            return o.astimezone(datetime.timezone.utc)
+    return o
+
+
+class ISODATETIME(DATETIME):
+    """A thin datetime type to override sqlalchemy's datetime parsing to
+    support a wider range of timestamp formats accepted by SQLite.
+
+    See https://sqlite.org/lang_datefunc.html#time_values for the full
+    list of datetime formats SQLite accepts.
+    """
+
+    def result_processor(self, value, dialect):
+        return to_datetime
 
 
 class Backend(BaseAlchemyBackend):
@@ -37,11 +71,6 @@ class Backend(BaseAlchemyBackend):
     # if there is technical debt that makes this required
     database_class = Database
     compiler = SQLiteCompiler
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._con: sqlalchemy.engine.Engine = None
-        self._meta: sqlalchemy.MetaData = None
 
     def __getstate__(self) -> dict:
         r = super().__getstate__()
@@ -55,64 +84,80 @@ class Backend(BaseAlchemyBackend):
         )
         return r
 
-    @property
-    def con(self) -> sqlalchemy.engine.Engine:
-        if self._con is None:
-            self.reconnect()
-        return self._con
-
-    @con.setter
-    def con(self, v: sqlalchemy.engine.Engine | None):
-        self._con = v
-
-    @property
-    def meta(self) -> sqlalchemy.MetaData:
-        if self._meta is None:
-            self.reconnect()
-        return self._meta
-
-    @meta.setter
-    def meta(self, v: sqlalchemy.MetaData):
-        self._meta = v
-
     def do_connect(
         self,
+        database: str | Path | None = None,
         path: str | Path | None = None,
-        create: bool = False,
+        type_map: dict[str, str | dt.DataType] | None = None,
     ) -> None:
         """Create an Ibis client connected to a SQLite database.
 
-        Multiple database files can be created using the `attach()` method
+        Multiple database files can be accessed using the `attach()` method.
 
         Parameters
         ----------
-        path
-            File path to the SQLite database file. If None, creates an
+        database
+            File path to the SQLite database file. If `None`, creates an
             in-memory transient database and you can use attach() to add more
             files
-        create
-            If the database file does not exist, create it
+        type_map
+            An optional mapping from a string name of a SQLite "type" to the
+            corresponding ibis DataType that it represents. This can be used
+            to override schema inference for a given SQLite database.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.sqlite.connect("path/to/my/sqlite.db")
         """
-        self.database_name = "base"
-
-        super().do_connect(sqlalchemy.create_engine("sqlite://"))
         if path is not None:
-            self.attach(self.database_name, path, create=create)
+            warnings.warn(
+                "The `path` argument is deprecated in 4.0. Use `database=...`"
+            )
+            database = path
 
-        udf.register_all(self.con)
+        self.database_name = "main"
 
-        self._meta = sqlalchemy.MetaData(bind=self.con)
+        engine = sa.create_engine(
+            f"sqlite:///{database if database is not None else ':memory:'}"
+        )
 
-    def list_tables(self, like=None, database=None):
-        if database is None:
-            database = self.current_database
-        return super().list_tables(like, database=database)
+        if type_map:
+            # Patch out ischema_names for the instantiated dialect. This
+            # attribute is required for all SQLAlchemy dialects, but as no
+            # public way of modifying it for a given dialect. Patching seems
+            # easier than subclassing the builtin SQLite dialect, and achieves
+            # the same desired behavior.
+            def _to_ischema_val(t):
+                sa_type = to_sqla_type(datatype(t))
+                if isinstance(sa_type, sa.types.TypeEngine):
+                    # SQLAlchemy expects a callable here, rather than an
+                    # instance. Use a lambda to work around this.
+                    return lambda: sa_type
+                return sa_type
+
+            overrides = {k: _to_ischema_val(v) for k, v in type_map.items()}
+            engine.dialect.ischema_names = engine.dialect.ischema_names.copy()
+            engine.dialect.ischema_names.update(overrides)
+
+        sqlite3.register_adapter(pd.Timestamp, lambda value: value.isoformat())
+
+        @sa.event.listens_for(engine, "connect")
+        def connect(dbapi_connection, connection_record):
+            """Register UDFs on connection."""
+            udf.register_all(dbapi_connection)
+
+        super().do_connect(engine)
+
+        @sa.event.listens_for(self.meta, "column_reflect")
+        def column_reflect(inspector, table, column_info):
+            if type(column_info["type"]) is TIMESTAMP:
+                column_info["type"] = ISODATETIME()
 
     def attach(
         self,
         name: str,
         path: str | Path,
-        create: bool = False,
     ) -> None:
         """Connect another SQLite database file to the current connection.
 
@@ -122,32 +167,19 @@ class Backend(BaseAlchemyBackend):
             Database name within SQLite
         path
             Path to sqlite3 database file
-        create
-            If the database file does not exist, create file if `True`
-            otherwise raise an exception
         """
-        if not os.path.exists(path) and not create:
-            raise FileNotFoundError(
-                errno.ENOENT, os.strerror(errno.ENOENT), path
-            )
-
         quoted_name = self.con.dialect.identifier_preparer.quote(name)
-        self.raw_sql(
-            "ATTACH DATABASE {path!r} AS {name}".format(
-                path=path, name=quoted_name
-            )
-        )
-        self.has_attachment = True
+        self.raw_sql(f"ATTACH DATABASE {path!r} AS {quoted_name}")
 
     def _get_sqla_table(self, name, schema=None, autoload=True):
-        return sqlalchemy.Table(
+        return sa.Table(
             name,
             self.meta,
             schema=schema or self.current_database,
             autoload=autoload,
         )
 
-    def table(self, name: str, database: str | None = None) -> ir.TableExpr:
+    def table(self, name: str, database: str | None = None) -> ir.Table:
         """Create a table expression from a table in the SQLite database.
 
         Parameters
@@ -159,15 +191,17 @@ class Backend(BaseAlchemyBackend):
 
         Returns
         -------
-        TableExpr
+        Table
             Table expression
         """
         alch_table = self._get_sqla_table(name, schema=database)
-        node = self.table_class(alch_table, self)
+        node = self.table_class(source=self, sqla_table=alch_table)
         return self.table_expr_class(node)
 
-    def _table_from_schema(
-        self, name, schema, database: str | None = None
-    ) -> sqlalchemy.Table:
+    def _table_from_schema(self, name, schema, database: str | None = None) -> sa.Table:
         columns = self._columns_from_schema(name, schema)
-        return sqlalchemy.Table(name, self.meta, schema=database, *columns)
+        return sa.Table(name, self.meta, schema=database, *columns)
+
+    @property
+    def _current_schema(self) -> str | None:
+        return self.current_database

@@ -1,11 +1,12 @@
 from pathlib import Path
 
-import pyarrow as pa
 import pytest
 
 import ibis
 import ibis.expr.types as ir
 from ibis.backends.tests.base import BackendTest, RoundAwayFromZero
+
+pa = pytest.importorskip("pyarrow")
 
 
 class TestConf(BackendTest, RoundAwayFromZero):
@@ -14,6 +15,8 @@ class TestConf(BackendTest, RoundAwayFromZero):
     # supports_divide_by_zero = True
     # returned_timestamp_unit = 'ns'
     bool_is_int = True
+    supports_structs = False
+    supports_json = False
 
     @staticmethod
     def connect(data_directory: Path):
@@ -45,16 +48,14 @@ class TestConf(BackendTest, RoundAwayFromZero):
                 ]
             ),
         )
-        client.register_csv(
-            name='batting', path=data_directory / 'batting.csv'
-        )
+        client.register_csv(name='batting', path=data_directory / 'batting.csv')
         client.register_csv(
             name='awards_players', path=data_directory / 'awards_players.csv'
         )
         return client
 
     @property
-    def functional_alltypes(self) -> ir.TableExpr:
+    def functional_alltypes(self) -> ir.Table:
         t = self.connection.table('functional_alltypes')
         return t.mutate(
             bool_col=t.bool_col == 1,

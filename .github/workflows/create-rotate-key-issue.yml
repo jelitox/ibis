@@ -17,10 +17,10 @@ jobs:
           private_key: ${{ secrets.SQUAWK_BOT_APP_PRIVATE_KEY }}
 
       - name: checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: create issue to rotate key
-        uses: peter-evans/create-issue-from-file@v3
+        uses: peter-evans/create-issue-from-file@v4
         with:
           token: ${{ steps.generate_token.outputs.token }}
           title: "chore: rotate ibis bot keys"

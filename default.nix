@@ -1,79 +1,55 @@
-{ python ? "3.9"
+{ python ? "3.10"
 , doCheck ? true
+, backends ? [
+    "dask"
+    "datafusion"
+    "duckdb"
+    "pandas"
+    "sqlite"
+  ]
 }:
 let
-  pkgs = import ./nix;
-  drv =
-    { poetry2nix
-    , python
-    , lib
-    }:
+  pkgs = import ./nix { };
+  drv = { poetry2nix, python, lib }: poetry2nix.mkPoetryApplication rec {
+    inherit python;
 
-    let
-      backends = [
-        "dask"
-        "datafusion"
-        "pandas"
-        "sqlite"
-      ];
+    groups = [ ];
+    checkGroups = lib.optionals doCheck [ "test" ];
+    projectDir = ./.;
+    src = pkgs.gitignoreSource ./.;
 
-      backendsString = lib.concatStringsSep " " backends;
-    in
-    poetry2nix.mkPoetryApplication {
-      inherit python;
+    overrides = pkgs.poetry2nix.overrides.withDefaults (
+      import ./poetry-overrides.nix
+    );
 
-      projectDir = ./.;
-      src = pkgs.gitignoreSource ./.;
+    buildInputs = with pkgs; [ gdal graphviz-nox proj sqlite ];
+    checkInputs = buildInputs;
 
-      overrides = pkgs.poetry2nix.overrides.withDefaults (
-        import ./poetry-overrides.nix {
-          inherit pkgs;
-          inherit (pkgs) lib stdenv;
-        }
-      );
+    preCheck = ''
+      set -euo pipefail
 
-      preConfigure = ''
-        rm -f setup.py
-      '';
+      export IBIS_TEST_DATA_DIRECTORY="$PWD/ci/ibis-testing-data"
 
-      buildInputs = with pkgs; [ graphviz-nox ];
-      checkInputs = with pkgs; [ graphviz-nox ];
+      ${pkgs.rsync}/bin/rsync \
+        --chmod=Du+rwx,Fu+rw --archive --delete \
+        "${pkgs.ibisTestingData}/" \
+        "$IBIS_TEST_DATA_DIRECTORY"
+    '';
 
-      preCheck = ''
-        export PYTEST_BACKENDS="${backendsString}"
-      '';
+    checkPhase = ''
+      set -euo pipefail
 
-      checkPhase = ''
-        set -euo pipefail
+      runHook preCheck
 
-        runHook preCheck
+      pytest --numprocesses auto --dist loadgroup -m '${lib.concatStringsSep " or " backends} or core'
 
-        tempdir="$(mktemp -d)"
+      runHook postCheck
+    '';
 
-        cp -r ${pkgs.ibisTestingData}/* "$tempdir"
+    inherit doCheck;
 
-        chmod -R u+rwx "$tempdir"
-
-        ln -s "$tempdir" ci/ibis-testing-data
-
-        for backend in ${backendsString}; do
-          python ci/datamgr.py "$backend" &
-        done
-
-        wait
-
-        pytest --numprocesses auto \
-          ibis/tests \
-          ibis/backends/tests \
-          ibis/backends/{${lib.concatStringsSep "," backends}}/tests
-
-        runHook postCheck
-      '';
-
-      inherit doCheck;
-
-      pythonImportsCheck = [ "ibis" ] ++ (map (backend: "ibis.backends.${backend}") backends);
-    };
+    pythonImportsCheck = [ "ibis" ] ++ (map (backend: "ibis.backends.${backend}") backends);
+  };
 in
 pkgs.callPackage drv {
   python = pkgs."python${builtins.replaceStrings [ "." ] [ "" ] python}";

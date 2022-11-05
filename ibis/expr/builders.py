@@ -1,26 +1,23 @@
+import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.rules as rlz
 import ibis.expr.types as ir
+from ibis.common.grounds import Annotable
 
 
-class TypedCaseBuilder:
-    __slots__ = ()
-
+class TypedCaseBuilder(Annotable):
     def type(self):
         return rlz.highest_precedence_dtype(self.results)
 
     def else_(self, result_expr):
-        """
-        Specify
+        """Specify.
 
         Returns
         -------
         builder : CaseBuilder
         """
         kwargs = {
-            slot: getattr(self, slot)
-            for slot in self.__slots__
-            if slot != 'default'
+            slot: getattr(self, slot) for slot in self.__slots__ if slot != 'default'
         }
 
         result_expr = rlz.any(result_expr)
@@ -33,28 +30,23 @@ class TypedCaseBuilder:
         if default is None:
             default = ir.null().cast(self.type())
 
-        args = [
-            getattr(self, slot) for slot in self.__slots__ if slot != 'default'
-        ]
+        args = [getattr(self, slot) for slot in self.__slots__ if slot != 'default']
         args.append(default)
-        op = self.__class__.case_op(*args)
+
+        op = self.__class__.op(*args)
         return op.to_expr()
 
 
 class SimpleCaseBuilder(TypedCaseBuilder):
-    __slots__ = 'base', 'cases', 'results', 'default'
+    op = ops.SimpleCase
 
-    case_op = ops.SimpleCase
-
-    def __init__(self, base, cases=None, results=None, default=None):
-        self.base = base
-        self.cases = list(cases if cases is not None else [])
-        self.results = list(results if results is not None else [])
-        self.default = default
+    base = rlz.any
+    cases = rlz.optional(rlz.nodes_of(rlz.any), default=[])
+    results = rlz.optional(rlz.nodes_of(rlz.any), default=[])
+    default = rlz.optional(rlz.any)
 
     def when(self, case_expr, result_expr):
-        """
-        Add a new case-result pair.
+        """Add a new case-result pair.
 
         Parameters
         ----------
@@ -68,12 +60,15 @@ class SimpleCaseBuilder(TypedCaseBuilder):
         -------
         builder : CaseBuilder
         """
+
+        # TODO(kszucs): update the rule to accept boolean predicate
         case_expr = rlz.any(case_expr)
         result_expr = rlz.any(result_expr)
 
         if not rlz.comparable(self.base, case_expr):
             raise TypeError(
-                'Base expression and passed case are not ' 'comparable'
+                f'Base expression {rlz._arg_type_error_format(self.base)} and '
+                f'case {rlz._arg_type_error_format(case_expr)} are not comparable'
             )
 
         cases = list(self.cases)
@@ -87,18 +82,14 @@ class SimpleCaseBuilder(TypedCaseBuilder):
 
 
 class SearchedCaseBuilder(TypedCaseBuilder):
-    __slots__ = 'cases', 'results', 'default'
+    op = ops.SearchedCase
 
-    case_op = ops.SearchedCase
-
-    def __init__(self, cases=None, results=None, default=None):
-        self.cases = list(cases if cases is not None else [])
-        self.results = list(results if results is not None else [])
-        self.default = default
+    cases = rlz.optional(rlz.nodes_of(rlz.any), default=[])
+    results = rlz.optional(rlz.nodes_of(rlz.any), default=[])
+    default = rlz.optional(rlz.any)
 
     def when(self, case_expr, result_expr):
-        """
-        Add a new case-result pair.
+        """Add a new case-result pair.
 
         Parameters
         ----------
@@ -112,10 +103,11 @@ class SearchedCaseBuilder(TypedCaseBuilder):
         -------
         builder : CaseBuilder
         """
+        # TODO(kszucs): update the rule to accept boolean predicate
         case_expr = rlz.any(case_expr)
         result_expr = rlz.any(result_expr)
 
-        if not isinstance(case_expr, ir.BooleanValue):
+        if not isinstance(case_expr.output_dtype, dt.Boolean):
             raise TypeError(case_expr)
 
         cases = list(self.cases)

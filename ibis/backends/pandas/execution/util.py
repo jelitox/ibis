@@ -1,24 +1,28 @@
-import operator
 from typing import Any, Optional, Union
 
-import numpy as np
 import pandas as pd
-import toolz
 
-import ibis.common.exceptions as com
+import ibis.expr.analysis as an
+import ibis.expr.operations as ops
 import ibis.util
-from ibis.expr import operations as ops
-from ibis.expr import types as ir
+from ibis.backends.pandas.core import execute
+from ibis.backends.pandas.execution import constants
 from ibis.expr.scope import Scope
-from ibis.udf.vectorized import coerce_to_dataframe
 
-from ..core import execute
-from ..execution import constants
+
+def get_grouping(grouper):
+    # this is such an annoying hack
+    assert isinstance(grouper, list)
+    if len(grouper) == 1:
+        return grouper[0]
+    return grouper
 
 
 def get_join_suffix_for_op(op: ops.TableColumn, join_op: ops.Join):
-    (root_table,) = op.root_tables()
-    left_root, right_root = ops.distinct_roots(join_op.left, join_op.right)
+    (root_table,) = an.find_immediate_parent_tables(op)
+    left_root, right_root = an.find_immediate_parent_tables(
+        [join_op.left, join_op.right]
+    )
     return {
         left_root: constants.LEFT_JOIN_SUFFIX,
         right_root: constants.RIGHT_JOIN_SUFFIX,
@@ -26,32 +30,36 @@ def get_join_suffix_for_op(op: ops.TableColumn, join_op: ops.Join):
 
 
 def compute_sort_key(key, data, timecontext, scope=None, **kwargs):
-    by = key.to_expr()
-    try:
-        if isinstance(by, str):
-            return by, None
-        return by.get_name(), None
-    except com.ExpressionError:
+    if isinstance(key, str):
+        return key, None
+    elif key.name in data:
+        return key.name, None
+    else:
         if scope is None:
             scope = Scope()
         scope = scope.merge_scopes(
-            Scope({t: data}, timecontext) for t in by.op().root_tables()
+            Scope({t: data}, timecontext) for t in an.find_immediate_parent_tables(key)
         )
-        new_column = execute(by, scope=scope, **kwargs)
+        new_column = execute(key, scope=scope, **kwargs)
         name = ibis.util.guid()
         new_column.name = name
         return name, new_column
 
 
-def compute_sorted_frame(
-    df, order_by, group_by=(), timecontext=None, **kwargs
-):
-    computed_sort_keys = []
-    sort_keys = list(toolz.concatv(group_by, order_by))
-    ascending = [getattr(key.op(), 'ascending', True) for key in sort_keys]
-    new_columns = {}
+def compute_sorted_frame(df, order_by, group_by=(), timecontext=None, **kwargs):
+    sort_keys = []
+    ascending = []
 
-    for i, key in enumerate(map(operator.methodcaller('op'), sort_keys)):
+    for value in group_by:
+        sort_keys.append(value)
+        ascending.append(True)
+    for key in order_by:
+        sort_keys.append(key)
+        ascending.append(key.ascending)
+
+    new_columns = {}
+    computed_sort_keys = []
+    for key in sort_keys:
         computed_sort_key, temporary_column = compute_sort_key(
             key, df, timecontext, **kwargs
         )
@@ -75,7 +83,7 @@ def compute_sorted_frame(
 
 
 def coerce_to_output(
-    result: Any, expr: ir.Expr, index: Optional[pd.Index] = None
+    result: Any, node: ops.Node, index: Optional[pd.Index] = None
 ) -> Union[pd.Series, pd.DataFrame]:
     """Cast the result to either a Series or DataFrame.
 
@@ -86,8 +94,8 @@ def coerce_to_output(
     ----------
     result: Any
         The result to cast
-    expr: ibis.expr.types.Expr
-        The expression associated with the result
+    node: ibis.expr.operations.Node
+        The operation node associated with the result
     index: pd.Index
         Optional. If passed, scalar results will be broadcasted according
         to the index.
@@ -100,45 +108,28 @@ def coerce_to_output(
     --------
     For dataframe outputs, see ``ibis.util.coerce_to_dataframe``.
 
-    >>> coerce_to_output(pd.Series(1), expr)
+    >>> coerce_to_output(pd.Series(1), node)
     0    1
     Name: result, dtype: int64
-    >>> coerce_to_output(1, expr)
+    >>> coerce_to_output(1, node)
     0    1
     Name: result, dtype: int64
-    >>> coerce_to_output(1, expr, [1,2,3])
+    >>> coerce_to_output(1, node, [1,2,3])
     1    1
     2    1
     3    1
     Name: result, dtype: int64
-    >>> coerce_to_output([1,2,3], expr)
+    >>> coerce_to_output([1,2,3], node)
     0    [1, 2, 3]
     Name: result, dtype: object
     """
-    result_name = getattr(expr, '_name', None)
+    if isinstance(result, pd.DataFrame):
+        rows = result.to_dict(orient="records")
+        return pd.Series(rows, name=node.name)
 
-    if isinstance(expr, (ir.DestructColumn, ir.StructColumn)):
-        return coerce_to_dataframe(result, expr.type())
-    elif isinstance(expr, (ir.DestructScalar, ir.StructScalar)):
-        # Here there are two cases, if this is groupby aggregate,
-        # then the result e a Series of tuple/list, or
-        # if this is non grouped aggregate, then the result
-        return coerce_to_dataframe(result, expr.type())
-    elif isinstance(result, pd.Series):
-        return result.rename(result_name)
-    elif isinstance(expr.op(), ops.Reduction):
-        if index is None:
-            # Wrap `result` into a single-element Series.
-            return pd.Series([result], name=result_name)
-        else:
-            # Broadcast `result` to a multi-element Series according to the
-            # given `index`.
-            return pd.Series(
-                np.repeat(result, len(index)),
-                index=index,
-                name=result_name,
-            )
-    elif isinstance(result, np.ndarray):
-        return pd.Series(result, name=result_name)
-    else:
-        raise ValueError(f"Cannot coerce_to_output. Result: {result}")
+    # columnar result
+    if isinstance(result, pd.Series):
+        return result.rename(node.name)
+
+    # Wrap `result` into a single-element Series.
+    return pd.Series([result], name=node.name)

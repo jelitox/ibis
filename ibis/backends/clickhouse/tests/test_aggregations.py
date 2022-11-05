@@ -7,6 +7,8 @@ import pytest
 
 from ibis import literal as L
 
+pytest.importorskip("clickhouse_driver")
+
 
 @pytest.mark.parametrize(
     ('reduction', 'func_translated'),
@@ -28,7 +30,7 @@ def test_reduction_where(con, alltypes, translate, reduction, func_translated):
     cond = alltypes.bigint_col < 70
     expr = method(where=cond)
 
-    assert translate(expr) == expected
+    assert translate(expr.op()) == expected
 
 
 def test_std_var_pop(con, alltypes, translate):
@@ -36,8 +38,8 @@ def test_std_var_pop(con, alltypes, translate):
     expr1 = alltypes.double_col.std(where=cond, how='pop')
     expr2 = alltypes.double_col.var(where=cond, how='pop')
 
-    assert translate(expr1) == 'stddevPopIf(`double_col`, `bigint_col` < 70)'
-    assert translate(expr2) == 'varPopIf(`double_col`, `bigint_col` < 70)'
+    assert translate(expr1.op()) == 'stddevPopIf(`double_col`, `bigint_col` < 70)'
+    assert translate(expr2.op()) == 'varPopIf(`double_col`, `bigint_col` < 70)'
     assert isinstance(con.execute(expr1), float)
     assert isinstance(con.execute(expr2), float)
 
@@ -196,6 +198,4 @@ def test_boolean_summary(alltypes):
             'approx_nunique',
         ],
     )
-    tm.assert_frame_equal(
-        result, expected, check_column_type=False, check_dtype=False
-    )
+    tm.assert_frame_equal(result, expected, check_column_type=False, check_dtype=False)

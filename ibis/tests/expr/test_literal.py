@@ -6,6 +6,7 @@ import ibis
 from ibis.expr import datatypes
 from ibis.expr.operations import Literal
 from ibis.tests.util import assert_pickle_roundtrip
+from ibis.util import frozendict
 
 
 def test_literal_equality_basic():
@@ -71,18 +72,15 @@ def test_pickle_literal_interval():
     [
         pytest.param(uuid.uuid1(), "uuid", uuid.UUID, id="uuid1_as_uuid"),
         pytest.param(uuid.uuid4(), "uuid", uuid.UUID, id="uuid4_as_uuid"),
-        pytest.param(
-            str(uuid.uuid1()), "uuid", uuid.UUID, id="str_uuid1_as_uuid"
-        ),
-        pytest.param(
-            str(uuid.uuid4()), "uuid", uuid.UUID, id="str_uuid4_as_uuid"
-        ),
+        pytest.param(str(uuid.uuid1()), "uuid", uuid.UUID, id="str_uuid1_as_uuid"),
+        pytest.param(str(uuid.uuid4()), "uuid", uuid.UUID, id="str_uuid4_as_uuid"),
         pytest.param(uuid.uuid1(), "string", str, id="uuid1_as_str"),
         pytest.param(uuid.uuid4(), "string", str, id="uuid4_as_str"),
         pytest.param(str(uuid.uuid1()), "string", str, id="str_uuid1_as_str"),
         pytest.param(str(uuid.uuid4()), "string", str, id="str_uuid4_as_str"),
         pytest.param(0, "float", float, id="int_zero_as_float"),
         pytest.param(0.0, "float", float, id="float_zero_as_float"),
+        pytest.param(0.0, "float32", float, id="float32_zero_as_float"),
         pytest.param(42, "float", float, id="int_as_float"),
         pytest.param(42.0, "float", float, id="float_as_float"),
         pytest.param(42.0, None, float, id="float_implicit_type_as_float"),
@@ -106,7 +104,7 @@ def test_normalized_underlying_value(userinput, literal_type, expected_type):
 def test_struct_literal(value):
     typestr = "struct<field1: string, field2: float64>"
     a = ibis.struct(value, type=typestr)
-    assert a.op().value == value
+    assert a.op().value == frozendict(field1=value['field1'], field2=value['field2'])
     assert a.type() == datatypes.dtype(typestr)
 
 
@@ -120,9 +118,7 @@ def test_struct_literal(value):
 )
 def test_struct_literal_non_castable(value):
     typestr = "struct<field1: string, field2: float64>"
-    with pytest.raises(
-        (KeyError, TypeError, ibis.common.exceptions.IbisTypeError)
-    ):
+    with pytest.raises((KeyError, TypeError, ibis.common.exceptions.IbisTypeError)):
         ibis.struct(value, type=typestr)
 
 
@@ -133,9 +129,10 @@ def test_struct_literal_non_castable(value):
     ],
 )
 def test_map_literal(value):
-    typestr = "map<string, string>"
-    a = ibis.map(value, type=typestr)
-    assert a.op().value == value
+    typestr = "map<string, int8>"
+    a = ibis.map(["a", "b"], [1, 2])
+    assert a.op().keys.value == ("a", "b")
+    assert a.op().values.value == (1, 2)
     assert a.type() == datatypes.dtype(typestr)
 
 
@@ -147,5 +144,5 @@ def test_map_literal(value):
 )
 def test_map_literal_non_castable(value):
     typestr = "map<string, string>"
-    with pytest.raises(ibis.common.exceptions.IbisTypeError):
+    with pytest.raises(TypeError):
         ibis.map(value, type=typestr)

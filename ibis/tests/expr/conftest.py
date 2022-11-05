@@ -12,13 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import collections
+import sys
 
 import pytest
 
 import ibis
 import ibis.common.exceptions as com
 from ibis.tests.expr.mocks import MockBackend
+
+collect_ignore = []
+if sys.version_info < (3, 10):
+    collect_ignore.append("test_operations_py310.py")
 
 
 @pytest.fixture
@@ -28,19 +32,14 @@ def schema():
         ('b', 'int16'),
         ('c', 'int32'),
         ('d', 'int64'),
-        ('e', 'float'),
-        ('f', 'double'),
+        ('e', 'float32'),
+        ('f', 'float64'),
         ('g', 'string'),
         ('h', 'boolean'),
         ('i', 'timestamp'),
         ('j', 'date'),
         ('k', 'time'),
     ]
-
-
-@pytest.fixture
-def schema_dict(schema):
-    return collections.OrderedDict(schema)
 
 
 @pytest.fixture
@@ -105,7 +104,5 @@ def pytest_pyfunc_call(pyfuncitem):
             raise
         assert (
             len(markers) == 1
-        ), "More than one xfail_unsupported marker found on test {}".format(
-            pyfuncitem
-        )
+        ), f"More than one xfail_unsupported marker found on test {pyfuncitem}"
         pytest.xfail(reason=repr(e))

@@ -20,60 +20,63 @@ from ibis.expr.operations import (
 )
 
 
-def coerce_to_tuple(
+def _coerce_to_dict(
     data: Union[List, np.ndarray, pd.Series],
     output_type: dt.Struct,
     index: Optional[pd.Index] = None,
 ) -> Tuple:
     """Coerce the following shapes to a tuple.
 
-    (1) A list
-    (2) An np.ndarray
-    (3) A Series
+    - [`list`][list]
+    - `np.ndarray`
+    - `pd.Series`
     """
-    return tuple(data)
+    return dict(zip(output_type.names, data))
 
 
-def coerce_to_np_array(
+def _coerce_to_np_array(
     data: Union[List, np.ndarray, pd.Series],
     output_type: dt.Struct,
     index: Optional[pd.Index] = None,
 ) -> np.ndarray:
     """Coerce the following shapes to an np.ndarray.
 
-    (1) A list
-    (2) An np.ndarray
-    (3) A Series
+    - [`list`][list]
+    - `np.ndarray`
+    - `pd.Series`
     """
     return np.array(data)
 
 
-def coerce_to_series(
+def _coerce_to_series(
     data: Union[List, np.ndarray, pd.Series],
     output_type: dt.DataType,
     original_index: Optional[pd.Index] = None,
 ) -> pd.Series:
     """Coerce the following shapes to a Series.
 
-    (1) A list
-    (2) An np.ndarray
-    (3) A Series
-
-    Note:
     This method does NOT always return a new Series. If a Series is
     passed in, this method will return the original object.
 
+    - [`list`][list]
+    - `np.ndarray`
+    - `pd.Series`
+
+    Note:
+
     Parameters
     ----------
-    data : pd.Series, a list, or an np.array
-
-    output_type : the type of the output
-
-    original_index : Optional parameter containing the index of the output
+    data
+        Input
+    output_type
+        The type of the output
+    original_index
+        Optional parameter containing the index of the output
 
     Returns
     -------
     pd.Series
+        Output Series
     """
     if isinstance(data, (list, np.ndarray)):
         result = pd.Series(data)
@@ -88,58 +91,61 @@ def coerce_to_series(
     return result
 
 
-def coerce_to_dataframe(
+def _coerce_to_dataframe(
     data: Any,
     output_type: dt.Struct,
     original_index: Optional[pd.Index] = None,
 ) -> pd.DataFrame:
     """Coerce the following shapes to a DataFrame.
 
-    The following shapes are allowed:
-    (1) A list/tuple of Series
-    (2) A list/tuple np.ndarray
-    (3) A list/tuple of scalars
-    (4) A Series of list/tuple
-    (5) pd.DataFrame
-
-    Note:
     This method does NOT always return a new DataFrame. If a DataFrame is
     passed in, this method will return the original object.
 
+    The following shapes are allowed:
+
+    - A list/tuple of Series
+    - A list/tuple np.ndarray
+    - A list/tuple of scalars
+    - A Series of list/tuple
+    - pd.DataFrame
+
+    Note:
+
     Parameters
     ----------
-    data : pd.DataFrame, a tuple/list of pd.Series, a tuple/list of np.array
-    or a pd.Series of tuple/list
-
-    output_type : a Struct containing the names and types of the output
-
-    original_index : Optional parameter containing the index of the output
+    data
+        Input
+    output_type
+        A Struct containing the names and types of the output
+    original_index
+        Optional parameter containing the index of the output
 
     Returns
     -------
     pd.DataFrame
+        Output DataFrame
 
     Examples
     --------
-    >>> coerce_to_dataframe(pd.DataFrame({'a': [1, 2, 3]}), dt.Struct([('b', 'int32')]))  # noqa: E501
+    >>> _coerce_to_dataframe(pd.DataFrame({'a': [1, 2, 3]}), dt.Struct([('b', 'int32')]))  # noqa: E501
        b
     0  1
     1  2
     2  3
     dtype: int32
-    >>> coerce_to_dataframe(pd.Series([[1, 2, 3]]), dt.Struct([('a', 'int32'), ('b', 'int32'), ('c', 'int32')]))  # noqa: E501
+    >>> _coerce_to_dataframe(pd.Series([[1, 2, 3]]), dt.Struct([('a', 'int32'), ('b', 'int32'), ('c', 'int32')]))  # noqa: E501
        a  b  c
     0  1  2  3
     dtypes: [int32, int32, int32]
-    >>> coerce_to_dataframe(pd.Series([range(3), range(3)]), dt.Struct([('a', 'int32'), ('b', 'int32'), ('c', 'int32')]))  # noqa: E501
+    >>> _coerce_to_dataframe(pd.Series([range(3), range(3)]), dt.Struct([('a', 'int32'), ('b', 'int32'), ('c', 'int32')]))  # noqa: E501
        a  b  c
     0  0  1  2
     1  0  1  2
     dtypes: [int32, int32, int32]
-    >>> coerce_to_dataframe([pd.Series(x) for x in [1, 2, 3]], dt.Struct([('a', 'int32'), ('b', 'int32'), ('c', 'int32')]))  # noqa: E501
+    >>> _coerce_to_dataframe([pd.Series(x) for x in [1, 2, 3]], dt.Struct([('a', 'int32'), ('b', 'int32'), ('c', 'int32')]))  # noqa: E501
        a  b  c
     0  1  2  3
-    >>>  coerce_to_dataframe([1, 2, 3], dt.Struct([('a', 'int32'), ('b', 'int32'), ('c', 'int32')]))  # noqa: E501
+    >>>  _coerce_to_dataframe([1, 2, 3], dt.Struct([('a', 'int32'), ('b', 'int32'), ('c', 'int32')]))  # noqa: E501
        a  b  c
     0  1  2  3
     dtypes: [int32, int32, int32]
@@ -173,7 +179,8 @@ def coerce_to_dataframe(
 class UserDefinedFunction:
     """Class representing a user defined function.
 
-    This class Implements __call__ that returns an ibis expr for the UDF.
+    This class Implements __call__ that returns an ibis expr for the
+    UDF.
     """
 
     def __init__(self, func, func_type, input_type, output_type):
@@ -195,19 +202,19 @@ class UserDefinedFunction:
                 self.func_type is ElementWiseVectorizedUDF
                 or self.func_type is AnalyticVectorizedUDF
             ):
-                return coerce_to_dataframe
+                return _coerce_to_dataframe
             else:
-                # Case 2: Struct output, reduction UDF -> coerce to tuple
-                return coerce_to_tuple
+                # Case 2: Struct output, reduction UDF -> coerce to dictionary
+                return _coerce_to_dict
         # Case 3: Vector output, non-reduction UDF -> coerce to Series
         elif (
             self.func_type is ElementWiseVectorizedUDF
             or self.func_type is AnalyticVectorizedUDF
         ):
-            return coerce_to_series
+            return _coerce_to_series
         # Case 4: Array output type, reduction UDF -> coerce to np.ndarray
         elif isinstance(self.output_type, dt.Array):
-            return coerce_to_np_array
+            return _coerce_to_np_array
         else:
             # Case 5: Default, do nothing (e.g. reduction UDF returning
             # len-0 value such as a single integer or float).
@@ -226,9 +233,7 @@ class UserDefinedFunction:
             if self.coercion_fn:
                 # coercion function signature must take result, output type,
                 # and optionally the index
-                result = self.coercion_fn(
-                    result, self.output_type, saved_index
-                )
+                result = self.coercion_fn(result, self.output_type, saved_index)
             return result
 
         op = self.func_type(
@@ -249,8 +254,8 @@ def _udf_decorator(node_type, input_type, output_type):
 
 
 def analytic(input_type, output_type):
-    """Define an *analytic* user-defined function that takes N
-    pandas Series or scalar values as inputs and produces N rows of output.
+    """Define an *analytic* user-defined function that takes N pandas Series or
+    scalar values as inputs and produces N rows of output.
 
     Parameters
     ----------
@@ -334,8 +339,8 @@ def elementwise(input_type, output_type):
 
 
 def reduction(input_type, output_type):
-    """Define a user-defined reduction function that takes N pandas Series
-    or scalar values as inputs and produces one row of output.
+    """Define a user-defined reduction function that takes N pandas Series or
+    scalar values as inputs and produces one row of output.
 
     Parameters
     ----------
@@ -365,7 +370,7 @@ def reduction(input_type, output_type):
     ...     return v.mean(), v.std()
     >>>
     >>> # create aggregation columns "mean" and "std"
-    >>> table = table.groupby('key').aggregate(
+    >>> table = table.group_by('key').aggregate(
     ...     mean_and_std(table['v']).destructure()
     ... )
     """

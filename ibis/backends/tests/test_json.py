@@ -1,30 +1,39 @@
-""" Tests for json data types"""
-import json
+"""Tests for JSON operations."""
 
+import pandas as pd
 import pytest
 from pytest import param
 
-import ibis
 
-# add here backends that support json types
-all_db_geo_supported = ['postgres']
-
-
-@pytest.mark.parametrize('data', [param({'status': True}, id='status')])
-@pytest.mark.only_on_backends(all_db_geo_supported)
-def test_json(backend, con, data, alltypes):
-    json_value = json.dumps(data)
-    lit = ibis.literal(json_value, type='json').name('tmp')
-    expr = alltypes[[alltypes.id, lit]].head(1)
-    df = expr.execute()
-    assert df['tmp'].iloc[0] == json_value
-
-
-@pytest.mark.parametrize('data', [param({'status': True}, id='status')])
-@pytest.mark.only_on_backends(all_db_geo_supported)
-def test_jsonb(backend, con, data, alltypes):
-    jsonb_value = json.dumps(data).encode('utf8')
-    lit = ibis.literal(jsonb_value, type='jsonb').name('tmp')
-    expr = alltypes[[alltypes.id, lit]].head(1)
-    df = expr.execute()
-    assert df['tmp'].iloc[0] == jsonb_value
+@pytest.mark.notimpl(["datafusion", "pyspark"])
+@pytest.mark.notyet(["clickhouse"], reason="upstream is broken")
+@pytest.mark.never(["impala"], reason="doesn't support JSON and never will")
+@pytest.mark.parametrize(
+    ("expr_fn", "expected"),
+    [
+        param(
+            lambda t: t.js["a"].name("res"),
+            pd.Series(
+                [[1, 2, 3, 4], None, "foo", None, None, None],
+                name="res",
+                dtype="object",
+            ),
+            id="getitem_object",
+            marks=[pytest.mark.min_server_version(sqlite="3.38.0")],
+        ),
+        param(
+            lambda t: t.js[1].name("res"),
+            pd.Series(
+                [None, None, None, None, 47, None],
+                dtype="object",
+                name="res",
+            ),
+            marks=[pytest.mark.min_server_version(sqlite="3.38.0")],
+            id="getitem_array",
+        ),
+    ],
+)
+def test_json_getitem(backend, json_t, expr_fn, expected):
+    expr = expr_fn(json_t)
+    result = expr.execute()
+    backend.assert_series_equal(result, expected)

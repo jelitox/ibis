@@ -1,4 +1,7 @@
-from typing import Optional
+from __future__ import annotations
+
+import functools
+from typing import Iterable
 
 import sqlalchemy as sa
 from sqlalchemy.dialects import mysql, postgresql, sqlite
@@ -6,17 +9,65 @@ from sqlalchemy.dialects.mysql.base import MySQLDialect
 from sqlalchemy.dialects.postgresql.base import PGDialect
 from sqlalchemy.dialects.sqlite.base import SQLiteDialect
 from sqlalchemy.engine.interfaces import Dialect
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.types import UserDefinedType
 
 import ibis.expr.datatypes as dt
 import ibis.expr.schema as sch
-
-from .geospatial import geospatial_supported
+from ibis.backends.base.sql.alchemy.geospatial import geospatial_supported
 
 if geospatial_supported:
     import geoalchemy2 as ga
 
 
-def table_from_schema(name, meta, schema, database: Optional[str] = None):
+class StructType(UserDefinedType):
+    def __init__(
+        self,
+        pairs: Iterable[tuple[str, sa.types.TypeEngine]],
+    ):
+        self.pairs = [(name, sa.types.to_instance(type)) for name, type in pairs]
+
+    def get_col_spec(self, **_):
+        pairs = ", ".join(f"{k} {v}" for k, v in self.pairs)
+        return f"STRUCT({pairs})"
+
+
+class UInt64(sa.types.Integer):
+    pass
+
+
+class UInt32(sa.types.Integer):
+    pass
+
+
+class UInt16(sa.types.Integer):
+    pass
+
+
+class UInt8(sa.types.Integer):
+    pass
+
+
+@compiles(UInt64, "postgresql")
+@compiles(UInt32, "postgresql")
+@compiles(UInt16, "postgresql")
+@compiles(UInt8, "postgresql")
+@compiles(UInt64, "mysql")
+@compiles(UInt32, "mysql")
+@compiles(UInt16, "mysql")
+@compiles(UInt8, "mysql")
+@compiles(UInt64, "sqlite")
+@compiles(UInt32, "sqlite")
+@compiles(UInt16, "sqlite")
+@compiles(UInt8, "sqlite")
+def compile_uint(element, compiler, **kw):
+    dialect_name = compiler.dialect.name
+    raise TypeError(
+        f"unsigned integers are not supported in the {dialect_name} backend"
+    )
+
+
+def table_from_schema(name, meta, schema, database: str | None = None):
     # Convert Ibis schema to SQLA table
     columns = []
 
@@ -38,44 +89,75 @@ ibis_type_to_sqla = {
     dt.String: sa.Text,
     dt.Decimal: sa.NUMERIC,
     # Mantissa-based
-    dt.Float: sa.REAL,
-    dt.Double: sa.FLOAT,
+    dt.Float16: sa.REAL,
+    dt.Float32: sa.REAL,
+    # precision is the number of bits in the mantissa
+    # without specifying this, some backends interpret the type as FLOAT, which
+    # means float32 (and precision == 24)
+    dt.Float64: sa.Float(precision=53),
     dt.Int8: sa.SmallInteger,
     dt.Int16: sa.SmallInteger,
     dt.Int32: sa.Integer,
     dt.Int64: sa.BigInteger,
+    dt.UInt8: UInt8,
+    dt.UInt16: UInt16,
+    dt.UInt32: UInt32,
+    dt.UInt64: UInt64,
+    dt.JSON: sa.JSON,
 }
 
 
+@functools.singledispatch
 def to_sqla_type(itype, type_map=None):
     if type_map is None:
         type_map = ibis_type_to_sqla
-    if isinstance(itype, dt.Decimal):
-        return sa.types.NUMERIC(itype.precision, itype.scale)
-    elif isinstance(itype, dt.Date):
-        return sa.Date()
-    elif isinstance(itype, dt.Timestamp):
-        # SQLAlchemy DateTimes do not store the timezone, just whether the db
-        # supports timezones.
-        return sa.TIMESTAMP(bool(itype.timezone))
-    elif isinstance(itype, dt.Array):
-        ibis_type = itype.value_type
-        if not isinstance(ibis_type, (dt.Primitive, dt.String)):
-            raise TypeError(
-                'Type {} is not a primitive type or string type'.format(
-                    ibis_type
-                )
-            )
-        return sa.ARRAY(to_sqla_type(ibis_type, type_map=type_map))
-    elif geospatial_supported and isinstance(itype, dt.GeoSpatial):
-        if itype.geotype == 'geometry':
-            return ga.Geometry
-        elif itype.geotype == 'geography':
-            return ga.Geography
-        else:
-            return ga.types._GISType
+    return type_map[type(itype)]
+
+
+@to_sqla_type.register(dt.Decimal)
+def _(itype, **kwargs):
+    return sa.types.NUMERIC(itype.precision, itype.scale)
+
+
+@to_sqla_type.register(dt.Interval)
+def _(itype, **kwargs):
+    return sa.types.Interval()
+
+
+@to_sqla_type.register(dt.Date)
+def _(itype, **kwargs):
+    return sa.Date()
+
+
+@to_sqla_type.register(dt.Timestamp)
+def _(itype, **kwargs):
+    return sa.TIMESTAMP(bool(itype.timezone))
+
+
+@to_sqla_type.register(dt.Array)
+def _(itype, **kwargs):
+    # Unwrap the array element type because sqlalchemy doesn't allow arrays of
+    # arrays. This doesn't affect the underlying data.
+    while isinstance(itype, dt.Array):
+        itype = itype.value_type
+    return sa.ARRAY(to_sqla_type(itype, **kwargs))
+
+
+@to_sqla_type.register(dt.Struct)
+def _(itype, **_):
+    return StructType(
+        [(name, to_sqla_type(type)) for name, type in itype.pairs.items()]
+    )
+
+
+@to_sqla_type.register(dt.GeoSpatial)
+def _(itype, **kwargs):
+    if itype.geotype == 'geometry':
+        return ga.Geometry
+    elif itype.geotype == 'geography':
+        return ga.Geography
     else:
-        return type_map[type(itype)]
+        return ga.types._GISType
 
 
 @dt.dtype.register(Dialect, sa.types.NullType)
@@ -89,22 +171,33 @@ def sa_boolean(_, satype, nullable=True):
 
 
 @dt.dtype.register(MySQLDialect, mysql.NUMERIC)
+@dt.dtype.register(MySQLDialect, sa.NUMERIC)
 def sa_mysql_numeric(_, satype, nullable=True):
     # https://dev.mysql.com/doc/refman/8.0/en/fixed-point-types.html
-    return dt.Decimal(
-        satype.precision or 10, satype.scale or 0, nullable=nullable
-    )
+    return dt.Decimal(satype.precision or 10, satype.scale or 0, nullable=nullable)
 
 
-@dt.dtype.register(PGDialect, postgresql.NUMERIC)
-def sa_postgres_numeric(_, satype, nullable=True):
-    # PostgreSQL allows any precision for numeric values if not specified,
-    # up to the implementation limit. Here, default to the maximum value that
-    # can be specified by the user. The scale defaults to zero.
-    # https://www.postgresql.org/docs/10/datatype-numeric.html
-    return dt.Decimal(
-        satype.precision or 1000, satype.scale or 0, nullable=nullable
-    )
+@dt.dtype.register(MySQLDialect, mysql.TINYBLOB)
+@dt.dtype.register(MySQLDialect, mysql.MEDIUMBLOB)
+@dt.dtype.register(MySQLDialect, mysql.BLOB)
+@dt.dtype.register(MySQLDialect, mysql.LONGBLOB)
+def sa_mysql_blob(_, satype, nullable=True):
+    return dt.Binary(nullable=nullable)
+
+
+_FLOAT_PREC_TO_TYPE = {
+    11: dt.Float16,
+    24: dt.Float32,
+    53: dt.Float64,
+}
+
+
+@dt.dtype.register(Dialect, sa.types.Float)
+def sa_float(_, satype, nullable=True):
+    precision = satype.precision
+    if (typ := _FLOAT_PREC_TO_TYPE.get(precision)) is not None:
+        return typ(nullable=nullable)
+    return dt.Decimal(precision, satype.scale, nullable=nullable)
 
 
 @dt.dtype.register(Dialect, sa.types.Numeric)
@@ -134,7 +227,7 @@ def sa_bigint(_, satype, nullable=True):
 
 
 @dt.dtype.register(Dialect, sa.REAL)
-def sa_float(_, satype, nullable=True):
+def sa_real(_, satype, nullable=True):
     return dt.Float32(nullable=nullable)
 
 
@@ -160,7 +253,7 @@ def sa_inet(_, satype, nullable=True):
     return dt.INET(nullable=nullable)
 
 
-@dt.dtype.register(PGDialect, postgresql.JSON)
+@dt.dtype.register(Dialect, sa.types.JSON)
 def sa_json(_, satype, nullable=True):
     return dt.JSON(nullable=nullable)
 
@@ -226,7 +319,7 @@ def sa_postgres_interval(_, satype, nullable=True):
 @dt.dtype.register(MySQLDialect, mysql.DOUBLE)
 def sa_mysql_double(_, satype, nullable=True):
     # TODO: handle asdecimal=True
-    return dt.Double(nullable=nullable)
+    return dt.Float64(nullable=nullable)
 
 
 @dt.dtype.register(Dialect, sa.types.String)
@@ -265,7 +358,13 @@ def sa_array(dialect, satype, nullable=True):
     return dt.Array(value_dtype, nullable=nullable)
 
 
-@sch.infer.register(sa.Table)
+@dt.dtype.register(Dialect, StructType)
+def sa_struct(dialect, satype, nullable=True):
+    pairs = [(name, dt.dtype(dialect, typ)) for name, typ in satype.pairs]
+    return dt.Struct.from_tuples(pairs, nullable=nullable)
+
+
+@sch.infer.register((sa.Table, sa.sql.TableClause))
 def schema_from_table(table, schema=None):
     """Retrieve an ibis schema from a SQLAlchemy ``Table``.
 

@@ -8,22 +8,21 @@ import dask.dataframe.groupby as ddgb
 import numpy as np
 
 import ibis.expr.operations as ops
+from ibis.backends.dask.dispatch import execute_node
+from ibis.backends.dask.execution.util import make_selected_obj
 from ibis.backends.pandas.core import numeric_types
-
-from ..dispatch import execute_node
-from .util import make_selected_obj
 
 
 @execute_node.register(ops.Negate, dd.Series)
-def execute_series_negate(op, data, **kwargs):
-    return data.mul(-1)
+def execute_series_negate(_, data, **kwargs):
+    return -data
 
 
 @execute_node.register(ops.Negate, ddgb.SeriesGroupBy)
 def execute_series_group_by_negate(op, data, **kwargs):
-    return execute_series_negate(
-        op, make_selected_obj(data), **kwargs
-    ).groupby(data.index)
+    return execute_series_negate(op, make_selected_obj(data), **kwargs).groupby(
+        data.index
+    )
 
 
 def call_numpy_ufunc(func, op, data, **kwargs):
@@ -35,10 +34,37 @@ def call_numpy_ufunc(func, op, data, **kwargs):
     return func(data)
 
 
-@execute_node.register(ops.UnaryOp, dd.Series)
+@execute_node.register(ops.Unary, dd.Series)
 def execute_series_unary_op(op, data, **kwargs):
     function = getattr(np, type(op).__name__.lower())
     return call_numpy_ufunc(function, op, data, **kwargs)
+
+
+@execute_node.register(ops.Acos, dd.Series)
+def execute_series_acos(_, data, **kwargs):
+    return np.arccos(data)
+
+
+@execute_node.register(ops.Asin, dd.Series)
+def execute_series_asin(_, data, **kwargs):
+    return np.arcsin(data)
+
+
+@execute_node.register(ops.Atan, dd.Series)
+def execute_series_atan(_, data, **kwargs):
+    return np.arctan(data)
+
+
+@execute_node.register(ops.Cot, dd.Series)
+def execute_series_cot(_, data, **kwargs):
+    return np.cos(data) / np.sin(data)
+
+
+@execute_node.register(ops.Atan2, dd.Series, dd.Series)
+@execute_node.register(ops.Atan2, numeric_types, dd.Series)
+@execute_node.register(ops.Atan2, dd.Series, numeric_types)
+def execute_series_atan2(_, y, x, **kwargs):
+    return np.arctan2(y, x)
 
 
 @execute_node.register((ops.Ceil, ops.Floor), dd.Series)
@@ -78,27 +104,19 @@ def execute_series_natural_log(op, data, **kwargs):
     return np.log(data)
 
 
-@execute_node.register(
-    ops.Quantile, (dd.Series, ddgb.SeriesGroupBy), numeric_types
-)
+@execute_node.register(ops.Quantile, (dd.Series, ddgb.SeriesGroupBy), numeric_types)
 def execute_series_quantile(op, data, quantile, aggcontext=None, **kwargs):
     return data.quantile(q=quantile)
 
 
 @execute_node.register(ops.MultiQuantile, dd.Series, collections.abc.Sequence)
-def execute_series_quantile_sequence(
-    op, data, quantile, aggcontext=None, **kwargs
-):
+def execute_series_quantile_sequence(op, data, quantile, aggcontext=None, **kwargs):
     return list(data.quantile(q=quantile))
 
 
 # TODO - aggregations - #2553
-@execute_node.register(
-    ops.MultiQuantile, ddgb.SeriesGroupBy, collections.abc.Sequence
-)
-def execute_series_quantile_groupby(
-    op, data, quantile, aggcontext=None, **kwargs
-):
+@execute_node.register(ops.MultiQuantile, ddgb.SeriesGroupBy, collections.abc.Sequence)
+def execute_series_quantile_groupby(op, data, quantile, aggcontext=None, **kwargs):
     def q(x, quantile, interpolation):
         result = x.quantile(quantile, interpolation=interpolation).tolist()
         res = [result for _ in range(len(x))]
@@ -108,9 +126,7 @@ def execute_series_quantile_groupby(
     return result
 
 
-@execute_node.register(
-    ops.Round, dd.Series, (dd.Series, np.integer, type(None), int)
-)
+@execute_node.register(ops.Round, dd.Series, (dd.Series, np.integer, type(None), int))
 def execute_round_series(op, data, places, **kwargs):
     if data.dtype == np.dtype(np.object_):
         return vectorize_object(op, data, places, **kwargs)

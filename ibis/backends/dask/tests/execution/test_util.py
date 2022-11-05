@@ -1,6 +1,10 @@
 import pytest
 
-from ...execution.util import assert_identical_grouping_keys
+pytest.importorskip("dask.dataframe")
+
+from ibis.backends.dask.execution.util import (  # noqa: E402
+    assert_identical_grouping_keys,
+)
 
 
 @pytest.mark.parametrize(
@@ -22,7 +26,5 @@ def test_identical_grouping_keys_assertion(df, grouping, bad_grouping):
 
     c = df.groupby(bad_grouping).plain_int64
 
-    with pytest.raises(
-        AssertionError, match=r"Differing grouping keys passed*"
-    ):
+    with pytest.raises(AssertionError, match=r"Differing grouping keys passed*"):
         assert_identical_grouping_keys(a, b, c)

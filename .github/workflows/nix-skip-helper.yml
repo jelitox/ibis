@@ -12,6 +12,7 @@ on:
       - "nix/**"
     branches:
       - master
+      - "*.x.x"
   pull_request:
     paths-ignore:
       - "**/*.nix"
@@ -20,13 +21,17 @@ on:
       - "nix/**"
     branches:
       - master
+      - "*.x.x"
 
 jobs:
   nix:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
         python-version:
           - "3.8"
           - "3.9"

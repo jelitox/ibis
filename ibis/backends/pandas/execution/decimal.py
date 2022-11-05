@@ -7,8 +7,7 @@ import pandas as pd
 
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-
-from ..dispatch import execute_node
+from ibis.backends.pandas.dispatch import execute_node
 
 
 @execute_node.register(ops.Ln, decimal.Decimal)
@@ -50,10 +49,10 @@ def execute_decimal_log2(op, data, **kwargs):
         return decimal.Decimal('NaN')
 
 
-# While ops.Negate is a subclass of ops.UnaryOp, multipledispatch will be
+# While ops.Negate is a subclass of ops.Unary, multipledispatch will be
 # faster if we provide types that can potentially match the types of inputs
 # exactly
-@execute_node.register((ops.UnaryOp, ops.Negate), decimal.Decimal)
+@execute_node.register((ops.Unary, ops.Negate), decimal.Decimal)
 def execute_decimal_unary(op, data, **kwargs):
     operation_name = type(op).__name__.lower()
     math_function = getattr(math, operation_name, None)
@@ -92,9 +91,7 @@ def execute_round_decimal(op, data, places, **kwargs):
             max(integer_part_length + places, abs(places)),
         )
     else:
-        decimal_format_string = '{}.{}'.format(
-            '0' * integer_part_length, '0' * places
-        )
+        decimal_format_string = '{}.{}'.format('0' * integer_part_length, '0' * places)
 
     places = decimal.Decimal(decimal_format_string)
     return data.quantize(places)

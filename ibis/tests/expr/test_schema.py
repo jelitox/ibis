@@ -1,3 +1,7 @@
+import pandas as pd
+import pandas.testing as tm
+import pytest
+
 import ibis
 from ibis.expr import datatypes as dt
 
@@ -155,14 +159,43 @@ def test_nullable_output():
     sch = ibis.schema(
         [
             ('foo', 'int64'),
-            ('bar', ibis.expr.datatypes.int64(nullable=False)),
+            ('bar', dt.int64(nullable=False)),
             ('baz', 'boolean'),
         ]
     )
 
     sch_str = str(sch)
     assert 'foo  int64' in sch_str
-    assert 'foo  int64[non-nullable]' not in sch_str
-    assert 'bar  int64[non-nullable]' in sch_str
+    assert 'foo  !int64' not in sch_str
+    assert 'bar  !int64' in sch_str
     assert 'baz  boolean' in sch_str
-    assert 'baz  boolean[non-nullable]' not in sch_str
+    assert 'baz  !boolean' not in sch_str
+
+
+@pytest.fixture
+def df():
+    return pd.DataFrame({"A": pd.Series([1], dtype="int8"), "b": ["x"]})
+
+
+def test_apply_to_column_rename(df):
+    schema = ibis.schema([("a", "int8"), ("B", "string")])
+    expected = df.rename({"A": "a", "b": "B"}, axis=1)
+    tm.assert_frame_equal(schema.apply_to(df.copy()), expected)
+
+
+def test_apply_to_column_order(df):
+    schema = ibis.schema([("a", "int8"), ("b", "string")])
+    expected = df.rename({"A": "a"}, axis=1)
+    new_df = schema.apply_to(df.copy())
+    tm.assert_frame_equal(new_df, expected)
+
+
+def test_api_accepts_schema_objects():
+    s1 = ibis.schema(dict(a="int", b="str"))
+    s2 = ibis.schema(s1)
+    assert s1 == s2
+
+
+def test_names_types():
+    s = ibis.schema(names=["a"], types=["array<float64>"])
+    assert s == ibis.schema(dict(a="array<float64>"))

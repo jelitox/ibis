@@ -2,96 +2,86 @@ from __future__ import annotations
 
 import os
 import webbrowser
-from typing import TYPE_CHECKING, Any, Hashable, Mapping
+from typing import TYPE_CHECKING, Any, Iterable, Mapping
 
+import toolz
 from public import public
 
-import ibis
-import ibis.common.exceptions as com
-import ibis.config as config
-import ibis.util as util
-from ibis.config import options
+import ibis.common.graph as g
+import ibis.expr.operations as ops
+from ibis.common.exceptions import IbisError, IbisTypeError, TranslationError
+from ibis.common.grounds import Immutable
+from ibis.config import _default_backend, options
 from ibis.expr.typing import TimeContext
+from ibis.util import UnnamedMarker, experimental
 
 if TYPE_CHECKING:
-    import ibis.expr.operations as ops
+    import pyarrow as pa
+
+    import ibis.expr.types as ir
     from ibis.backends.base import BaseBackend
-    from ibis.expr.format import FormatMemo
-
-    from .generic import ValueExpr
 
 
+# TODO(kszucs): consider to subclass from Annotable with a single _arg field
 @public
-class Expr:
-    """Base expression class"""
+class Expr(Immutable):
+    """Base expression class."""
 
-    def _type_display(self) -> str:
-        return type(self).__name__
+    __slots__ = ("_arg",)
 
     def __init__(self, arg: ops.Node) -> None:
-        # TODO: all inputs must inherit from a common table API
-        self._arg = arg
+        object.__setattr__(self, "_arg", arg)
 
     def __repr__(self) -> str:
-        from ibis.expr.format import FormatMemo
+        from ibis.expr.types.pretty import simple_console
 
-        if not config.options.interactive:
-            return self._repr(memo=FormatMemo(get_text_repr=True))
+        if not options.interactive:
+            return self._repr()
 
-        try:
-            result = self.execute()
-        except com.TranslationError as e:
-            output = (
-                'Translation to backend failed\n'
-                'Error message: {}\n'
-                'Expression repr follows:\n{}'.format(e.args[0], self._repr())
+        with simple_console.capture() as capture:
+            try:
+                simple_console.print(self)
+            except TranslationError as e:
+                lines = [
+                    "Translation to backend failed",
+                    f"Error message: {e.args[0]}",
+                    "Expression repr follows:",
+                    self._repr(),
+                ]
+                return "\n".join(lines)
+        return capture.get()
+
+    def __reduce__(self):
+        return (self.__class__, (self._arg,))
+
+    def __hash__(self):
+        return hash((self.__class__, self._arg))
+
+    def _repr(self) -> str:
+        from ibis.expr.format import fmt
+
+        return fmt(self)
+
+    def equals(self, other):
+        if not isinstance(other, Expr):
+            raise TypeError(
+                "invalid equality comparison between Expr and " f"{type(other)}"
             )
-            return output
-        else:
-            return repr(result)
-
-    def __hash__(self) -> int:
-        return hash(self._key)
+        return self._arg.equals(other._arg)
 
     def __bool__(self) -> bool:
-        raise ValueError(
-            "The truth value of an Ibis expression is not defined"
-        )
+        raise ValueError("The truth value of an Ibis expression is not defined")
 
     __nonzero__ = __bool__
 
-    def _repr(self, memo: FormatMemo | None = None) -> str:
-        from ibis.expr.format import ExprFormatter
+    def has_name(self):
+        return isinstance(self._arg, ops.Named)
 
-        return ExprFormatter(self, memo=memo).get_result()
-
-    @property
-    def _safe_name(self) -> str | None:
-        """Get the name of an expression `expr` if one exists
-
-        Returns
-        -------
-        str | None
-            `str` if the Expr has a name, otherwise `None`
-        """
-        try:
-            return self.get_name()
-        except (com.ExpressionError, AttributeError):
-            return None
-
-    @property
-    def _key(self) -> tuple[Hashable, ...]:
-        """Key suitable for hashing an expression.
-
-        Returns
-        -------
-        tuple[Hashable, ...]
-            A tuple of hashable objects uniquely identifying this expression.
-        """
-        return type(self), self._safe_name, self.op()
+    def get_name(self):
+        return self._arg.name
 
     def _repr_png_(self) -> bytes | None:
-        if config.options.interactive or not ibis.options.graphviz_repr:
+        if options.interactive or not options.graphviz_repr:
             return None
         try:
             import ibis.expr.visualize as viz
@@ -105,14 +95,24 @@ class Expr:
                 # so fallback to the default text representation.
                 return None
 
-    def visualize(self, format: str = 'svg') -> None:
-        """Visualize an expression in the browser as an SVG image.
+    def visualize(
+        self,
+        format: str = "svg",
+        *,
+        label_edges: bool = False,
+        verbose: bool = False,
+    ) -> None:
+        """Visualize an expression in the browser.
 
         Parameters
         ----------
         format
             Image output format. These are specified by the ``graphviz`` Python
             library.
+        label_edges
+            Show operation input names as edge labels
+        verbose
+            Print the graphviz DOT code to stderr if [`True`][True]
 
         Notes
         -----
@@ -126,7 +126,11 @@ class Expr:
         """
         import ibis.expr.visualize as viz
 
-        path = viz.draw(viz.to_graph(self), format=format)
+        path = viz.draw(
+            viz.to_graph(self, label_edges=label_edges),
+            format=format,
+            verbose=verbose,
+        )
         webbrowser.open(f'file://{os.path.abspath(path)}')
 
     def pipe(self, f, *args: Any, **kwargs: Any) -> Expr:
@@ -151,25 +155,12 @@ class Expr:
         >>> f = lambda a: (a + 1).name('a')
         >>> g = lambda a: (a * 2).name('a')
         >>> result1 = t.a.pipe(f).pipe(g)
-        >>> result1  # doctest: +NORMALIZE_WHITESPACE
-        ref_0
-        UnboundTable[table]
-          name: t
-          schema:
-            a : int64
-            b : string
-        a = Multiply[int64*]
-          left:
-            a = Add[int64*]
-              left:
-                a = Column[int64*] 'a' from table
-                  ref_0
-              right:
-                Literal[int8]
-                  1
-          right:
-            Literal[int8]
-              2
+        >>> result1
+        r0 := UnboundTable[t]
+          a int64
+          b string
+        a: r0.a + 1 * 2
+
         >>> result2 = g(f(t.a))  # equivalent to the above
         >>> result1.equals(result2)
         True
@@ -190,11 +181,7 @@ class Expr:
     def op(self) -> ops.Node:
         return self._arg
 
-    @property
-    def _factory(self) -> type[Expr]:
-        return type(self)
-
-    def _find_backends(self) -> list[BaseBackend]:
+    def _find_backends(self) -> tuple[list[BaseBackend], bool]:
         """Return the possible backends for an expression.
 
         Returns
@@ -202,37 +189,54 @@ class Expr:
         list[BaseBackend]
             A list of the backends found.
         """
+        import ibis.expr.operations as ops
         from ibis.backends.base import BaseBackend
 
-        seen_backends: dict[
-            str, BaseBackend
-        ] = {}  # key is backend.db_identity
+        def finder(node):
+            # BaseBackend objects are not operation instances, so they don't
+            # get traversed, this is why we need to select backends out from
+            # the node's arguments
+            backends = [arg for arg in node.args if isinstance(arg, BaseBackend)]
+            return g.proceed, (backends, isinstance(node, ops.UnboundTable))
 
-        stack = [self.op()]
-        seen = set()
+        all_backends = []
+        any_unbound = False
+        for backends, has_unbound in g.traverse(finder, self.op()):
+            all_backends += backends
+            any_unbound |= has_unbound
 
-        while stack:
-            node = stack.pop()
+        return list(toolz.unique(all_backends)), any_unbound
 
-            if node not in seen:
-                seen.add(node)
+    def _find_backend(self, *, use_default: bool = False) -> BaseBackend:
+        """Find the backend attached to an expression.
 
-                for arg in node.flat_args():
-                    if isinstance(arg, BaseBackend):
-                        if arg.db_identity not in seen_backends:
-                            seen_backends[arg.db_identity] = arg
-                    elif isinstance(arg, Expr):
-                        stack.append(arg.op())
+        Parameters
+        ----------
+        use_default
+            If [`True`][True] and the default backend isn't set, initialize the
+            default backend and use that. This should only be set to `True` for
+            `.execute()`. For other contexts such as compilation, this option
+            doesn't make sense so the default value is [`False`][False].
 
-        return list(seen_backends.values())
-
-    def _find_backend(self) -> BaseBackend:
-        backends = self._find_backends()
+        Returns
+        -------
+        BaseBackend
+            A backend that is attached to the expression
+        """
+        backends, has_unbound = self._find_backends()
 
         if not backends:
-            default = options.default_backend
+            if has_unbound:
+                raise IbisError(
+                    "Expression contains unbound tables and therefore cannot "
+                    "be executed. Use ibis.<backend>.execute(expr) or "
+                    "assign a backend instance to "
+                    "`ibis.options.default_backend`."
+                )
+            if (default := options.default_backend) is None and use_default:
+                default = _default_backend()
             if default is None:
-                raise com.IbisError(
+                raise IbisError(
                     'Expression depends on no backends, and found no default'
                 )
             return default
@@ -246,74 +250,163 @@ class Expr:
         self,
         limit: int | str | None = 'default',
         timecontext: TimeContext | None = None,
-        params: Mapping[str, ValueExpr] | None = None,
+        params: Mapping[ir.Value, Any] | None = None,
         **kwargs: Any,
     ):
-        """
-        If this expression is based on physical tables in a database backend,
-        execute it against that backend.
+        """Execute an expression against its backend if one exists.
 
         Parameters
         ----------
         limit
             An integer to effect a specific row limit. A value of `None` means
-            "no limit". The default is whatever is in `ibis/config.py`.
-
+            "no limit". The default is in `ibis/config.py`.
         timecontext
-            Defines a time range of (begin, end). When defined, the execution
+            Defines a time range of `(begin, end)`. When defined, the execution
             will only compute result for data inside the time range. The time
             range is inclusive of both endpoints. This is conceptually same as
             a time filter.
-            The time column must be named as 'time' and should preserve
-            across the expression. e.g. If that column is dropped then
+            The time column must be named `'time'` and should preserve
+            across the expression. For example, if that column is dropped then
             execute will result in an error.
-        Returns
-        -------
-        result : expression-dependent
-          Result of compiling expression and executing in backend
+        params
+            Mapping of scalar parameter expressions to value
         """
-        return self._find_backend().execute(
+        return self._find_backend(use_default=True).execute(
             self, limit=limit, timecontext=timecontext, params=params, **kwargs
         )
 
     def compile(
         self,
-        limit=None,
+        limit: int | None = None,
         timecontext: TimeContext | None = None,
-        params=None,
+        params: Mapping[ir.Value, Any] | None = None,
     ):
-        """
-        Compile expression to whatever execution target, to verify
+        """Compile to an execution target.
 
-        Returns
-        -------
-        compiled : value or list
-           query representation or list thereof
+        Parameters
+        ----------
+        limit
+            An integer to effect a specific row limit. A value of `None` means
+            "no limit". The default is in `ibis/config.py`.
+        timecontext
+            Defines a time range of `(begin, end)`. When defined, the execution
+            will only compute result for data inside the time range. The time
+            range is inclusive of both endpoints. This is conceptually same as
+            a time filter.
+            The time column must be named `'time'` and should preserve
+            across the expression. For example, if that column is dropped then
+            execute will result in an error.
+        params
+            Mapping of scalar parameter expressions to value
         """
         return self._find_backend().compile(
             self, limit=limit, timecontext=timecontext, params=params
         )
 
-    @util.deprecated(version='2.0', instead='compile & catch TranslationError')
-    def verify(self):
+    @experimental
+    def to_pyarrow_batches(
+        self,
+        *,
+        limit: int | str | None = None,
+        params: Mapping[ir.Value, Any] | None = None,
+        chunk_size: int = 1_000_000,
+        **kwargs: Any,
+    ) -> Iterable[pa.RecordBatch]:
+        """Execute expression and return results in an iterator of pyarrow
+        record batches.
+
+        This method is eager and will execute the associated expression
+        immediately.
+
+        Parameters
+        ----------
+        limit
+            An integer to effect a specific row limit. A value of `None` means
+            "no limit". The default is in `ibis/config.py`.
+        params
+            Mapping of scalar parameter expressions to value.
+        chunk_size
+            Number of rows in each returned record batch.
+
+        Returns
+        -------
+        record_batches
+            An iterator of pyarrow record batches.
         """
-        Returns True if expression can be compiled to its attached client
+        return self._find_backend().to_pyarrow_batches(
+            self,
+            params=params,
+            limit=limit,
+            chunk_size=chunk_size,
+            **kwargs,
+        )
+
+    @experimental
+    def to_pyarrow(
+        self,
+        *,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        limit: int | str | None = None,
+        **kwargs: Any,
+    ) -> pa.Table:
+        """Execute expression and return results in as a pyarrow table.
+
+        This method is eager and will execute the associated expression
+        immediately.
+
+        Parameters
+        ----------
+        params
+            Mapping of scalar parameter expressions to value.
+        limit
+            An integer to effect a specific row limit. A value of `None` means
+            "no limit". The default is in `ibis/config.py`.
+
+        Returns
+        -------
+        Table
+            A pyarrow table holding the results of the executed expression.
         """
-        try:
-            self.compile()
-        except Exception:
-            return False
-        else:
-            return True
-
-    def equals(self, other, cache=None):
-        if type(self) != type(other):
-            return False
-        return self._arg.equals(other._arg, cache=cache)
-
-
-class UnnamedMarker:
-    pass
+        return self._find_backend().to_pyarrow(
+            self, params=params, limit=limit, **kwargs
+        )
 
 
 unnamed = UnnamedMarker()
+
+
+def _binop(
+    op_class: type[ops.Binary], left: ir.Value, right: ir.Value
+) -> ir.Value | NotImplemented:
+    """Try to construct a binary operation.
+
+    Parameters
+    ----------
+    op_class
+        The [`Binary`][ibis.expr.operations.Binary] subclass for the
+        operation
+    left
+        Left operand
+    right
+        Right operand
+
+    Returns
+    -------
+    ir.Value
+        A value expression
+
+    Examples
+    --------
+    >>> import ibis.expr.operations as ops
+    >>> expr = _binop(ops.TimeAdd, ibis.time("01:00"), ibis.interval(hours=1))
+    >>> expr
+    datetime.time(1, 0) + 1
+    >>> _binop(ops.TimeAdd, 1, ibis.interval(hours=1))
+    NotImplemented
+    """
+    try:
+        node = op_class(left, right)
+    except (IbisTypeError, NotImplementedError):
+        return NotImplemented
+    else:
+        return node.to_expr()

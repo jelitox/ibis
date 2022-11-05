@@ -10,18 +10,13 @@ from multipledispatch import Dispatcher
 from pandas.core.groupby import SeriesGroupBy
 
 import ibis.common.exceptions as com
+import ibis.expr.analysis as an
+import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.window as win
-from ibis.expr.scope import Scope
-from ibis.expr.timecontext import (
-    construct_time_context_aware_series,
-    get_time_col,
-)
-from ibis.expr.typing import TimeContext
-
-from .. import aggcontext as agg_ctx
-from ..aggcontext import AggregationContext
-from ..core import (
+from ibis.backends.pandas import aggcontext as agg_ctx
+from ibis.backends.pandas.aggcontext import AggregationContext
+from ibis.backends.pandas.core import (
     compute_time_context,
     date_types,
     execute,
@@ -30,8 +25,11 @@ from ..core import (
     timedelta_types,
     timestamp_types,
 )
-from ..dispatch import execute_node, pre_execute
-from ..execution import util
+from ibis.backends.pandas.dispatch import execute_node, pre_execute
+from ibis.backends.pandas.execution import util
+from ibis.expr.scope import Scope
+from ibis.expr.timecontext import construct_time_context_aware_series, get_time_col
+from ibis.expr.typing import TimeContext
 
 
 def _post_process_empty(
@@ -108,9 +106,7 @@ def _post_process_group_by_order_by(
 
     # get the levels common to series.index, in the order that they occur in
     # the parent's index
-    reordered_levels = [
-        name for name in index.names if name in series_index_names
-    ]
+    reordered_levels = [name for name in index.names if name in series_index_names]
 
     if len(reordered_levels) > 1:
         series = series.reorder_levels(reordered_levels)
@@ -153,22 +149,20 @@ def get_aggcontext_window(
     # expand or roll.
     #
     # otherwise we're transforming
-    output_type = operand.type()
+    output_type = operand.output_dtype
 
     aggcontext: agg_ctx.AggregationContext
     if not group_by and not order_by:
         aggcontext = agg_ctx.Summarize(parent=parent, output_type=output_type)
     elif (
-        isinstance(
-            operand.op(), (ops.Reduction, ops.CumulativeOp, ops.Any, ops.All)
-        )
+        isinstance(operand, (ops.Reduction, ops.CumulativeOp, ops.Any, ops.All))
         and order_by
     ):
         # XXX(phillipc): What a horror show
         preceding = window.preceding
         if preceding is not None:
             max_lookback = window.max_lookback
-            assert not isinstance(operand.op(), ops.CumulativeOp)
+            assert not isinstance(operand, ops.CumulativeOp)
             aggcontext = agg_ctx.Moving(
                 preceding,
                 max_lookback,
@@ -200,7 +194,7 @@ def get_aggcontext_window(
 def trim_window_result(
     data: Union[pd.Series, pd.DataFrame], timecontext: Optional[TimeContext]
 ):
-    """Trim data within time range defined by timecontext
+    """Trim data within time range defined by timecontext.
 
     This is a util function used in ``execute_window_op``, where time
     context might be adjusted for calculation. Data must be trimmed
@@ -217,7 +211,6 @@ def trim_window_result(
     ------
     a trimmed pd.Series or or pd.DataFrame with the same Multiindex
     as data's
-
     """
     # noop if timecontext is None
     if not timecontext:
@@ -253,7 +246,7 @@ def trim_window_result(
     return indexed_subset[name]
 
 
-@execute_node.register(ops.WindowOp, pd.Series, win.Window)
+@execute_node.register(ops.Window, pd.Series, win.Window)
 def execute_window_op(
     op,
     data,
@@ -264,11 +257,18 @@ def execute_window_op(
     clients=None,
     **kwargs,
 ):
+    if window.how == "range" and any(
+        not isinstance(ob.output_dtype, (dt.Time, dt.Date, dt.Timestamp))
+        for ob in window._order_by
+    ):
+        raise NotImplementedError(
+            "The pandas backend only implements range windows with temporal "
+            "ordering keys"
+        )
     operand = op.expr
     # pre execute "manually" here because otherwise we wouldn't pickup
     # relevant scope changes from the child operand since we're managing
     # execution of that by hand
-    operand_op = operand.op()
 
     adjusted_timecontext = None
     if timecontext:
@@ -276,13 +276,13 @@ def execute_window_op(
             op, timecontext=timecontext, clients=clients, scope=scope
         )
         # timecontext is the original time context required by parent node
-        # of this WindowOp, while adjusted_timecontext is the adjusted context
+        # of this Window, while adjusted_timecontext is the adjusted context
         # of this Window, since we are doing a manual execution here, use
         # adjusted_timecontext in later execution phases
         adjusted_timecontext = arg_timecontexts[0]
 
     pre_executed_scope = pre_execute(
-        operand_op,
+        operand,
         *clients,
         scope=scope,
         timecontext=adjusted_timecontext,
@@ -293,11 +293,10 @@ def execute_window_op(
         scope = pre_executed_scope
     else:
         scope = scope.merge_scope(pre_executed_scope)
-    (root,) = op.root_tables()
-    root_expr = root.to_expr()
 
+    root_table = an.find_first_base_table(op)
     data = execute(
-        root_expr,
+        root_table,
         scope=scope,
         timecontext=adjusted_timecontext,
         clients=clients,
@@ -307,11 +306,7 @@ def execute_window_op(
     following = window.following
     order_by = window._order_by
 
-    if (
-        order_by
-        and following != 0
-        and not isinstance(operand_op, ops.ShiftBase)
-    ):
+    if order_by and following != 0 and not isinstance(operand, ops.ShiftBase):
         raise com.OperationNotDefinedError(
             'Window functions affected by following with order_by are not '
             'implemented'
@@ -319,8 +314,8 @@ def execute_window_op(
 
     group_by = window._group_by
     grouping_keys = [
-        key_op.name
-        if isinstance(key_op, ops.TableColumn)
+        key.name
+        if isinstance(key, ops.TableColumn)
         else execute(
             key,
             scope=scope,
@@ -329,9 +324,7 @@ def execute_window_op(
             aggcontext=aggcontext,
             **kwargs,
         )
-        for key, key_op in zip(
-            group_by, map(operator.methodcaller('op'), group_by)
-        )
+        for key in group_by
     ]
 
     order_by = window._order_by
@@ -344,21 +337,17 @@ def execute_window_op(
     ]
     if group_by:
         if order_by:
-            (
-                sorted_df,
-                grouping_keys,
-                ordering_keys,
-            ) = util.compute_sorted_frame(
+            (sorted_df, grouping_keys, ordering_keys,) = util.compute_sorted_frame(
                 data,
                 order_by,
                 group_by=group_by,
                 timecontext=adjusted_timecontext,
                 **kwargs,
             )
-            source = sorted_df.groupby(grouping_keys, sort=True)
+            source = sorted_df.groupby(grouping_keys, sort=True, group_keys=False)
             post_process = _post_process_group_by_order_by
         else:
-            source = data.groupby(grouping_keys, sort=False)
+            source = data.groupby(grouping_keys, sort=False, group_keys=False)
             post_process = _post_process_group_by
     else:
         if order_by:
@@ -376,7 +365,7 @@ def execute_window_op(
     new_scope = scope.merge_scopes(
         [
             Scope({t: source}, adjusted_timecontext)
-            for t in operand.op().root_tables()
+            for t in an.find_immediate_parent_tables(operand)
         ],
         overwrite=True,
     )
@@ -421,9 +410,7 @@ def execute_window_op(
 def execute_series_cumulative_sum_min_max(op, data, **kwargs):
     typename = type(op).__name__
     method_name = (
-        re.match(r"^Cumulative([A-Za-z_][A-Za-z0-9_]*)$", typename)
-        .group(1)
-        .lower()
+        re.match(r"^Cumulative([A-Za-z_][A-Za-z0-9_]*)$", typename).group(1).lower()
     )
     method = getattr(data, f"cum{method_name}")
     return method()
@@ -438,9 +425,7 @@ def execute_series_cumulative_mean(op, data, **kwargs):
 
 @execute_node.register(ops.CumulativeOp, (pd.Series, SeriesGroupBy))
 def execute_series_cumulative_op(op, data, aggcontext=None, **kwargs):
-    assert aggcontext is not None, "aggcontext is none in {} operation".format(
-        type(op)
-    )
+    assert aggcontext is not None, f"aggcontext is none in {type(op)} operation"
     typename = type(op).__name__
     match = re.match(r'^Cumulative([A-Za-z_][A-Za-z0-9_]*)$', typename)
     if match is None:
@@ -449,9 +434,7 @@ def execute_series_cumulative_op(op, data, aggcontext=None, **kwargs):
     try:
         (operation_name,) = match.groups()
     except ValueError:
-        raise ValueError(
-            f'More than one operation name found in {typename} class'
-        )
+        raise ValueError(f'More than one operation name found in {typename} class')
 
     dtype = op.to_expr().type().to_pandas()
     assert isinstance(aggcontext, agg_ctx.Cumulative), f'Got {type()}'
@@ -493,8 +476,7 @@ def execute_series_lead_lag_timedelta(
     op, data, offset, default, aggcontext=None, **kwargs
 ):
     """An implementation of shifting a column relative to another one that is
-    in units of time rather than rows.
-    """
+    in units of time rather than rows."""
     # lagging adds time (delayed), leading subtracts time (moved up)
     func = operator.add if isinstance(op, ops.Lag) else operator.sub
     group_by = aggcontext.group_by
@@ -560,7 +542,21 @@ def execute_series_dense_rank(op, data, **kwargs):
     return data.rank(method='dense', ascending=True).astype('int64') - 1
 
 
-@execute_node.register(ops.PercentRank, (pd.Series, SeriesGroupBy))
+@execute_node.register(ops.PercentRank, SeriesGroupBy)
+def execute_series_group_by_percent_rank(op, data, **kwargs):
+    return (
+        data.rank(method="min", ascending=True)
+        .sub(1)
+        .div(data.transform("count").sub(1))
+    )
+
+
+@execute_node.register(ops.PercentRank, pd.Series)
 def execute_series_percent_rank(op, data, **kwargs):
     # TODO(phillipc): Handle ORDER BY
+    return data.rank(method="min", ascending=True).sub(1).div(len(data) - 1)
+
+
+@execute_node.register(ops.CumeDist, (pd.Series, SeriesGroupBy))
+def execute_series_group_by_cume_dist(op, data, **kwargs):
     return data.rank(method='min', ascending=True, pct=True)

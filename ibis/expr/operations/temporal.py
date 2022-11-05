@@ -3,20 +3,22 @@ import operator
 import toolz
 from public import public
 
-from .. import datatypes as dt
-from .. import rules as rlz
-from .. import types as ir
-from .core import BinaryOp, Node, UnaryOp, ValueOp
-from .logical import Between
+import ibis.expr.datatypes as dt
+import ibis.expr.rules as rlz
+from ibis import util
+from ibis.common.annotations import attribute
+from ibis.expr.operations.core import Binary, Unary, Value
+from ibis.expr.operations.generic import Cast
+from ibis.expr.operations.logical import Between
 
 
 @public
-class TemporalUnaryOp(UnaryOp):
+class TemporalUnary(Unary):
     arg = rlz.temporal
 
 
 @public
-class TimestampUnaryOp(UnaryOp):
+class TimestampUnary(Unary):
     arg = rlz.timestamp
 
 
@@ -75,44 +77,54 @@ _timestamp_units = toolz.merge(_date_units, _time_units)
 
 
 @public
-class TimestampTruncate(ValueOp):
+class TimestampTruncate(Value):
     arg = rlz.timestamp
     unit = rlz.isin(_timestamp_units)
-    output_type = rlz.shape_like('arg', dt.timestamp)
+
+    output_shape = rlz.shape_like("arg")
+    output_dtype = dt.timestamp
 
 
 @public
-class DateTruncate(ValueOp):
+class DateTruncate(Value):
     arg = rlz.date
     unit = rlz.isin(_date_units)
-    output_type = rlz.shape_like('arg', dt.date)
+
+    output_shape = rlz.shape_like("arg")
+    output_dtype = dt.date
 
 
 @public
-class TimeTruncate(ValueOp):
+class TimeTruncate(Value):
     arg = rlz.time
     unit = rlz.isin(_time_units)
-    output_type = rlz.shape_like('arg', dt.time)
+
+    output_shape = rlz.shape_like("arg")
+    output_dtype = dt.time
 
 
 @public
-class Strftime(ValueOp):
+class Strftime(Value):
     arg = rlz.temporal
     format_str = rlz.string
-    output_type = rlz.shape_like('arg', dt.string)
+
+    output_shape = rlz.shape_like("arg")
+    output_dtype = dt.string
 
 
 @public
-class StringToTimestamp(ValueOp):
+class StringToTimestamp(Value):
     arg = rlz.string
     format_str = rlz.string
     timezone = rlz.optional(rlz.string)
-    output_type = rlz.shape_like('arg', dt.Timestamp(timezone='UTC'))
+
+    output_shape = rlz.shape_like("arg")
+    output_dtype = dt.Timestamp(timezone='UTC')
 
 
 @public
-class ExtractTemporalField(TemporalUnaryOp):
-    output_type = rlz.shape_like('arg', dt.int32)
+class ExtractTemporalField(TemporalUnary):
+    output_dtype = dt.int32
 
 
 ExtractTimestampField = ExtractTemporalField
@@ -184,171 +196,215 @@ class ExtractMillisecond(ExtractTimeField):
 
 
 @public
-class DayOfWeekIndex(UnaryOp):
+class DayOfWeekIndex(Unary):
     arg = rlz.one_of([rlz.date, rlz.timestamp])
-    output_type = rlz.shape_like('arg', dt.int16)
+    output_dtype = dt.int16
 
 
 @public
-class DayOfWeekName(UnaryOp):
+class DayOfWeekName(Unary):
     arg = rlz.one_of([rlz.date, rlz.timestamp])
-    output_type = rlz.shape_like('arg', dt.string)
+    output_dtype = dt.string
 
 
 @public
-class DayOfWeekNode(Node):
-    arg = rlz.one_of([rlz.date, rlz.timestamp])
-
-    def output_type(self):
-        return ir.DayOfWeek
+class Time(Unary):
+    output_dtype = dt.time
 
 
 @public
-class Time(UnaryOp):
-    output_type = rlz.shape_like('arg', dt.time)
+class Date(Unary):
+    output_dtype = dt.date
 
 
 @public
-class Date(UnaryOp):
-    output_type = rlz.shape_like('arg', dt.date)
+class DateFromYMD(Value):
+    year = rlz.integer
+    month = rlz.integer
+    day = rlz.integer
+
+    output_dtype = dt.date
+    output_shape = rlz.shape_like("args")
 
 
 @public
-class TimestampFromUNIX(ValueOp):
+class TimeFromHMS(Value):
+    hours = rlz.integer
+    minutes = rlz.integer
+    seconds = rlz.integer
+
+    output_dtype = dt.time
+    output_shape = rlz.shape_like("args")
+
+
+@public
+class TimestampFromYMDHMS(Value):
+    year = rlz.integer
+    month = rlz.integer
+    day = rlz.integer
+    hours = rlz.integer
+    minutes = rlz.integer
+    seconds = rlz.integer
+
+    output_dtype = dt.timestamp
+    output_shape = rlz.shape_like("args")
+
+
+@public
+class TimestampFromUNIX(Value):
     arg = rlz.any
     # Only pandas-based backends support 'ns'
     unit = rlz.isin({'s', 'ms', 'us', 'ns'})
-    output_type = rlz.shape_like('arg', dt.timestamp)
+
+    output_dtype = dt.timestamp
+    output_shape = rlz.shape_like('arg')
 
 
 @public
-class DateAdd(BinaryOp):
+class DateAdd(Binary):
     left = rlz.date
     right = rlz.interval(units={'Y', 'Q', 'M', 'W', 'D'})
-    output_type = rlz.shape_like('left')
+    output_dtype = rlz.dtype_like('left')
 
 
 @public
-class DateSub(BinaryOp):
+class DateSub(Binary):
     left = rlz.date
     right = rlz.interval(units={'Y', 'Q', 'M', 'W', 'D'})
-    output_type = rlz.shape_like('left')
+    output_dtype = rlz.dtype_like('left')
 
 
 @public
-class DateDiff(BinaryOp):
+class DateDiff(Binary):
     left = rlz.date
     right = rlz.date
-    output_type = rlz.shape_like('left', dt.Interval('D'))
+    output_dtype = dt.Interval('D')
 
 
 @public
-class TimeAdd(BinaryOp):
+class TimeAdd(Binary):
     left = rlz.time
     right = rlz.interval(units={'h', 'm', 's', 'ms', 'us', 'ns'})
-    output_type = rlz.shape_like('left')
+    output_dtype = rlz.dtype_like('left')
 
 
 @public
-class TimeSub(BinaryOp):
+class TimeSub(Binary):
     left = rlz.time
     right = rlz.interval(units={'h', 'm', 's', 'ms', 'us', 'ns'})
-    output_type = rlz.shape_like('left')
+    output_dtype = rlz.dtype_like('left')
 
 
 @public
-class TimeDiff(BinaryOp):
+class TimeDiff(Binary):
     left = rlz.time
     right = rlz.time
-    output_type = rlz.shape_like('left', dt.Interval('s'))
+    output_dtype = dt.Interval('s')
 
 
 @public
-class TimestampAdd(BinaryOp):
+class TimestampAdd(Binary):
     left = rlz.timestamp
     right = rlz.interval(
         units={'Y', 'Q', 'M', 'W', 'D', 'h', 'm', 's', 'ms', 'us', 'ns'}
     )
-    output_type = rlz.shape_like('left')
+    output_dtype = rlz.dtype_like('left')
 
 
 @public
-class TimestampSub(BinaryOp):
+class TimestampSub(Binary):
     left = rlz.timestamp
     right = rlz.interval(
         units={'Y', 'Q', 'M', 'W', 'D', 'h', 'm', 's', 'ms', 'us', 'ns'}
     )
-    output_type = rlz.shape_like('left')
+    output_dtype = rlz.dtype_like('left')
 
 
 @public
-class TimestampDiff(BinaryOp):
+class TimestampDiff(Binary):
     left = rlz.timestamp
     right = rlz.timestamp
-    output_type = rlz.shape_like('left', dt.Interval('s'))
+    output_dtype = dt.Interval('s')
 
 
 @public
-class IntervalBinaryOp(BinaryOp):
-    def output_type(self):
-        args = [
-            arg.cast(arg.type().value_type)
-            if isinstance(arg.type(), dt.Interval)
+class ToIntervalUnit(Value):
+    arg = rlz.interval
+    unit = rlz.isin({'Y', 'Q', 'M', 'W', 'D', 'h', 'm', 's', 'ms', 'us', 'ns'})
+
+    output_shape = rlz.shape_like("arg")
+
+    def __init__(self, arg, unit):
+        dtype = arg.output_dtype
+
+        # TODO(kszucs): remove the expression wrapping required for arithmetic
+        # overloads
+        if dtype.unit != unit:
+            arg = util.convert_unit(arg, dtype.unit, unit)
+        super().__init__(arg=arg, unit=unit)
+
+    @attribute.default
+    def output_dtype(self):
+        return self.arg.output_dtype.copy(unit=self.unit)
+
+
+@public
+class IntervalBinary(Binary):
+    @attribute.default
+    def output_dtype(self):
+        integer_args = [
+            Cast(arg, to=arg.output_dtype.value_type)
+            if isinstance(arg.output_dtype, dt.Interval)
             else arg
-            for arg in self.args
+            for arg in (self.left, self.right)
         ]
-        expr = rlz.numeric_like(args, self.__class__.op)(self)
-        left_dtype = self.left.type()
-        dtype_type = type(left_dtype)
-        additional_args = {
-            attr: getattr(left_dtype, attr)
-            for attr in dtype_type.__slots__
-            if attr not in {'unit', 'value_type'}
-        }
-        dtype = dtype_type(left_dtype.unit, expr.type(), **additional_args)
-        return rlz.shape_like(self.args, dtype=dtype)
+        value_dtype = rlz._promote_integral_binop(integer_args, self.op)
+
+        return self.left.output_dtype.copy(value_type=value_dtype)
 
 
 @public
-class IntervalAdd(IntervalBinaryOp):
+class IntervalAdd(IntervalBinary):
     left = rlz.interval
     right = rlz.interval
     op = operator.add
 
 
 @public
-class IntervalSubtract(IntervalBinaryOp):
+class IntervalSubtract(IntervalBinary):
     left = rlz.interval
     right = rlz.interval
     op = operator.sub
 
 
 @public
-class IntervalMultiply(IntervalBinaryOp):
+class IntervalMultiply(IntervalBinary):
     left = rlz.interval
     right = rlz.numeric
     op = operator.mul
 
 
 @public
-class IntervalFloorDivide(IntervalBinaryOp):
+class IntervalFloorDivide(IntervalBinary):
     left = rlz.interval
     right = rlz.numeric
     op = operator.floordiv
 
 
 @public
-class IntervalFromInteger(ValueOp):
+class IntervalFromInteger(Value):
     arg = rlz.integer
     unit = rlz.isin({'Y', 'Q', 'M', 'W', 'D', 'h', 'm', 's', 'ms', 'us', 'ns'})
 
+    output_shape = rlz.shape_like("arg")
+
+    @attribute.default
+    def output_dtype(self):
+        return dt.Interval(self.unit, value_type=self.arg.output_dtype)
+
     @property
     def resolution(self):
-        return dt.Interval(self.unit).resolution
-
-    def output_type(self):
-        dtype = dt.Interval(self.unit, self.arg.type())
-        return rlz.shape_like(self.arg, dtype=dtype)
+        return self.output_dtype.resolution
 
 
 @public

@@ -1,69 +1,82 @@
 from public import public
 
-from ...common import exceptions as com
-from .. import datatypes as dt
-from .. import rules as rlz
-from .core import ValueOp
+import ibis.expr.datatypes as dt
+import ibis.expr.rules as rlz
+from ibis.common.annotations import attribute
+from ibis.expr.operations.core import Unary, Value
+from ibis.expr.types.generic import null
 
 
 @public
-class MapLength(ValueOp):
+class Map(Value):
+    keys = rlz.array
+    values = rlz.array
+
+    output_shape = rlz.shape_like("args")
+
+    @attribute.default
+    def output_dtype(self):
+        return dt.Map(
+            self.keys.output_dtype.value_type,
+            self.values.output_dtype.value_type,
+        )
+
+
+@public
+class MapLength(Unary):
     arg = rlz.mapping
-    output_type = rlz.shape_like('arg', dt.int64)
+    output_dtype = dt.int64
 
 
 @public
-class MapValueForKey(ValueOp):
+class MapGet(Value):
+    arg = rlz.mapping
+    key = rlz.one_of([rlz.string, rlz.integer])
+    default = rlz.optional(rlz.any, default=null())
+
+    output_shape = rlz.shape_like("args")
+
+    @attribute.default
+    def output_dtype(self):
+        return dt.higher_precedence(
+            self.default.output_dtype, self.arg.output_dtype.value_type
+        )
+
+
+@public
+class MapContains(Value):
     arg = rlz.mapping
     key = rlz.one_of([rlz.string, rlz.integer])
 
-    def output_type(self):
-        return rlz.shape_like(tuple(self.args), self.arg.type().value_type)
+    output_shape = rlz.shape_like("args")
+    output_dtype = dt.bool
 
 
 @public
-class MapValueOrDefaultForKey(ValueOp):
-    arg = rlz.mapping
-    key = rlz.one_of([rlz.string, rlz.integer])
-    default = rlz.any
-
-    def output_type(self):
-        arg = self.arg
-        default = self.default
-        map_type = arg.type()
-        value_type = map_type.value_type
-        default_type = default.type()
-
-        if default is not None and not dt.same_kind(default_type, value_type):
-            raise com.IbisTypeError(
-                "Default value\n{}\nof type {} cannot be cast to map's value "
-                "type {}".format(default, default_type, value_type)
-            )
-
-        result_type = dt.highest_precedence((default_type, value_type))
-        return rlz.shape_like(tuple(self.args), result_type)
-
-
-@public
-class MapKeys(ValueOp):
+class MapKeys(Unary):
     arg = rlz.mapping
 
-    def output_type(self):
-        arg = self.arg
-        return rlz.shape_like(arg, dt.Array(arg.type().key_type))
+    @attribute.default
+    def output_dtype(self):
+        return dt.Array(self.arg.output_dtype.key_type)
 
 
 @public
-class MapValues(ValueOp):
+class MapValues(Unary):
     arg = rlz.mapping
 
-    def output_type(self):
-        arg = self.arg
-        return rlz.shape_like(arg, dt.Array(arg.type().value_type))
+    @attribute.default
+    def output_dtype(self):
+        return dt.Array(self.arg.output_dtype.value_type)
 
 
 @public
-class MapConcat(ValueOp):
+class MapMerge(Value):
     left = rlz.mapping
     right = rlz.mapping
-    output_type = rlz.typeof('left')
+
+    output_shape = rlz.shape_like("args")
+    output_dtype = rlz.dtype_like("args")
+
+
+public(MapValueForKey=MapGet, MapValueOrDefaultForKey=MapGet, MapConcat=MapMerge)

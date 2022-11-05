@@ -5,8 +5,7 @@ import pandas as pd
 import pytest
 
 import ibis.expr.datatypes as dt
-
-from ... import Backend
+from ibis.backends.pandas import Backend
 
 
 @pytest.fixture(scope='module')
@@ -17,20 +16,15 @@ def df():
             'plain_strings': list('abc'),
             'plain_float64': [4.0, 5.0, 6.0],
             'plain_datetimes_naive': pd.Series(
-                pd.date_range(
-                    start='2017-01-02 01:02:03.234', periods=3
-                ).values
+                pd.date_range(start='2017-01-02 01:02:03.234', periods=3).values
             ),
             'plain_datetimes_ny': pd.Series(
-                pd.date_range(
-                    start='2017-01-02 01:02:03.234', periods=3
-                ).values
+                pd.date_range(start='2017-01-02 01:02:03.234', periods=3).values
             ).dt.tz_localize('America/New_York'),
             'plain_datetimes_utc': pd.Series(
-                pd.date_range(
-                    start='2017-01-02 01:02:03.234', periods=3
-                ).values
+                pd.date_range(start='2017-01-02 01:02:03.234', periods=3).values
             ).dt.tz_localize('UTC'),
+            'plain_uint64': pd.Series(range(1, 4), dtype=np.dtype('uint64')),
             'dup_strings': list('dad'),
             'dup_ints': [1, 2, 1],
             'float64_as_strings': ['100.01', '234.23', '-999.34'],
@@ -41,21 +35,15 @@ def df():
             'float64_positive': [1.0, 2.0, 1.0],
             'strings_with_nulls': ['a', None, 'b'],
             'datetime_strings_naive': pd.Series(
-                pd.date_range(
-                    start='2017-01-02 01:02:03.234', periods=3
-                ).values
+                pd.date_range(start='2017-01-02 01:02:03.234', periods=3).values
             ).astype(str),
             'datetime_strings_ny': pd.Series(
-                pd.date_range(
-                    start='2017-01-02 01:02:03.234', periods=3
-                ).values
+                pd.date_range(start='2017-01-02 01:02:03.234', periods=3).values
             )
             .dt.tz_localize('America/New_York')
             .astype(str),
             'datetime_strings_utc': pd.Series(
-                pd.date_range(
-                    start='2017-01-02 01:02:03.234', periods=3
-                ).values
+                pd.date_range(start='2017-01-02 01:02:03.234', periods=3).values
             )
             .dt.tz_localize('UTC')
             .astype(str),
@@ -118,9 +106,7 @@ def df2():
 
 @pytest.fixture(scope='module')
 def intersect_df2():
-    return pd.DataFrame(
-        {'key': list('cd'), 'value': [5, 6], 'key2': list('ff')}
-    )
+    return pd.DataFrame({'key': list('cd'), 'value': [5, 6], 'key2': list('ff')})
 
 
 @pytest.fixture(scope='module')
@@ -132,9 +118,7 @@ def time_df1():
 
 @pytest.fixture(scope='module')
 def time_df2():
-    return pd.DataFrame(
-        {'time': pd.to_datetime([2, 4]), 'other_value': [1.2, 2.0]}
-    )
+    return pd.DataFrame({'time': pd.to_datetime([2, 4]), 'other_value': [1.2, 2.0]})
 
 
 @pytest.fixture(scope='module')
@@ -142,9 +126,7 @@ def time_df3():
     return pd.DataFrame(
         {
             'time': pd.Series(
-                pd.date_range(
-                    start='2017-01-02 01:02:03.234', periods=8
-                ).values
+                pd.date_range(start='2017-01-02 01:02:03.234', periods=8).values
             ),
             'id': list(range(1, 5)) * 2,
             'value': [1.1, 2.2, 3.3, 4.4, 5.5, 6.6, 7.7, 8.8],
@@ -157,9 +139,7 @@ def time_keyed_df1():
     return pd.DataFrame(
         {
             'time': pd.Series(
-                pd.date_range(
-                    start='2017-01-02 01:02:03.234', periods=6
-                ).values
+                pd.date_range(start='2017-01-02 01:02:03.234', periods=6).values
             ),
             'key': [1, 2, 3, 1, 2, 3],
             'value': [1.2, 1.4, 2.0, 4.0, 8.0, 16.0],
@@ -297,12 +277,12 @@ def sel_cols(batting):
 
 @pytest.fixture(scope='module')
 def players_base(batting, sel_cols):
-    return batting[sel_cols].sort_by(sel_cols[:3])
+    return batting[sel_cols].order_by(sel_cols[:3])
 
 
 @pytest.fixture(scope='module')
 def players(players_base):
-    return players_base.groupby('playerID')
+    return players_base.group_by('playerID')
 
 
 @pytest.fixture(scope='module')

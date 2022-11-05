@@ -1,5 +1,6 @@
 """Test ibis.util utilities."""
 
+
 import pytest
 
 from ibis import util
@@ -34,3 +35,24 @@ def test_flatten_invalid_input(case):
 
     with pytest.raises(TypeError):
         list(flat)
+
+
+def test_dotdict():
+    d = util.DotDict({"a": 1, "b": 2, "c": 3})
+    assert d["a"] == d.a == 1
+    assert d["b"] == d.b == 2
+
+    d.b = 3
+    assert d.b == 3
+    assert d["b"] == 3
+
+    del d.c
+    assert not hasattr(d, "c")
+    assert "c" not in d
+
+    assert repr(d) == "DotDict({'a': 1, 'b': 3})"
+
+    with pytest.raises(KeyError):
+        assert d['x']
+    with pytest.raises(AttributeError):
+        assert d.x

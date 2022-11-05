@@ -1,12 +1,12 @@
 from itertools import product
 
-import clickhouse_driver
 import pandas as pd
 import pandas.testing as tm
 import pytest
 
 import ibis
-import ibis.common.exceptions as com
+
+clickhouse_driver = pytest.importorskip("clickhouse_driver")
 
 
 @pytest.fixture(scope='module')
@@ -165,9 +165,7 @@ WHERE `int_col` > 0"""
 # TODO use alltypes
 def test_table_column_unbox(db, alltypes):
     m = alltypes.float_col.sum().name('total')
-    agged = (
-        alltypes[alltypes.int_col > 0].group_by('string_col').aggregate([m])
-    )
+    agged = alltypes[alltypes.int_col > 0].group_by('string_col').aggregate([m])
     expr = agged.string_col
 
     sql_query = ibis.clickhouse.compile(expr)
@@ -185,26 +183,25 @@ FROM (
 
 def test_complex_array_expr_projection(db, alltypes):
     # May require finding the base table and forming a projection.
-    expr = alltypes.group_by('string_col').aggregate(
-        [alltypes.count().name('count')]
-    )
+    expr = alltypes.group_by('string_col').aggregate([alltypes.count().name('count')])
     expr2 = expr.string_col.cast('double')
 
     query = ibis.clickhouse.compile(expr2)
-    expected = """SELECT CAST(`string_col` AS Float64) AS `tmp`
+    name = expr2.get_name()
+    expected = f"""SELECT CAST(`string_col` AS Nullable(Float64)) AS `{name}`
 FROM (
-  SELECT `string_col`, count(*) AS `count`
-  FROM {0}.`functional_alltypes`
+  SELECT `string_col`, count() AS `count`
+  FROM {db.name}.`functional_alltypes`
   GROUP BY `string_col`
 ) t0"""
-    assert query == expected.format(db.name)
+    assert query == expected
 
 
 @pytest.mark.parametrize(
     ('expr', 'expected'),
     [
-        (ibis.now(), 'SELECT now() AS `tmp`'),
-        (ibis.literal(1) + ibis.literal(2), 'SELECT 1 + 2 AS `tmp`'),
+        (ibis.now(), 'SELECT now() AS `TimestampNow()`'),
+        (ibis.literal(1) + ibis.literal(2), 'SELECT 1 + 2 AS `Add(1, 2)`'),
     ],
 )
 def test_scalar_exprs_no_table_refs(expr, expected):
@@ -219,7 +216,7 @@ def test_isnull_case_expr_rewrite_failure(db, alltypes):
 
     result = ibis.clickhouse.compile(reduction)
     expected = """\
-SELECT sum(CASE WHEN isNull(`string_col`) THEN 1 ELSE 0 END) AS `sum`
+SELECT sum(if(isNull(`string_col`), 1, 0)) AS `sum`
 FROM {0}.`functional_alltypes`"""
     assert result == expected.format(db.name)
 
@@ -249,7 +246,11 @@ def test_non_equijoin(alltypes):
     t2 = t.view()
     expr = t.join(t2, t.tinyint_col < t2.timestamp_col.minute()).count()
 
-    with pytest.raises(com.TranslationError):
+    # compilation should pass
+    expr.compile()
+
+    # while execution should fail since clickhouse doesn't support non-equijoin
+    with pytest.raises(Exception, match="Unsupported JOIN ON conditions"):
         expr.execute()
 
 
@@ -259,8 +260,8 @@ def test_non_equijoin(alltypes):
         [
             ('any_inner_join', 'ANY INNER JOIN'),
             ('inner_join', 'ALL INNER JOIN'),
-            ('any_left_join', 'ANY LEFT JOIN'),
-            ('left_join', 'ALL LEFT JOIN'),
+            ('any_left_join', 'ANY LEFT OUTER JOIN'),
+            ('left_join', 'ALL LEFT OUTER JOIN'),
         ],
         [
             ('playerID', 'playerID'),
@@ -339,19 +340,14 @@ WHERE (`int_col` > 0) AND
 
 
 def test_where_use_if(con, alltypes, translate):
-    expr = ibis.where(
-        alltypes.float_col > 0, alltypes.int_col, alltypes.bigint_col
-    )
+    expr = ibis.where(alltypes.float_col > 0, alltypes.int_col, alltypes.bigint_col)
 
-    result = translate(expr)
+    result = translate(expr.op())
     expected = "if(`float_col` > 0, `int_col`, `bigint_col`)"
     assert result == expected
     con.execute(expr)
 
 
-@pytest.mark.xfail(
-    raises=com.RelationError, reason='Expression equality is broken'
-)
 def test_filter_predicates(diamonds):
     predicates = [
         lambda x: x.color.lower().like('%de%'),
@@ -371,9 +367,7 @@ def test_where_with_timestamp():
         [('uuid', 'string'), ('ts', 'timestamp'), ('search_level', 'int64')],
         name='t',
     )
-    expr = t.group_by(t.uuid).aggregate(
-        min_date=t.ts.min(where=t.search_level == 1)
-    )
+    expr = t.group_by(t.uuid).aggregate(min_date=t.ts.min(where=t.search_level == 1))
     result = ibis.clickhouse.compile(expr)
     expected = """\
 SELECT `uuid`, minIf(`ts`, `search_level` = 1) AS `min_date`
@@ -397,7 +391,7 @@ def test_timestamp_scalar_in_filter(alltypes, translate):
 
 def test_named_from_filter_groupby():
     t = ibis.table([('key', 'string'), ('value', 'double')], name='t0')
-    gb = t.filter(t.value == 42).groupby(t.key)
+    gb = t.filter(t.value == 42).group_by(t.key)
     sum_expr = lambda t: (t.value + 1 + 2 + 3).sum()  # noqa: E731
     expr = gb.aggregate(abc=sum_expr)
     expected = """\
@@ -450,9 +444,7 @@ def test_join_with_external_table(con, alltypes, df):
     ]
 
     result = expr.execute(external_tables={'external': external_df})
-    expected = df.assign(b=df.tinyint_col).merge(external_df, on='b')[
-        ['a', 'c', 'id']
-    ]
+    expected = df.assign(b=df.tinyint_col).merge(external_df, on='b')[['a', 'c', 'id']]
 
     result = result.sort_values('id').reset_index(drop=True)
     expected = expected.sort_values('id').reset_index(drop=True)

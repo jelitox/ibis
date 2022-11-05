@@ -1,7 +1,7 @@
 version: "3.4"
 services:
   clickhouse:
-    image: yandex/clickhouse-server:20-alpine
+    image: clickhouse/clickhouse-server:22.10.2.11-alpine
     ports:
       - 8123:8123
       - 9000:9000
@@ -10,6 +10,7 @@ services:
   impala:
     depends_on:
       - impala-postgres
+      - kudu
     environment:
       PGPASSWORD: postgres
     healthcheck:
@@ -47,7 +48,7 @@ services:
         - CMD
         - pg_isready
       timeout: 5s
-    image: postgres:13.3-alpine
+    image: postgres:13.8-alpine
     networks:
       - impala
   kudu:
@@ -88,7 +89,7 @@ services:
         - mysqladmin
         - ping
       timeout: 5s
-    image: mariadb:10.4.22
+    image: mariadb:10.9.3
     ports:
       - 3306:3306
     networks:

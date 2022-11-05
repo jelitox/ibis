@@ -1,6 +1,6 @@
 """The pandas backend is a departure from the typical ibis backend in that it
-doesn't compile to anything, and the execution of the ibis expression
-is under the purview of ibis itself rather than executing SQL on a server.
+doesn't compile to anything, and the execution of the ibis expression is under
+the purview of ibis itself rather than executing SQL on a server.
 
 Design
 ------
@@ -42,7 +42,7 @@ different times during the loop.
 First, at the beginning of the main execution loop, ``compute_time_context`` is
 called. This function computes time contexts, and pass them to all children of
 the current node. These time contexts could be used in later steps to get data.
-This is essential for time series TableExpr, and related operations that adjust
+This is essential for time series Table, and related operations that adjust
 time context, such as window, asof_join, etc.
 
 By default, this function simply pass the unchanged time context to all
@@ -81,7 +81,7 @@ Let's say you want to take a three day rolling average, and you want to include
 data in the result for a few reasons, one of which is that it would break the
 contract of window functions: given N rows of input there are N rows of output.
 
-Defining a ``post_execute`` rule for :class:`~ibis.expr.operations.WindowOp`
+Defining a ``post_execute`` rule for :class:`~ibis.expr.operations.Window`
 allows you to encode such logic. One might want to implement this using
 :class:`~ibis.expr.operations.ScalarParameter`, in which case the ``scope``
 passed to ``post_execute`` would be the bound values passed in at the time the
@@ -116,17 +116,20 @@ from multipledispatch import Dispatcher
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-import ibis.expr.types as ir
 import ibis.expr.window as win
 import ibis.util
 from ibis.backends.base import BaseBackend
+from ibis.backends.pandas import aggcontext as agg_ctx
+from ibis.backends.pandas.dispatch import (
+    execute_literal,
+    execute_node,
+    post_execute,
+    pre_execute,
+)
+from ibis.backends.pandas.trace import trace
 from ibis.expr.scope import Scope
 from ibis.expr.timecontext import canonicalize_context
 from ibis.expr.typing import TimeContext
-
-from . import aggcontext as agg_ctx
-from .dispatch import execute_literal, execute_node, post_execute, pre_execute
-from .trace import trace
 
 integer_types = np.integer, int
 floating_types = (numbers.Real,)
@@ -149,7 +152,7 @@ def is_computable_input(arg):
 
 
 @is_computable_input.register(BaseBackend)
-@is_computable_input.register(ir.Expr)
+@is_computable_input.register(ops.Node)
 @is_computable_input.register(dt.DataType)
 @is_computable_input.register(type(None))
 @is_computable_input.register(win.Window)
@@ -162,13 +165,12 @@ def is_computable_input_arg(arg):
 # Register is_computable_input for each scalar type (int, float, date, etc).
 # We use consume here to avoid leaking the iteration variable into the module.
 ibis.util.consume(
-    is_computable_input.register(t)(is_computable_input_arg)
-    for t in scalar_types
+    is_computable_input.register(t)(is_computable_input_arg) for t in scalar_types
 )
 
 
 def execute_with_scope(
-    expr,
+    node,
     scope: Scope,
     timecontext: Optional[TimeContext] = None,
     aggcontext=None,
@@ -179,8 +181,8 @@ def execute_with_scope(
 
     Parameters
     ----------
-    expr : ibis.expr.types.Expr
-        The expression to execute.
+    node : ibis.expr.operations.Node
+        The operation node to execute.
     scope : Scope
         A Scope class, with dictionary mapping
         :class:`~ibis.expr.operations.Node` subclass instances to concrete
@@ -195,19 +197,17 @@ def execute_with_scope(
     -------
     result : scalar, pd.Series, pd.DataFrame
     """
-    op = expr.op()
-
     # Call pre_execute, to allow clients to intercept the expression before
     # computing anything *and* before associating leaf nodes with data. This
     # allows clients to provide their own data for each leaf.
     if clients is None:
-        clients = expr._find_backends()
+        clients, _ = node.to_expr()._find_backends()
 
     if aggcontext is None:
         aggcontext = agg_ctx.Summarize()
 
     pre_executed_scope = pre_execute(
-        op,
+        node,
         *clients,
         scope=scope,
         timecontext=timecontext,
@@ -216,7 +216,7 @@ def execute_with_scope(
     )
     new_scope = scope.merge_scope(pre_executed_scope)
     result = execute_until_in_scope(
-        expr,
+        node,
         new_scope,
         timecontext=timecontext,
         aggcontext=aggcontext,
@@ -233,13 +233,13 @@ def execute_with_scope(
             **kwargs,
         ),
         **kwargs,
-    ).get_value(op, timecontext)
+    ).get_value(node, timecontext)
     return result
 
 
 @trace
 def execute_until_in_scope(
-    expr,
+    node,
     scope: Scope,
     timecontext: Optional[TimeContext] = None,
     aggcontext=None,
@@ -251,7 +251,7 @@ def execute_until_in_scope(
 
     Parameters
     ----------
-    expr : ibis.expr.types.Expr
+    node : ibis.expr.operations.Node
     scope : Scope
     timecontext : Optional[TimeContext]
     aggcontext : Optional[AggregationContext]
@@ -265,16 +265,19 @@ def execute_until_in_scope(
 
     # base case: our op has been computed (or is a leaf data node), so
     # return the corresponding value
-    op = expr.op()
-    if scope.get_value(op, timecontext) is not None:
+    if scope.get_value(node, timecontext) is not None:
         return scope
-    if isinstance(op, ops.Literal):
+    if isinstance(node, ops.Literal):
         # special case literals to avoid the overhead of dispatching
         # execute_node
         return Scope(
             {
-                op: execute_literal(
-                    op, op.value, expr.type(), aggcontext=aggcontext, **kwargs
+                node: execute_literal(
+                    node,
+                    node.value,
+                    node.output_dtype,
+                    aggcontext=aggcontext,
+                    **kwargs,
                 )
             },
             timecontext,
@@ -283,13 +286,15 @@ def execute_until_in_scope(
     # figure out what arguments we're able to compute on based on the
     # expressions inputs. things like expressions, None, and scalar types are
     # computable whereas ``list``s are not
-    computable_args = [arg for arg in op.inputs if is_computable_input(arg)]
+    computable_args = [
+        arg for arg in get_node_arguments(node) if is_computable_input(arg)
+    ]
 
     # pre_executed_states is a list of states with same the length of
     # computable_args, these states are passed to each arg
     if timecontext:
         arg_timecontexts = compute_time_context(
-            op,
+            node,
             num_args=len(computable_args),
             timecontext=timecontext,
             clients=clients,
@@ -299,7 +304,7 @@ def execute_until_in_scope(
         arg_timecontexts = [None] * len(computable_args)
 
     pre_executed_scope = pre_execute(
-        op,
+        node,
         *clients,
         scope=scope,
         timecontext=timecontext,
@@ -311,7 +316,7 @@ def execute_until_in_scope(
 
     # Short circuit: if pre_execute puts op in scope, then we don't need to
     # execute its computable_args
-    if new_scope.get_value(op, timecontext) is not None:
+    if new_scope.get_value(node, timecontext) is not None:
         return new_scope
 
     # recursively compute each node's arguments until we've changed type.
@@ -321,7 +326,7 @@ def execute_until_in_scope(
     if len(arg_timecontexts) != len(computable_args):
         raise com.IbisError(
             'arg_timecontexts differ with computable_arg in length '
-            f'for type:\n{type(op).__name__}.'
+            f'for type:\n{type(node).__name__}.'
         )
 
     scopes = [
@@ -334,16 +339,14 @@ def execute_until_in_scope(
             clients=clients,
             **kwargs,
         )
-        if hasattr(arg, 'op')
+        if isinstance(arg, ops.Node)
         else Scope({arg: arg}, timecontext)
         for (arg, timecontext) in zip(computable_args, arg_timecontexts)
     ]
 
     # if we're unable to find data then raise an exception
     if not scopes and computable_args:
-        raise com.UnboundExpressionError(
-            f'Unable to find data for expression:\n{repr(expr)}'
-        )
+        raise com.UnboundExpressionError(f'Unable to find data for node:\n{repr(node)}')
 
     # there should be exactly one dictionary per computable argument
     assert len(computable_args) == len(scopes)
@@ -351,13 +354,11 @@ def execute_until_in_scope(
     new_scope = new_scope.merge_scopes(scopes)
     # pass our computed arguments to this node's execute_node implementation
     data = [
-        new_scope.get_value(arg.op(), timecontext)
-        if hasattr(arg, 'op')
-        else arg
+        new_scope.get_value(arg, timecontext) if isinstance(arg, ops.Node) else arg
         for (arg, timecontext) in zip(computable_args, arg_timecontexts)
     ]
     result = execute_node(
-        op,
+        node,
         *data,
         scope=scope,
         timecontext=timecontext,
@@ -365,32 +366,35 @@ def execute_until_in_scope(
         clients=clients,
         **kwargs,
     )
-    computed = post_execute_(op, result, timecontext=timecontext)
-    return Scope({op: computed}, timecontext)
+    computed = post_execute_(
+        node, result, timecontext=timecontext, aggcontext=aggcontext, **kwargs
+    )
+    return Scope({node: computed}, timecontext)
 
 
 execute = Dispatcher('execute')
 
 
-@execute.register(ir.Expr)
+@execute.register(ops.Node)
 @trace
 def main_execute(
-    expr,
+    node,
     params=None,
     scope=None,
     timecontext: Optional[TimeContext] = None,
     aggcontext=None,
+    cache=None,
     **kwargs,
 ):
-    """Execute an expression against data that are bound to it. If no data
-    are bound, raise an Exception.
+    """Execute an expression against data that are bound to it. If no data are
+    bound, raise an Exception.
 
     Parameters
     ----------
-    expr : ibis.expr.types.Expr
-        The expression to execute
-    params : Mapping[ibis.expr.types.Expr, object]
-        The data that an unbound parameter in `expr` maps to
+    node : ibis.expr.operations.Node
+        The operation node to execute
+    params : Mapping[ibis.expr.operations.Node, object]
+        The data that an unbound parameter in `node` maps to
     scope : Mapping[ibis.expr.operations.Node, object]
         Additional scope, mapping ibis operations to data
     timecontext : Optional[TimeContext]
@@ -414,7 +418,6 @@ def main_execute(
     ValueError
         * If no data are bound to the input expression
     """
-
     if scope is None:
         scope = Scope()
 
@@ -425,29 +428,33 @@ def main_execute(
     if params is None:
         params = {}
 
+    if cache is None:
+        cache = {}
+
     # TODO: make expresions hashable so that we can get rid of these .op()
     # calls everywhere
     params = {k.op() if hasattr(k, 'op') else k: v for k, v in params.items()}
     scope = scope.merge_scope(Scope(params, timecontext))
     return execute_with_scope(
-        expr,
+        node,
         scope,
         timecontext=timecontext,
         aggcontext=aggcontext,
+        cache=cache,
         **kwargs,
     )
 
 
 def execute_and_reset(
-    expr,
+    node,
     params=None,
     scope=None,
     timecontext: Optional[TimeContext] = None,
     aggcontext=None,
     **kwargs,
 ):
-    """Execute an expression against data that are bound to it. If no data
-    are bound, raise an Exception.
+    """Execute an expression against data that are bound to it. If no data are
+    bound, raise an Exception.
 
     Notes
     -----
@@ -457,10 +464,10 @@ def execute_and_reset(
 
     Parameters
     ----------
-    expr : ibis.expr.types.Expr
-        The expression to execute
-    params : Mapping[ibis.expr.types.Expr, object]
-        The data that an unbound parameter in `expr` maps to
+    node : ibis.expr.operations.Node
+        The operation node to execute
+    params : Mapping[ibis.expr.operation.Node, object]
+        The data that an unbound parameter in `node` maps to
     scope : Mapping[ibis.expr.operations.Node, object]
         Additional scope, mapping ibis operations to data
     timecontext : Optional[TimeContext]
@@ -485,7 +492,7 @@ def execute_and_reset(
         * If no data are bound to the input expression
     """
     result = execute(
-        expr,
+        node,
         params=params,
         scope=scope,
         timecontext=timecontext,
@@ -493,9 +500,8 @@ def execute_and_reset(
         **kwargs,
     )
     if isinstance(result, pd.DataFrame):
-        schema = expr.schema()
         df = result.reset_index()
-        return df.loc[:, schema.names]
+        return df.loc[:, node.schema.names]
     elif isinstance(result, pd.Series):
         return result.reset_index(drop=True)
     return result
@@ -512,7 +518,7 @@ Notes
 For a given node, return with a list of timecontext that are going to be
 passed to its children nodes.
 time context is useful when data is not uniquely defined by op tree. e.g.
-a TableExpr can represent the query select count(a) from table, but the
+a Table can represent the query select count(a) from table, but the
 result of that is different with time context (pd.Timestamp("20190101"),
 pd.Timestamp("20200101")) vs (pd.Timestamp("20200101"),
 pd.Timestamp("20210101“)), because what data is in "table" also depends on
@@ -544,4 +550,53 @@ def compute_time_context_default(
     timecontext: Optional[TimeContext] = None,
     **kwargs,
 ):
-    return [timecontext for arg in node.inputs if is_computable_input(arg)]
+    return [timecontext for arg in get_node_arguments(node) if is_computable_input(arg)]
+
+
+get_node_arguments = Dispatcher('get_node_arguments')
+
+
+@get_node_arguments.register(ops.Node)
+def get_node_arguments_default(node):
+    return node.args
+
+
+@get_node_arguments.register(ops.ScalarParameter)
+def get_node_arguments_parameter(node):
+    return ()
+
+
+@get_node_arguments.register(ops.NodeList)
+def get_node_arguments_list(node):
+    return (node.values,)
+
+
+@get_node_arguments.register(ops.DropNa)
+def get_node_arguments_dropna(node):
+    return (node.table,)
+
+
+@get_node_arguments.register(ops.Selection)
+def get_node_arguments_selection(node):
+    return (node.table,)
+
+
+@get_node_arguments.register(ops.Aggregation)
+def get_node_arguments_aggregation(node):
+    return (node.table,)
+
+
+@get_node_arguments.register(ops.Window)
+def get_node_arguments_window(node):
+    return (get_node_arguments(node.expr)[0], node.window)
+
+
+@get_node_arguments.register(
+    (
+        ops.ElementWiseVectorizedUDF,
+        ops.ReductionVectorizedUDF,
+        ops.AnalyticVectorizedUDF,
+    )
+)
+def get_node_arguments_udf(node):
+    return node.func_args

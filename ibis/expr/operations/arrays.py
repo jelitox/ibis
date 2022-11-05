@@ -1,70 +1,97 @@
 from public import public
 
-from ...common import exceptions as com
-from .. import datatypes as dt
-from .. import rules as rlz
-from .core import UnaryOp, ValueOp
+import ibis.common.exceptions as com
+import ibis.expr.datatypes as dt
+import ibis.expr.rules as rlz
+from ibis.common.annotations import attribute
+from ibis.expr.operations.core import Unary, Value
 
 
 @public
-class ArrayColumn(ValueOp):
-    cols = rlz.value_list_of(rlz.column(rlz.any), min_length=1)
+class ArrayColumn(Value):
+    cols = rlz.nodes_of(rlz.column(rlz.any), min_length=1)
 
-    def _validate(self):
-        if len({col.type() for col in self.cols}) > 1:
+    output_shape = rlz.Shape.COLUMNAR
+
+    def __init__(self, cols):
+        unique_dtypes = {col.output_dtype for col in cols.values}
+        if len(unique_dtypes) > 1:
             raise com.IbisTypeError(
                 f'The types of all input columns must match exactly in a '
                 f'{type(self).__name__} operation.'
             )
+        super().__init__(cols=cols)
 
-    def output_type(self):
-        first_dtype = self.cols[0].type()
-        return dt.Array(first_dtype).column_type()
+    @attribute.default
+    def output_dtype(self):
+        first_dtype = self.cols.values[0].output_dtype
+        return dt.Array(first_dtype)
 
 
 @public
-class ArrayLength(UnaryOp):
+class ArrayLength(Unary):
     arg = rlz.array
-    output_type = rlz.shape_like('arg', dt.int64)
+
+    output_dtype = dt.int64
+    output_shape = rlz.shape_like("args")
 
 
 @public
-class ArraySlice(ValueOp):
+class ArraySlice(Value):
     arg = rlz.array
     start = rlz.integer
     stop = rlz.optional(rlz.integer)
-    output_type = rlz.typeof('arg')
+
+    output_dtype = rlz.dtype_like("arg")
+    output_shape = rlz.shape_like("arg")
 
 
 @public
-class ArrayIndex(ValueOp):
+class ArrayIndex(Value):
     arg = rlz.array
     index = rlz.integer
 
-    def output_type(self):
-        value_dtype = self.arg.type().value_type
-        return rlz.shape_like(self.arg, value_dtype)
+    output_shape = rlz.shape_like("args")
+
+    @attribute.default
+    def output_dtype(self):
+        return self.arg.output_dtype.value_type
 
 
 @public
-class ArrayConcat(ValueOp):
+class ArrayConcat(Value):
     left = rlz.array
     right = rlz.array
-    output_type = rlz.shape_like('left')
 
-    def _validate(self):
-        left_dtype, right_dtype = self.left.type(), self.right.type()
-        if left_dtype != right_dtype:
+    output_dtype = rlz.dtype_like("left")
+    output_shape = rlz.shape_like("args")
+
+    def __init__(self, left, right):
+        if left.output_dtype != right.output_dtype:
             raise com.IbisTypeError(
                 'Array types must match exactly in a {} operation. '
                 'Left type {} != Right type {}'.format(
-                    type(self).__name__, left_dtype, right_dtype
+                    type(self).__name__, left.output_dtype, right.output_dtype
                 )
             )
+        super().__init__(left=left, right=right)
 
 
 @public
-class ArrayRepeat(ValueOp):
+class ArrayRepeat(Value):
     arg = rlz.array
     times = rlz.integer
-    output_type = rlz.typeof('arg')
+
+    output_dtype = rlz.dtype_like("arg")
+    output_shape = rlz.shape_like("args")
+
+
+@public
+class Unnest(Value):
+    arg = rlz.array
+
+    @attribute.default
+    def output_dtype(self):
+        return self.arg.output_dtype.value_type
+
+    output_shape = rlz.Shape.COLUMNAR

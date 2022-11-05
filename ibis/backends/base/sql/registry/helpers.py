@@ -1,9 +1,7 @@
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-import ibis.expr.types as ir
-
-from . import identifiers
+from ibis.backends.base.sql.registry import identifiers
 
 
 def format_call(translator, func, *args):
@@ -23,32 +21,33 @@ def quote_identifier(name, quotechar='`', force=False):
         return name
 
 
-def needs_parens(op):
-    if isinstance(op, ir.Expr):
-        op = op.op()
-    op_klass = type(op)
-    # function calls don't need parens
-    return op_klass in {
-        ops.Negate,
-        ops.IsNull,
-        ops.NotNull,
-        ops.Add,
-        ops.Subtract,
-        ops.Multiply,
-        ops.Divide,
-        ops.Power,
-        ops.Modulus,
-        ops.Equals,
-        ops.NotEquals,
-        ops.GreaterEqual,
-        ops.Greater,
-        ops.LessEqual,
-        ops.Less,
-        ops.IdenticalTo,
-        ops.And,
-        ops.Or,
-        ops.Xor,
-    }
+_NEEDS_PARENS_OPS = (
+    ops.Negate,
+    ops.IsNull,
+    ops.NotNull,
+    ops.Add,
+    ops.Subtract,
+    ops.Multiply,
+    ops.Divide,
+    ops.Power,
+    ops.Modulus,
+    ops.Equals,
+    ops.NotEquals,
+    ops.GreaterEqual,
+    ops.Greater,
+    ops.LessEqual,
+    ops.Less,
+    ops.IdenticalTo,
+    ops.And,
+    ops.Or,
+    ops.Xor,
+)
+
+
+def needs_parens(op: ops.Node):
+    if isinstance(op, ops.Alias):
+        op = op.arg
+    return isinstance(op, _NEEDS_PARENS_OPS)
 
 
 parenthesize = '({})'.format

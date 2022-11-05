@@ -12,11 +12,10 @@ import ibis.expr.datatypes as dt
 import ibis.expr.rules as rules
 import ibis.expr.types as ir
 import ibis.util as util
+from ibis.backends.impala import ddl
 from ibis.common.exceptions import IbisTypeError
 
-from .. import ddl
-
-pytestmark = pytest.mark.udf
+pytest.importorskip("impala")
 
 
 @pytest.fixture(scope="module")
@@ -100,10 +99,10 @@ def test_sql_generation():
     func.register('identity', 'udf_testing')
 
     result = func('hello world')
-    assert (
-        ibis.impala.compile(result)
-        == "SELECT udf_testing.identity('hello world') AS `tmp`"
+    expected = (
+        "SELECT udf_testing.identity('hello world') AS " "`UDF_Tester('hello world')`"
     )
+    assert ibis.impala.compile(result) == expected
 
 
 def test_sql_generation_from_infoclass():
@@ -111,7 +110,7 @@ def test_sql_generation_from_infoclass():
     repr(func)
 
     func.register('info_test', 'udf_testing')
-    result = func('hello world')
+    result = func('hello world').name('tmp')
     assert (
         ibis.impala.compile(result)
         == "SELECT udf_testing.info_test('hello world') AS `tmp`"
@@ -143,13 +142,10 @@ def test_udf_primitive_output_types(ty, value, column, table):
     ibis_type = dt.validate_type(ty)
 
     expr = func(value)
-    assert type(expr) == type(  # noqa: E501, E721
-        ibis_type.scalar_type()(expr.op())
-    )
+    assert type(expr) == ibis_type.scalar
+
     expr = func(table[column])
-    assert type(expr) == type(  # noqa: E501, E721
-        ibis_type.column_type()(expr.op())
-    )
+    assert type(expr) == ibis_type.column
 
 
 @pytest.mark.parametrize(
@@ -170,17 +166,16 @@ def test_udf_primitive_output_types(ty, value, column, table):
         ),
     ],
 )
-def test_uda_primitive_output_types(ty, value, table):
+def test_uda_primitive_output_types(ty, value):
     func = _register_uda([ty], ty, 'test')
 
     ibis_type = dt.validate_type(ty)
 
     expr1 = func(value)
+    assert isinstance(expr1, ibis_type.scalar)
+
     expr2 = func(value)
-    expected_type1 = type(ibis_type.scalar_type()(expr1.op()))
-    expected_type2 = type(ibis_type.scalar_type()(expr2.op()))
-    assert isinstance(expr1, expected_type1)
-    assert isinstance(expr2, expected_type2)
+    assert isinstance(expr2, ibis_type.scalar)
 
 
 def test_decimal(dec):
@@ -243,10 +238,10 @@ def test_mult_args(i32, d, s, b, t):
     )
 
     expr = func(i32, d, s, b, t)
-    assert issubclass(type(expr), ir.ColumnExpr)
+    assert issubclass(type(expr), ir.Column)
 
     expr = func(1, 1.0, 'a', True, ibis.timestamp('1961-04-10'))
-    assert issubclass(type(expr), ir.ScalarExpr)
+    assert issubclass(type(expr), ir.Scalar)
 
 
 def _register_udf(inputs, output, name):
@@ -348,12 +343,12 @@ def test_decimal_fail(udfcon, test_data_db, udf_ll):
     )
 
     expr = func(literal)
-    assert issubclass(type(expr), ir.ScalarExpr)
+    assert issubclass(type(expr), ir.Scalar)
     result = udfcon.execute(expr)
     assert result == Decimal(1)
 
     expr = func(col)
-    assert issubclass(type(expr), ir.ColumnExpr)
+    assert issubclass(type(expr), ir.Column)
     udfcon.execute(expr)
 
 
@@ -370,11 +365,11 @@ def test_mixed_inputs(udfcon, alltypes, test_data_db, udf_ll):
     )
 
     expr = func(alltypes.int_col, 1)
-    assert issubclass(type(expr), ir.ColumnExpr)
+    assert issubclass(type(expr), ir.Column)
     udfcon.execute(expr)
 
     expr = func(1, alltypes.int_col)
-    assert issubclass(type(expr), ir.ColumnExpr)
+    assert issubclass(type(expr), ir.Column)
     udfcon.execute(expr)
 
     expr = func(alltypes.int_col, alltypes.tinyint_col)
@@ -390,9 +385,7 @@ def test_implicit_typecasting(udfcon, alltypes, test_data_db, udf_ll):
     identity_func_testing(udf_ll, udfcon, test_data_db, 'int32', literal, col)
 
 
-def identity_func_testing(
-    udf_ll, udfcon, test_data_db, datatype, literal, column
-):
+def identity_func_testing(udf_ll, udfcon, test_data_db, datatype, literal, column):
     inputs = [datatype]
     name = '__tmp_udf_' + util.guid()
     func = udf_creation_to_op(
@@ -400,7 +393,7 @@ def identity_func_testing(
     )
 
     expr = func(literal)
-    assert issubclass(type(expr), ir.ScalarExpr)
+    assert issubclass(type(expr), ir.Scalar)
     result = udfcon.execute(expr)
     # Hacky
     if datatype == 'timestamp':
@@ -413,7 +406,7 @@ def identity_func_testing(
             np.testing.assert_allclose(result, udfcon.execute(literal), 5)
 
     expr = func(column)
-    assert issubclass(type(expr), ir.ColumnExpr)
+    assert issubclass(type(expr), ir.Column)
     udfcon.execute(expr)
 
 
@@ -512,9 +505,7 @@ def test_drop_uda_not_exists(udfcon):
         udfcon.drop_uda(random_name)
 
 
-def udf_creation_to_op(
-    udf_ll, udfcon, test_data_db, name, symbol, inputs, output
-):
+def udf_creation_to_op(udf_ll, udfcon, test_data_db, name, symbol, inputs, output):
     func = api.wrap_udf(udf_ll, inputs, output, symbol, name)
 
     udfcon.create_function(func, database=test_data_db)
@@ -531,9 +522,7 @@ def test_ll_uda_not_supported(uda_ll):
         conforming_wrapper(uda_ll, ['double'], 'double', 'Variance')
 
 
-def conforming_wrapper(
-    where, inputs, output, prefix, serialize=True, name=None
-):
+def conforming_wrapper(where, inputs, output, prefix, serialize=True, name=None):
     kwds = {'name': name}
     if serialize:
         kwds['serialize_fn'] = f'{prefix}Serialize'
@@ -580,9 +569,7 @@ def test_list_udas(udfcon, temp_database, wrapped_count_uda):
 @pytest.mark.xfail(
     reason='Unknown reason. xfailing to restore the CI for udf tests. #2358'
 )
-def test_drop_database_with_udfs_and_udas(
-    udfcon, temp_database, wrapped_count_uda
-):
+def test_drop_database_with_udfs_and_udas(udfcon, temp_database, wrapped_count_uda):
     uda1 = wrapped_count_uda
 
     udf1 = api.wrap_udf(

@@ -1,3 +1,4 @@
+import os
 from posixpath import join as pjoin
 
 import pandas as pd
@@ -6,8 +7,11 @@ import pytest
 
 import ibis
 import ibis.util as util
-from ibis.backends.impala.compat import ImpylaError
 from ibis.tests.util import assert_equal
+
+pytest.importorskip("impala")
+
+from ibis.backends.impala.compat import ImpylaError  # noqa: E402
 
 
 @pytest.fixture
@@ -37,9 +41,7 @@ def unpart_t(con, df, tmp_db):
 
 
 def test_is_partitioned(con, temp_table):
-    schema = ibis.schema(
-        [('foo', 'string'), ('year', 'int32'), ('month', 'string')]
-    )
+    schema = ibis.schema([('foo', 'string'), ('year', 'int32'), ('month', 'string')])
     name = temp_table
     con.create_table(name, schema=schema, partition=['year', 'month'])
     assert con.table(name).is_partitioned
@@ -56,9 +58,7 @@ def test_create_table_with_partition_column(con, temp_table_db):
     )
 
     tmp_db, name = temp_table_db
-    con.create_table(
-        name, schema=schema, database=tmp_db, partition=['year', 'month']
-    )
+    con.create_table(name, schema=schema, database=tmp_db, partition=['year', 'month'])
 
     # the partition column get put at the end of the table
     ex_schema = ibis.schema(
@@ -115,9 +115,7 @@ def test_insert_select_partitioned_table(con, df, temp_table, unpart_t):
     unique_keys = df[part_keys].drop_duplicates()
 
     for i, (year, month) in enumerate(unique_keys.itertuples(index=False)):
-        select_stmt = unpart_t[
-            (unpart_t.year == year) & (unpart_t.month == month)
-        ]
+        select_stmt = unpart_t[(unpart_t.year == year) & (unpart_t.month == month)]
 
         # test both styles of insert
         if i:
@@ -147,9 +145,7 @@ def test_create_partitioned_table_from_expr(con, alltypes):
 
 
 def test_add_drop_partition_no_location(con, temp_table):
-    schema = ibis.schema(
-        [('foo', 'string'), ('year', 'int32'), ('month', 'int16')]
-    )
+    schema = ibis.schema([('foo', 'string'), ('year', 'int32'), ('month', 'int16')])
     name = temp_table
     con.create_table(name, schema=schema, partition=['year', 'month'])
     table = con.table(name)
@@ -165,10 +161,9 @@ def test_add_drop_partition_no_location(con, temp_table):
     assert len(table.partitions()) == 1
 
 
+@pytest.mark.hdfs
 def test_add_drop_partition_owned_by_impala(hdfs, con, temp_table):
-    schema = ibis.schema(
-        [('foo', 'string'), ('year', 'int32'), ('month', 'int16')]
-    )
+    schema = ibis.schema([('foo', 'string'), ('year', 'int32'), ('month', 'int16')])
     name = temp_table
     con.create_table(name, schema=schema, partition=['year', 'month'])
 
@@ -180,8 +175,9 @@ def test_add_drop_partition_owned_by_impala(hdfs, con, temp_table):
     basename = util.guid()
     path = f'/tmp/{subdir}/{basename}'
 
-    hdfs.mkdir(f'/tmp/{subdir}')
-    hdfs.chown(f'/tmp/{subdir}', owner='impala', group='supergroup')
+    parent = os.path.dirname(path)
+    hdfs.mkdir(parent, create_parents=True)
+    hdfs.chown(parent, owner='impala', group='supergroup')
 
     table.add_partition(part, location=path)
 
@@ -193,9 +189,7 @@ def test_add_drop_partition_owned_by_impala(hdfs, con, temp_table):
 
 
 def test_add_drop_partition_hive_bug(con, temp_table):
-    schema = ibis.schema(
-        [('foo', 'string'), ('year', 'int32'), ('month', 'int16')]
-    )
+    schema = ibis.schema([('foo', 'string'), ('year', 'int32'), ('month', 'int16')])
     name = temp_table
     con.create_table(name, schema=schema, partition=['year', 'month'])
 
@@ -214,6 +208,7 @@ def test_add_drop_partition_hive_bug(con, temp_table):
     assert len(table.partitions()) == 1
 
 
+@pytest.mark.hdfs
 def test_load_data_partition(con, hdfs, tmp_dir, unpart_t, df, temp_table):
     part_keys = ['year', 'month']
 
@@ -247,16 +242,12 @@ def test_load_data_partition(con, hdfs, tmp_dir, unpart_t, df, temp_table):
         part_t.alter_partition(part, format='text', serde_properties=csv_props)
         part_t.load_data(chunk_path, partition=part)
 
-    hdfs.rmdir(hdfs_dir)
+    hdfs.rm(hdfs_dir, recursive=True)
     verify_partitioned_table(part_t, df, unique_keys)
 
 
 def verify_partitioned_table(part_t, df, unique_keys):
-    result = (
-        part_t.execute()
-        .sort_values(by='id')
-        .reset_index(drop=True)[df.columns]
-    )
+    result = part_t.execute().sort_values(by='id').reset_index(drop=True)[df.columns]
 
     tm.assert_frame_equal(result, df)
 

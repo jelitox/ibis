@@ -1,2 +1,2 @@
-FROM postgis/postgis:13-3.2-alpine
-RUN apk add postgresql-plpython3
+FROM postgis/postgis:15-3.3-alpine
+RUN apk add postgresql14-plpython3

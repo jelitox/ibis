@@ -1,5 +1,4 @@
 from decimal import Decimal
-from io import StringIO
 
 import pandas as pd
 import pandas.testing as tm
@@ -10,7 +9,6 @@ import ibis.expr.api as api
 import ibis.expr.types as ir
 from ibis import literal as L
 from ibis.backends.impala.compiler import ImpalaCompiler
-from ibis.common.exceptions import RelationError
 from ibis.expr.datatypes import Category
 
 
@@ -19,13 +17,6 @@ def test_embedded_identifier_quoting(alltypes):
 
     expr = t[[(t.double_col * 2).name('double(fun)')]]['double(fun)'].sum()
     expr.execute()
-
-
-def test_table_info(alltypes):
-    buf = StringIO()
-    alltypes.info(buf=buf)
-
-    assert buf.getvalue() is not None
 
 
 def test_summary_execute(alltypes):
@@ -52,14 +43,6 @@ def test_summary_execute(alltypes):
     assert isinstance(result, pd.DataFrame)
 
 
-def test_distinct_array(con, alltypes):
-    table = alltypes
-
-    expr = table.string_col.distinct()
-    result = con.execute(expr)
-    assert isinstance(result, pd.Series)
-
-
 def test_decimal_metadata(con):
     table = con.table('tpch_lineitem')
 
@@ -70,7 +53,7 @@ def test_decimal_metadata(con):
     # TODO: what if user impyla version does not have decimal Metadata?
 
 
-def test_builtins_1(con, alltypes):
+def test_builtins(con, alltypes):
     table = alltypes
 
     i1 = table.tinyint_col
@@ -191,16 +174,14 @@ def _check_impala_output_types_match(con, table):
         return x
 
     left, right = t.schema(), table.schema()
-    for i, (n, left, right) in enumerate(
-        zip(left.names, left.types, right.types)
-    ):
+    for n, left, right in zip(left.names, left.types, right.types):
         left = _clean_type(left)
         right = _clean_type(right)
 
         if left != right:
             pytest.fail(
                 'Value for {} had left type {}'
-                ' and right type {}'.format(n, left, right)
+                ' and right type {}\nquery:\n{}'.format(n, left, right, query)
             )
 
 
@@ -390,10 +371,6 @@ def test_div_floordiv(con, expr, expected):
     assert result == expected
 
 
-@pytest.mark.xfail(
-    raises=RelationError,
-    reason='Equality was broken, and fixing it broke this test',
-)
 def test_filter_predicates(con):
     t = con.table('tpch_nation')
 
@@ -593,9 +570,7 @@ def test_tpch_self_join_failure(con):
     joined_all = (
         region.join(nation, region.r_regionkey == nation.n_regionkey)
         .join(customer, customer.c_nationkey == nation.n_nationkey)
-        .join(orders, orders.o_custkey == customer.c_custkey)[
-            fields_of_interest
-        ]
+        .join(orders, orders.o_custkey == customer.c_custkey)[fields_of_interest]
     )
 
     year = joined_all.odate.year().name('year')
@@ -608,10 +583,7 @@ def test_tpch_self_join_failure(con):
     yoy_change = (current.total - prior.total).name('yoy_change')
     yoy = current.join(
         prior,
-        (
-            (current.region == prior.region)
-            & (current.year == (prior.year - 1))
-        ),
+        ((current.region == prior.region) & (current.year == (prior.year - 1))),
     )[current.region, current.year, yoy_change]
 
     # no analysis failure
@@ -635,9 +607,7 @@ def test_tpch_correlated_subquery_failure(con):
     tpch = (
         region.join(nation, region.r_regionkey == nation.n_regionkey)
         .join(customer, customer.c_nationkey == nation.n_nationkey)
-        .join(orders, orders.o_custkey == customer.c_custkey)[
-            fields_of_interest
-        ]
+        .join(orders, orders.o_custkey == customer.c_custkey)[fields_of_interest]
     )
 
     t2 = tpch.view()
@@ -722,13 +692,10 @@ def test_where_with_timestamp():
         [('uuid', 'string'), ('ts', 'timestamp'), ('search_level', 'int64')],
         name='t',
     )
-    expr = t.group_by(t.uuid).aggregate(
-        min_date=t.ts.min(where=t.search_level == 1)
-    )
+    expr = t.group_by(t.uuid).aggregate(min_date=t.ts.min(where=t.search_level == 1))
     result = ibis.impala.compile(expr)
     expected = """\
-SELECT `uuid`,
-       min(CASE WHEN `search_level` = 1 THEN `ts` ELSE NULL END) AS `min_date`
+SELECT `uuid`, min(if(`search_level` = 1, `ts`, NULL)) AS `min_date`
 FROM t
 GROUP BY 1"""
     assert result == expected
@@ -747,7 +714,7 @@ def test_filter_with_analytic():
     expected = """\
 SELECT `col`, `analytic`
 FROM (
-  SELECT `col`, count(*) OVER () AS `analytic`
+  SELECT `col`, count(1) OVER () AS `analytic`
   FROM (
     SELECT `col`, `filter`
     FROM (
@@ -764,9 +731,9 @@ FROM (
     assert result == expected
 
 
-def test_named_from_filter_groupby():
+def test_named_from_filter_group_by():
     t = ibis.table([('key', 'string'), ('value', 'double')], name='t0')
-    gb = t.filter(t.value == 42).groupby(t.key)
+    gb = t.filter(t.value == 42).group_by(t.key)
     sum_expr = lambda t: (t.value + 1 + 2 + 3).sum()  # noqa: E731
     expr = gb.aggregate(abc=sum_expr)
     expected = """\
@@ -789,7 +756,7 @@ def test_nunique_where():
     t = ibis.table([('key', 'string'), ('value', 'double')], name='t0')
     expr = t.key.nunique(where=t.value >= 1.0)
     expected = """\
-SELECT count(DISTINCT CASE WHEN `value` >= 1.0 THEN `key` ELSE NULL END) AS `nunique`
+SELECT count(DISTINCT if(`value` >= 1.0, `key`, NULL)) AS `nunique`
 FROM t0"""  # noqa: E501
     result = ibis.impala.compile(expr)
     assert result == expected

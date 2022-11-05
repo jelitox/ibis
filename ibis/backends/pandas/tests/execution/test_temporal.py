@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import pandas.testing as tm
 import pytest
-from pkg_resources import parse_version
+from packaging.version import parse as parse_version
 from pytest import param
 
 from ibis import literal as L  # noqa: E402
@@ -53,7 +53,7 @@ def test_timestamp_functions(case_func, expected_func):
     )
     result = case_func(v)
     expected = expected_func(vt)
-    assert execute(result) == expected
+    assert execute(result.op()) == expected
 
 
 @pytest.mark.parametrize(
@@ -125,9 +125,7 @@ def test_times_ops(t, df):
     ('tz', 'rconstruct'),
     [('US/Eastern', np.zeros), ('UTC', np.ones), (None, np.ones)],
 )
-@pytest.mark.parametrize(
-    'column', ['plain_datetimes_utc', 'plain_datetimes_naive']
-)
+@pytest.mark.parametrize('column', ['plain_datetimes_utc', 'plain_datetimes_naive'])
 def test_times_ops_with_tz(t, df, tz, rconstruct, column):
     expected = pd.Series(rconstruct(len(df), dtype=bool))
     time = t[column].time()

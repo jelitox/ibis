@@ -16,13 +16,12 @@ import dask.dataframe as dd
 import dask.dataframe.groupby as ddgb
 
 import ibis.expr.operations as ops
+from ibis.backends.dask.core import execute
+from ibis.backends.dask.dispatch import execute_node
+from ibis.backends.dask.execution.util import coerce_to_output, safe_concat
 from ibis.backends.pandas.execution.generic import agg_ctx
 from ibis.expr.scope import Scope
 from ibis.expr.typing import TimeContext
-
-from ..core import execute
-from ..dispatch import execute_node
-from .util import coerce_to_output, safe_concat
 
 
 # TODO - aggregations - #2553
@@ -34,17 +33,14 @@ def execute_aggregation_dataframe(
     assert op.metrics, 'no metrics found during aggregation execution'
 
     if op.sort_keys:
-        raise NotImplementedError(
-            'sorting on aggregations not yet implemented'
-        )
+        raise NotImplementedError('sorting on aggregations not yet implemented')
 
-    predicates = op.predicates
-    if predicates:
+    if op.predicates:
         predicate = functools.reduce(
             operator.and_,
             (
                 execute(p, scope=scope, timecontext=timecontext, **kwargs)
-                for p in predicates
+                for p in op.predicates
             ),
         )
         data = data.loc[predicate]
@@ -52,27 +48,19 @@ def execute_aggregation_dataframe(
     columns = {}
 
     if op.by:
-        grouping_key_pairs = list(
-            zip(op.by, map(operator.methodcaller('op'), op.by))
-        )
         grouping_keys = [
-            by_op.name
-            if isinstance(by_op, ops.TableColumn)
-            else execute(
-                by, scope=scope, timecontext=timecontext, **kwargs
-            ).rename(by.get_name())
-            for by, by_op in grouping_key_pairs
+            key.name
+            if isinstance(key, ops.TableColumn)
+            else execute(key, scope=scope, timecontext=timecontext, **kwargs).rename(
+                key.name
+            )
+            for key in op.by
         ]
-        columns.update(
-            (by_op.name, by.get_name())
-            for by, by_op in grouping_key_pairs
-            if hasattr(by_op, 'name')
-        )
         source = data.groupby(grouping_keys)
     else:
         source = data
 
-    scope = scope.merge_scope(Scope({op.table.op(): source}, timecontext))
+    scope = scope.merge_scope(Scope({op.table: source}, timecontext))
 
     pieces = []
     for metric in op.metrics:

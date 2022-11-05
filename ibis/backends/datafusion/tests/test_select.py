@@ -1,4 +1,8 @@
-from .conftest import BackendTest
+import pytest
+
+from ibis.backends.datafusion.tests.conftest import BackendTest
+
+pytest.importorskip("datafusion")
 
 
 def test_where_multiple_conditions(alltypes, alltypes_df):

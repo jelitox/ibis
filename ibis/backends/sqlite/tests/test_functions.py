@@ -1,6 +1,5 @@
 import datetime
 import math
-import operator
 import sqlite3
 import uuid
 
@@ -8,13 +7,14 @@ import numpy as np
 import pandas as pd
 import pandas.testing as tm
 import pytest
-import sqlalchemy as sa
 from packaging.version import parse
 
 import ibis
 import ibis.expr.datatypes as dt
 from ibis import config
 from ibis import literal as L
+
+sa = pytest.importorskip("sqlalchemy")
 
 
 @pytest.mark.parametrize(
@@ -24,18 +24,20 @@ from ibis import literal as L
             lambda t: t.double_col.cast(dt.int8),
             lambda at: sa.cast(at.c.double_col, sa.SMALLINT),
         ),
+        # TODO(kszucs): double check the validity of this test case
         (
-            lambda t: t.string_col.cast(dt.double),
-            lambda at: sa.cast(at.c.string_col, sa.REAL),
+            lambda t: t.string_col.cast(dt.float64),
+            lambda at: sa.cast(at.c.string_col, sa.FLOAT),
         ),
         (
-            lambda t: t.string_col.cast(dt.float),
+            lambda t: t.string_col.cast(dt.float32),
             lambda at: sa.cast(at.c.string_col, sa.REAL),
         ),
     ],
 )
 def test_cast(alltypes, alltypes_sqla, translate, func, expected):
-    assert translate(func(alltypes)) == str(expected(alltypes_sqla))
+    expr = func(alltypes)
+    assert translate(expr.op()) == str(expected(alltypes_sqla))
 
 
 @pytest.mark.parametrize(
@@ -43,9 +45,7 @@ def test_cast(alltypes, alltypes_sqla, translate, func, expected):
     [
         (
             lambda t: t.timestamp_col.cast(dt.timestamp),
-            lambda at: sa.func.strftime(
-                '%Y-%m-%d %H:%M:%f', at.c.timestamp_col
-            ),
+            lambda at: sa.func.strftime('%Y-%m-%d %H:%M:%f', at.c.timestamp_col),
         ),
         (
             lambda t: t.int_col.cast(dt.timestamp),
@@ -59,26 +59,13 @@ def test_timestamp_cast_noop(
     # See GH #592
     result = func(alltypes)
     expected = expected_func(alltypes_sqla)
-    assert translate(result) == sqla_compile(expected)
+    assert translate(result.op()) == sqla_compile(expected)
 
 
-TIMESTAMP_CONSTANT = ibis.literal('2015-09-01 14:48:05.359').cast('timestamp')
-
-
-@pytest.mark.parametrize(
-    ('expr', 'expected'),
-    [
-        (TIMESTAMP_CONSTANT.strftime('%Y%m%d'), '20150901'),
-        (TIMESTAMP_CONSTANT.year(), 2015),
-        (TIMESTAMP_CONSTANT.month(), 9),
-        (TIMESTAMP_CONSTANT.day(), 1),
-        (TIMESTAMP_CONSTANT.hour(), 14),
-        (TIMESTAMP_CONSTANT.minute(), 48),
-        (TIMESTAMP_CONSTANT.second(), 5),
-        (TIMESTAMP_CONSTANT.millisecond(), 359),
-    ],
-)
-def test_timestamp_functions(con, expr, expected):
+def test_timestamp_functions(con):
+    value = ibis.timestamp('2015-09-01 14:48:05.359')
+    expr = value.strftime('%Y%m%d')
+    expected = '20150901'
     assert con.execute(expr) == expected
 
 
@@ -244,7 +231,7 @@ def test_str_replace(con):
     ],
 )
 def test_math_functions(con, expr, expected):
-    assert con.execute(expr) == expected
+    assert con.execute(expr.op()) == expected
 
 
 NULL_STRING = L(None).cast(dt.string)
@@ -316,7 +303,7 @@ def test_fillna_nullif(con, expr, expected):
 
 
 def test_numeric_builtins_work(alltypes, df):
-    expr = alltypes.double_col.fillna(0)
+    expr = alltypes.double_col.fillna(0).name('tmp')
     result = expr.execute()
     expected = df.double_col.fillna(0)
     expected.name = 'tmp'
@@ -341,7 +328,8 @@ def test_numeric_builtins_work(alltypes, df):
     ],
 )
 def test_ifelse(alltypes, df, func, expected_func):
-    result = func(alltypes).execute()
+    expr = func(alltypes).name('tmp')
+    result = expr.execute()
     expected = expected_func(df)
     tm.assert_series_equal(result, expected)
 
@@ -352,24 +340,18 @@ def test_ifelse(alltypes, df, func, expected_func):
         # tier and histogram
         (
             lambda d: d.bucket([0, 10, 25, 50, 100]),
-            lambda s: pd.cut(
-                s, [0, 10, 25, 50, 100], right=False, labels=False
-            ),
+            lambda s: pd.cut(s, [0, 10, 25, 50, 100], right=False, labels=False),
         ),
         (
             lambda d: d.bucket([0, 10, 25, 50], include_over=True),
-            lambda s: pd.cut(
-                s, [0, 10, 25, 50, np.inf], right=False, labels=False
-            ),
+            lambda s: pd.cut(s, [0, 10, 25, 50, np.inf], right=False, labels=False),
         ),
         (
             lambda d: d.bucket([0, 10, 25, 50], close_extreme=False),
             lambda s: pd.cut(s, [0, 10, 25, 50], right=False, labels=False),
         ),
         (
-            lambda d: d.bucket(
-                [0, 10, 25, 50], closed='right', close_extreme=False
-            ),
+            lambda d: d.bucket([0, 10, 25, 50], closed='right', close_extreme=False),
             lambda s: pd.cut(
                 s,
                 [0, 10, 25, 50],
@@ -380,9 +362,7 @@ def test_ifelse(alltypes, df, func, expected_func):
         ),
         (
             lambda d: d.bucket([10, 25, 50, 100], include_under=True),
-            lambda s: pd.cut(
-                s, [0, 10, 25, 50, 100], right=False, labels=False
-            ),
+            lambda s: pd.cut(s, [0, 10, 25, 50, 100], right=False, labels=False),
         ),
     ],
 )
@@ -419,7 +399,7 @@ def test_union(alltypes):
     expr = (
         t.group_by('string_col')
         .aggregate(t.double_col.sum().name('foo'))
-        .sort_by('string_col')
+        .order_by('string_col')
     )
 
     t1 = expr.limit(4)
@@ -556,7 +536,7 @@ def test_interactive_repr_shows_error(alltypes):
     # #591. Doing this in SQLite because so many built-in functions are not
     # available
 
-    expr = alltypes.double_col.approx_nunique()
+    expr = alltypes.double_col.approx_median()
 
     with config.option_context('interactive', True):
         result = repr(expr)
@@ -566,12 +546,7 @@ def test_interactive_repr_shows_error(alltypes):
 def test_subquery(alltypes, df):
     t = alltypes
 
-    expr = (
-        t.mutate(d=t.double_col.fillna(0))
-        .limit(1000)
-        .group_by('string_col')
-        .size()
-    )
+    expr = t.mutate(d=t.double_col.fillna(0)).limit(1000).group_by('string_col').size()
     result = expr.execute()
     expected = (
         df.assign(d=df.double_col.fillna(0))
@@ -591,27 +566,52 @@ def test_filter(alltypes, df):
     assert len(result) == len(expected)
 
 
-@pytest.mark.parametrize(
-    'column', [lambda t: 'float_col', lambda t: t['float_col']]
-)
+@pytest.mark.parametrize('column', [lambda t: 'float_col', lambda t: t['float_col']])
 def test_column_access_after_sort(alltypes, df, column):
-    expr = alltypes.sort_by(column(alltypes)).head(10).string_col
+    expr = alltypes.order_by(column(alltypes)).head(10).string_col
     result = expr.execute()
-    expected = (
-        df.sort_values('float_col').string_col.head(10).reset_index(drop=True)
-    )
+    expected = df.sort_values('float_col').string_col.head(10).reset_index(drop=True)
     tm.assert_series_equal(result, expected)
 
 
-def test_simple_join(con):
-    con.raw_sql('CREATE TABLE mj1 (id1 INTEGER, val1 REAL)')
-    con.raw_sql('INSERT INTO mj1 VALUES (1, 10), (2, 20)')
-    con.raw_sql('CREATE TABLE mj2 (id2 INTEGER, val2 REAL)')
-    con.raw_sql('INSERT INTO mj2 VALUES (1, 15), (2, 25)')
+@pytest.fixture
+def mj1(con):
+    con.create_table(
+        "mj1",
+        schema=ibis.schema(dict(id1="int32", val1="float64")),
+        force=True,
+    )
+    try:
+        con.insert(
+            "mj1",
+            pd.DataFrame(dict(id1=[1, 2], val1=[10, 20])),
+            overwrite=True,
+        )
+        yield con.table("mj1")
+    finally:
+        con.drop_table("mj1", force=True)
 
-    t1 = con.table('mj1', database="main")
-    t2 = con.table('mj2', database="main")
-    joined = t1.join(t2, t1.id1 == t2.id2)
+
+@pytest.fixture
+def mj2(con):
+    con.create_table(
+        "mj2",
+        schema=ibis.schema(dict(id2="int32", val2="float64")),
+        force=True,
+    )
+    try:
+        con.insert(
+            "mj2",
+            pd.DataFrame(dict(id2=[1, 2], val2=[15, 25])),
+            overwrite=True,
+        )
+        yield con.table("mj2")
+    finally:
+        con.drop_table("mj2", force=True)
+
+
+def test_simple_join(con, mj1, mj2):
+    joined = mj1.join(mj2, mj1.id1 == mj2.id2)
     result = joined.val2.execute()
     assert len(result) == 2
 
@@ -712,30 +712,18 @@ def test_compile_with_one_unnamed_table():
     assert str(result) == str(expected)
 
 
-@pytest.mark.parametrize(
-    ('attr', 'expected'),
-    [
-        (operator.methodcaller('year'), {2009, 2010}),
-        (operator.methodcaller('month'), set(range(1, 13))),
-        (operator.methodcaller('day'), set(range(1, 32))),
-    ],
-)
-def test_date_extract_field(alltypes, attr, expected):
-    t = alltypes
-    expr = attr(t.timestamp_col.cast('date')).distinct()
-    result = expr.execute().astype(int)
-    assert set(result) == expected
-
-
 def test_scalar_parameter(alltypes):
+    start_string, end_string = '2009-03-01', '2010-07-03'
+
     start = ibis.param(dt.date)
     end = ibis.param(dt.date)
     t = alltypes
     col = t.date_string_col.cast('date')
-    expr = col.between(start, end)
-    start_string, end_string = '2009-03-01', '2010-07-03'
+    expr = col.between(start, end).name('result')
     result = expr.execute(params={start: start_string, end: end_string})
-    expected = col.between(start_string, end_string).execute()
+
+    expected_expr = col.between(start_string, end_string).name('result')
+    expected = expected_expr.execute()
     tm.assert_series_equal(result, expected)
 
 
@@ -743,13 +731,13 @@ def test_compile_twice(dbpath):
     con1 = ibis.sqlite.connect(dbpath)
     t1 = con1.table('batting')
     sort_key1 = ibis.desc(t1.playerID)
-    sorted_table1 = t1.sort_by(sort_key1)
+    sorted_table1 = t1.order_by(sort_key1)
     expr1 = sorted_table1.count()
 
     con2 = ibis.sqlite.connect(dbpath)
     t2 = con2.table('batting')
     sort_key2 = ibis.desc(t2.playerID)
-    sorted_table2 = t2.sort_by(sort_key2)
+    sorted_table2 = t2.order_by(sort_key2)
     expr2 = sorted_table2.count()
 
     result1 = str(expr1.compile())
@@ -761,12 +749,8 @@ def test_compile_twice(dbpath):
 def test_count_on_order_by(con):
     t = con.table("batting")
     sort_key = ibis.desc(t.playerID)
-    sorted_table = t.sort_by(sort_key)
+    sorted_table = t.order_by(sort_key)
     expr = sorted_table.count()
-    result = str(
-        expr.compile().compile(compile_kwargs={'literal_binds': True})
-    )
-    expected = (
-        'SELECT count(\'*\') AS count \n' 'FROM base.batting AS t0'
-    )  # noqa: W291
+    result = str(expr.compile().compile(compile_kwargs={'literal_binds': True}))
+    expected = "SELECT count(*) AS count \nFROM main.batting AS t0"
     assert result == expected

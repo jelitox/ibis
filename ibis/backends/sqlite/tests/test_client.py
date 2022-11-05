@@ -1,4 +1,3 @@
-import os
 import uuid
 
 import numpy as np
@@ -8,27 +7,13 @@ import pytest
 import ibis
 import ibis.config as config
 import ibis.expr.types as ir
-from ibis.backends.sqlite import Backend
-from ibis.util import guid
 
-
-def test_file_not_exist_and_create():
-    path = f'__ibis_tmp_{guid()}.db'
-
-    with pytest.raises(FileNotFoundError):
-        ibis.sqlite.connect(path)
-
-    con = ibis.sqlite.connect(path, create=True)
-    try:
-        assert os.path.exists(path)
-    finally:
-        con.con.dispose()
-        os.remove(path)
+pytest.importorskip("sqlalchemy")
 
 
 def test_table(con):
     table = con.table('functional_alltypes')
-    assert isinstance(table, ir.TableExpr)
+    assert isinstance(table, ir.Table)
 
 
 def test_column_execute(alltypes, df):
@@ -57,7 +42,7 @@ def test_list_tables(con):
 
 
 def test_attach_file(dbpath):
-    client = Backend().connect(None)
+    client = ibis.sqlite.connect(None)
 
     client.attach('foo', dbpath)
     client.attach('bar', dbpath)
@@ -74,9 +59,8 @@ def test_compile_toplevel():
     # it works!
     expr = t.foo.sum()
     result = ibis.sqlite.compile(expr)
-    expected = """\
-SELECT sum(t0.foo) AS sum 
-FROM t0 AS t0"""  # noqa
+    expected = "SELECT sum(t0.foo) AS sum \nFROM t0 AS t0"  # noqa: W291
+
     assert str(result) == expected
 
 
@@ -99,10 +83,7 @@ def test_verbose_log_queries(con):
 
     assert len(queries) == 1
     (query,) = queries
-    expected = 'SELECT t0.year \n'
-    expected += 'FROM base.functional_alltypes AS t0\n'
-    expected += ' LIMIT ? OFFSET ?'
-    assert query == expected
+    assert "SELECT t0.year" in query
 
 
 def test_table_equality(dbpath):

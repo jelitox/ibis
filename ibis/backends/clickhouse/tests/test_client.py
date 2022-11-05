@@ -2,9 +2,13 @@ import pandas as pd
 import pandas.testing as tm
 import pytest
 
+import ibis
 import ibis.config as config
+import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
 from ibis import util
+
+pytest.importorskip("clickhouse_driver")
 
 
 def test_run_sql(con):
@@ -12,7 +16,7 @@ def test_run_sql(con):
     table = con.sql(query)
 
     fa = con.table('functional_alltypes')
-    assert isinstance(table, ir.TableExpr)
+    assert isinstance(table, ir.Table)
     assert table.schema() == fa.schema()
 
     expr = table.limit(10)
@@ -29,7 +33,7 @@ def test_get_schema(con):
 def test_result_as_dataframe(con, alltypes):
     expr = alltypes.limit(10)
 
-    ex_names = expr.schema().names
+    ex_names = list(expr.schema().names)
     result = con.execute(expr)
 
     assert isinstance(result, pd.DataFrame)
@@ -63,7 +67,7 @@ def test_verbose_log_queries(con):
         with config.option_context('verbose_log', logger):
             con.table('functional_alltypes')
 
-    expected = 'DESC ibis_testing.`functional_alltypes`'
+    expected = 'DESCRIBE ibis_testing.`functional_alltypes`'
 
     assert len(queries) == 1
     assert queries[0] == expected
@@ -74,23 +78,23 @@ def test_sql_query_limits(alltypes):
     with config.option_context('sql.default_limit', 100000):
         # table has 25 rows
         assert len(table.execute()) == 7300
-        # comply with limit arg for TableExpr
+        # comply with limit arg for Table
         assert len(table.execute(limit=10)) == 10
         # state hasn't changed
         assert len(table.execute()) == 7300
-        # non-TableExpr ignores default_limit
+        # non-Table ignores default_limit
         assert table.count().execute() == 7300
-        # non-TableExpr doesn't observe limit arg
+        # non-Table doesn't observe limit arg
         assert table.count().execute(limit=10) == 7300
     with config.option_context('sql.default_limit', 20):
-        # TableExpr observes default limit setting
+        # Table observes default limit setting
         assert len(table.execute()) == 20
         # explicit limit= overrides default
         assert len(table.execute(limit=15)) == 15
         assert len(table.execute(limit=23)) == 23
-        # non-TableExpr ignores default_limit
+        # non-Table ignores default_limit
         assert table.count().execute() == 7300
-        # non-TableExpr doesn't observe limit arg
+        # non-Table doesn't observe limit arg
         assert table.count().execute(limit=10) == 7300
     # eliminating default_limit doesn't break anything
     with config.option_context('sql.default_limit', None):
@@ -118,7 +122,7 @@ def temporary_alltypes(con):
         con.raw_sql(f"DROP TABLE temporary_alltypes_{id}")
 
 
-def test_insert(con, temporary_alltypes, alltypes, df):
+def test_insert(temporary_alltypes, df):
     temporary = temporary_alltypes
     records = df[:10]
 
@@ -128,7 +132,7 @@ def test_insert(con, temporary_alltypes, alltypes, df):
     tm.assert_frame_equal(temporary.execute(), records)
 
 
-def test_insert_with_less_columns(con, temporary_alltypes, alltypes, df):
+def test_insert_with_less_columns(temporary_alltypes, df):
     temporary = temporary_alltypes
     records = df.loc[:10, ['string_col']].copy()
     records['date_col'] = None
@@ -137,10 +141,45 @@ def test_insert_with_less_columns(con, temporary_alltypes, alltypes, df):
         temporary.insert(records)
 
 
-def test_insert_with_more_columns(con, temporary_alltypes, alltypes, df):
+def test_insert_with_more_columns(temporary_alltypes, df):
     temporary = temporary_alltypes
     records = df[:10].copy()
     records['non_existing_column'] = 'raise on me'
 
     with pytest.raises(AssertionError):
         temporary.insert(records)
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_schema"),
+    [
+        (
+            "SELECT 1 as a, 2 + dummy as b",
+            ibis.schema(dict(a=dt.UInt8(nullable=False), b=dt.UInt16(nullable=False))),
+        ),
+        (
+            "SELECT string_col, sum(double_col) as b FROM functional_alltypes GROUP BY string_col",  # noqa: E501
+            ibis.schema(
+                dict(
+                    string_col=dt.String(nullable=True),
+                    b=dt.Float64(nullable=True),
+                )
+            ),
+        ),
+    ],
+)
+def test_get_schema_using_query(con, query, expected_schema):
+    result = con._get_schema_using_query(query)
+    assert result == expected_schema
+
+
+def test_list_tables_empty(con, worker_id):
+    dbname = f"tmpdb_{worker_id}"
+    db = con.current_database
+    con.raw_sql(f"CREATE DATABASE IF NOT EXISTS {dbname}")
+    try:
+        con.raw_sql(f"USE {dbname}")
+        assert not con.list_tables()
+    finally:
+        con.raw_sql(f"USE {db}")
+        con.raw_sql(f"DROP DATABASE IF EXISTS {dbname}")

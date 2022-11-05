@@ -10,6 +10,8 @@ import ibis
 import ibis.expr.datatypes as dt
 from ibis import literal as L
 
+pytest.importorskip("clickhouse_driver")
+
 
 @pytest.mark.parametrize(
     ('left', 'right', 'type'),
@@ -49,27 +51,6 @@ def test_string_temporal_compare(con, op, left, right, type):
 
 
 @pytest.mark.parametrize(
-    ('func', 'left', 'right', 'expected'),
-    [
-        (operator.add, L(3), L(4), 7),
-        (operator.sub, L(3), L(4), -1),
-        (operator.mul, L(3), L(4), 12),
-        (operator.truediv, L(12), L(4), 3),
-        (operator.pow, L(12), L(2), 144),
-        (operator.mod, L(12), L(5), 2),
-        (operator.truediv, L(7), L(2), 3.5),
-        (operator.floordiv, L(7), L(2), 3),
-        (lambda x, y: x.floordiv(y), L(7), 2, 3),
-        (lambda x, y: x.rfloordiv(y), L(2), 7, 3),
-    ],
-)
-def test_binary_arithmetic(con, func, left, right, expected):
-    expr = func(left, right)
-    result = con.execute(expr)
-    assert result == expected
-
-
-@pytest.mark.parametrize(
     ('op', 'expected'),
     [
         (lambda a, b: a + b, '`int_col` + `tinyint_col`'),
@@ -88,7 +69,7 @@ def test_binary_arithmetic(con, func, left, right, expected):
 def test_binary_infix_operators(con, alltypes, translate, op, expected):
     a, b = alltypes.int_col, alltypes.tinyint_col
     expr = op(a, b)
-    assert translate(expr) == expected
+    assert translate(expr.op()) == expected
     assert len(con.execute(expr))
 
 
@@ -118,13 +99,13 @@ def test_binary_infix_parenthesization(con, alltypes, translate, op, expected):
     c = alltypes.double_col
 
     expr = op(a, b, c)
-    assert translate(expr) == expected
+    assert translate(expr.op()) == expected
     assert len(con.execute(expr))
 
 
 def test_between(con, alltypes, translate):
     expr = alltypes.int_col.between(0, 10)
-    assert translate(expr) == '`int_col` BETWEEN 0 AND 10'
+    assert translate(expr.op()) == '`int_col` BETWEEN 0 AND 10'
     assert len(con.execute(expr))
 
 
@@ -167,11 +148,11 @@ def test_field_in_literals(con, alltypes, translate, container):
     expected = tuple(values)
 
     expr = alltypes.string_col.isin(foobar)
-    assert translate(expr) == f"`string_col` IN {expected}"
+    assert translate(expr.op()) == f"`string_col` IN {expected}"
     assert len(con.execute(expr))
 
     expr = alltypes.string_col.notin(foobar)
-    assert translate(expr) == f"`string_col` NOT IN {expected}"
+    assert translate(expr.op()) == f"`string_col` NOT IN {expected}"
     assert len(con.execute(expr))
 
 
@@ -179,7 +160,7 @@ def test_field_in_literals(con, alltypes, translate, container):
 def test_negate(con, alltypes, translate, column):
     # clickhouse represent boolean as UInt8
     expr = -getattr(alltypes, column)
-    assert translate(expr) == f'-`{column}`'
+    assert translate(expr.op()) == f'-`{column}`'
     assert len(con.execute(expr))
 
 
@@ -214,16 +195,12 @@ def test_negate_literal(con):
     [
         (
             lambda t: (t.double_col > 20).ifelse(10, -20),
-            lambda df: pd.Series(
-                np.where(df.double_col > 20, 10, -20), dtype='int8'
-            ),
+            lambda df: pd.Series(np.where(df.double_col > 20, 10, -20), dtype='int8'),
         ),
         (
             lambda t: (t.double_col > 20).ifelse(10, -20).abs(),
             lambda df: (
-                pd.Series(np.where(df.double_col > 20, 10, -20))
-                .abs()
-                .astype('int8')
+                pd.Series(np.where(df.double_col > 20, 10, -20)).abs().astype('int8')
             ),
         ),
     ],
@@ -240,11 +217,7 @@ def test_ifelse(alltypes, df, op, pandas_op, translate):
 def test_simple_case(con, alltypes, translate):
     t = alltypes
     expr = (
-        t.string_col.case()
-        .when('foo', 'bar')
-        .when('baz', 'qux')
-        .else_('default')
-        .end()
+        t.string_col.case().when('foo', 'bar').when('baz', 'qux').else_('default').end()
     )
 
     expected = """CASE `string_col`
@@ -252,7 +225,7 @@ def test_simple_case(con, alltypes, translate):
   WHEN 'baz' THEN 'qux'
   ELSE 'default'
 END"""
-    assert translate(expr) == expected
+    assert translate(expr.op()) == expected
     assert len(con.execute(expr))
 
 
@@ -271,7 +244,7 @@ def test_search_case(con, alltypes, translate):
   WHEN `float_col` < 0 THEN `int_col`
   ELSE 0
 END"""
-    assert translate(expr) == expected
+    assert translate(expr.op()) == expected
     assert len(con.execute(expr))
 
 
@@ -310,10 +283,10 @@ def test_array_index(con, arr, ids):
     ],
 )
 def test_array_concat(con, arrays):
-    expr = L([]).cast(dt.Array(dt.int8))
+    expr = L([]).cast("!array<int8>")
     expected = sum(arrays, [])
     for arr in arrays:
-        expr += L(arr)
+        expr += L(arr, type="!array<int8>")
 
     assert con.execute(expr) == expected
 

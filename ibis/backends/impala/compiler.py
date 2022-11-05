@@ -1,13 +1,6 @@
 import ibis.expr.operations as ops
-from ibis.backends.base.sql.compiler import (
-    Compiler,
-    ExprTranslator,
-    TableSetFormatter,
-)
-from ibis.backends.base.sql.registry import (
-    binary_infix_ops,
-    operation_registry,
-)
+from ibis.backends.base.sql.compiler import Compiler, ExprTranslator, TableSetFormatter
+from ibis.backends.base.sql.registry import binary_infix_ops, operation_registry
 
 
 class ImpalaTableSetFormatter(TableSetFormatter):
@@ -29,9 +22,8 @@ rewrites = ImpalaExprTranslator.rewrites
 
 
 @rewrites(ops.FloorDivide)
-def _floor_divide(expr):
-    left, right = expr.op().args
-    return left.div(right).floor()
+def _floor_divide(op):
+    return ops.Floor(ops.Divide(op.left, op.right))
 
 
 class ImpalaCompiler(Compiler):

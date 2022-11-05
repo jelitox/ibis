@@ -1,4 +1,3 @@
-import concurrent.futures
 from posixpath import join as pjoin
 
 import pytest
@@ -9,8 +8,10 @@ import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
 import ibis.util as util
 from ibis.backends.base.sql.ddl import fully_qualified_re
-from ibis.backends.impala.compat import HS2Error
 from ibis.tests.util import assert_equal
+
+pytest.importorskip("impala")
+from ibis.backends.impala.compat import HS2Error  # noqa: E402
 
 
 def test_create_exists_view(con, temp_view):
@@ -36,6 +37,7 @@ def test_drop_non_empty_database(con, alltypes, temp_table_db):
         con.drop_database(temp_database)
 
 
+@pytest.mark.hdfs
 def test_create_database_with_location(con, tmp_dir, hdfs):
     base = pjoin(tmp_dir, util.guid())
     name = f'__ibis_test_{util.guid()}'
@@ -48,9 +50,10 @@ def test_create_database_with_location(con, tmp_dir, hdfs):
         try:
             con.drop_database(name)
         finally:
-            hdfs.rmdir(base)
+            hdfs.rm(base, recursive=True)
 
 
+@pytest.mark.hdfs
 def test_create_table_with_location_execute(
     con, hdfs, tmp_dir, alltypes, test_data_db, temp_table
 ):
@@ -61,9 +64,7 @@ def test_create_table_with_location_execute(
     expr = alltypes
     table_name = temp_table
 
-    con.create_table(
-        table_name, obj=expr, location=tmp_path, database=test_data_db
-    )
+    con.create_table(table_name, obj=expr, location=tmp_path, database=test_data_db)
     assert hdfs.exists(tmp_path)
 
 
@@ -175,9 +176,7 @@ def test_insert_validate_types(con, alltypes, test_data_db, temp_table):
     ]
     t.insert(to_insert.limit(10))
 
-    to_insert = expr[
-        expr.tinyint_col, expr.bigint_col.name('int_col'), expr.string_col
-    ]
+    to_insert = expr[expr.tinyint_col, expr.bigint_col.name('int_col'), expr.string_col]
 
     limit_expr = to_insert.limit(10)
     with pytest.raises(com.IbisError):
@@ -328,9 +327,7 @@ def test_create_table_reserved_identifier(con):
 def test_query_delimited_file_directory(con, test_data_dir, tmp_db):
     hdfs_path = pjoin(test_data_dir, 'csv')
 
-    schema = ibis.schema(
-        [('foo', 'string'), ('bar', 'double'), ('baz', 'int8')]
-    )
+    schema = ibis.schema([('foo', 'string'), ('bar', 'double'), ('baz', 'int8')])
     name = 'delimited_table_test1'
     table = con.delimited_file(
         hdfs_path, schema, name=name, database=tmp_db, delimiter=','
@@ -349,22 +346,51 @@ def test_query_delimited_file_directory(con, test_data_dir, tmp_db):
     assert expr.execute() is not None
 
 
+@pytest.fixture
+def temp_char_table(con):
+    name = "testing_varchar_support"
+    con.raw_sql(
+        f"""\
+CREATE TABLE IF NOT EXISTS {name} (
+  group1 VARCHAR(10),
+  group2 CHAR(10)
+)"""
+    )
+    try:
+        yield con.table(name)
+    finally:
+        try:
+            assert name in con.list_tables(), name
+        finally:
+            con.drop_table(name, force=True)
+
+
 def test_varchar_char_support(temp_char_table):
     assert isinstance(temp_char_table['group1'], ir.StringValue)
     assert isinstance(temp_char_table['group2'], ir.StringValue)
 
 
 def test_temp_table_concurrency(con, test_data_dir):
-    def limit_10(i, hdfs_path):
-        t = con.parquet_file(hdfs_path)
-        return t.sort_by(t.r_regionkey).limit(1, offset=i).execute()
+    import concurrent.futures
+    import multiprocessing
 
-    nthreads = 4
+    def limit(con, hdfs_path, offset):
+        t = con.parquet_file(hdfs_path)
+        return t.order_by(t.r_regionkey).limit(1, offset=offset).execute()
+
+    nthreads = multiprocessing.cpu_count()
     hdfs_path = pjoin(test_data_dir, 'parquet/tpch_region')
 
+    num_rows = int(con.parquet_file(hdfs_path).count().execute())
     with concurrent.futures.ThreadPoolExecutor(max_workers=nthreads) as e:
-        futures = [e.submit(limit_10, i, hdfs_path) for i in range(nthreads)]
-    assert all(len(future.result()) for future in futures)
+        futures = [
+            e.submit(limit, con, hdfs_path, offset=offset % (num_rows - 1) + 1)
+            for offset in range(nthreads)
+        ]
+        results = [
+            future.result() for future in concurrent.futures.as_completed(futures)
+        ]
+    assert all(map(len, results))
 
 
 def test_access_kudu_table(kudu_table):

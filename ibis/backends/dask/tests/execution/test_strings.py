@@ -1,8 +1,10 @@
 from warnings import catch_warnings
 
 import pytest
-from dask.dataframe.utils import tm  # noqa: E402
 from pytest import param
+
+dd = pytest.importorskip("dask.dataframe")
+from dask.dataframe.utils import tm  # noqa: E402
 
 
 @pytest.mark.parametrize(
@@ -79,8 +81,7 @@ from pytest import param
         param(
             lambda s: s.re_search('(ab)+') | s.re_search('d{1,2}ee'),
             lambda s: (
-                s.str.contains('(ab)+', regex=True)
-                | s.str.contains('d{1,2}ee')
+                s.str.contains('(ab)+', regex=True) | s.str.contains('d{1,2}ee')
             ),
             id='re_search_or',
         ),
@@ -98,7 +99,6 @@ from pytest import param
     ],
 )
 def test_string_ops(t, df, case_func, expected_func):
-
     # ignore matching UserWarnings
     with catch_warnings(record=True):
         expr = case_func(t.strings_with_space)
@@ -108,16 +108,14 @@ def test_string_ops(t, df, case_func, expected_func):
 
 
 def test_grouped_string_re_search(t, df):
-    expr = t.groupby(t.dup_strings).aggregate(
+    expr = t.group_by(t.dup_strings).aggregate(
         sum=t.strings_with_space.re_search('(ab)+').cast('int64').sum()
     )
 
     result = expr.compile()
     expected = (
         df.groupby('dup_strings')
-        .strings_with_space.apply(
-            lambda s: s.str.contains('(ab)+', regex=True).sum()
-        )
+        .strings_with_space.apply(lambda s: s.str.contains('(ab)+', regex=True).sum())
         .reset_index()
         .rename(columns={'strings_with_space': 'sum'})
     )

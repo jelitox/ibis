@@ -3,10 +3,10 @@ import logging
 import traceback
 from datetime import datetime
 
-from ibis.config import get_option, set_option
+import ibis
+from ibis.backends.pandas.dispatcher import TwoLevelDispatcher
+from ibis.config import options
 from ibis.expr import types as ir
-
-from .dispatcher import TwoLevelDispatcher
 
 """Module that adds tracing to pandas execution.
 
@@ -79,13 +79,14 @@ _logger = logging.getLogger('ibis.backends.pandas.trace')
 
 # A list of funcs that is traced
 _trace_funcs = set()
-_trace_root = "main_execute"
-_TRACE_CONFIG = 'pandas.enable_trace'
 
 
 def enable():
     """Enable tracing."""
-    set_option(_TRACE_CONFIG, True)
+    if options.pandas is None:
+        # pandas options haven't been registered yet - force module __getattr__
+        ibis.pandas
+    options.pandas.enable_trace = True
     logging.getLogger('ibis.backends.pandas.trace').setLevel(logging.DEBUG)
 
 
@@ -118,8 +119,7 @@ def _log_trace(func, start=None):
 
 def trace(func):
     """Return a function decorator that wraped the decorated function with
-    tracing.
-    """
+    tracing."""
     _trace_funcs.add(func.__name__)
 
     @functools.wraps(func)
@@ -132,9 +132,7 @@ def trace(func):
 
         ibis.pandas
 
-        trace_enabled = get_option(_TRACE_CONFIG)
-
-        if not trace_enabled:
+        if not options.pandas.enable_trace:
             return func(*args, **kwargs)
         else:
             start = datetime.now()

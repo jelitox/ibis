@@ -1,15 +1,11 @@
 import numpy as np
 import pandas as pd
 import pandas.testing as tm
-import pyspark
 import pytest
 
 import ibis
 
-if pyspark.__version__ < '3.0.0':
-    null_representation = None
-else:
-    null_representation = np.nan
+pytest.importorskip("pyspark")
 
 
 def test_array_length(client):
@@ -18,9 +14,7 @@ def test_array_length(client):
     result = table.mutate(length=table.array_int.length()).compile()
 
     expected = table.compile().toPandas()
-    expected['length'] = (
-        expected['array_int'].map(lambda a: len(a)).astype('int32')
-    )
+    expected['length'] = expected['array_int'].map(lambda a: len(a)).astype('int32')
     tm.assert_frame_equal(result.toPandas(), expected)
 
 
@@ -92,9 +86,7 @@ def test_array_index(client, index):
     expected = pd.DataFrame(
         {
             'indexed': df.array_int.apply(
-                lambda x: x[index]
-                if -len(x) <= index < len(x)
-                else null_representation
+                lambda x: x[index] if -len(x) <= index < len(x) else np.nan
             )
         }
     )
@@ -107,9 +99,7 @@ def test_array_index_scalar(client, index):
     value = ibis.literal(raw_value)
     expr = value[index]
     result = client.execute(expr)
-    expected = (
-        raw_value[index] if index < len(raw_value) else null_representation
-    )
+    expected = raw_value[index] if index < len(raw_value) else np.nan
     assert result == expected or (np.isnan(result) and np.isnan(expected))
 
 
@@ -118,13 +108,13 @@ def test_array_concat(client, op):
     table = client.table('array_table')
     x = table.array_int.cast('array<string>')
     y = table.array_str
-    expr = op(x, y)
+    expr = op(x, y).name('array_result')
     result = expr.execute()
 
     df = table.compile().toPandas()
-    expected = op(
-        df.array_int.apply(lambda x: list(map(str, x))), df.array_str
-    ).rename('tmp')
+    expected = op(df.array_int.apply(lambda x: list(map(str, x))), df.array_str).rename(
+        'array_result'
+    )
     tm.assert_series_equal(result, expected)
 
 
@@ -165,9 +155,7 @@ def test_array_repeat_scalar(client, n, mul):
 
 def test_array_collect(client):
     table = client.table('array_table')
-    expr = table.group_by(table.key).aggregate(
-        collected=table.array_int.collect()
-    )
+    expr = table.group_by(table.key).aggregate(collected=table.array_int.collect())
     result = expr.execute().sort_values('key').reset_index(drop=True)
 
     df = table.compile().toPandas()

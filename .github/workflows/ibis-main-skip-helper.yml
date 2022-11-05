@@ -6,20 +6,19 @@ on:
   push:
     paths:
       - "docs/**"
+      - "mkdocs.yml"
     branches:
       - master
+      - "*.x.x"
   pull_request:
     paths:
       - "docs/**"
+      - "mkdocs.yml"
     branches:
       - master
+      - "*.x.x"
 jobs:
   nix-lint:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "No build required"
-  benchmarks:
-    name: Benchmarks
     runs-on: ubuntu-latest
     steps:
       - run: echo "No build required"

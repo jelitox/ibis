@@ -1,10 +1,8 @@
-import threading
 import time
 import traceback
-import weakref
-from collections import deque
 
 import pandas as pd
+import sqlalchemy as sa
 
 import ibis.common.exceptions as com
 import ibis.expr.schema as sch
@@ -18,16 +16,15 @@ from ibis.backends.base.sql.ddl import (
     RenameTable,
     fully_qualified_re,
 )
-
-from . import ddl
-from .compat import HS2Error, impyla
+from ibis.backends.impala import ddl
+from ibis.backends.impala.compat import HS2Error, impyla
 
 
 class ImpalaDatabase(Database):
     def create_table(self, table_name, obj=None, **kwargs):
-        """
-        Dispatch to ImpalaClient.create_table. See that function's docstring
-        for more
+        """Dispatch to ImpalaClient.create_table.
+
+        See that function's docstring for more
         """
         return self.client.create_table(
             table_name, obj=obj, database=self.name, **kwargs
@@ -41,140 +38,99 @@ class ImpalaDatabase(Database):
 
 
 class ImpalaConnection:
-
-    """
-    Database connection wrapper
-    """
+    """Database connection wrapper."""
 
     def __init__(self, pool_size=8, database='default', **params):
         self.params = params
         self.database = database
-
-        self.lock = threading.Lock()
-
         self.options = {}
+        self.pool = sa.pool.QueuePool(
+            self._new_cursor,
+            pool_size=pool_size,
+            # disable invoking rollback, because any transactions in impala are
+            # automatic:
+            # https://impala.apache.org/docs/build/html/topics/impala_transactions.html
+            reset_on_return=False,
+        )
 
-        self.max_pool_size = pool_size
-        self._connections = weakref.WeakSet()
-
-        self.connection_pool = deque(maxlen=pool_size)
-        with self.lock:
-            self.connection_pool_size = 0
+        @sa.event.listens_for(self.pool, "checkout")
+        def _(dbapi_connection, *_):
+            """Update `dbapi_connection` options if they don't match `self`."""
+            if (options := self.options) != dbapi_connection.options:
+                dbapi_connection.options = options.copy()
+                dbapi_connection.set_options()
 
     def set_options(self, options):
         self.options.update(options)
 
     def close(self):
-        """
-        Close all open Impyla sessions
-        """
-        for impyla_connection in self._connections:
-            impyla_connection.close()
-
-        self._connections.clear()
-        self.connection_pool.clear()
+        """Close all idle Impyla connections."""
+        self.pool.dispose()
 
     def set_database(self, name):
         self.database = name
 
     def disable_codegen(self, disabled=True):
-        key = 'DISABLE_CODEGEN'
-        if disabled:
-            self.options[key] = '1'
-        elif key in self.options:
-            del self.options[key]
+        self.options["DISABLE_CODEGEN"] = str(int(disabled))
 
     def execute(self, query):
         if isinstance(query, (DDL, DML)):
             query = query.compile()
 
-        cursor = self._get_cursor()
         util.log(query)
 
+        cursor = self.pool.connect()
         try:
             cursor.execute(query)
         except Exception:
-            cursor.release()
-            util.log(
-                'Exception caused by {}: {}'.format(
-                    query, traceback.format_exc()
-                )
-            )
+            cursor.close()
+            util.log(f'Exception caused by {query}: {traceback.format_exc()}')
             raise
 
         return cursor
 
     def fetchall(self, query):
-        with self.execute(query) as cur:
-            results = cur.fetchall()
-        return results
-
-    def _get_cursor(self):
+        cur = self.execute(query)
         try:
-            cursor = self.connection_pool.popleft()
-        except IndexError:  # deque is empty
-            with self.lock:
-                # NB: Do not put a lock around the entire if statement.
-                # This will cause a deadlock because _new_cursor calls the
-                # ImpalaCursor constructor which takes a lock to increment the
-                # connection pool size.
-                connection_pool_size = self.connection_pool_size
-            if connection_pool_size < self.max_pool_size:
-                return self._new_cursor()
-            raise com.InternalError('Too many concurrent / hung queries')
-        else:
-            if (
-                cursor.database != self.database
-                or cursor.options != self.options
-            ):
-                return self._new_cursor()
-            cursor.released = False
-            return cursor
+            results = cur.fetchall()
+        finally:
+            cur.close()
+        return results
 
     def _new_cursor(self):
         params = self.params.copy()
         con = impyla.connect(database=self.database, **params)
 
-        self._connections.add(con)
-
         # make sure the connection works
         cursor = con.cursor(user=params.get('user'), convert_types=True)
         cursor.ping()
 
-        wrapper = ImpalaCursor(
-            cursor, self, con, self.database, self.options.copy()
-        )
+        wrapper = ImpalaCursor(cursor, con, self.database, self.options.copy())
         wrapper.set_options()
         return wrapper
 
-    def ping(self):
-        self._get_cursor()._cursor.ping()
+    @util.deprecated(instead="", version="4.0")
+    def ping(self):  # pragma: no cover
+        self.pool.connect()._cursor.ping()
 
-    def release(self, cur):
-        self.connection_pool.append(cur)
+    def release(self, cur):  # pragma: no cover
+        pass
 
 
 class ImpalaCursor:
-    def __init__(self, cursor, con, impyla_con, database, options):
+    def __init__(self, cursor, impyla_con, database, options):
         self._cursor = cursor
-        self.con = con
         self.impyla_con = impyla_con
         self.database = database
         self.options = options
-        self.released = False
-        with self.con.lock:
-            self.con.connection_pool_size += 1
 
     def __del__(self):
         try:
-            self._close_cursor()
+            self.close()
         except Exception:
             pass
 
-        with self.con.lock:
-            self.con.connection_pool_size -= 1
-
-    def _close_cursor(self):
+    def close(self):
         try:
             self._cursor.close()
         except HS2Error as e:
@@ -189,12 +145,6 @@ class ImpalaCursor:
             else:
                 raise
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, type, value, tb):
-        self.release()
-
     def set_options(self):
         for k, v in self.options.items():
             query = f'SET {k} = {v!r}'
@@ -205,9 +155,7 @@ class ImpalaCursor:
         return self._cursor.description
 
     def release(self):
-        if not self.released:
-            self.con.release(self)
-            self.released = True
+        pass
 
     def execute(self, stmt):
         self._cursor.execute_async(stmt)
@@ -241,7 +189,7 @@ class ImpalaCursor:
                     break
                 time.sleep(_sleep_interval(loop_start))
         except KeyboardInterrupt:
-            print('Canceling query')
+            util.log('Canceling query')
             self.cancel()
             raise
 
@@ -264,8 +212,8 @@ class ImpalaCursor:
             return self._cursor.fetchall()
 
 
-class ImpalaTable(ir.TableExpr):
-    """A physical table in the Impala-Hive metastore"""
+class ImpalaTable(ir.Table):
+    """A physical table in the Impala-Hive metastore."""
 
     @property
     def _qualified_name(self):
@@ -283,9 +231,7 @@ class ImpalaTable(ir.TableExpr):
         m = fully_qualified_re.match(self._qualified_name)
         if not m:
             raise com.IbisError(
-                'Cannot determine database name from {}'.format(
-                    self._qualified_name
-                )
+                f'Cannot determine database name from {self._qualified_name}'
             )
         db, quoted, unquoted = m.groups()
         return db, quoted or unquoted
@@ -296,9 +242,7 @@ class ImpalaTable(ir.TableExpr):
 
     def compute_stats(self, incremental=False):
         """Invoke Impala COMPUTE STATS command on the table."""
-        return self._client.compute_stats(
-            self._qualified_name, incremental=incremental
-        )
+        return self._client.compute_stats(self._qualified_name, incremental=incremental)
 
     def invalidate_metadata(self):
         self._client.invalidate_metadata(self._qualified_name)
@@ -429,9 +373,7 @@ class ImpalaTable(ir.TableExpr):
         m = fully_qualified_re.match(new_name)
         if not m and database is None:
             database = self._database
-        statement = RenameTable(
-            self._qualified_name, new_name, new_database=database
-        )
+        statement = RenameTable(self._qualified_name, new_name, new_database=database)
         self._client.raw_sql(statement)
 
         op = self.op().change_name(statement.new_qualified_name)
@@ -535,9 +477,7 @@ class ImpalaTable(ir.TableExpr):
         part_schema = self.partition_schema()
 
         def _run_ddl(**kwds):
-            stmt = ddl.AlterPartition(
-                self._qualified_name, spec, part_schema, **kwds
-            )
+            stmt = ddl.AlterPartition(self._qualified_name, spec, part_schema, **kwds)
             return self._client.raw_sql(stmt)
 
         return self._alter_table_helper(

@@ -1,13 +1,16 @@
-import dask.dataframe as dd
+import re
+
 import numpy as np
 import pandas as pd
 import pytest
-from dask.dataframe.utils import tm
 from pytest import param
 
 import ibis
 
-from ..client import DaskTable
+dd = pytest.importorskip("dask.dataframe")
+from dask.dataframe.utils import tm  # noqa: E402
+
+from ibis.backends.dask.client import DaskTable  # noqa: E402
 
 
 def make_dask_data_frame(npartitions):
@@ -78,7 +81,7 @@ def test_read_with_undiscoverable_type(client):
 
 def test_drop(table):
     table = table.mutate(c=table.a)
-    expr = table.drop(['a'])
+    expr = table.drop('a')
     result = expr.execute()
     expected = table[['b', 'c']].execute()
     tm.assert_frame_equal(result, expected)
@@ -106,3 +109,30 @@ def test_datetime64_infer(client, unit):
     expr = ibis.literal(value, type='timestamp')
     result = client.execute(expr)
     assert result == value
+
+
+def test_invalid_connection_parameter_types(npartitions):
+    # Check that the user receives a TypeError with an informative message when
+    # passing invalid an connection parameter to the backend.
+    expected_msg = re.escape(
+        "Expected an instance of 'dask.dataframe.DataFrame' for 'invalid_str',"
+        " got an instance of 'str' instead."
+    )
+    with pytest.raises(TypeError, match=expected_msg):
+        ibis.dask.connect(
+            {
+                "valid_dask_df": dd.from_pandas(
+                    pd.DataFrame({'a': [1, 2, 3], 'b': list('abc')}),
+                    npartitions=npartitions,
+                ),
+                "valid_pandas_df": pd.DataFrame({'a': [1, 2, 3], 'b': list('abc')}),
+                "invalid_str": "file.csv",
+            }
+        )
+
+    expeced_msg = re.escape(
+        "Expected an instance of 'dask.dataframe.DataFrame' for 'df', "
+        "got an instance of 'str' instead."
+    )
+    with pytest.raises(TypeError, match=expeced_msg):
+        ibis.dask.from_dataframe("file.csv")

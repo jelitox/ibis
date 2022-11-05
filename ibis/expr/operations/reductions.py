@@ -1,54 +1,59 @@
-import functools
+from __future__ import annotations
 
 from public import public
 
-from .. import datatypes as dt
-from .. import rules as rlz
-from .. import types as ir
-from .core import ValueOp
+import ibis.expr.datatypes as dt
+import ibis.expr.rules as rlz
+from ibis.common.annotations import attribute
+from ibis.expr.operations.core import Value
+from ibis.expr.operations.generic import _Negatable
+from ibis.util import deprecated
 
 
 @public
-class Reduction(ValueOp):
-    _reduction = True
+class Reduction(Value):
+    output_shape = rlz.Shape.SCALAR
 
 
-class Filterable(ValueOp):
+class Filterable(Value):
     where = rlz.optional(rlz.boolean)
 
 
 @public
 class Count(Filterable, Reduction):
-    arg = rlz.one_of((rlz.column(rlz.any), rlz.table))
+    arg = rlz.column(rlz.any)
+    output_dtype = dt.int64
 
-    def output_type(self):
-        return functools.partial(ir.IntegerScalar, dtype=dt.int64)
+
+@public
+class CountStar(Filterable, Reduction):
+    arg = rlz.table
+    output_dtype = dt.int64
 
 
 @public
 class Arbitrary(Filterable, Reduction):
     arg = rlz.column(rlz.any)
     how = rlz.optional(rlz.isin({'first', 'last', 'heavy'}))
-    output_type = rlz.scalar_like('arg')
+    output_dtype = rlz.dtype_like('arg')
 
 
 @public
 class BitAnd(Filterable, Reduction):
     """Aggregate bitwise AND operation.
 
-    All elements in an integer column are ANDed together. This can be used
-    to determine which bit flags are set on all elements.
+    All elements in an integer column are ANDed together.
+
+    This can be used to determine which bit flags are set on all elements.
 
     Resources:
 
-    * `BigQuery BIT_AND
-      <https://cloud.google.com/bigquery/docs/reference/standard-sql/aggregate_functions#bit_and>`_
-    * `MySQL BIT_AND
-      <https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_bit-and>`_
-    """
+    * BigQuery [`BIT_AND`](https://cloud.google.com/bigquery/docs/reference/standard-sql/aggregate_functions#bit_and)
+    * MySQL [`BIT_AND`](https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_bit-and)
+    """  # noqa: E501
 
     arg = rlz.column(rlz.integer)
-    output_type = rlz.scalar_like('arg')
+    output_dtype = rlz.dtype_like('arg')
 
 
 @public
@@ -60,14 +65,12 @@ class BitOr(Filterable, Reduction):
 
     Resources:
 
-    * `BigQuery BIT_OR
-      <https://cloud.google.com/bigquery/docs/reference/standard-sql/aggregate_functions#bit_or>`_
-    * `MySQL BIT_OR
-      <https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_bit-or>`_
-    """
+    * BigQuery [`BIT_OR`](https://cloud.google.com/bigquery/docs/reference/standard-sql/aggregate_functions#bit_or)
+    * MySQL [`BIT_OR`](https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_bit-or)
+    """  # noqa: E501
 
     arg = rlz.column(rlz.integer)
-    output_type = rlz.scalar_like('arg')
+    output_dtype = rlz.dtype_like('arg')
 
 
 @public
@@ -79,62 +82,54 @@ class BitXor(Filterable, Reduction):
 
     Resources:
 
-    * `BigQuery BIT_XOR
-      <https://cloud.google.com/bigquery/docs/reference/standard-sql/aggregate_functions#bit_xor>`_
-    * `MySQL BIT_XOR
-      <https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_bit-xor>`_
-    """
+    * BigQuery [`BIT_XOR`](https://cloud.google.com/bigquery/docs/reference/standard-sql/aggregate_functions#bit_xor)
+    * MySQL [`BIT_XOR`](https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_bit-xor)
+    """  # noqa: E501
 
     arg = rlz.column(rlz.integer)
-    output_type = rlz.scalar_like('arg')
+    output_dtype = rlz.dtype_like('arg')
 
 
 @public
 class Sum(Filterable, Reduction):
     arg = rlz.column(rlz.numeric)
 
-    def output_type(self):
-        if isinstance(self.arg, ir.BooleanValue):
-            dtype = dt.int64
+    @attribute.default
+    def output_dtype(self):
+        if isinstance(self.arg.output_dtype, dt.Boolean):
+            return dt.int64
         else:
-            dtype = self.arg.type().largest
-        return dtype.scalar_type()
+            return self.arg.output_dtype.largest
 
 
 @public
 class Mean(Filterable, Reduction):
     arg = rlz.column(rlz.numeric)
 
-    def output_type(self):
-        if isinstance(self.arg, ir.DecimalValue):
-            dtype = self.arg.type()
+    @attribute.default
+    def output_dtype(self):
+        if isinstance(self.arg.output_dtype, dt.Boolean):
+            return dt.float64
         else:
-            dtype = dt.float64
-        return dtype.scalar_type()
+            return dt.higher_precedence(self.arg.output_dtype, dt.float64)
 
 
 @public
 class Quantile(Reduction):
     arg = rlz.any
     quantile = rlz.strict_numeric
-    interpolation = rlz.isin(
-        {'linear', 'lower', 'higher', 'midpoint', 'nearest'}
-    )
+    interpolation = rlz.isin({'linear', 'lower', 'higher', 'midpoint', 'nearest'})
 
-    def output_type(self):
-        return dt.float64.scalar_type()
+    output_dtype = dt.float64
 
 
 @public
 class MultiQuantile(Quantile):
     arg = rlz.any
     quantile = rlz.value(dt.Array(dt.float64))
-    interpolation = rlz.isin(
-        {'linear', 'lower', 'higher', 'midpoint', 'nearest'}
-    )
+    interpolation = rlz.isin({'linear', 'lower', 'higher', 'midpoint', 'nearest'})
 
-    def output_type(self):
-        return dt.Array(dt.float64).scalar_type()
+    output_dtype = dt.Array(dt.float64)
 
 
 @public
@@ -142,12 +137,12 @@ class VarianceBase(Filterable, Reduction):
     arg = rlz.column(rlz.numeric)
     how = rlz.isin({'sample', 'pop'})
 
-    def output_type(self):
-        if isinstance(self.arg, ir.DecimalValue):
-            dtype = self.arg.type().largest
+    @attribute.default
+    def output_dtype(self):
+        if isinstance(self.arg.output_dtype, dt.Decimal):
+            return self.arg.output_dtype.largest
         else:
-            dtype = dt.float64
-        return dtype.scalar_type()
+            return dt.float64
 
 
 @public
@@ -166,10 +161,9 @@ class Correlation(Filterable, Reduction):
 
     left = rlz.column(rlz.numeric)
     right = rlz.column(rlz.numeric)
-    how = rlz.isin({'sample', 'pop'})
+    how = rlz.optional(rlz.isin({'sample', 'pop'}), default='sample')
 
-    def output_type(self):
-        return dt.float64.scalar_type()
+    output_dtype = dt.float64
 
 
 @public
@@ -180,24 +174,43 @@ class Covariance(Filterable, Reduction):
     right = rlz.column(rlz.numeric)
     how = rlz.isin({'sample', 'pop'})
 
-    def output_type(self):
-        return dt.float64.scalar_type()
+    output_dtype = dt.float64
+
+
+@public
+class Mode(Filterable, Reduction):
+    arg = rlz.column(rlz.any)
+    output_dtype = rlz.dtype_like('arg')
 
 
 @public
 class Max(Filterable, Reduction):
     arg = rlz.column(rlz.any)
-    output_type = rlz.scalar_like('arg')
+    output_dtype = rlz.dtype_like('arg')
 
 
 @public
 class Min(Filterable, Reduction):
     arg = rlz.column(rlz.any)
-    output_type = rlz.scalar_like('arg')
+    output_dtype = rlz.dtype_like('arg')
 
 
 @public
-class HLLCardinality(Filterable, Reduction):
+class ArgMax(Filterable, Reduction):
+    arg = rlz.column(rlz.any)
+    key = rlz.column(rlz.any)
+    output_dtype = rlz.dtype_like("arg")
+
+
+@public
+class ArgMin(Filterable, Reduction):
+    arg = rlz.column(rlz.any)
+    key = rlz.column(rlz.any)
+    output_dtype = rlz.dtype_like("arg")
+
+
+@public
+class ApproxCountDistinct(Filterable, Reduction):
     """Approximate number of unique values using HyperLogLog algorithm.
 
     Impala offers the NDV built-in function for this.
@@ -205,10 +218,14 @@ class HLLCardinality(Filterable, Reduction):
 
     arg = rlz.column(rlz.any)
 
-    def output_type(self):
-        # Impala 2.0 and higher returns a DOUBLE
-        # return ir.DoubleScalar
-        return functools.partial(ir.IntegerScalar, dtype=dt.int64)
+    # Impala 2.0 and higher returns a DOUBLE return ir.DoubleScalar
+    output_dtype = dt.int64
+
+
+@public
+@deprecated(version='4.0', instead='use ApproxCountDistinct')
+class HLLCardinality(ApproxCountDistinct):
+    pass
 
 
 @public
@@ -216,25 +233,31 @@ class GroupConcat(Filterable, Reduction):
     arg = rlz.column(rlz.any)
     sep = rlz.string
 
-    def output_type(self):
-        return dt.string.scalar_type()
+    output_dtype = dt.string
 
 
 @public
-class CMSMedian(Filterable, Reduction):
-    """
-    Compute the approximate median of a set of comparable values using the
-    Count-Min-Sketch algorithm. Exposed in Impala using APPX_MEDIAN.
+class ApproxMedian(Filterable, Reduction):
+    """Compute the approximate median of a set of comparable values using the
+    Count-Min-Sketch algorithm.
+
+    Exposed in Impala using APPX_MEDIAN.
     """
 
     arg = rlz.column(rlz.any)
-    output_type = rlz.scalar_like('arg')
+    output_dtype = rlz.dtype_like('arg')
+
+
+@public
+@deprecated(version="4.0", instead="use ApproxMedian")
+class CMSMedian(ApproxMedian):
+    pass
 
 
 @public
 class All(Reduction):
     arg = rlz.column(rlz.boolean)
-    output_type = rlz.scalar_like('arg')
+    output_dtype = dt.boolean
 
     def negate(self):
         return NotAll(self.arg)
@@ -250,14 +273,33 @@ class NotAll(All):
 class CountDistinct(Filterable, Reduction):
     arg = rlz.column(rlz.any)
 
-    def output_type(self):
-        return dt.int64.scalar_type()
+    output_dtype = dt.int64
 
 
 @public
 class ArrayCollect(Reduction):
     arg = rlz.column(rlz.any)
 
-    def output_type(self):
-        dtype = dt.Array(self.arg.type())
-        return dtype.scalar_type()
+    @attribute.default
+    def output_dtype(self):
+        return dt.Array(self.arg.output_dtype)
+
+
+@public
+class Any(Reduction, _Negatable):
+    arg = rlz.column(rlz.boolean)
+
+    output_dtype = dt.boolean
+
+    def negate(self) -> NotAny:
+        return NotAny(*self.args)
+
+
+@public
+class NotAny(Reduction, _Negatable):
+    arg = rlz.column(rlz.boolean)
+
+    output_dtype = dt.boolean
+
+    def negate(self) -> Any:
+        return Any(*self.args)

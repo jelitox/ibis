@@ -8,8 +8,14 @@ from ibis.backends.base.sql.compiler import (
     SelectBuilder,
     TableSetFormatter,
 )
+from ibis.backends.base.sql.compiler.query_builder import Union
+from ibis.backends.clickhouse.registry import operation_registry
 
-from .registry import operation_registry
+
+class ClickhouseUnion(Union):
+    @staticmethod
+    def keyword(distinct):
+        return 'UNION DISTINCT' if distinct else 'UNION ALL'
 
 
 class ClickhouseSelectBuilder(SelectBuilder):
@@ -25,7 +31,7 @@ class ClickhouseSelect(Select):
 
         lines = []
         if len(self.group_by) > 0:
-            columns = [f'`{expr.get_name()}`' for expr in self.group_by]
+            columns = [f'`{op.name}`' for op in self.group_by]
             clause = 'GROUP BY {}'.format(', '.join(columns))
             lines.append(clause)
 
@@ -44,8 +50,8 @@ class ClickhouseSelect(Select):
 
         buf = StringIO()
 
-        n, offset = self.limit['n'], self.limit['offset']
-        if offset is not None and offset != 0:
+        n = self.limit.n
+        if offset := self.limit.offset:
             buf.write(f'LIMIT {offset}, {n}')
         else:
             buf.write(f'LIMIT {n}')
@@ -57,12 +63,20 @@ class ClickhouseTableSetFormatter(TableSetFormatter):
 
     _join_names = {
         ops.InnerJoin: 'ALL INNER JOIN',
-        ops.LeftJoin: 'ALL LEFT JOIN',
+        ops.LeftJoin: 'ALL LEFT OUTER JOIN',
+        ops.RightJoin: 'ALL RIGHT OUTER JOIN',
+        ops.OuterJoin: 'ALL FULL OUTER JOIN',
+        ops.CrossJoin: 'CROSS JOIN',
+        ops.LeftSemiJoin: 'LEFT SEMI JOIN',
+        ops.LeftAntiJoin: 'LEFT ANTI JOIN',
         ops.AnyInnerJoin: 'ANY INNER JOIN',
-        ops.AnyLeftJoin: 'ANY LEFT JOIN',
+        ops.AnyLeftJoin: 'ANY LEFT OUTER JOIN',
     }
 
-    _non_equijoin_supported = False
+    def _format_in_memory_table(self, op):
+        # We register in memory tables as external tables because clickhouse
+        # doesn't implement a generic VALUES statement
+        return op.name
 
 
 class ClickhouseExprTranslator(ExprTranslator):
@@ -73,13 +87,16 @@ rewrites = ClickhouseExprTranslator.rewrites
 
 
 @rewrites(ops.FloorDivide)
-def _floor_divide(expr):
-    left, right = expr.op().args
-    return left.div(right).floor()
+def _floor_divide(op):
+    # TODO(kszucs): avoid the expression roundtrip
+    left = op.left.to_expr()
+    right = op.right.to_expr()
+    new_expr = left.div(right).floor()
+    return new_expr.op()
 
 
 @rewrites(ops.DayOfWeekName)
-def day_of_week_name(expr):
+def day_of_week_name(op):
     # ClickHouse 20 doesn't support dateName
     #
     # ClickHouse 21 supports dateName is broken for regexen:
@@ -90,8 +107,8 @@ def day_of_week_name(expr):
     #
     # We test against 20 in CI, so we implement day_of_week_name as follows
     return (
-        expr.op()
-        .arg.day_of_week.index()
+        op.arg.to_expr()
+        .day_of_week.index()
         .case()
         .when(0, "Monday")
         .when(1, "Tuesday")
@@ -103,11 +120,14 @@ def day_of_week_name(expr):
         .else_("")
         .end()
         .nullif("")
+        .op()
     )
 
 
 class ClickhouseCompiler(Compiler):
+    cheap_in_memory_tables = True
     translator_class = ClickhouseExprTranslator
     table_set_formatter_class = ClickhouseTableSetFormatter
     select_builder_class = ClickhouseSelectBuilder
     select_class = ClickhouseSelect
+    union_class = ClickhouseUnion

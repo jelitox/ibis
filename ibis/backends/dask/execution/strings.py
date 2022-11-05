@@ -9,19 +9,29 @@ from pandas import isnull
 
 import ibis
 import ibis.expr.operations as ops
+from ibis.backends.dask.dispatch import execute_node
+from ibis.backends.dask.execution.util import (
+    TypeRegistrationDict,
+    make_selected_obj,
+    register_types_to_dispatcher,
+)
 from ibis.backends.pandas.core import integer_types, scalar_types
 from ibis.backends.pandas.execution.strings import (
+    execute_json_getitem_series_series,
+    execute_json_getitem_series_str_int,
     execute_series_join_scalar_sep,
     execute_series_regex_extract,
     execute_series_regex_replace,
     execute_series_regex_search,
     execute_series_right,
+    execute_series_string_replace,
     execute_series_translate_scalar_scalar,
     execute_series_translate_scalar_series,
     execute_series_translate_series_scalar,
     execute_series_translate_series_series,
     execute_string_capitalize,
     execute_string_contains,
+    execute_string_find,
     execute_string_length_series,
     execute_string_like_series_string,
     execute_string_lower,
@@ -37,13 +47,6 @@ from ibis.backends.pandas.execution.strings import (
     haystack_to_series_of_lists,
 )
 
-from ..dispatch import execute_node
-from .util import (
-    TypeRegistrationDict,
-    make_selected_obj,
-    register_types_to_dispatcher,
-)
-
 DASK_DISPATCH_TYPES: TypeRegistrationDict = {
     ops.StringLength: [((dd.Series,), execute_string_length_series)],
     ops.Substring: [
@@ -51,7 +54,7 @@ DASK_DISPATCH_TYPES: TypeRegistrationDict = {
             (
                 dd.Series,
                 integer_types,
-                integer_types,
+                (type(None), *integer_types),
             ),
             execute_substring_int_int,
         ),
@@ -80,6 +83,12 @@ DASK_DISPATCH_TYPES: TypeRegistrationDict = {
         ),
     ],
     ops.Reverse: [((dd.Series,), execute_string_reverse)],
+    ops.StringReplace: [
+        (
+            (dd.Series, (dd.Series, str), (dd.Series, str)),
+            execute_series_string_replace,
+        )
+    ],
     ops.Lowercase: [((dd.Series,), execute_string_lower)],
     ops.Uppercase: [((dd.Series,), execute_string_upper)],
     ops.Capitalize: [((dd.Series,), execute_string_capitalize)],
@@ -93,6 +102,15 @@ DASK_DISPATCH_TYPES: TypeRegistrationDict = {
                 (dd.Series, str),
                 (dd.Series, type(None)) + integer_types,
                 (dd.Series, type(None)) + integer_types,
+            ),
+            execute_string_find,
+        )
+    ],
+    ops.StringContains: [
+        (
+            (
+                dd.Series,
+                (dd.Series, str),
             ),
             execute_string_contains,
         )
@@ -145,6 +163,10 @@ DASK_DISPATCH_TYPES: TypeRegistrationDict = {
     ops.StringJoin: [
         (((dd.Series, str), list), execute_series_join_scalar_sep),
     ],
+    ops.JSONGetItem: [
+        ((dd.Series, (str, int)), execute_json_getitem_series_str_int),
+        ((dd.Series, dd.Series), execute_json_getitem_series_series),
+    ],
 }
 register_types_to_dispatcher(execute_node, DASK_DISPATCH_TYPES)
 
@@ -173,16 +195,10 @@ def execute_substring_series_series(op, data, start, length, **kwargs):
     end = start + length
 
     # TODO - this is broken
-    def iterate(
-        value,
-        start_iter=start.iteritems(),
-        end_iter=end.iteritems(),
-    ):
+    def iterate(value, start_iter=start.items(), end_iter=end.items()):
         _, begin = next(start_iter)
         _, end = next(end_iter)
-        if (begin is not None and isnull(begin)) or (
-            end is not None and isnull(end)
-        ):
+        if (begin is not None and isnull(begin)) or (end is not None and isnull(end)):
             return None
         return value[begin:end]
 
@@ -190,21 +206,15 @@ def execute_substring_series_series(op, data, start, length, **kwargs):
 
 
 @execute_node.register(ops.StringSQLLike, ddgb.SeriesGroupBy, str, str)
-def execute_string_like_series_groupby_string(
-    op, data, pattern, escape, **kwargs
-):
+def execute_string_like_series_groupby_string(op, data, pattern, escape, **kwargs):
     return execute_string_like_series_string(
         op, make_selected_obj(data), pattern, escape, **kwargs
     ).groupby(data.grouper.groupings)
 
 
 # TODO - aggregations - #2553
-@execute_node.register(
-    ops.GroupConcat, dd.Series, str, (dd.Series, type(None))
-)
-def execute_group_concat_series_mask(
-    op, data, sep, mask, aggcontext=None, **kwargs
-):
+@execute_node.register(ops.GroupConcat, dd.Series, str, (dd.Series, type(None)))
+def execute_group_concat_series_mask(op, data, sep, mask, aggcontext=None, **kwargs):
     return aggcontext.agg(
         data[mask] if mask is not None else data,
         lambda series, sep=sep: sep.join(series.values),
@@ -212,9 +222,7 @@ def execute_group_concat_series_mask(
 
 
 @execute_node.register(ops.GroupConcat, ddgb.SeriesGroupBy, str, type(None))
-def execute_group_concat_series_gb(
-    op, data, sep, _, aggcontext=None, **kwargs
-):
+def execute_group_concat_series_gb(op, data, sep, _, aggcontext=None, **kwargs):
     custom_group_concat = dd.Aggregation(
         name='custom_group_concat',
         chunk=lambda s: s.apply(list),
@@ -228,20 +236,14 @@ def execute_group_concat_series_gb(
 
 
 # TODO - aggregations - #2553
-@execute_node.register(
-    ops.GroupConcat, ddgb.SeriesGroupBy, str, ddgb.SeriesGroupBy
-)
-def execute_group_concat_series_gb_mask(
-    op, data, sep, mask, aggcontext=None, **kwargs
-):
+@execute_node.register(ops.GroupConcat, ddgb.SeriesGroupBy, str, ddgb.SeriesGroupBy)
+def execute_group_concat_series_gb_mask(op, data, sep, mask, aggcontext=None, **kwargs):
     def method(series, sep=sep):
         return sep.join(series.values.astype(str))
 
     return aggcontext.agg(
         data,
-        lambda data, mask=mask.obj, method=method: method(
-            data[mask[data.index]]
-        ),
+        lambda data, mask=mask.obj, method=method: method(data[mask[data.index]]),
     )
 
 
@@ -268,9 +270,7 @@ def execute_series_regex_search_gb(op, data, pattern, **kwargs):
     ).groupby(data.index)
 
 
-@execute_node.register(
-    ops.RegexExtract, ddgb.SeriesGroupBy, str, integer_types
-)
+@execute_node.register(ops.RegexExtract, ddgb.SeriesGroupBy, str, integer_types)
 def execute_series_regex_extract_gb(op, data, pattern, index, **kwargs):
     return execute_series_regex_extract(
         op, make_selected_obj(data), pattern, index, **kwargs
@@ -286,9 +286,7 @@ def execute_series_regex_replace_gb(op, data, pattern, replacement, **kwargs):
 
 @execute_node.register(ops.StrRight, ddgb.SeriesGroupBy, integer_types)
 def execute_series_right_gb(op, data, nchars, **kwargs):
-    return execute_series_right(op, make_selected_obj(data), nchars).groupby(
-        data.index
-    )
+    return execute_series_right(op, make_selected_obj(data), nchars).groupby(data.index)
 
 
 def haystack_to_dask_series_of_lists(haystack, index=None):
@@ -343,8 +341,6 @@ def execute_string_group_by_find_in_set(op, needle, haystack, **kwargs):
 
     return result.groupby(
         toolz.first(
-            piece.grouper.groupings
-            for piece in haystack
-            if hasattr(piece, 'grouper')
+            piece.grouper.groupings for piece in haystack if hasattr(piece, 'grouper')
         )
     )

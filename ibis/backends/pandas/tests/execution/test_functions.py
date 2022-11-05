@@ -92,9 +92,7 @@ def test_math_functions_decimal(t, df, ibis_func, pandas_func):
     expected = df.float64_as_strings.apply(
         lambda x: context.create_decimal(x).quantize(
             decimal.Decimal(
-                '{}.{}'.format(
-                    '0' * (dtype.precision - dtype.scale), '0' * dtype.scale
-                )
+                '{}.{}'.format('0' * (dtype.precision - dtype.scale), '0' * dtype.scale)
             )
         )
     ).apply(pandas_func)
@@ -220,7 +218,7 @@ def test_execute_with_same_hash_value_in_scope(
     table = ibis.pandas.from_dataframe(df)
 
     expr = my_func(table.left, table.right)
-    result = execute(expr)
+    result = execute(expr.op())
     assert isinstance(result, pd.Series)
 
     result = result.tolist()
@@ -234,7 +232,7 @@ def test_ifelse_returning_bool():
     true = ibis.literal(True)
     false = ibis.literal(False)
     expr = ibis.ifelse(one + one == two, true, false)
-    result = execute(expr)
+    result = execute(expr.op())
     assert result is True
 
 
@@ -257,7 +255,7 @@ def test_signature_does_not_match_input_type(dtype, value):
     df = pd.DataFrame({"col": [value]})
     table = ibis.pandas.from_dataframe(df)
 
-    result = execute(table.col)
+    result = execute(table.col.op())
     assert isinstance(result, pd.Series)
 
     result = result.tolist()

@@ -10,6 +10,8 @@ import ibis
 import ibis.expr.datatypes as dt  # noqa: E402
 from ibis.backends.pandas.execution import execute
 
+TIMESTAMP = "2022-03-13 06:59:10.467417"
+
 
 @pytest.mark.parametrize('from_', ['plain_float64', 'plain_int64'])
 @pytest.mark.parametrize(
@@ -18,8 +20,7 @@ from ibis.backends.pandas.execution import execute
         ('float16', 'float16'),
         ('float32', 'float32'),
         ('float64', 'float64'),
-        ('double', 'float64'),
-        ('float', 'float32'),
+        ('float', 'float64'),
         ('int8', 'int8'),
         ('int16', 'int16'),
         ('int32', 'int32'),
@@ -101,10 +102,10 @@ def test_cast_timestamp_column(t, df, column, to, expected):
     ],
 )
 def test_cast_timestamp_scalar_naive(to, expected):
-    literal_expr = ibis.literal(pd.Timestamp('now'))
+    literal_expr = ibis.literal(pd.Timestamp(TIMESTAMP))
     value = literal_expr.cast(to)
-    result = execute(value)
-    raw = execute(literal_expr)
+    result = execute(value.op())
+    raw = execute(literal_expr.op())
     assert result == expected(raw)
 
 
@@ -126,10 +127,10 @@ def test_cast_timestamp_scalar_naive(to, expected):
 )
 @pytest.mark.parametrize('tz', ['UTC', 'America/New_York'])
 def test_cast_timestamp_scalar(to, expected, tz):
-    literal_expr = ibis.literal(pd.Timestamp('now').tz_localize(tz))
+    literal_expr = ibis.literal(pd.Timestamp(TIMESTAMP).tz_localize(tz))
     value = literal_expr.cast(to)
-    result = execute(value)
-    raw = execute(literal_expr)
+    result = execute(value.op())
+    raw = execute(literal_expr.op())
     assert result == expected(raw)
 
 
@@ -158,16 +159,13 @@ def test_cast_to_decimal(t, df, type):
     expected = df.float64_as_strings.apply(
         lambda x: context.create_decimal(x).quantize(
             decimal.Decimal(
-                '{}.{}'.format(
-                    '0' * (type.precision - type.scale), '0' * type.scale
-                )
+                '{}.{}'.format('0' * (type.precision - type.scale), '0' * type.scale)
             )
         )
     )
     tm.assert_series_equal(result, expected)
     assert all(
-        abs(element.as_tuple().exponent) == type.scale
-        for element in result.values
+        abs(element.as_tuple().exponent) == type.scale for element in result.values
     )
     assert all(
         1 <= len(element.as_tuple().digits) <= type.precision

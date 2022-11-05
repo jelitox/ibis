@@ -15,14 +15,9 @@ import ibis.expr.rules as rlz
 import ibis.udf.validate as v
 from ibis import IbisError
 from ibis.backends.base.sql.alchemy import to_sqla_type
-from ibis.backends.postgres.compiler import (
-    PostgreSQLExprTranslator,
-    PostgresUDFNode,
-)
+from ibis.backends.postgres.compiler import PostgreSQLExprTranslator, PostgresUDFNode
 
-_udf_name_cache: MutableMapping[str, Any] = collections.defaultdict(
-    itertools.count
-)
+_udf_name_cache: MutableMapping[str, Any] = collections.defaultdict(itertools.count)
 
 
 class PostgresUDFError(IbisError):
@@ -30,20 +25,20 @@ class PostgresUDFError(IbisError):
 
 
 def _ibis_to_pg_sa_type(ibis_type):
-    """Map an ibis DataType to a Postgres-compatible sqlalchemy type"""
+    """Map an ibis DataType to a Postgres-compatible sqlalchemy type."""
     return to_sqla_type(ibis_type, type_map=PostgreSQLExprTranslator._type_map)
 
 
 def _sa_type_to_postgres_str(sa_type):
     """Map a Postgres-compatible sqlalchemy type to a Postgres-appropriate
-    string"""
+    string."""
     if callable(sa_type):
         sa_type = sa_type()
     return sa_type.compile(dialect=dialect())
 
 
 def _ibis_to_postgres_str(ibis_type):
-    """Map an ibis DataType to a Postgres-appropriate string"""
+    """Map an ibis DataType to a Postgres-appropriate string."""
     return _sa_type_to_postgres_str(_ibis_to_pg_sa_type(ibis_type))
 
 
@@ -72,7 +67,7 @@ def _create_udf_node(
 
 def existing_udf(name, input_types, output_type, schema=None, parameters=None):
     """Create an ibis function that refers to an existing Postgres UDF already
-    defined in database
+    defined in database.
 
     Parameters
     ----------
@@ -100,31 +95,21 @@ def existing_udf(name, input_types, output_type, schema=None, parameters=None):
 
     v.validate_output_type(output_type)
 
-    udf_node_fields = collections.OrderedDict(
-        [
-            (name, rlz.value(type_))
-            for name, type_ in zip(parameters, input_types)
-        ]
-        + [
-            (
-                'output_type',
-                lambda self, output_type=output_type: rlz.shape_like(
-                    self.args, dtype=output_type
-                ),
-            )
-        ]
-    )
-    udf_node_fields['resolve_name'] = lambda self: name
+    udf_node_fields = {
+        name: rlz.value(type_) for name, type_ in zip(parameters, input_types)
+    }
+    udf_node_fields['name'] = name
+    udf_node_fields['output_dtype'] = output_type
 
     udf_node = _create_udf_node(name, udf_node_fields)
 
-    def _translate_udf(t, expr):
+    def _translate_udf(t, op):
         func_obj = sa.func
         if schema is not None:
             func_obj = getattr(func_obj, schema)
         func_obj = getattr(func_obj, name)
 
-        sa_args = [t.translate(arg) for arg in expr.op().args]
+        sa_args = [t.translate(arg) for arg in op.args]
 
         return func_obj(*sa_args)
 

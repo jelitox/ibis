@@ -1,67 +1,83 @@
-{ python ? "3.9" }:
+{ python ? "3.10" }:
 let
-  pkgs = import ./nix;
+  pkgs = import ./nix { };
+
+  pythonEnv = pkgs."ibisFullDevEnv${pythonShortVersion}";
 
   devDeps = with pkgs; [
-    cacert
-    cachix
+    # terminal markdown rendering
+    glow
+    # used in the justfile
+    jq
+    yj
+    # linting
     commitlint
-    curl
-    git
+    lychee
+    # packaging
     niv
-    nix-linter
-    nixpkgs-fmt
-    poetry
-    pre-commit
-    prettierTOML
-    shellcheck
-    shfmt
+    pythonEnv.pkgs.poetry
   ];
 
   impalaUdfDeps = with pkgs; [
-    boost
     clang_12
     cmake
+    ninja
   ];
-
+  snowflakeDeps = [ pkgs.openssl ];
   backendTestDeps = [ pkgs.docker-compose ];
   vizDeps = [ pkgs.graphviz-nox ];
-  pysparkDeps = [ pkgs.openjdk11 ];
-  docDeps = [ pkgs.pandoc ];
+  duckdbDeps = [ pkgs.duckdb ];
+  mysqlDeps = [ pkgs.mariadb-client ];
+  pysparkDeps = [ pkgs.openjdk11_headless ];
 
-  # postgresql is the client, not the server
   postgresDeps = [ pkgs.postgresql ];
-  geospatialDeps = with pkgs; [ gdal proj ];
-
+  geospatialDeps = [ pkgs.gdal pkgs.proj ];
   sqliteDeps = [ pkgs.sqlite-interactive ];
 
   libraryDevDeps = impalaUdfDeps
     ++ backendTestDeps
     ++ vizDeps
     ++ pysparkDeps
-    ++ docDeps
     ++ geospatialDeps
     ++ postgresDeps
-    ++ sqliteDeps;
+    ++ sqliteDeps
+    ++ duckdbDeps
+    ++ mysqlDeps
+    ++ snowflakeDeps;
 
   pythonShortVersion = builtins.replaceStrings [ "." ] [ "" ] python;
+
+  updateLockFiles = pkgs.writeShellApplication {
+    name = "update-lock-files";
+    text = ''
+      ${./dev/update-lock-files.sh} "$PWD"
+    '';
+  };
 in
 pkgs.mkShell {
   name = "ibis${pythonShortVersion}";
 
   shellHook = ''
-    data_dir="$PWD/ci/ibis-testing-data"
-    mkdir -p "$data_dir"
-    chmod u+rwx "$data_dir"
-    cp -rf ${pkgs.ibisTestingData}/* "$data_dir"
-    chmod --recursive u+rw "$data_dir"
+    export IBIS_TEST_DATA_DIRECTORY="$PWD/ci/ibis-testing-data"
 
-    export IBIS_TEST_DATA_DIRECTORY="$data_dir"
+    ${pkgs.rsync}/bin/rsync \
+      --chmod=Du+rwx,Fu+rw --archive --delete \
+      "${pkgs.ibisTestingData}/" \
+      "$IBIS_TEST_DATA_DIRECTORY"
+
+    export TEMPDIR
+    TEMPDIR="$(python -c 'import tempfile; print(tempfile.gettempdir())')"
   '';
 
-  buildInputs = devDeps ++ libraryDevDeps ++ [
-    pkgs."ibisDevEnv${pythonShortVersion}"
-  ];
+  nativeBuildInputs = devDeps ++ libraryDevDeps ++ [
+    pythonEnv
+    updateLockFiles
+  ] ++ pkgs.preCommitShell.buildInputs ++ (with pkgs; [
+    changelog
+    mic
+  ]);
 
   PYTHONPATH = builtins.toPath ./.;
+  PGPASSWORD = "postgres";
+  MYSQL_PWD = "ibis";
 }

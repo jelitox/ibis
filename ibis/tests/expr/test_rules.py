@@ -2,10 +2,12 @@ import enum
 
 import parsy
 import pytest
+from pytest import param
 from toolz import identity
 
 import ibis
 import ibis.expr.datatypes as dt
+import ibis.expr.operations as ops
 import ibis.expr.rules as rlz
 import ibis.expr.types as ir
 from ibis.common.exceptions import IbisTypeError
@@ -56,7 +58,7 @@ def test_valid_instance_of(klass, value, expected):
 @pytest.mark.parametrize(
     ('klass', 'value', 'expected'),
     [
-        (ir.TableExpr, object, IbisTypeError),
+        (ir.Table, object, IbisTypeError),
         (ir.IntegerValue, 4, IbisTypeError),
     ],
 )
@@ -80,7 +82,11 @@ def test_invalid_instance_of(klass, value, expected):
         pytest.param(dt.float64, 26.4, ibis.literal(26.4)),
         pytest.param(dt.double, 26.3, ibis.literal(26.3)),
         pytest.param(dt.string, 'bar', ibis.literal('bar')),
-        pytest.param(dt.Array(dt.float), [3.4, 5.6], ibis.literal([3.4, 5.6])),
+        pytest.param(
+            dt.Array(dt.float64),
+            [3.4, 5.6],
+            ibis.literal([3.4, 5.6]),
+        ),
         pytest.param(
             dt.Map(dt.string, dt.Array(dt.boolean)),
             {'a': [True, False], 'b': [True]},
@@ -91,7 +97,7 @@ def test_invalid_instance_of(klass, value, expected):
 )
 def test_valid_value(dtype, value, expected):
     result = rlz.value(dtype, value)
-    assert result.equals(expected)
+    assert result == expected.op()
 
 
 @pytest.mark.parametrize(
@@ -100,7 +106,7 @@ def test_valid_value(dtype, value, expected):
         (dt.uint8, -3, IbisTypeError),
         (dt.int32, {}, IbisTypeError),
         (dt.string, 1, IbisTypeError),
-        (dt.Array(dt.float), ['s'], IbisTypeError),
+        (dt.Array(dt.float64), ['s'], IbisTypeError),
         (
             dt.Map(dt.string, dt.Array(dt.boolean)),
             {'a': [True, False], 'b': ['B']},
@@ -157,84 +163,71 @@ class Baz:
 
 
 @pytest.mark.parametrize(
-    ('obj', 'value', 'expected'),
-    [
-        (Foo, Foo.a, Foo.a),
-        (Foo, 'b', Foo.b),
-        (Bar, 'a', 'A'),
-        (Bar, 'b', 'B'),
-        (Baz(2), 'a', 2),
-        (Foo, ibis.literal(Foo.a), Foo.a),
-    ],
-)
-def test_valid_member_of(obj, value, expected):
-    assert rlz.member_of(obj, value) == expected
-
-
-@pytest.mark.parametrize(
-    ('obj', 'value', 'expected'),
-    [
-        (Foo, 'c', IbisTypeError),
-        (Bar, 'c', IbisTypeError),
-        (Baz(3), 'b', IbisTypeError),
-    ],
-)
-def test_invalid_member_of(obj, value, expected):
-    with pytest.raises(expected):
-        rlz.member_of(obj, value)
-
-
-@pytest.mark.parametrize(
     ('validator', 'values', 'expected'),
     [
-        (rlz.value_list_of(identity), (3, 2), ibis.sequence([3, 2])),
-        (rlz.value_list_of(rlz.integer), (3, 2), ibis.sequence([3, 2])),
-        (
-            rlz.value_list_of(rlz.integer),
+        param(
+            rlz.nodes_of(rlz.integer),
+            (3, 2),
+            ibis.sequence([3, 2]),
+            id="list_int",
+        ),
+        param(
+            rlz.nodes_of(rlz.integer),
             (3, None),
             ibis.sequence([3, ibis.NA]),
+            id="list_int_null",
         ),
-        (rlz.value_list_of(rlz.string), ('a',), ibis.sequence(['a'])),
-        (rlz.value_list_of(rlz.string), ['a', 'b'], ibis.sequence(['a', 'b'])),
-        pytest.param(
-            rlz.value_list_of(rlz.value_list_of(rlz.string)),
-            [[], ['a']],
-            ibis.sequence([[], ['a']]),
-            marks=pytest.mark.xfail(
-                raises=ValueError, reason='Not yet implemented'
-            ),
+        param(
+            rlz.nodes_of(rlz.string),
+            ('a',),
+            ibis.sequence(['a']),
+            id="list_string_one",
         ),
-        (
-            rlz.value_list_of(rlz.boolean, min_length=2),
+        param(
+            rlz.nodes_of(rlz.string),
+            ['a', 'b'],
+            ibis.sequence(['a', 'b']),
+            id="list_string_two",
+        ),
+        # TODO(kszucs): currently this is disallowed, probably shouldn't
+        # support this case
+        # param(
+        #     rlz.list_of(rlz.list_of(rlz.string)),
+        #     [[], ['a']],
+        #     ibis.sequence([ibis.sequence([]), ibis.sequence(['a'])]),
+        #     id="list_list_string",
+        # ),
+        param(
+            rlz.nodes_of(rlz.boolean, min_length=2),
             [True, False],
             ibis.sequence([True, False]),
+            id="boolean",
         ),
     ],
 )
-def test_valid_value_list_of(validator, values, expected):
+def test_valid_list_of(validator, values, expected):
     result = validator(values)
-    assert isinstance(result, ir.ListExpr)
-    assert len(result) == len(values)
-    for a, b in zip(result, expected):
-        assert a.equals(b)
+    assert isinstance(result, ops.NodeList)
+    assert len(result.values) == len(values)
+    assert result == expected.op()
 
 
 def test_valid_list_of_extra():
-    validator = rlz.list_of(identity)
-    assert validator((3, 2)) == [3, 2]
+    validator = rlz.tuple_of(identity)
+    assert validator((3, 2)) == tuple([3, 2])
 
-    validator = rlz.list_of(rlz.list_of(rlz.string))
+    validator = rlz.nodes_of(rlz.nodes_of(rlz.string))
     result = validator([[], ['a']])
-    assert result[1][0].equals(ibis.literal('a'))
+    assert result[1][0].equals(ibis.literal('a').op())
 
 
 @pytest.mark.parametrize(
     ('validator', 'values'),
     [
-        (rlz.value_list_of(rlz.double, min_length=2), [1]),
-        (rlz.value_list_of(rlz.integer), 1.1),
-        (rlz.value_list_of(rlz.string), 'asd'),
-        (rlz.value_list_of(identity), 3),
+        (rlz.nodes_of(rlz.double, min_length=2), [1]),
+        (rlz.nodes_of(rlz.integer), 1.1),
+        (rlz.nodes_of(rlz.string), 'asd'),
+        (rlz.nodes_of(identity), 3),
     ],
 )
 def test_invalid_list_of(validator, values):
@@ -251,7 +244,7 @@ def test_invalid_list_of(validator, values):
 )
 def test_valid_interval(units, value, expected):
     result = rlz.interval(value, units=units)
-    assert result.equals(expected)
+    assert result.equals(expected.op())
 
 
 @pytest.mark.parametrize(
@@ -278,7 +271,7 @@ def test_invalid_interval(units, value, expected):
 )
 def test_valid_column_or_scalar(validator, value, expected):
     result = validator(value)
-    assert result.equals(expected)
+    assert result.equals(expected.op())
 
 
 @pytest.mark.parametrize(
@@ -302,30 +295,25 @@ def test_invalid_column_or_scalar(validator, value, expected):
     ],
 )
 def test_valid_column_from(check_table, value, expected):
-    class Test:
-        table = check_table
-
-    validator = rlz.column_from("table")
-    assert validator(value, this=Test()).equals(expected)
+    validator = rlz.column_from(rlz.ref("table"))
+    this = dict(table=table.op())
+    assert validator(value, this=this).equals(expected.op())
 
 
 @pytest.mark.parametrize(
     ('check_table', 'validator', 'value'),
     [
-        (table, rlz.column_from("not_table"), "int_col"),
-        (table, rlz.column_from("table"), "col_not_in_table"),
+        (table, rlz.column_from(rlz.ref("not_table")), "int_col"),
+        (table, rlz.column_from(rlz.ref("table")), "col_not_in_table"),
         (
             table,
-            rlz.column_from("table"),
+            rlz.column_from(rlz.ref("table")),
             similar_table.int_col,
         ),
     ],
 )
 def test_invalid_column_from(check_table, validator, value):
-    class Test:
-        table = check_table
-
-    test = Test()
+    test = dict(table=check_table.op())
 
     with pytest.raises(IbisTypeError):
         validator(value, this=test)
@@ -335,72 +323,45 @@ def test_invalid_column_from(check_table, validator, value):
     'table',
     [
         ibis.table([('group', dt.int64), ('value', dt.double)]),
-        ibis.table(
-            [('group', dt.int64), ('value', dt.double), ('value2', dt.double)]
-        ),
+        ibis.table([('group', dt.int64), ('value', dt.double), ('value2', dt.double)]),
     ],
 )
 def test_table_with_schema(table):
     validator = rlz.table(schema=[('group', dt.int64), ('value', dt.double)])
-    assert validator(table) == table
+    assert validator(table) == table.op()
 
 
 @pytest.mark.parametrize(
     'table', [ibis.table([('group', dt.int64), ('value', dt.timestamp)])]
 )
 def test_table_with_schema_invalid(table):
-    validator = rlz.table(
-        schema=[('group', dt.double), ('value', dt.timestamp)]
-    )
+    validator = rlz.table(schema=[('group', dt.double), ('value', dt.timestamp)])
     with pytest.raises(IbisTypeError):
         validator(table)
-
-
-def test_shape_like_with_no_arguments():
-    with pytest.raises(ValueError) as e:
-        rlz.shape_like([])
-    assert str(e.value) == 'Must pass at least one expression'
-
-
-@pytest.mark.parametrize(
-    ('rule', 'input'),
-    [
-        (rlz.array_of(rlz.integer), [1, 2, 3]),
-        (rlz.array_of(rlz.integer), []),
-        (rlz.array_of(rlz.double), [1, 2]),
-        (rlz.array_of(rlz.string), ['a', 'b']),
-        (rlz.array_of(rlz.array_of(rlz.string)), [['a'], [], [], ['a', 'b']]),
-    ],
-)
-def test_array_of(rule, input):
-    assert isinstance(rule(input).type(), dt.Array)
-
-
-@pytest.mark.parametrize(
-    ('rule', 'input'),
-    [
-        (rlz.array_of(rlz.array_of(rlz.string)), [1, 2]),
-        (rlz.array_of(rlz.string), [1, 2.0]),
-        (rlz.array_of(rlz.array_of(rlz.integer)), [2, 2.0]),
-    ],
-)
-def test_array_of_invalid_input(rule, input):
-    with pytest.raises(IbisTypeError):
-        rule(input)
 
 
 @pytest.mark.parametrize(
     ('validator', 'input'),
     [
-        (rlz.array_of(rlz.integer), [1, 2, 3]),
-        (rlz.value_list_of(rlz.integer), (3, 2)),
+        (rlz.nodes_of(rlz.integer), (3, 2)),
         (rlz.instance_of(int), 32),
     ],
 )
 def test_optional(validator, input):
     expected = validator(input)
     if isinstance(expected, ibis.Expr):
-        assert rlz.optional(validator)(input).equals(expected)
+        assert rlz.optional(validator).validate(input).equals(expected)
     else:
-        assert rlz.optional(validator)(input) == expected
-    assert rlz.optional(validator)(None) is None
+        assert rlz.optional(validator).validate(input) == expected
+    assert rlz.optional(validator).validate(None) is None
+
+
+def test_base_table_of_failure_mode():
+    class BrokenUseOfBaseTableOf(ops.Node):
+        arg = rlz.any
+        foo = rlz.function_of(rlz.base_table_of(rlz.ref("arg"), strict=True))
+
+    arg = ibis.literal("abc")
+
+    with pytest.raises(IbisTypeError, match="doesn't have a base table"):
+        BrokenUseOfBaseTableOf(arg, identity)

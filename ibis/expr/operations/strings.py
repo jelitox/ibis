@@ -1,141 +1,162 @@
 from public import public
 
-from .. import datatypes as dt
-from .. import rules as rlz
-from .core import UnaryOp, ValueOp
+import ibis.expr.datatypes as dt
+import ibis.expr.rules as rlz
+from ibis.common.annotations import attribute
+from ibis.expr.operations.core import Unary, Value, Variadic
 
 
 @public
-class StringUnaryOp(UnaryOp):
+class StringUnary(Unary):
     arg = rlz.string
-    output_type = rlz.shape_like('arg', dt.string)
+    output_dtype = dt.string
 
 
 @public
-class Uppercase(StringUnaryOp):
-    """Convert string to all uppercase"""
+class Uppercase(StringUnary):
+    pass
 
 
 @public
-class Lowercase(StringUnaryOp):
-    """Convert string to all lowercase"""
+class Lowercase(StringUnary):
+    pass
 
 
 @public
-class Reverse(StringUnaryOp):
-    """Reverse string"""
+class Reverse(StringUnary):
+    pass
 
 
 @public
-class Strip(StringUnaryOp):
-    """Remove whitespace from left and right sides of string"""
+class Strip(StringUnary):
+    pass
 
 
 @public
-class LStrip(StringUnaryOp):
-    """Remove whitespace from left side of string"""
+class LStrip(StringUnary):
+    pass
 
 
 @public
-class RStrip(StringUnaryOp):
-    """Remove whitespace from right side of string"""
+class RStrip(StringUnary):
+    pass
 
 
 @public
-class Capitalize(StringUnaryOp):
-    """Return a capitalized version of input string"""
+class Capitalize(StringUnary):
+    pass
 
 
 @public
-class Substring(ValueOp):
+class Substring(Value):
     arg = rlz.string
     start = rlz.integer
     length = rlz.optional(rlz.integer)
-    output_type = rlz.shape_like('arg', dt.string)
+
+    output_dtype = dt.string
+    output_shape = rlz.shape_like('arg')
 
 
 @public
-class StrRight(ValueOp):
+class StrRight(Value):
     arg = rlz.string
     nchars = rlz.integer
-    output_type = rlz.shape_like('arg', dt.string)
+    output_shape = rlz.shape_like("arg")
+    output_dtype = dt.string
 
 
 @public
-class Repeat(ValueOp):
+class Repeat(Value):
     arg = rlz.string
     times = rlz.integer
-    output_type = rlz.shape_like('arg', dt.string)
+    output_shape = rlz.shape_like("arg")
+    output_dtype = dt.string
 
 
 @public
-class StringFind(ValueOp):
+class StringFind(Value):
     arg = rlz.string
     substr = rlz.string
     start = rlz.optional(rlz.integer)
     end = rlz.optional(rlz.integer)
-    output_type = rlz.shape_like('arg', dt.int64)
+
+    output_shape = rlz.shape_like("arg")
+    output_dtype = dt.int64
 
 
 @public
-class Translate(ValueOp):
+class Translate(Value):
     arg = rlz.string
     from_str = rlz.string
     to_str = rlz.string
-    output_type = rlz.shape_like('arg', dt.string)
+
+    output_shape = rlz.shape_like("arg")
+    output_dtype = dt.string
 
 
 @public
-class LPad(ValueOp):
+class LPad(Value):
     arg = rlz.string
     length = rlz.integer
     pad = rlz.optional(rlz.string)
-    output_type = rlz.shape_like('arg', dt.string)
+
+    output_shape = rlz.shape_like("arg")
+    output_dtype = dt.string
 
 
 @public
-class RPad(ValueOp):
+class RPad(Value):
     arg = rlz.string
     length = rlz.integer
     pad = rlz.optional(rlz.string)
-    output_type = rlz.shape_like('arg', dt.string)
+
+    output_shape = rlz.shape_like("arg")
+    output_dtype = dt.string
 
 
 @public
-class FindInSet(ValueOp):
+class FindInSet(Value):
     needle = rlz.string
-    values = rlz.value_list_of(rlz.string, min_length=1)
-    output_type = rlz.shape_like('needle', dt.int64)
+    values = rlz.nodes_of(rlz.string, min_length=1)
+
+    output_shape = rlz.shape_like("needle")
+    output_dtype = dt.int64
 
 
 @public
-class StringJoin(ValueOp):
+class StringJoin(Value):
     sep = rlz.string
-    arg = rlz.value_list_of(rlz.string, min_length=1)
+    arg = rlz.nodes_of(rlz.string, min_length=1)
 
-    def output_type(self):
-        return rlz.shape_like(tuple(self.flat_args()), dt.string)
+    output_dtype = dt.string
+
+    @attribute.default
+    def output_shape(self):
+        return rlz.highest_precedence_shape(self.arg.values)
 
 
 @public
-class StartsWith(ValueOp):
+class StartsWith(Value):
     arg = rlz.string
-    start = rlz.string
-    output_type = rlz.shape_like("arg", dt.boolean)
+    start = rlz.scalar(rlz.string)
+    output_dtype = dt.boolean
+    output_shape = rlz.shape_like("arg")
 
 
 @public
-class EndsWith(ValueOp):
+class EndsWith(Value):
     arg = rlz.string
-    end = rlz.string
-    output_type = rlz.shape_like("arg", dt.boolean)
+    end = rlz.scalar(rlz.string)
+    output_dtype = dt.boolean
+    output_shape = rlz.shape_like("arg")
 
 
 @public
-class FuzzySearch(ValueOp):
+class FuzzySearch(Value):
     arg = rlz.string
     pattern = rlz.string
-    output_type = rlz.shape_like('arg', dt.boolean)
+    output_dtype = dt.boolean
+    output_shape = rlz.shape_like('arg')
 
 
 @public
@@ -147,7 +168,7 @@ class StringSQLLike(FuzzySearch):
 
 @public
 class StringSQLILike(StringSQLLike):
-    """SQL ilike operation"""
+    """SQL ilike operation."""
 
 
 @public
@@ -156,44 +177,51 @@ class RegexSearch(FuzzySearch):
 
 
 @public
-class RegexExtract(ValueOp):
+class RegexExtract(Value):
     arg = rlz.string
     pattern = rlz.string
     index = rlz.integer
-    output_type = rlz.shape_like('arg', dt.string)
+
+    output_shape = rlz.shape_like("arg")
+    output_dtype = dt.string
 
 
 @public
-class RegexReplace(ValueOp):
+class RegexReplace(Value):
     arg = rlz.string
     pattern = rlz.string
     replacement = rlz.string
-    output_type = rlz.shape_like('arg', dt.string)
+
+    output_shape = rlz.shape_like("arg")
+    output_dtype = dt.string
 
 
 @public
-class StringReplace(ValueOp):
+class StringReplace(Value):
     arg = rlz.string
     pattern = rlz.string
     replacement = rlz.string
-    output_type = rlz.shape_like('arg', dt.string)
+
+    output_shape = rlz.shape_like("arg")
+    output_dtype = dt.string
 
 
 @public
-class StringSplit(ValueOp):
+class StringSplit(Value):
     arg = rlz.string
     delimiter = rlz.string
-    output_type = rlz.shape_like('arg', dt.Array(dt.string))
+
+    output_shape = rlz.shape_like("arg")
+    output_dtype = dt.Array(dt.string)
 
 
 @public
-class StringConcat(ValueOp):
-    arg = rlz.value_list_of(rlz.string)
-    output_type = rlz.shape_like('arg', dt.string)
+class StringConcat(Variadic):
+    arg = rlz.variadic(rlz.string)
 
 
 @public
-class ParseURL(ValueOp):
+class ParseURL(Value):
     arg = rlz.string
     extract = rlz.isin(
         {
@@ -208,16 +236,25 @@ class ParseURL(ValueOp):
         }
     )
     key = rlz.optional(rlz.string)
-    output_type = rlz.shape_like('arg', dt.string)
+
+    output_shape = rlz.shape_like("arg")
+    output_dtype = dt.string
 
 
 @public
-class StringLength(UnaryOp):
-    """Compute the length of a string."""
-
-    output_type = rlz.shape_like('arg', dt.int32)
+class StringLength(StringUnary):
+    output_dtype = dt.int32
 
 
 @public
-class StringAscii(UnaryOp):
-    output_type = rlz.shape_like('arg', dt.int32)
+class StringAscii(StringUnary):
+    output_dtype = dt.int32
+
+
+@public
+class StringContains(Value):
+    haystack = rlz.string
+    needle = rlz.string
+
+    output_shape = rlz.shape_like("args")
+    output_dtype = dt.bool

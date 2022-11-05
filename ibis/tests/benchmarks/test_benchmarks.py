@@ -1,10 +1,21 @@
+import copy
+import functools
+import inspect
+import itertools
+import string
+
 import numpy as np
 import pandas as pd
 import pytest
+from packaging.version import parse as vparse
 
 import ibis
 import ibis.expr.datatypes as dt
+import ibis.expr.types as ir
+from ibis.backends.base import _get_backend_names
 from ibis.backends.pandas.udf import udf
+
+pytestmark = pytest.mark.benchmark
 
 
 def make_t():
@@ -26,46 +37,49 @@ def make_t():
     )
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def t():
     return make_t()
 
 
 def make_base(t):
-    return (
-        (t.year > 2016)
-        | ((t.year == 2016) & (t.month > 6))
-        | ((t.year == 2016) & (t.month == 6) & (t.day > 6))
-        | ((t.year == 2016) & (t.month == 6) & (t.day == 6) & (t.hour > 6))
-        | (
-            (t.year == 2016)
-            & (t.month == 6)
-            & (t.day == 6)
-            & (t.hour == 6)
-            & (t.minute >= 5)
+    return t[
+        (
+            (t.year > 2016)
+            | ((t.year == 2016) & (t.month > 6))
+            | ((t.year == 2016) & (t.month == 6) & (t.day > 6))
+            | ((t.year == 2016) & (t.month == 6) & (t.day == 6) & (t.hour > 6))
+            | (
+                (t.year == 2016)
+                & (t.month == 6)
+                & (t.day == 6)
+                & (t.hour == 6)
+                & (t.minute >= 5)
+            )
         )
-    ) & (
-        (t.year < 2016)
-        | ((t.year == 2016) & (t.month < 6))
-        | ((t.year == 2016) & (t.month == 6) & (t.day < 6))
-        | ((t.year == 2016) & (t.month == 6) & (t.day == 6) & (t.hour < 6))
-        | (
-            (t.year == 2016)
-            & (t.month == 6)
-            & (t.day == 6)
-            & (t.hour == 6)
-            & (t.minute <= 5)
+        & (
+            (t.year < 2016)
+            | ((t.year == 2016) & (t.month < 6))
+            | ((t.year == 2016) & (t.month == 6) & (t.day < 6))
+            | ((t.year == 2016) & (t.month == 6) & (t.day == 6) & (t.hour < 6))
+            | (
+                (t.year == 2016)
+                & (t.month == 6)
+                & (t.day == 6)
+                & (t.hour == 6)
+                & (t.minute <= 5)
+            )
         )
-    )
+    ]
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def base(t):
     return make_base(t)
 
 
-def make_large_expr(t, base):
-    src_table = t[base]
+def make_large_expr(base):
+    src_table = base
     src_table = src_table.mutate(
         _timestamp=(src_table['_timestamp'] - src_table['_timestamp'] % 3600)
         .cast('int32')
@@ -103,9 +117,9 @@ def make_large_expr(t, base):
     ]
 
 
-@pytest.fixture
-def large_expr(t, base):
-    return make_large_expr(t, base)
+@pytest.fixture(scope="module")
+def large_expr(base):
+    return make_large_expr(base)
 
 
 @pytest.mark.benchmark(group="construction")
@@ -114,7 +128,7 @@ def large_expr(t, base):
     [
         pytest.param(lambda *_: make_t(), id="small"),
         pytest.param(lambda t, *_: make_base(t), id="medium"),
-        pytest.param(lambda t, base: make_large_expr(t, base), id="large"),
+        pytest.param(lambda _, base: make_large_expr(base), id="large"),
     ],
 )
 def test_construction(benchmark, construction_fn, t, base):
@@ -136,8 +150,29 @@ def test_builtins(benchmark, expr_fn, builtin, t, base, large_expr):
     benchmark(builtin, expr)
 
 
+_backends = set(_get_backend_names())
+# spark is a duplicate of pyspark
+_backends.remove("spark")
+# compile is a no-op
+_backends.remove("pandas")
+
+_XFAIL_COMPILE_BACKENDS = {"dask", "datafusion", "pyspark", "polars"}
+
+
 @pytest.mark.benchmark(group="compilation")
-@pytest.mark.parametrize("module", ["impala", "sqlite"])
+@pytest.mark.parametrize(
+    "module",
+    [
+        pytest.param(
+            mod,
+            marks=pytest.mark.xfail(
+                condition=mod in _XFAIL_COMPILE_BACKENDS,
+                reason=f"{mod} backend doesn't support compiling UnboundTable",
+            ),
+        )
+        for mod in _backends
+    ],
+)
 @pytest.mark.parametrize(
     "expr_fn",
     [
@@ -149,14 +184,14 @@ def test_builtins(benchmark, expr_fn, builtin, t, base, large_expr):
 def test_compile(benchmark, module, expr_fn, t, base, large_expr):
     try:
         mod = getattr(ibis, module)
-    except AttributeError as e:
+    except (AttributeError, ImportError) as e:
         pytest.skip(str(e))
     else:
         expr = expr_fn(t, base, large_expr)
         benchmark(mod.compile, expr)
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def pt():
     n = 60_000
     data = pd.DataFrame(
@@ -164,15 +199,13 @@ def pt():
             'key': np.random.choice(16000, size=n),
             'low_card_key': np.random.choice(30, size=n),
             'value': np.random.rand(n),
-            'timestamps': pd.date_range(
-                start='now', periods=n, freq='s'
-            ).values,
+            'timestamps': pd.date_range(start='now', periods=n, freq='s').values,
             'timestamp_strings': pd.date_range(
                 start='now', periods=n, freq='s'
             ).values.astype(str),
-            'repeated_timestamps': pd.date_range(
-                start='2018-09-01', periods=30
-            ).repeat(int(n / 30)),
+            'repeated_timestamps': pd.date_range(start='2018-09-01', periods=30).repeat(
+                int(n / 30)
+            ),
         }
     )
 
@@ -180,7 +213,7 @@ def pt():
 
 
 def high_card_group_by(t):
-    return t.groupby(t.key).aggregate(avg_value=t.value.mean())
+    return t.group_by(t.key).aggregate(avg_value=t.value.mean())
 
 
 def cast_to_dates(t):
@@ -194,25 +227,25 @@ def cast_to_dates_from_strings(t):
 def multikey_group_by_with_mutate(t):
     return (
         t.mutate(dates=t.timestamps.cast('date'))
-        .groupby(['low_card_key', 'dates'])
+        .group_by(['low_card_key', 'dates'])
         .aggregate(avg_value=lambda t: t.value.mean())
     )
 
 
 def simple_sort(t):
-    return t.sort_by([t.key])
+    return t.order_by([t.key])
 
 
 def simple_sort_projection(t):
-    return t[['key', 'value']].sort_by(['key'])
+    return t[['key', 'value']].order_by(['key'])
 
 
 def multikey_sort(t):
-    return t.sort_by(['low_card_key', 'key'])
+    return t.order_by(['low_card_key', 'key'])
 
 
 def multikey_sort_projection(t):
-    return t[['low_card_key', 'key', 'value']].sort_by(['low_card_key', 'key'])
+    return t[['low_card_key', 'key', 'value']].order_by(['low_card_key', 'key'])
 
 
 def low_card_rolling_window(t):
@@ -286,50 +319,286 @@ def high_card_grouped_rolling_udf_wm(t):
     return my_wm(t.value, t.value).over(low_card_rolling_window(t))
 
 
+broken_pandas_grouped_rolling = pytest.mark.xfail(
+    condition=vparse("1.4") <= vparse(pd.__version__) < vparse("1.4.2"),
+    raises=ValueError,
+    reason="https://github.com/pandas-dev/pandas/pull/44068",
+)
+
+
 @pytest.mark.benchmark(group="execution")
 @pytest.mark.parametrize(
     "expression_fn",
     [
         pytest.param(high_card_group_by, id="high_card_group_by"),
         pytest.param(cast_to_dates, id="cast_to_dates"),
-        pytest.param(
-            cast_to_dates_from_strings, id="cast_to_dates_from_strings"
-        ),
-        pytest.param(
-            multikey_group_by_with_mutate, id="multikey_group_by_with_mutate"
-        ),
+        pytest.param(cast_to_dates_from_strings, id="cast_to_dates_from_strings"),
+        pytest.param(multikey_group_by_with_mutate, id="multikey_group_by_with_mutate"),
         pytest.param(simple_sort, id="simple_sort"),
         pytest.param(simple_sort_projection, id="simple_sort_projection"),
         pytest.param(multikey_sort, id="multikey_sort"),
         pytest.param(multikey_sort_projection, id="multikey_sort_projection"),
-        pytest.param(low_card_grouped_rolling, id="low_card_grouped_rolling"),
         pytest.param(
-            high_card_grouped_rolling, id="high_card_grouped_rolling"
+            low_card_grouped_rolling,
+            id="low_card_grouped_rolling",
+            marks=[broken_pandas_grouped_rolling],
+        ),
+        pytest.param(
+            high_card_grouped_rolling,
+            id="high_card_grouped_rolling",
+            marks=[broken_pandas_grouped_rolling],
         ),
         pytest.param(
             low_card_grouped_rolling_udf_mean,
             id="low_card_grouped_rolling_udf_mean",
+            marks=[broken_pandas_grouped_rolling],
         ),
         pytest.param(
             high_card_grouped_rolling_udf_mean,
             id="high_card_grouped_rolling_udf_mean",
+            marks=[broken_pandas_grouped_rolling],
         ),
-        pytest.param(
-            low_card_window_analytics_udf, id="low_card_window_analytics_udf"
-        ),
+        pytest.param(low_card_window_analytics_udf, id="low_card_window_analytics_udf"),
         pytest.param(
             high_card_window_analytics_udf, id="high_card_window_analytics_udf"
         ),
         pytest.param(
             low_card_grouped_rolling_udf_wm,
             id="low_card_grouped_rolling_udf_wm",
+            marks=[broken_pandas_grouped_rolling],
         ),
         pytest.param(
             high_card_grouped_rolling_udf_wm,
             id="high_card_grouped_rolling_udf_wm",
+            marks=[broken_pandas_grouped_rolling],
         ),
     ],
 )
 def test_execute(benchmark, expression_fn, pt):
     expr = expression_fn(pt)
     benchmark(expr.execute)
+
+
+@pytest.fixture(scope="module")
+def part():
+    return ibis.table(
+        dict(
+            p_partkey="int64",
+            p_size="int64",
+            p_type="string",
+            p_mfgr="string",
+        ),
+        name="part",
+    )
+
+
+@pytest.fixture(scope="module")
+def supplier():
+    return ibis.table(
+        dict(
+            s_suppkey="int64",
+            s_nationkey="int64",
+            s_name="string",
+            s_acctbal="decimal(15, 3)",
+            s_address="string",
+            s_phone="string",
+            s_comment="string",
+        ),
+        name="supplier",
+    )
+
+
+@pytest.fixture(scope="module")
+def partsupp():
+    return ibis.table(
+        dict(
+            ps_partkey="int64",
+            ps_suppkey="int64",
+            ps_supplycost="decimal(15, 3)",
+        ),
+        name="partsupp",
+    )
+
+
+@pytest.fixture(scope="module")
+def nation():
+    return ibis.table(
+        dict(n_nationkey="int64", n_regionkey="int64", n_name="string"),
+        name="nation",
+    )
+
+
+@pytest.fixture(scope="module")
+def region():
+    return ibis.table(dict(r_regionkey="int64", r_name="string"), name="region")
+
+
+@pytest.fixture(scope="module")
+def tpc_h02(part, supplier, partsupp, nation, region):
+    REGION = "EUROPE"
+    SIZE = 25
+    TYPE = "BRASS"
+
+    expr = (
+        part.join(partsupp, part.p_partkey == partsupp.ps_partkey)
+        .join(supplier, supplier.s_suppkey == partsupp.ps_suppkey)
+        .join(nation, supplier.s_nationkey == nation.n_nationkey)
+        .join(region, nation.n_regionkey == region.r_regionkey)
+    )
+
+    subexpr = (
+        partsupp.join(supplier, supplier.s_suppkey == partsupp.ps_suppkey)
+        .join(nation, supplier.s_nationkey == nation.n_nationkey)
+        .join(region, nation.n_regionkey == region.r_regionkey)
+    )
+
+    subexpr = subexpr[
+        (subexpr.r_name == REGION) & (expr.p_partkey == subexpr.ps_partkey)
+    ]
+
+    filters = [
+        expr.p_size == SIZE,
+        expr.p_type.like(f"%{TYPE}"),
+        expr.r_name == REGION,
+        expr.ps_supplycost == subexpr.ps_supplycost.min(),
+    ]
+    q = expr.filter(filters)
+
+    q = q.select(
+        [
+            q.s_acctbal,
+            q.s_name,
+            q.n_name,
+            q.p_partkey,
+            q.p_mfgr,
+            q.s_address,
+            q.s_phone,
+            q.s_comment,
+        ]
+    )
+
+    return q.order_by(
+        [
+            ibis.desc(q.s_acctbal),
+            q.n_name,
+            q.s_name,
+            q.p_partkey,
+        ]
+    ).limit(100)
+
+
+@pytest.mark.benchmark(group="repr")
+def test_repr_tpc_h02(benchmark, tpc_h02):
+    benchmark(repr, tpc_h02)
+
+
+@pytest.mark.benchmark(group="repr")
+def test_repr_huge_union(benchmark):
+    n = 10
+    raw_types = [
+        "int64",
+        "float64",
+        "string",
+        "array<struct<a: array<string>, b: map<string, array<int64>>>>",
+    ]
+    tables = [
+        ibis.table(
+            list(zip(string.ascii_letters, itertools.cycle(raw_types))),
+            name=f"t{i:d}",
+        )
+        for i in range(n)
+    ]
+    expr = functools.reduce(ir.Table.union, tables)
+    benchmark(repr, expr)
+
+
+@pytest.mark.benchmark(group="node_args")
+def test_op_argnames(benchmark):
+    t = ibis.table([("a", "int64")])
+    expr = t[["a"]]
+    benchmark(lambda op: op.argnames, expr.op())
+
+
+@pytest.mark.benchmark(group="node_args")
+def test_op_args(benchmark):
+    t = ibis.table([("a", "int64")])
+    expr = t[["a"]]
+    benchmark(lambda op: op.args, expr.op())
+
+
+@pytest.mark.benchmark(group="datatype")
+def test_complex_datatype_parse(benchmark):
+    type_str = "array<struct<a: array<string>, b: map<string, array<int64>>>>"
+    expected = dt.Array(
+        dt.Struct.from_dict(
+            dict(a=dt.Array(dt.string), b=dt.Map(dt.string, dt.Array(dt.int64)))
+        )
+    )
+    assert dt.parse(type_str) == expected
+    benchmark(dt.parse, type_str)
+
+
+@pytest.mark.benchmark(group="datatype")
+@pytest.mark.parametrize("func", [str, hash])
+def test_complex_datatype_builtins(benchmark, func):
+    datatype = dt.Array(
+        dt.Struct.from_dict(
+            dict(a=dt.Array(dt.string), b=dt.Map(dt.string, dt.Array(dt.int64)))
+        )
+    )
+    benchmark(func, datatype)
+
+
+@pytest.mark.benchmark(group="equality")
+def test_large_expr_equals(benchmark, tpc_h02):
+    benchmark(ir.Expr.equals, tpc_h02, copy.deepcopy(tpc_h02))
+
+
+@pytest.mark.benchmark(group="datatype")
+@pytest.mark.parametrize(
+    "dtypes",
+    [
+        pytest.param(
+            [
+                obj
+                for _, obj in inspect.getmembers(
+                    dt,
+                    lambda obj: isinstance(obj, dt.DataType),
+                )
+            ],
+            id="singletons",
+        ),
+        pytest.param(
+            dt.Array(
+                dt.Struct.from_dict(
+                    dict(
+                        a=dt.Array(dt.string),
+                        b=dt.Map(dt.string, dt.Array(dt.int64)),
+                    )
+                )
+            ),
+            id="complex",
+        ),
+    ],
+)
+def test_eq_datatypes(benchmark, dtypes):
+    def eq(a, b):
+        assert a == b
+
+    benchmark(eq, dtypes, copy.deepcopy(dtypes))
+
+
+def multiple_joins(table, num_joins):
+    for _ in range(num_joins):
+        table = table.mutate(dummy=ibis.literal(""))
+        table = table.left_join(table, ["dummy"])[[table]]
+
+
+@pytest.mark.parametrize("num_joins", [1, 10])
+@pytest.mark.parametrize("num_columns", [1, 10, 100])
+def test_multiple_joins(benchmark, num_joins, num_columns):
+    table = ibis.table(
+        {f"col_{i:d}": "string" for i in range(num_columns)},
+        name="t",
+    )
+    benchmark(multiple_joins, table, num_joins)

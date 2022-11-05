@@ -53,10 +53,15 @@ def _try_timestamp(x):
 
 def _try_unix_timestamp(x):
     try:
-        ts = pd.Timestamp.utcfromtimestamp(int(x))
-        return ts.to_pydatetime()
+        value = int(x)
     except (ValueError, TypeError):
         return x
+    else:
+        return (
+            pd.Timestamp.fromtimestamp(value, tz="UTC")
+            .tz_localize(None)
+            .to_pydatetime()
+        )
 
 
 def _try_boolean(x):
@@ -80,9 +85,8 @@ def _try_int(x):
 
 class MetadataParser:
 
-    """
-    A simple state-ish machine to parse the results of DESCRIBE FORMATTED
-    """
+    """A simple state-ish machine to parse the results of DESCRIBE
+    FORMATTED."""
 
     def __init__(self, table):
         self.table = table
@@ -275,10 +279,8 @@ def _get_meta(attr, key):
 
 class TableMetadata:
 
-    """
-    Container for the parsed and wrangled results of DESCRIBE FORMATTED for
-    easier Ibis use (and testing).
-    """
+    """Container for the parsed and wrangled results of DESCRIBE FORMATTED for
+    easier Ibis use (and testing)."""
 
     def __init__(self, schema, info, storage, partitions=None):
         self.schema = schema

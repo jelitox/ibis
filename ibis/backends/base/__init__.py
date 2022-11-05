@@ -1,24 +1,38 @@
 from __future__ import annotations
 
 import abc
+import collections.abc
+import functools
+import importlib.metadata
+import keyword
 import re
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterable, Mapping
+import sys
+import urllib.parse
+from pathlib import Path
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ClassVar,
+    Iterable,
+    Iterator,
+    Mapping,
+    MutableMapping,
+)
 
 if TYPE_CHECKING:
     import pandas as pd
-
-from cached_property import cached_property
+    import pyarrow as pa
+    import ibis.expr.schema as sch
 
 import ibis
 import ibis.common.exceptions as exc
 import ibis.config
 import ibis.expr.operations as ops
-import ibis.expr.schema as sch
 import ibis.expr.types as ir
-from ibis.common.exceptions import TranslationError
-from ibis.util import deprecated
+import ibis.util as util
 
-__all__ = ('BaseBackend', 'Database')
+__all__ = ('BaseBackend', 'Database', 'connect')
 
 
 class Database:
@@ -70,8 +84,8 @@ class Database:
         """
         return self.list_tables()
 
-    def __getitem__(self, table: str) -> ir.TableExpr:
-        """Return a TableExpr for the given table name.
+    def __getitem__(self, table: str) -> ir.Table:
+        """Return a Table for the given table name.
 
         Parameters
         ----------
@@ -80,13 +94,13 @@ class Database:
 
         Returns
         -------
-        TableExpr
+        Table
             Table expression
         """
         return self.table(table)
 
-    def __getattr__(self, table: str) -> ir.TableExpr:
-        """Return a TableExpr for the given table name.
+    def __getattr__(self, table: str) -> ir.Table:
+        """Return a Table for the given table name.
 
         Parameters
         ----------
@@ -95,7 +109,7 @@ class Database:
 
         Returns
         -------
-        TableExpr
+        Table
             Table expression
         """
         return self.table(table)
@@ -117,7 +131,7 @@ class Database:
         """
         self.client.drop_database(self.name, force=force)
 
-    def table(self, name: str) -> ir.TableExpr:
+    def table(self, name: str) -> ir.Table:
         """Return a table expression referencing a table in this database.
 
         Parameters
@@ -127,7 +141,7 @@ class Database:
 
         Returns
         -------
-        TableExpr
+        Table
             Table expression
         """
         qualified_name = self._qualify(name)
@@ -144,11 +158,176 @@ class Database:
         return self.client.list_tables(like, database=self.name)
 
 
-class BaseBackend(abc.ABC):
+class TablesAccessor(collections.abc.Mapping):
+    """A mapping-like object for accessing tables off a backend.
+
+    Tables may be accessed by name using either index or attribute access:
+
+    Examples
+    --------
+    >>> con = ibis.sqlite.connect("example.db")
+    >>> people = con.tables['people']  # access via index
+    >>> people = con.tables.people  # access via attribute
+    """
+
+    def __init__(self, backend: BaseBackend):
+        self._backend = backend
+
+    def __getitem__(self, name) -> ir.Table:
+        try:
+            return self._backend.table(name)
+        except Exception as exc:
+            raise KeyError(name) from exc
+
+    def __getattr__(self, name) -> ir.Table:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        try:
+            return self._backend.table(name)
+        except Exception as exc:
+            raise AttributeError(name) from exc
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(sorted(self._backend.list_tables()))
+
+    def __len__(self) -> int:
+        return len(self._backend.list_tables())
+
+    def __dir__(self) -> list[str]:
+        o = set()
+        o.update(dir(type(self)))
+        o.update(
+            name
+            for name in self._backend.list_tables()
+            if name.isidentifier() and not keyword.iskeyword(name)
+        )
+        return list(o)
+
+    def _ipython_key_completions_(self) -> list[str]:
+        return self._backend.list_tables()
+
+
+# should have a better name
+class ResultHandler:
+    @staticmethod
+    def _import_pyarrow():
+        try:
+            import pyarrow
+        except ImportError:
+            raise ModuleNotFoundError(
+                "Exporting to arrow formats requires `pyarrow` but it is not installed"  # noqa: ignore
+            )
+        else:
+            return pyarrow
+
+    @staticmethod
+    def _table_or_column_schema(expr: ir.Expr) -> sch.Schema:
+        from ibis.backends.pyarrow.datatypes import sch
+
+        if isinstance(expr, ir.Table):
+            return expr.schema()
+        else:
+            # ColumnExpr has no schema method, define single-column schema
+            return sch.schema([(expr.get_name(), expr.type())])
+
+    @util.experimental
+    def to_pyarrow(
+        self,
+        expr: ir.Expr,
+        *,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        limit: int | str | None = None,
+        **kwargs: Any,
+    ) -> pa.Table:
+        """Execute expression and return results in as a pyarrow table.
+
+        This method is eager and will execute the associated expression
+        immediately.
+
+        Parameters
+        ----------
+        expr
+            Ibis expression to export to pyarrow
+        params
+            Mapping of scalar parameter expressions to value.
+        limit
+            An integer to effect a specific row limit. A value of `None` means
+            "no limit". The default is in `ibis/config.py`.
+
+        Returns
+        -------
+        Table
+            A pyarrow table holding the results of the executed expression.
+        """
+        pa = self._import_pyarrow()
+        try:
+            # Can't construct an array from record batches
+            # so construct at one column table (if applicable)
+            # then return the column _from_ the table
+            table = pa.Table.from_batches(
+                self.to_pyarrow_batches(expr, params=params, limit=limit, **kwargs)
+            )
+        except ValueError:
+            # The pyarrow batches iterator is empty so pass in an empty
+            # iterator and a pyarrow schema
+            schema = self._table_or_column_schema(expr)
+            table = pa.Table.from_batches([], schema=schema.to_pyarrow())
+
+        if isinstance(expr, ir.Table):
+            return table
+        elif isinstance(expr, ir.Column):
+            # Column will be a ChunkedArray, `combine_chunks` will
+            # flatten it
+            if len(table.columns[0]):
+                return table.columns[0].combine_chunks()
+            else:
+                return pa.array(table.columns[0])
+        elif isinstance(expr, ir.Scalar):
+            return table.columns[0][0]
+        else:
+            raise ValueError
+
+    @util.experimental
+    def to_pyarrow_batches(
+        self,
+        expr: ir.Expr,
+        *,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        limit: int | str | None = None,
+        chunk_size: int = 1_000_000,
+        **kwargs: Any,
+    ) -> pa.RecordBatchReader:
+        """Execute expression and return results in an iterator of pyarrow
+        record batches.
+
+        This method is eager and will execute the associated expression
+        immediately.
+
+        Parameters
+        ----------
+        expr
+            Ibis expression to export to pyarrow
+        limit
+            An integer to effect a specific row limit. A value of `None` means
+            "no limit". The default is in `ibis/config.py`.
+        params
+            Mapping of scalar parameter expressions to value.
+        chunk_size
+            Number of rows in each returned record batch.
+
+        Returns
+        -------
+        record_batches
+            An iterator of pyarrow record batches.
+        """
+        raise NotImplementedError
+
+
+class BaseBackend(abc.ABC, ResultHandler):
     """Base backend class.
 
-    All Ibis backends must subclass this class and implement all the required
-    methods.
+    All Ibis backends must subclass this class and implement all the
+    required methods.
     """
 
     database_class = Database
@@ -173,7 +352,7 @@ class BaseBackend(abc.ABC):
     def __eq__(self, other):
         return self.db_identity == other.db_identity
 
-    @cached_property
+    @functools.cached_property
     def db_identity(self) -> str:
         """Return the identity of the database.
 
@@ -199,14 +378,17 @@ class BaseBackend(abc.ABC):
         Parameters
         ----------
         args
-            Connection parameters
+            Mandatory connection parameters, see the docstring of `do_connect`
+            for details.
         kwargs
-            Additional connection parameters
+            Extra connection parameters, see the docstring of `do_connect` for
+            details.
 
         Notes
         -----
-        This returns a new backend instance with saved `args` and `kwargs`,
-        calling `reconnect` is called before returning.
+        This creates a new backend instance with saved `args` and `kwargs`,
+        then calls `reconnect` and finally returns the newly created and
+        connected backend instance.
 
         Returns
         -------
@@ -217,6 +399,16 @@ class BaseBackend(abc.ABC):
         new_backend.reconnect()
         return new_backend
 
+    def _from_url(self, url: str) -> BaseBackend:
+        """Construct an ibis backend from a SQLAlchemy-conforming URL."""
+        raise NotImplementedError(
+            f"`_from_url` not implemented for the {self.name} backend"
+        )
+
+    @staticmethod
+    def _convert_kwargs(kwargs: MutableMapping) -> None:
+        """Manipulate keyword arguments to `.connect` method."""
+
     def reconnect(self) -> None:
         """Reconnect to the database already configured with connect."""
         self.do_connect(*self._con_args, **self._con_kwargs)
@@ -224,7 +416,7 @@ class BaseBackend(abc.ABC):
     def do_connect(self, *args, **kwargs) -> None:
         """Connect to database specified by `args` and `kwargs`."""
 
-    @deprecated(instead='equivalent methods in the backend')
+    @util.deprecated(instead='use equivalent methods in the backend')
     def database(self, name: str | None = None) -> Database:
         """Return a `Database` object for the `name` database.
 
@@ -238,9 +430,7 @@ class BaseBackend(abc.ABC):
         Database
             A database object for the specified database.
         """
-        return self.database_class(
-            name=name or self.current_database, client=self
-        )
+        return self.database_class(name=name or self.current_database, client=self)
 
     @property
     @abc.abstractmethod
@@ -271,22 +461,6 @@ class BaseBackend(abc.ABC):
             The database names that exist in the current connection, that match
             the `like` pattern if provided.
         """
-
-    @deprecated(version='2.0', instead='`name in client.list_databases()`')
-    def exists_database(self, name: str) -> bool:
-        """Return whether a database name exists in the current connection.
-
-        Parameters
-        ----------
-        name
-            Database to check for existence
-
-        Returns
-        -------
-        bool
-            Whether `name` exists
-        """
-        return name in self.list_databases()
 
     @staticmethod
     def _filter_with_like(
@@ -342,35 +516,19 @@ class BaseBackend(abc.ABC):
             The list of the table names that match the pattern `like`.
         """
 
-    @deprecated(version='2.0', instead='`name in client.list_tables()`')
-    def exists_table(self, name: str, database: str | None = None) -> bool:
-        """Return whether a table name exists in the database.
+    @functools.cached_property
+    def tables(self):
+        """An accessor for tables in the database.
 
-        Parameters
-        ----------
-        name
-            Table name
-        database
-            Database to check if given
+        Tables may be accessed by name using either index or attribute access:
 
-        Returns
-        -------
-        bool
-            Whether `name` is a table
+        Examples
+        --------
+        >>> con = ibis.sqlite.connect("example.db")
+        >>> people = con.tables['people']  # access via index
+        >>> people = con.tables.people  # access via attribute
         """
-        return len(self.list_tables(like=name, database=database)) > 0
-
-    @deprecated(
-        version='2.0',
-        instead='change the current database before calling `.table()`',
-    )
-    def table(self, name: str, database: str | None = None) -> ir.TableExpr:
-        """Return a table expression from the database."""
-
-    @deprecated(version='2.0', instead='`.table(name).schema()`')
-    def get_schema(self, table_name: str, database: str = None) -> sch.Schema:
-        """Return the schema of `table_name`."""
-        return self.table(name=table_name, database=database).schema()
+        return TablesAccessor(self)
 
     @property
     @abc.abstractmethod
@@ -401,9 +559,7 @@ class BaseBackend(abc.ABC):
             try:
                 setattr(options, backend_name, backend_options)
             except ValueError as e:
-                raise exc.BackendConfigurationNotRegistered(
-                    backend_name
-                ) from e
+                raise exc.BackendConfigurationNotRegistered(backend_name) from e
 
     def compile(
         self,
@@ -415,22 +571,6 @@ class BaseBackend(abc.ABC):
 
     def execute(self, expr: ir.Expr) -> Any:
         """Execute an expression."""
-
-    @deprecated(
-        version='2.0',
-        instead='`compile` and capture `TranslationError` instead',
-    )
-    def verify(
-        self,
-        expr: ir.Expr,
-        params: Mapping[ir.Expr, Any] | None = None,
-    ) -> bool:
-        """Verify `expr` is an expression that can be compiled."""
-        try:
-            self.compile(expr, params=params)
-            return True
-        except TranslationError:
-            return False
 
     def add_operation(self, operation: ops.Node) -> Callable:
         """Add a translation function to the backend for a specific operation.
@@ -448,9 +588,7 @@ class BaseBackend(abc.ABC):
         ...     return 'NULL'
         """
         if not hasattr(self, 'compiler'):
-            raise RuntimeError(
-                'Only SQL-based backends support `add_operation`'
-            )
+            raise RuntimeError('Only SQL-based backends support `add_operation`')
 
         def decorator(translation_function: Callable) -> None:
             self.compiler.translator_class.add_operation(
@@ -478,7 +616,7 @@ class BaseBackend(abc.ABC):
     def create_table(
         self,
         name: str,
-        obj: pd.DataFrame | ir.TableExpr | None = None,
+        obj: pd.DataFrame | ir.Table | None = None,
         schema: ibis.Schema | None = None,
         database: str | None = None,
     ) -> None:
@@ -529,7 +667,7 @@ class BaseBackend(abc.ABC):
     def create_view(
         self,
         name: str,
-        expr: ir.TableExpr,
+        expr: ir.Table,
         database: str | None = None,
     ) -> None:
         """Create a view.
@@ -566,3 +704,131 @@ class BaseBackend(abc.ABC):
         raise NotImplementedError(
             f'Backend "{self.name}" does not implement "drop_view"'
         )
+
+    @classmethod
+    def has_operation(cls, operation: type[ops.Value]) -> bool:
+        """Return whether the backend implements support for `operation`.
+
+        Parameters
+        ----------
+        operation
+            A class corresponding to an operation.
+
+        Returns
+        -------
+        bool
+            Whether the backend implements the operation.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> import ibis.expr.operations as ops
+        >>> ibis.sqlite.has_operation(ops.ArrayIndex)
+        False
+        >>> ibis.postgres.has_operation(ops.ArrayIndex)
+        True
+        """
+        raise NotImplementedError(
+            f"{cls.name} backend has not implemented `has_operation` API"
+        )
+
+
+@functools.lru_cache(maxsize=None)
+def _get_backend_names() -> frozenset[str]:
+    """Return the set of known backend names.
+
+    Notes
+    -----
+    This function returns a frozenset to prevent cache pollution.
+
+    If a `set` is used, then any in-place modifications to the set
+    are visible to every caller of this function.
+    """
+
+    if sys.version_info < (3, 10):
+        entrypoints = importlib.metadata.entry_points()["ibis.backends"]
+    else:
+        entrypoints = importlib.metadata.entry_points(group="ibis.backends")
+    return frozenset(ep.name for ep in entrypoints)
+
+
+def connect(resource: Path | str, **kwargs: Any) -> BaseBackend:
+    """Connect to `resource`, inferring the backend automatically.
+
+    Parameters
+    ----------
+    resource
+        A URL or path to the resource to be connected to.
+
+    Examples
+    --------
+    Connect to an on-disk parquet or csv file (uses duckdb by default):
+    >>> con = ibis.connect("/path/to/data.parquet")
+    >>> con = ibis.connect("/path/to/data.csv")
+
+    Connect to an in-memory duckdb database:
+    >>> con = ibis.connect("duckdb://")
+
+    Connect to an on-disk sqlite database:
+    >>> con = ibis.connect("sqlite://relative/path/to/data.db")
+    >>> con = ibis.connect("sqlite:///absolute/path/to/data.db")
+
+    Connect to a postgres server:
+    >>> con = ibis.connect("postgres://user:password@hostname:5432")
+    """
+    url = resource = str(resource)
+
+    if re.match("[A-Za-z]:", url):
+        # windows path with drive, treat it as a file
+        url = f"file://{url}"
+
+    parsed = urllib.parse.urlparse(url)
+    scheme = parsed.scheme or "file"
+
+    # Merge explicit kwargs with query string, explicit kwargs
+    # taking precedence
+    kwargs = dict(urllib.parse.parse_qsl(parsed.query), **kwargs)
+
+    if scheme == "file":
+        path = parsed.netloc + parsed.path
+        if path.endswith(".duckdb"):
+            return ibis.duckdb.connect(path, **kwargs)
+        elif path.endswith((".sqlite", ".db")):
+            return ibis.sqlite.connect(path, **kwargs)
+        elif path.endswith((".parquet", ".csv", ".csv.gz")):
+            # Load parquet/csv/csv.gz files with duckdb by default
+            con = ibis.duckdb.connect(**kwargs)
+            return con.register(path)
+        else:
+            raise ValueError(f"Don't know how to connect to {resource!r}")
+
+    if kwargs:
+        # If there are kwargs (either explicit or from the query string),
+        # re-add them to the parsed URL
+        query = urllib.parse.urlencode(kwargs)
+        parsed = parsed._replace(query=query)
+
+    if scheme in ("postgres", "postgresql"):
+        # Treat `postgres://` and `postgresql://` the same, just as postgres
+        # does. We normalize to `postgresql` since that's what SQLAlchemy
+        # accepts.
+        scheme = "postgres"
+        parsed = parsed._replace(scheme="postgresql")
+
+    # Convert all arguments back to a single URL string
+    url = parsed.geturl()
+    if "://" not in url:
+        # SQLAlchemy requires a `://`, while urllib may roundtrip
+        # `duckdb://` to `duckdb:`. Here we re-add the missing `//`.
+        url = url.replace(":", "://", 1)
+    if scheme in ("duckdb", "sqlite", "pyspark"):
+        # SQLAlchemy wants an extra slash for URLs where the path
+        # maps to a relative/absolute location on the filesystem
+        url = url.replace(":", ":/", 1)
+
+    try:
+        backend = getattr(ibis, scheme)
+    except AttributeError:
+        raise ValueError(f"Don't know how to connect to {resource!r}") from None
+
+    return backend._from_url(url)

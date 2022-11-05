@@ -10,8 +10,7 @@ import ibis.expr.datatypes as dt
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis.backends.base.sql.ddl import fully_qualified_re
-
-from . import ddl
+from ibis.backends.pyspark import ddl
 
 
 @sch.infer.register(ps.sql.dataframe.DataFrame)
@@ -23,7 +22,7 @@ def spark_dataframe_schema(df):
     return sch.schema(schema_struct.names, schema_struct.types)
 
 
-class PySparkTable(ir.TableExpr):
+class PySparkTable(ir.Table):
     @property
     def _qualified_name(self):
         return self.op().args[0]
@@ -75,14 +74,12 @@ class PySparkTable(ir.TableExpr):
         for name in from_schema:
             lt = from_schema[name]
             rt = to_schema[name]
-            if not lt.castable(rt):
-                raise com.IbisInputError(
-                    f'Cannot safely cast {lt!r} to {rt!r}'
-                )
+            if not dt.castable(lt, rt):
+                raise com.IbisInputError(f'Cannot safely cast {lt!r} to {rt!r}')
 
     def insert(
         self,
-        obj: ir.TableExpr | pd.DataFrame | None = None,
+        obj: ir.Table | pd.DataFrame | None = None,
         overwrite: bool = False,
         values: Iterable[Any] | None = None,
         validate: bool = True,
@@ -126,9 +123,7 @@ class PySparkTable(ir.TableExpr):
 
         ast = self._client.compiler.to_ast(expr)
         select = ast.queries[0]
-        statement = ddl.InsertSelect(
-            self._qualified_name, select, overwrite=overwrite
-        )
+        statement = ddl.InsertSelect(self._qualified_name, select, overwrite=overwrite)
         return self._client.raw_sql(statement.compile())
 
     def rename(self, new_name: str) -> PySparkTable:
@@ -166,7 +161,5 @@ class PySparkTable(ir.TableExpr):
             Spark table properties
         """
 
-        stmt = ddl.AlterTable(
-            self._qualified_name, tbl_properties=tbl_properties
-        )
+        stmt = ddl.AlterTable(self._qualified_name, tbl_properties=tbl_properties)
         return self._client.raw_sql(stmt.compile())

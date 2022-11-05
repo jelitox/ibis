@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import collections
 import itertools
+from abc import abstractmethod
 
-from cached_property import cached_property
 from public import public
 
-from ... import util
-from ...common import exceptions as com
-from .. import rules as rlz
-from .. import schema as sch
-from .. import types as ir
-from .core import Node, all_equal, distinct_roots
-from .sortkeys import _maybe_convert_sort_keys
+import ibis.common.exceptions as com
+import ibis.expr.operations as ops
+import ibis.expr.rules as rlz
+import ibis.expr.schema as sch
+import ibis.expr.types as ir
+import ibis.util as util
+from ibis.common.annotations import attribute
+from ibis.expr.deferred import Deferred
+from ibis.expr.operations.core import Named, Node, Value
+from ibis.expr.operations.generic import TableColumn
+from ibis.expr.operations.logical import Equals, ExistsSubquery, NotExistsSubquery
 
 _table_names = (f'unbound_table_{i:d}' for i in itertools.count())
 
@@ -24,46 +28,23 @@ def genname():
 
 @public
 class TableNode(Node):
-    def get_type(self, name):
-        return self.schema[name]
+    def order_by(self, sort_exprs):
+        return Selection(self, [], sort_keys=sort_exprs)
 
-    def output_type(self):
-        return ir.TableExpr
+    @property
+    @abstractmethod
+    def schema(self) -> sch.Schema:
+        """Return a schema."""
 
-    def aggregate(self, this, metrics, by=None, having=None):
-        return Aggregation(this, metrics, by=by, having=having)
+    def to_expr(self):
+        import ibis.expr.types as ir
 
-    def sort_by(self, expr, sort_exprs):
-        return Selection(
-            expr,
-            [],
-            sort_keys=_maybe_convert_sort_keys(
-                [self.to_expr(), expr],
-                sort_exprs,
-            ),
-        )
-
-    def is_ancestor(self, other):
-        import ibis.expr.lineage as lin
-
-        if isinstance(other, ir.Expr):
-            other = other.op()
-
-        if self.equals(other):
-            return True
-
-        fn = lambda e: (lin.proceed, e.op())  # noqa: E731
-        expr = self.to_expr()
-        for child in lin.traverse(fn, expr):
-            if child.equals(other):
-                return True
-        return False
+        return ir.Table(self)
 
 
 @public
-class PhysicalTable(TableNode, sch.HasSchema):
-    def blocks(self):
-        return True
+class PhysicalTable(TableNode, Named):
+    pass
 
 
 @public
@@ -83,102 +64,123 @@ class DatabaseTable(PhysicalTable):
 
 
 @public
-class SQLQueryResult(TableNode, sch.HasSchema):
-    """A table sourced from the result set of a select query"""
+class SQLQueryResult(TableNode):
+    """A table sourced from the result set of a select query."""
 
     query = rlz.instance_of(str)
     schema = rlz.instance_of(sch.Schema)
     source = rlz.client
 
-    def blocks(self):
+
+@public
+class InMemoryTable(PhysicalTable):
+    name = rlz.instance_of(str)
+    schema = rlz.instance_of(sch.Schema)
+
+    @property
+    @abstractmethod
+    def data(self) -> util.ToFrame:
+        """Return the data of an in-memory table."""
+
+    def has_resolved_name(self):
         return True
 
-
-def _make_distinct_join_predicates(left, right, predicates):
-    # see GH #667
-
-    # If left and right table have a common parent expression (e.g. they
-    # have different filters), must add a self-reference and make the
-    # appropriate substitution in the join predicates
-
-    if left.equals(right):
-        right = right.view()
-
-    predicates = _clean_join_predicates(left, right, predicates)
-    return left, right, predicates
+    def resolve_name(self):
+        return self.name
 
 
+# TODO(kszucs): desperately need to clean this up, the majority of this
+# functionality should be handled by input rules for the Join class
 def _clean_join_predicates(left, right, predicates):
     import ibis.expr.analysis as L
+    import ibis.expr.types as ir
+    from ibis.expr.analysis import shares_all_roots
 
     result = []
-
-    if not isinstance(predicates, (list, tuple)):
-        predicates = [predicates]
 
     for pred in predicates:
         if isinstance(pred, tuple):
             if len(pred) != 2:
                 raise com.ExpressionError('Join key tuple must be ' 'length 2')
             lk, rk = pred
-            lk = left._ensure_expr(lk)
-            rk = right._ensure_expr(rk)
+            lk = left.to_expr()._ensure_expr(lk)
+            rk = right.to_expr()._ensure_expr(rk)
             pred = lk == rk
         elif isinstance(pred, str):
-            pred = left[pred] == right[pred]
+            pred = left.to_expr()[pred] == right.to_expr()[pred]
+        elif isinstance(pred, Value):
+            pred = pred.to_expr()
+        elif isinstance(pred, Deferred):
+            # resolve deferred expressions on the left table
+            pred = pred.resolve(left.to_expr())
         elif not isinstance(pred, ir.Expr):
             raise NotImplementedError
 
         if not isinstance(pred, ir.BooleanColumn):
             raise com.ExpressionError('Join predicate must be comparison')
 
-        preds = L.flatten_predicate(pred)
+        preds = L.flatten_predicate(pred.op())
         result.extend(preds)
-
-    _validate_join_predicates(left, right, result)
-    return result
-
-
-def _validate_join_predicates(left, right, predicates):
-    from ibis.expr.analysis import fully_originate_from
 
     # Validate join predicates. Each predicate must be valid jointly when
     # considering the roots of each input table
-    for predicate in predicates:
-        if not fully_originate_from(predicate, [left, right]):
+    for predicate in result:
+        if not shares_all_roots(predicate, [left, right]):
             raise com.RelationError(
                 'The expression {!r} does not fully '
                 'originate from dependencies of the table '
                 'expression.'.format(predicate)
             )
 
+    assert all(isinstance(pred, ops.Node) for pred in result)
+
+    return tuple(result)
+
 
 @public
 class Join(TableNode):
     left = rlz.table
     right = rlz.table
-    predicates = rlz.optional(rlz.list_of(rlz.boolean), default=[])
+    predicates = rlz.optional(lambda x, this: x, default=())
 
-    def __init__(self, left, right, predicates):
-        left, right, predicates = _make_distinct_join_predicates(
-            left, right, predicates
-        )
-        super().__init__(left, right, predicates)
+    def __init__(self, left, right, predicates, **kwargs):
+        # TODO(kszucs): predicates should be already a list of operations, need
+        # to update the validation rule for the Join classes which is a noop
+        # currently
+        import ibis.expr.analysis as L
+        import ibis.expr.operations as ops
+
+        # TODO(kszucs): need to factor this out to appropiate join predicate
+        # rules
+        predicates = [
+            pred.op() if isinstance(pred, ir.Expr) else pred
+            for pred in util.promote_list(predicates)
+        ]
+
+        if left.equals(right):
+            # GH #667: If left and right table have a common parent expression,
+            # e.g. they have different filters, we need to add a self-reference
+            # and make the appropriate substitution in the join predicates
+            right = ops.SelfReference(right)
+        elif isinstance(right, Join):
+            # for joins with joins on the right side we turn the right side
+            # into a view, otherwise the join tree is incorrectly flattened
+            # and tables on the right are incorrectly scoped
+            old = right
+            new = right = ops.SelfReference(right)
+            predicates = [
+                L.sub_for(pred, {old: new}) if isinstance(pred, ops.Node) else pred
+                for pred in predicates
+            ]
+
+        predicates = _clean_join_predicates(left, right, predicates)
+
+        super().__init__(left=left, right=right, predicates=predicates, **kwargs)
 
     @property
     def schema(self):
         # For joins retaining both table schemas, merge them together here
-        return self.left.schema().append(self.right.schema())
-
-    def has_schema(self):
-        return not set(self.left.columns) & set(self.right.columns)
-
-    def root_tables(self):
-        if util.all_of([self.left.op(), self.right.op()], (Join, Selection)):
-            # Unraveling is not possible
-            return [self.left.op(), self.right.op()]
-        else:
-            return distinct_roots(self.left, self.right)
+        return self.left.schema.append(self.right.schema)
 
 
 @public
@@ -215,14 +217,14 @@ class AnyLeftJoin(Join):
 class LeftSemiJoin(Join):
     @property
     def schema(self):
-        return self.left.schema()
+        return self.left.schema
 
 
 @public
 class LeftAntiJoin(Join):
     @property
     def schema(self):
-        return self.left.schema()
+        return self.left.schema
 
 
 @public
@@ -232,60 +234,34 @@ class CrossJoin(Join):
 
 @public
 class AsOfJoin(Join):
-    left = rlz.table
-    right = rlz.table
-    predicates = rlz.list_of(rlz.boolean)
-    by = rlz.optional(
-        rlz.list_of(
-            rlz.one_of(
-                (
-                    rlz.function_of("table"),
-                    rlz.column_from("table"),
-                    rlz.any,
-                )
-            )
-        ),
-        default=[],
-    )
+    # TODO(kszucs): convert to proper predicate rules
+    by = rlz.optional(lambda x, this: x, default=())
     tolerance = rlz.optional(rlz.interval)
 
-    def __init__(self, left, right, predicates, by, tolerance):
-        super().__init__(left, right, predicates)
-        self.by = _clean_join_predicates(self.left, self.right, by)
-        self.tolerance = tolerance
-
-        self._validate_args(['by', 'tolerance'])
-
-    def _validate_args(self, args: list[str]):
-        # this should be removed altogether
-        for arg in args:
-            argument = self.__signature__.parameters[arg]
-            value = argument.validate(self, getattr(self, arg))
-            setattr(self, arg, value)
+    def __init__(self, left, right, by, predicates, **kwargs):
+        by = _clean_join_predicates(left, right, util.promote_list(by))
+        super().__init__(left=left, right=right, by=by, predicates=predicates, **kwargs)
 
 
 @public
-class SetOp(TableNode, sch.HasSchema):
+class SetOp(TableNode):
     left = rlz.table
     right = rlz.table
+    distinct = rlz.optional(rlz.instance_of(bool), default=False)
 
-    def _validate(self):
-        if not self.left.schema().equals(self.right.schema()):
-            raise com.RelationError(
-                'Table schemas must be equal for set operations'
-            )
+    def __init__(self, left, right, **kwargs):
+        if not left.schema == right.schema:
+            raise com.RelationError('Table schemas must be equal for set operations')
+        super().__init__(left=left, right=right, **kwargs)
 
-    @cached_property
+    @property
     def schema(self):
-        return self.left.schema()
-
-    def blocks(self):
-        return True
+        return self.left.schema
 
 
 @public
 class Union(SetOp):
-    distinct = rlz.optional(rlz.instance_of(bool), default=False)
+    pass
 
 
 @public
@@ -304,254 +280,106 @@ class Limit(TableNode):
     n = rlz.instance_of(int)
     offset = rlz.instance_of(int)
 
-    def blocks(self):
-        return True
+    @property
+    def schema(self):
+        return self.table.schema
+
+
+@public
+class SelfReference(TableNode):
+    table = rlz.table
 
     @property
     def schema(self):
-        return self.table.schema()
-
-    def has_schema(self):
-        return self.table.op().has_schema()
-
-    def root_tables(self):
-        return [self]
+        return self.table.schema
 
 
-@public
-class SelfReference(TableNode, sch.HasSchema):
+class Projection(TableNode):
     table = rlz.table
-
-    @cached_property
-    def schema(self):
-        return self.table.schema()
-
-    def root_tables(self):
-        # The dependencies of this operation are not walked, which makes the
-        # table expression holding this relationally distinct from other
-        # expressions, so things like self-joins are possible
-        return [self]
-
-    def blocks(self):
-        return True
-
-
-@public
-class Selection(TableNode, sch.HasSchema):
-    table = rlz.table
-    selections = rlz.optional(
-        rlz.list_of(
-            rlz.one_of(
-                (
-                    rlz.table,
-                    rlz.column_from("table"),
-                    rlz.function_of("table"),
-                    rlz.any,
-                    rlz.named_literal,
-                )
+    selections = rlz.nodes_of(
+        rlz.one_of(
+            (
+                rlz.table,
+                rlz.column_from(rlz.ref("table")),
+                rlz.function_of(rlz.ref("table")),
+                rlz.any,
             )
-        ),
-        default=[],
-    )
-    predicates = rlz.optional(rlz.list_of(rlz.boolean), default=[])
-    sort_keys = rlz.optional(
-        rlz.list_of(
-            rlz.one_of(
-                (
-                    rlz.column_from("table"),
-                    rlz.function_of("table"),
-                    rlz.sort_key(from_="table"),
-                    rlz.pair(
-                        rlz.one_of(
-                            (
-                                rlz.column_from("table"),
-                                rlz.function_of("table"),
-                                rlz.any,
-                            )
-                        ),
-                        rlz.map_to(
-                            {
-                                True: True,
-                                False: False,
-                                "desc": False,
-                                "descending": False,
-                                "asc": True,
-                                "ascending": True,
-                                1: True,
-                                0: False,
-                            }
-                        ),
-                    ),
-                )
-            )
-        ),
-        default=[],
+        )
     )
 
-    def _validate(self):
-        from ibis.expr.analysis import FilterValidator
-
-        # Need to validate that the column expressions are compatible with the
-        # input table; this means they must either be scalar expressions or
-        # array expressions originating from the same root table expression
-        dependent_exprs = self.selections + self.sort_keys
-        self.table._assert_valid(dependent_exprs)
-
-        # Validate predicates
-        validator = FilterValidator([self.table])
-        validator.validate_all(self.predicates)
-
-        # Validate no overlapping columns in schema
-        assert self.schema
-
-    @cached_property
+    @attribute.default
     def schema(self):
         # Resolve schema and initialize
+
         if not self.selections:
-            return self.table.schema()
+            return self.table.schema
 
         types = []
         names = []
 
         for projection in self.selections:
-            if isinstance(projection, ir.DestructColumn):
-                # If this is a destruct, then we destructure
-                # the result and assign to multiple columns
-                struct_type = projection.type()
-                for name in struct_type.names:
-                    names.append(name)
-                    types.append(struct_type[name])
-            elif isinstance(projection, ir.ValueExpr):
-                names.append(projection.get_name())
-                types.append(projection.type())
-            elif isinstance(projection, ir.TableExpr):
-                schema = projection.schema()
+            if isinstance(projection, Value):
+                names.append(projection.name)
+                types.append(projection.output_dtype)
+            elif isinstance(projection, TableNode):
+                schema = projection.schema
                 names.extend(schema.names)
                 types.extend(schema.types)
 
         return sch.Schema(names, types)
 
-    def blocks(self):
-        return bool(self.selections)
 
-    def substitute_table(self, table_expr):
-        return Selection(table_expr, self.selections)
+@public
+class Selection(Projection):
+    predicates = rlz.optional(rlz.nodes_of(rlz.boolean), default=())
+    sort_keys = rlz.optional(
+        rlz.nodes_of(rlz.sort_key_from(rlz.ref("table"))), default=()
+    )
 
-    def root_tables(self):
-        return [self]
+    def __init__(self, table, selections, predicates, sort_keys, **kwargs):
+        from ibis.expr.analysis import shares_all_roots, shares_some_roots
 
-    def can_add_filters(self, wrapped_expr, predicates):
-        pass
+        if not shares_all_roots(selections + sort_keys, table):
+            raise com.RelationError(
+                "Selection expressions don't fully originate from "
+                "dependencies of the table expression."
+            )
 
-    @staticmethod
-    def empty_or_equal(lefts, rights):
-        return not lefts or not rights or all_equal(lefts, rights)
+        for predicate in predicates:
+            if not shares_some_roots(predicate, table):
+                raise com.RelationError("Predicate doesn't share any roots with table")
 
-    def compatible_with(self, other):
-        # self and other are equivalent except for predicates, selections, or
-        # sort keys any of which is allowed to be empty. If both are not empty
-        # then they must be equal
-        if self.equals(other):
-            return True
-
-        if not isinstance(other, type(self)):
-            return False
-
-        return self.table.equals(other.table) and (
-            self.empty_or_equal(self.predicates, other.predicates)
-            and self.empty_or_equal(self.selections, other.selections)
-            and self.empty_or_equal(self.sort_keys, other.sort_keys)
+        super().__init__(
+            table=table,
+            selections=selections,
+            predicates=predicates,
+            sort_keys=sort_keys,
+            **kwargs,
         )
 
-    # Operator combination / fusion logic
+    def order_by(self, sort_exprs):
+        from ibis.expr.analysis import shares_all_roots
 
-    def aggregate(self, this, metrics, by=None, having=None):
-        if len(self.selections) > 0:
-            return Aggregation(this, metrics, by=by, having=having)
-        else:
-            helper = AggregateSelection(this, metrics, by, having)
-            return helper.get_result()
+        keys = rlz.tuple_of(rlz.sort_key_from(rlz.just(self)), sort_exprs)
 
-    def sort_by(self, expr, sort_exprs):
-        resolved_keys = _maybe_convert_sort_keys(
-            [self.table, expr], sort_exprs
-        )
-        if not self.blocks():
-            if self.table._is_valid(resolved_keys):
+        if not self.selections:
+            if shares_all_roots(keys, self.table):
                 return Selection(
                     self.table,
                     self.selections,
                     predicates=self.predicates,
-                    sort_keys=self.sort_keys + resolved_keys,
+                    sort_keys=self.sort_keys + keys,
                 )
 
-        return Selection(expr, [], sort_keys=resolved_keys)
+        return Selection(self, [], sort_keys=keys)
+
+    @attribute.default
+    def _projection(self):
+        return Projection(self.table, self.selections)
 
 
 @public
-class AggregateSelection:
-    # sort keys cannot be discarded because of order-dependent
-    # aggregate functions like GROUP_CONCAT
-
-    def __init__(self, parent, metrics, by, having):
-        self.parent = parent
-        self.op = parent.op()
-        self.metrics = metrics
-        self.by = by
-        self.having = having
-
-    def get_result(self):
-        if self.op.blocks():
-            return self._plain_subquery()
-        else:
-            return self._attempt_pushdown()
-
-    def _plain_subquery(self):
-        return Aggregation(
-            self.parent, self.metrics, by=self.by, having=self.having
-        )
-
-    def _attempt_pushdown(self):
-        metrics_valid, lowered_metrics = self._pushdown_exprs(self.metrics)
-        by_valid, lowered_by = self._pushdown_exprs(self.by)
-        having_valid, lowered_having = self._pushdown_exprs(self.having)
-
-        if metrics_valid and by_valid and having_valid:
-            return Aggregation(
-                self.op.table,
-                lowered_metrics,
-                by=lowered_by,
-                having=lowered_having,
-                predicates=self.op.predicates,
-                sort_keys=self.op.sort_keys,
-            )
-        else:
-            return self._plain_subquery()
-
-    def _pushdown_exprs(self, exprs):
-        import ibis.expr.analysis as L
-
-        # exit early if there's nothing to push down
-        if not exprs:
-            return True, []
-
-        resolved = self.op.table._resolve(exprs)
-        subbed_exprs = []
-
-        valid = False
-        if resolved:
-            for x in util.promote_list(resolved):
-                subbed = L.sub_for(x, [(self.parent, self.op.table)])
-                subbed_exprs.append(subbed)
-            valid = self.op.table._is_valid(subbed_exprs)
-        else:
-            valid = False
-
-        return valid, subbed_exprs
-
-
-@public
-class Aggregation(TableNode, sch.HasSchema):
+class Aggregation(TableNode):
 
     """
     metrics : per-group scalar aggregates
@@ -564,153 +392,108 @@ class Aggregation(TableNode, sch.HasSchema):
 
     table = rlz.table
     metrics = rlz.optional(
-        rlz.list_of(
+        rlz.nodes_of(
             rlz.one_of(
                 (
                     rlz.function_of(
-                        "table",
-                        output_rule=rlz.one_of(
-                            (rlz.reduction, rlz.scalar(rlz.any))
-                        ),
+                        rlz.ref("table"),
+                        output_rule=rlz.one_of((rlz.reduction, rlz.scalar(rlz.any))),
                     ),
                     rlz.reduction,
                     rlz.scalar(rlz.any),
-                    rlz.list_of(rlz.scalar(rlz.any)),
-                    rlz.named_literal,
+                    rlz.nodes_of(rlz.scalar(rlz.any)),  # TODO(kszucs): ???
                 )
             ),
             flatten=True,
         ),
-        default=[],
+        default=(),
     )
     by = rlz.optional(
-        rlz.list_of(
+        rlz.nodes_of(
             rlz.one_of(
                 (
-                    rlz.function_of("table"),
-                    rlz.column_from("table"),
+                    rlz.function_of(rlz.ref("table")),
+                    rlz.column_from(rlz.ref("table")),
                     rlz.column(rlz.any),
                 )
             )
         ),
-        default=[],
+        default=(),
     )
     having = rlz.optional(
-        rlz.list_of(
+        rlz.nodes_of(
             rlz.one_of(
                 (
                     rlz.function_of(
-                        "table", output_rule=rlz.scalar(rlz.boolean)
+                        rlz.ref("table"), output_rule=rlz.scalar(rlz.boolean)
                     ),
                     rlz.scalar(rlz.boolean),
                 )
             ),
         ),
-        default=[],
+        default=(),
     )
-    predicates = rlz.optional(rlz.list_of(rlz.boolean), default=[])
-    sort_keys = rlz.optional(
-        rlz.list_of(
-            rlz.one_of(
-                (
-                    rlz.column_from("table"),
-                    rlz.function_of("table"),
-                    rlz.sort_key(from_="table"),
-                    rlz.pair(
-                        rlz.one_of(
-                            (
-                                rlz.column_from("table"),
-                                rlz.function_of("table"),
-                                rlz.any,
-                            )
-                        ),
-                        rlz.map_to(
-                            {
-                                True: True,
-                                False: False,
-                                "desc": False,
-                                "descending": False,
-                                "asc": True,
-                                "ascending": True,
-                                1: True,
-                                0: False,
-                            }
-                        ),
-                    ),
-                )
-            )
-        ),
-        default=[],
-    )
+    predicates = rlz.optional(rlz.nodes_of(rlz.boolean), default=())
+    sort_keys = rlz.optional(rlz.nodes_of(rlz.sort_key_from("table")), default=())
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-        if not self.by:
-            self.sort_keys.clear()
-
-    def _validate(self):
-        from ibis.expr.analysis import FilterValidator
+    def __init__(self, table, metrics, by, having, predicates, sort_keys):
+        from ibis.expr.analysis import shares_all_roots, shares_some_roots
 
         # All non-scalar refs originate from the input table
-        all_exprs = self.metrics + self.by + self.having + self.sort_keys
-        self.table._assert_valid(all_exprs)
+        if not shares_all_roots(metrics + by + having + sort_keys, table):
+            raise com.RelationError(
+                "Selection expressions don't fully originate from "
+                "dependencies of the table expression."
+            )
 
-        # Validate predicates
-        validator = FilterValidator([self.table])
-        validator.validate_all(self.predicates)
+        # invariant due to Aggregation and AggregateSelection requiring a valid
+        # Selection
+        assert all(shares_some_roots(predicate, table) for predicate in predicates)
 
-        # Validate schema has no overlapping columns
-        assert self.schema
+        if not by:
+            sort_keys = tuple()
 
-    def blocks(self):
-        return True
-
-    def substitute_table(self, table_expr):
-        return Aggregation(
-            table_expr, self.metrics, by=self.by, having=self.having
+        super().__init__(
+            table=table,
+            metrics=metrics,
+            by=by,
+            having=having,
+            predicates=predicates,
+            sort_keys=sort_keys,
         )
 
-    @cached_property
+    @attribute.default
     def schema(self):
         names = []
         types = []
 
         for e in self.by + self.metrics:
-            if isinstance(e, ir.DestructValue):
-                # If this is a destruct, then we destructure
-                # the result and assign to multiple columns
-                struct_type = e.type()
-                for name in struct_type.names:
-                    names.append(name)
-                    types.append(struct_type[name])
-            else:
-                names.append(e.get_name())
-                types.append(e.type())
+            names.append(e.name)
+            types.append(e.output_dtype)
 
         return sch.Schema(names, types)
 
-    def sort_by(self, expr, sort_exprs):
-        resolved_keys = _maybe_convert_sort_keys(
-            [self.table, expr], sort_exprs
-        )
-        if self.table._is_valid(resolved_keys):
+    def order_by(self, sort_exprs):
+        from ibis.expr.analysis import shares_all_roots
+
+        keys = rlz.tuple_of(rlz.sort_key_from(rlz.just(self)), sort_exprs)
+
+        if shares_all_roots(keys, self.table):
             return Aggregation(
                 self.table,
                 self.metrics,
                 by=self.by,
                 having=self.having,
                 predicates=self.predicates,
-                sort_keys=self.sort_keys + resolved_keys,
+                sort_keys=self.sort_keys + keys,
             )
 
-        return Selection(expr, [], sort_keys=resolved_keys)
+        return Selection(self, [], sort_keys=keys)
 
 
 @public
-class Distinct(TableNode, sch.HasSchema):
-    """
-    Distinct is a table-level unique-ing operation.
+class Distinct(TableNode):
+    """Distinct is a table-level unique-ing operation.
 
     In SQL, you might have:
 
@@ -723,38 +506,13 @@ class Distinct(TableNode, sch.HasSchema):
 
     table = rlz.table
 
-    def _validate(self):
-        # check whether schema has overlapping columns or not
-        assert self.schema
-
-    @cached_property
+    @property
     def schema(self):
-        return self.table.schema()
-
-    def blocks(self):
-        return True
+        return self.table.schema
 
 
 @public
-class ExistsSubquery(Node):
-    foreign_table = rlz.table
-    predicates = rlz.list_of(rlz.boolean)
-
-    def output_type(self):
-        return ir.ExistsExpr
-
-
-@public
-class NotExistsSubquery(Node):
-    foreign_table = rlz.table
-    predicates = rlz.list_of(rlz.boolean)
-
-    def output_type(self):
-        return ir.ExistsExpr
-
-
-@public
-class FillNa(TableNode, sch.HasSchema):
+class FillNa(TableNode):
     """Fill null values in the table."""
 
     table = rlz.table
@@ -766,52 +524,111 @@ class FillNa(TableNode, sch.HasSchema):
         )
     )
 
-    @cached_property
+    def __init__(self, table, replacements, **kwargs):
+        super().__init__(
+            table=table,
+            replacements=(
+                replacements
+                if not isinstance(replacements, collections.abc.Mapping)
+                else util.frozendict(replacements)
+            ),
+            **kwargs,
+        )
+
+    @property
     def schema(self):
-        return self.table.schema()
+        return self.table.schema
 
 
 @public
-class DropNa(TableNode, sch.HasSchema):
+class DropNa(TableNode):
     """Drop null values in the table."""
 
     table = rlz.table
     how = rlz.isin({'any', 'all'})
-    subset = rlz.optional(rlz.list_of(rlz.column_from("table")), default=[])
+    subset = rlz.optional(rlz.nodes_of(rlz.column_from(rlz.ref("table"))))
 
-    @cached_property
+    @property
     def schema(self):
-        return self.table.schema()
+        return self.table.schema
 
 
-def _dedup_join_columns(
-    expr: ir.TableExpr,
-    *,
-    left: ir.TableExpr,
-    right: ir.TableExpr,
-    suffixes: tuple[str, str],
-):
+@public
+class View(PhysicalTable):
+    """A view created from an expression."""
+
+    child = rlz.table
+    name = rlz.instance_of(str)
+
+    @property
+    def schema(self):
+        return self.child.schema
+
+
+@public
+class SQLStringView(PhysicalTable):
+    """A view created from a SQL string."""
+
+    child = rlz.table
+    name = rlz.instance_of(str)
+    query = rlz.instance_of(str)
+
+    @attribute.default
+    def schema(self):
+        # TODO(kszucs): avoid converting to expression
+        backend = self.child.to_expr()._find_backend()
+        return backend._get_schema_using_query(self.query)
+
+
+def _dedup_join_columns(expr, suffixes: tuple[str, str]):
+    op = expr.op()
+    left = op.left.to_expr()
+    right = op.right.to_expr()
+
     right_columns = frozenset(right.columns)
-    overlap = frozenset(
-        column for column in left.columns if column in right_columns
-    )
+    overlap = frozenset(column for column in left.columns if column in right_columns)
+    equal = set()
+
+    if isinstance(op, InnerJoin) and util.all_of(op.predicates, Equals):
+        # For inner joins composed exclusively of equality predicates, we can
+        # avoid renaming columns with colliding names if their values are
+        # guaranteed to be equal due to the predicate. Here we collect a set of
+        # colliding column names that are known to have equal values between
+        # the left and right tables in the join.
+        tables = {op.left, op.right}
+        for pred in op.predicates:
+            if (
+                isinstance(pred.left, TableColumn)
+                and isinstance(pred.right, TableColumn)
+                and {pred.left.table, pred.right.table} == tables
+                and pred.left.name == pred.right.name
+            ):
+                equal.add(pred.left.name)
 
     if not overlap:
         return expr
 
     left_suffix, right_suffix = suffixes
 
+    # Rename columns in the left table that overlap, unless they're known to be
+    # equal to a column in the right
     left_projections = [
         left[column].name(f"{column}{left_suffix}")
-        if column in overlap
+        if column in overlap and column not in equal
         else left[column]
         for column in left.columns
     ]
 
+    # Rename columns in the right table that overlap, dropping any columns that
+    # are known to be equal to those in the left table
     right_projections = [
         right[column].name(f"{column}{right_suffix}")
         if column in overlap
         else right[column]
         for column in right.columns
+        if column not in equal
     ]
     return expr.projection(left_projections + right_projections)
+
+
+public(ExistsSubquery=ExistsSubquery, NotExistsSubquery=NotExistsSubquery)

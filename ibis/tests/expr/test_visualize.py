@@ -17,10 +17,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def key(expr, name=None):
-    if name is None:
-        name = expr._safe_name
-    return str(hash((expr._key, name)))
+def key(node):
+    return str(hash(node))
 
 
 @pytest.mark.parametrize(
@@ -38,8 +36,8 @@ def key(expr, name=None):
 def test_exprs(table, expr_func):
     expr = expr_func(table)
     graph = viz.to_graph(expr)
-    assert key(table, 'table') in graph.source
-    assert key(expr) in graph.source
+    assert key(table.op()) in graph.source
+    assert key(expr.op()) in graph.source
 
 
 def test_custom_expr():
@@ -50,13 +48,13 @@ def test_custom_expr():
         foo = rlz.string
         bar = rlz.numeric
 
-        def output_type(self):
-            return MyExpr
+        def to_expr(self):
+            return MyExpr(self)
 
     op = MyExprNode('Hello!', 42.3)
     expr = op.to_expr()
     graph = viz.to_graph(expr)
-    assert key(expr) in graph.source
+    assert key(expr.op()) in graph.source
 
 
 def test_custom_expr_with_not_implemented_type():
@@ -71,13 +69,23 @@ def test_custom_expr_with_not_implemented_type():
         foo = rlz.string
         bar = rlz.numeric
 
-        def output_type(self):
-            return MyExpr
+        def to_expr(self):
+            return MyExpr(self)
 
     op = MyExprNode('Hello!', 42.3)
     expr = op.to_expr()
     graph = viz.to_graph(expr)
-    assert key(expr) in graph.source
+    assert key(expr.op()) in graph.source
+
+
+@pytest.fixture
+def with_graphviz():
+    old = ibis.options.graphviz_repr
+    ibis.options.graphviz_repr = True
+    try:
+        yield
+    finally:
+        ibis.options.graphviz_repr = old
 
 
 @pytest.mark.parametrize('how', ['inner', 'left', 'right', 'outer'])
@@ -87,27 +95,23 @@ def test_join(how):
     joined = left.join(right, left.b == right.b, how=how)
     result = joined[left.a, right.c]
     graph = viz.to_graph(result)
-    assert key(result) in graph.source
+    assert key(result.op()) in graph.source
 
 
-def test_sort_by():
+def test_order_by():
     t = ibis.table([('a', 'int64'), ('b', 'string'), ('c', 'int32')])
-    expr = (
-        t.groupby(t.b).aggregate(sum_a=t.a.sum().cast('double')).sort_by('b')
-    )
+    expr = t.group_by(t.b).aggregate(sum_a=t.a.sum().cast('double')).order_by('b')
     graph = viz.to_graph(expr)
-    assert key(expr) in graph.source
+    assert key(expr.op()) in graph.source
 
 
 @pytest.mark.skipif(
     bool(os.environ.get('APPVEYOR', None)),
     reason='Not sure what the prerequisites for running this on Windows are',
 )
-def test_optional_graphviz_repr():
+def test_optional_graphviz_repr(with_graphviz):
     t = ibis.table([('a', 'int64'), ('b', 'string'), ('c', 'int32')])
-    expr = (
-        t.groupby(t.b).aggregate(sum_a=t.a.sum().cast('double')).sort_by('b')
-    )
+    expr = t.group_by(t.b).aggregate(sum_a=t.a.sum().cast('double')).order_by('b')
 
     # default behavior
     assert expr._repr_png_() is not None
@@ -129,8 +133,8 @@ def test_between():
     source = graph.source
 
     # one for the node itself and one for the edge to between
-    assert key(lower_bound, 'lower_bound') in source
-    assert key(upper_bound, 'upper_bound') in source
+    assert key(lower_bound) in source
+    assert key(upper_bound) in source
 
 
 def test_asof_join():
@@ -141,10 +145,19 @@ def test_asof_join():
     joined = api.asof_join(left, right, 'time')
     result = joined[left, right.foo]
     graph = viz.to_graph(result)
-    assert key(result) in graph.source
+    assert key(result.op()) in graph.source
 
 
-def test_html_escape():
+def test_filter():
+    # Smoketest that NodeList nodes are handled properly
+    t = ibis.table([('a', 'int64'), ('b', 'string'), ('c', 'int32')])
+    expr = t.filter((t.a == 1) & (t.b == "x"))
+    graph = viz.to_graph(expr, label_edges=True)
+    assert "values[0]" in graph.source
+    assert "values[1]" in graph.source
+
+
+def test_html_escape(with_graphviz):
     # Check that we correctly escape HTML <> characters in the graphviz
     # representation. If an error is thrown, _repr_png_ returns None.
     expr = ibis.table([('<a & b>', ibis.expr.datatypes.Array('string'))])

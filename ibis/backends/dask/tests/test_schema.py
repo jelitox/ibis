@@ -1,11 +1,14 @@
-import dask.dataframe as dd
 import numpy as np
 import pandas as pd
-from dask.dataframe.utils import tm
+import pytest
 
 import ibis
 from ibis.expr import datatypes as dt
 from ibis.expr import schema as sch
+
+dd = pytest.importorskip("dask.dataframe")
+
+from dask.dataframe.utils import tm  # noqa: E402
 
 
 def test_infer_exhaustive_dataframe(npartitions):
@@ -85,15 +88,11 @@ def test_infer_exhaustive_dataframe(npartitions):
                         8.8000001907348633,
                         9.8999996185302734,
                     ],
-                    dtype='f4',
+                    dtype=np.float32,
                 ),
-                'int_col': np.array(
-                    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], dtype='i4'
-                ),
+                'int_col': np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], dtype='i4'),
                 'month': [11, 11, 11, 11, 2, 11, 11, 11, 11, 11],
-                'smallint_col': np.array(
-                    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], dtype='i2'
-                ),
+                'smallint_col': np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], dtype='i2'),
                 'string_col': [
                     '0',
                     '1',
@@ -118,9 +117,7 @@ def test_infer_exhaustive_dataframe(npartitions):
                     pd.Timestamp('2010-11-01 00:08:00.280000'),
                     pd.Timestamp('2010-11-01 00:09:00.360000'),
                 ],
-                'tinyint_col': np.array(
-                    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], dtype='i1'
-                ),
+                'tinyint_col': np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9], dtype='i1'),
                 'year': [
                     2010,
                     2010,
@@ -143,8 +140,8 @@ def test_infer_exhaustive_dataframe(npartitions):
         ('bool_col', dt.boolean),
         ('bool_obj_col', dt.boolean),
         ('date_string_col', dt.string),
-        ('double_col', dt.double),
-        ('float_col', dt.float),
+        ('double_col', dt.float64),
+        ('float_col', dt.float32),
         ('int_col', dt.int32),
         ('month', dt.int64),
         ('smallint_col', dt.int16),

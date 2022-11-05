@@ -29,9 +29,7 @@ def test_no_infer_ambiguities():
         (np.uint32(500), dt.uint32),
         (np.uint64(5000), dt.uint64),
         (np.float32(5.5), dt.float32),
-        (np.float32(5.5), dt.float),
         (np.float64(5.55), dt.float64),
-        (np.float64(5.55), dt.double),
         (np.bool_(True), dt.boolean),
         (np.bool_(False), dt.boolean),
         # pandas types
@@ -132,6 +130,7 @@ def test_numpy_dtype(numpy_dtype, ibis_dtype):
             dt.Timestamp('US/Eastern'),
         ),
         (CategoricalDtype(), dt.Category()),
+        (pd.Series([], dtype="string").dtype, dt.String()),
     ],
 )
 def test_pandas_dtype(pandas_dtype, ibis_dtype):
@@ -146,7 +145,8 @@ def test_pandas_dtype(pandas_dtype, ibis_dtype):
         (np.array([-5, 0, 12], dtype='int16'), 'int16'),
         (np.array([-12, 3, 25000], dtype='int32'), 'int32'),
         (np.array([102, 67228734, -0], dtype='int64'), 'int64'),
-        (np.array([45e-3, -0.4, 99.0], dtype='float32'), 'float'),
+        (np.array([45e-3, -0.4, 99.0], dtype='float32'), 'float32'),
+        (np.array([45e-3, -0.4, 99.0], dtype='float64'), 'float64'),
         (np.array([-3e43, 43.0, 10000000.0], dtype='float64'), 'double'),
         (np.array([3, 0, 16], dtype='uint8'), 'uint8'),
         (np.array([5569, 1, 33], dtype='uint16'), 'uint16'),
@@ -207,6 +207,7 @@ def test_pandas_dtype(pandas_dtype, ibis_dtype):
         (pd.Series([b'1', '2', 3.0]), dt.binary),
         # empty
         (pd.Series([], dtype='object'), dt.binary),
+        (pd.Series([], dtype="string"), dt.string),
     ],
 )
 def test_schema_infer(col_data, schema_type):
@@ -215,3 +216,10 @@ def test_schema_infer(col_data, schema_type):
     inferred = sch.infer(df)
     expected = ibis.schema([('col', schema_type)])
     assert inferred == expected
+
+
+def test_pyarrow_string():
+    pytest.importorskip("pyarrow")
+
+    s = pd.Series([], dtype="string[pyarrow]")
+    assert dt.dtype(s.dtype) == dt.String()

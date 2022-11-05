@@ -4,16 +4,17 @@ import math
 import operator
 from operator import methodcaller
 
-import dask.dataframe as dd
 import numpy as np
 import pandas as pd
 import pytest
-from dask.dataframe.utils import tm  # noqa: E402
 
 import ibis
-import ibis.expr.datatypes as dt  # noqa: E402
+import ibis.expr.datatypes as dt
 
-from ...execution import execute
+dd = pytest.importorskip("dask.dataframe")
+from dask.dataframe.utils import tm  # noqa: E402
+
+from ibis.backends.dask.execution import execute  # noqa: E402
 
 
 @pytest.mark.parametrize(
@@ -93,9 +94,7 @@ def test_math_functions_decimal(t, df, ibis_func, dask_func):
     expected = df.float64_as_strings.apply(
         lambda x: context.create_decimal(x).quantize(
             decimal.Decimal(
-                '{}.{}'.format(
-                    '0' * (dtype.precision - dtype.scale), '0' * dtype.scale
-                )
+                '{}.{}'.format('0' * (dtype.precision - dtype.scale), '0' * dtype.scale)
             )
         ),
         meta=("float64_as_strings", "object"),
@@ -204,5 +203,5 @@ def test_ifelse_returning_bool():
     true = ibis.literal(True)
     false = ibis.literal(False)
     expr = ibis.ifelse(one + one == two, true, false)
-    result = execute(expr)
+    result = execute(expr.op())
     assert result is True

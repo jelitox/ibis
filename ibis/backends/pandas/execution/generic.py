@@ -7,7 +7,7 @@ import functools
 import math
 import numbers
 import operator
-from collections.abc import Sized
+from collections.abc import Mapping, Sized
 from typing import Dict, Optional
 
 import numpy as np
@@ -20,15 +20,12 @@ import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
-from ibis.expr.scope import Scope
-from ibis.expr.timecontext import get_time_col
-from ibis.expr.typing import TimeContext
-
-from .. import Backend as PandasBackend
-from .. import aggcontext as agg_ctx
-from ..client import PandasTable
-from ..core import (
+from ibis.backends.pandas import Backend as PandasBackend
+from ibis.backends.pandas import aggcontext as agg_ctx
+from ibis.backends.pandas.client import PandasTable
+from ibis.backends.pandas.core import (
     boolean_types,
+    date_types,
     execute,
     fixed_width_types,
     floating_types,
@@ -39,9 +36,12 @@ from ..core import (
     timedelta_types,
     timestamp_types,
 )
-from ..dispatch import execute_literal, execute_node
-from ..execution import constants
-from ..execution.util import coerce_to_output
+from ibis.backends.pandas.dispatch import execute_literal, execute_node
+from ibis.backends.pandas.execution import constants
+from ibis.backends.pandas.execution.util import coerce_to_output, get_grouping
+from ibis.expr.scope import Scope
+from ibis.expr.timecontext import get_time_col
+from ibis.expr.typing import TimeContext
 
 
 # By default return the literal value
@@ -94,7 +94,7 @@ def execute_limit_frame(op, data, nrows, offset, **kwargs):
 @execute_node.register(ops.Cast, SeriesGroupBy, dt.DataType)
 def execute_cast_series_group_by(op, data, type, **kwargs):
     result = execute_cast_series_generic(op, data.obj, type, **kwargs)
-    return result.groupby(data.grouper.groupings)
+    return result.groupby(get_grouping(data.grouper.groupings), group_keys=False)
 
 
 @execute_node.register(ops.Cast, pd.Series, dt.DataType)
@@ -111,15 +111,13 @@ def execute_cast_series_array(op, data, type, **kwargs):
             'Array value type must be a primitive type '
             '(e.g., number, string, or timestamp)'
         )
-    return data.map(
-        lambda array, numpy_type=numpy_type: array.astype(numpy_type)
-    )
+    return data.map(lambda array, numpy_type=numpy_type: array.astype(numpy_type))
 
 
 @execute_node.register(ops.Cast, pd.Series, dt.Timestamp)
 def execute_cast_series_timestamp(op, data, type, **kwargs):
     arg = op.arg
-    from_type = arg.type()
+    from_type = arg.output_dtype
 
     if from_type.equals(type):  # noop cast
         return data
@@ -127,9 +125,7 @@ def execute_cast_series_timestamp(op, data, type, **kwargs):
     tz = type.timezone
 
     if isinstance(from_type, (dt.Timestamp, dt.Date)):
-        return data.astype(
-            'M8[ns]' if tz is None else DatetimeTZDtype('ns', tz)
-        )
+        return data.astype('M8[ns]' if tz is None else DatetimeTZDtype('ns', tz))
 
     if isinstance(from_type, (dt.String, dt.Integer)):
         timestamps = pd.to_datetime(data.values, infer_datetime_format=True)
@@ -152,7 +148,7 @@ def _normalize(values, original_index, name, timezone=None):
 @execute_node.register(ops.Cast, pd.Series, dt.Date)
 def execute_cast_series_date(op, data, type, **kwargs):
     arg = op.args[0]
-    from_type = arg.type()
+    from_type = arg.output_dtype
 
     if from_type.equals(type):
         return data
@@ -183,12 +179,12 @@ def execute_cast_series_date(op, data, type, **kwargs):
 
 
 @execute_node.register(ops.SortKey, pd.Series, bool)
-def execute_sort_key_series_bool(op, data, ascending, **kwargs):
+def execute_sort_key_series(op, data, _, **kwargs):
     return data
 
 
 def call_numpy_ufunc(func, op, data, **kwargs):
-    if data.dtype == np.dtype(np.object_):
+    if getattr(data, "dtype", None) == np.dtype(np.object_):
         return data.apply(functools.partial(execute_node, op, **kwargs))
     return func(data)
 
@@ -206,14 +202,60 @@ def execute_series_negate(op, data, **kwargs):
 @execute_node.register(ops.Negate, SeriesGroupBy)
 def execute_series_group_by_negate(op, data, **kwargs):
     return execute_series_negate(op, data.obj, **kwargs).groupby(
-        data.grouper.groupings
+        get_grouping(data.grouper.groupings), group_keys=False
     )
 
 
-@execute_node.register(ops.UnaryOp, pd.Series)
+@execute_node.register(ops.Unary, pd.Series)
 def execute_series_unary_op(op, data, **kwargs):
     function = getattr(np, type(op).__name__.lower())
     return call_numpy_ufunc(function, op, data, **kwargs)
+
+
+@execute_node.register(ops.Acos, (pd.Series, *numeric_types))
+def execute_series_acos(_, data, **kwargs):
+    return np.arccos(data)
+
+
+@execute_node.register(ops.Asin, (pd.Series, *numeric_types))
+def execute_series_asin(_, data, **kwargs):
+    return np.arcsin(data)
+
+
+@execute_node.register(ops.Atan, (pd.Series, *numeric_types))
+def execute_series_atan(_, data, **kwargs):
+    return np.arctan(data)
+
+
+@execute_node.register(ops.Cot, (pd.Series, *numeric_types))
+def execute_series_cot(_, data, **kwargs):
+    return np.cos(data) / np.sin(data)
+
+
+@execute_node.register(
+    ops.Atan2, (pd.Series, *numeric_types), (pd.Series, *numeric_types)
+)
+def execute_series_atan2(_, y, x, **kwargs):
+    return np.arctan2(y, x)
+
+
+@execute_node.register(
+    (ops.Cos, ops.Sin, ops.Tan),
+    (pd.Series, *numeric_types),
+)
+def execute_series_trig(op, data, **kwargs):
+    function = getattr(np, type(op).__name__.lower())
+    return call_numpy_ufunc(function, op, data, **kwargs)
+
+
+@execute_node.register(ops.Radians, (pd.Series, *numeric_types))
+def execute_series_radians(_, data, **kwargs):
+    return np.radians(data)
+
+
+@execute_node.register(ops.Degrees, (pd.Series, *numeric_types))
+def execute_series_degrees(_, data, **kwargs):
+    return np.degrees(data)
 
 
 @execute_node.register((ops.Ceil, ops.Floor), pd.Series)
@@ -259,15 +301,11 @@ def execute_series_clip(op, data, lower, upper, **kwargs):
 
 @execute_node.register(ops.Quantile, (pd.Series, SeriesGroupBy), numeric_types)
 def execute_series_quantile(op, data, quantile, aggcontext=None, **kwargs):
-    return aggcontext.agg(
-        data, 'quantile', q=quantile, interpolation=op.interpolation
-    )
+    return aggcontext.agg(data, 'quantile', q=quantile, interpolation=op.interpolation)
 
 
 @execute_node.register(ops.MultiQuantile, pd.Series, np.ndarray)
-def execute_series_quantile_multi(
-    op, data, quantile, aggcontext=None, **kwargs
-):
+def execute_series_quantile_multi(op, data, quantile, aggcontext=None, **kwargs):
     result = aggcontext.agg(
         data, 'quantile', q=quantile, interpolation=op.interpolation
     )
@@ -294,19 +332,19 @@ def execute_cast_null_to_anything(op, data, type, **kwargs):
 
 @execute_node.register(ops.Cast, datetime.datetime, dt.String)
 def execute_cast_datetime_or_timestamp_to_string(op, data, type, **kwargs):
-    """Cast timestamps to strings"""
+    """Cast timestamps to strings."""
     return str(data)
 
 
 @execute_node.register(ops.Cast, datetime.datetime, dt.Int64)
 def execute_cast_datetime_to_integer(op, data, type, **kwargs):
-    """Cast datetimes to integers"""
+    """Cast datetimes to integers."""
     return pd.Timestamp(data).value
 
 
 @execute_node.register(ops.Cast, pd.Timestamp, dt.Int64)
 def execute_cast_timestamp_to_integer(op, data, type, **kwargs):
-    """Cast timestamps to integers"""
+    """Cast timestamps to integers."""
     return data.value
 
 
@@ -332,13 +370,13 @@ def execute_cast_bool_to_interval(op, data, type, **kwargs):
 
 @execute_node.register(ops.Cast, integer_types + (str,), dt.Timestamp)
 def execute_cast_simple_literal_to_timestamp(op, data, type, **kwargs):
-    """Cast integer and strings to timestamps"""
+    """Cast integer and strings to timestamps."""
     return pd.Timestamp(data, tz=type.timezone)
 
 
 @execute_node.register(ops.Cast, pd.Timestamp, dt.Timestamp)
 def execute_cast_timestamp_to_timestamp(op, data, type, **kwargs):
-    """Cast timestamps to other timestamps including timezone if necessary"""
+    """Cast timestamps to other timestamps including timezone if necessary."""
     input_timezone = data.tz
     target_timezone = type.timezone
 
@@ -353,9 +391,7 @@ def execute_cast_timestamp_to_timestamp(op, data, type, **kwargs):
 
 @execute_node.register(ops.Cast, datetime.datetime, dt.Timestamp)
 def execute_cast_datetime_to_datetime(op, data, type, **kwargs):
-    return execute_cast_timestamp_to_timestamp(
-        op, data, type, **kwargs
-    ).to_pydatetime()
+    return execute_cast_timestamp_to_timestamp(op, data, type, **kwargs).to_pydatetime()
 
 
 @execute_node.register(ops.Cast, fixed_width_types + (str,), dt.DataType)
@@ -368,14 +404,21 @@ def execute_cast_string_literal(op, data, type, **kwargs):
         return cast_function(data)
 
 
+@execute_node.register(ops.Cast, Mapping, dt.DataType)
+def execute_cast_mapping_literal(op, data, type, **kwargs):
+    data = (
+        (ops.Literal(k, type.key_type), ops.Literal(v, type.value_type))
+        for k, v in data.items()
+    )
+    return {execute(k, **kwargs): execute(v, **kwargs) for k, v in data}
+
+
 @execute_node.register(ops.Round, scalar_types, (int, type(None)))
 def execute_round_scalars(op, data, places, **kwargs):
     return round(data, places) if places else round(data)
 
 
-@execute_node.register(
-    ops.Round, pd.Series, (pd.Series, np.integer, type(None), int)
-)
+@execute_node.register(ops.Round, pd.Series, (pd.Series, np.integer, type(None), int))
 def execute_round_series(op, data, places, **kwargs):
     if data.dtype == np.dtype(np.object_):
         return vectorize_object(op, data, places, **kwargs)
@@ -390,22 +433,23 @@ def execute_table_column_df_or_df_groupby(op, data, **kwargs):
 
 @execute_node.register(ops.Aggregation, pd.DataFrame)
 def execute_aggregation_dataframe(
-    op, data, scope=None, timecontext: Optional[TimeContext] = None, **kwargs
+    op,
+    data,
+    scope=None,
+    timecontext: Optional[TimeContext] = None,
+    **kwargs,
 ):
     assert op.metrics, 'no metrics found during aggregation execution'
 
     if op.sort_keys:
-        raise NotImplementedError(
-            'sorting on aggregations not yet implemented'
-        )
+        raise NotImplementedError('sorting on aggregations not yet implemented')
 
-    predicates = op.predicates
-    if predicates:
+    if op.predicates:
         predicate = functools.reduce(
             operator.and_,
             (
                 execute(p, scope=scope, timecontext=timecontext, **kwargs)
-                for p in predicates
+                for p in op.predicates
             ),
         )
         data = data.loc[predicate]
@@ -413,27 +457,19 @@ def execute_aggregation_dataframe(
     columns: Dict[str, str] = {}
 
     if op.by:
-        grouping_key_pairs = list(
-            zip(op.by, map(operator.methodcaller('op'), op.by))
-        )
         grouping_keys = [
-            by_op.name
-            if isinstance(by_op, ops.TableColumn)
-            else execute(
-                by, scope=scope, timecontext=timecontext, **kwargs
-            ).rename(by.get_name())
-            for by, by_op in grouping_key_pairs
+            key.name
+            if isinstance(key, ops.TableColumn)
+            else execute(key, scope=scope, timecontext=timecontext, **kwargs).rename(
+                key.name
+            )
+            for key in op.by
         ]
-        columns.update(
-            (by_op.name, by.get_name())
-            for by, by_op in grouping_key_pairs
-            if hasattr(by_op, 'name')
-        )
-        source = data.groupby(grouping_keys)
+        source = data.groupby(grouping_keys, group_keys=False)
     else:
         source = data
 
-    scope = scope.merge_scope(Scope({op.table.op(): source}, timecontext))
+    scope = scope.merge_scope(Scope({op.table: source}, timecontext))
 
     pieces = [
         coerce_to_output(
@@ -464,8 +500,8 @@ def execute_aggregation_dataframe(
         predicate = functools.reduce(
             operator.and_,
             (
-                execute(having, scope=scope, timecontext=timecontext, **kwargs)
-                for having in op.having
+                execute(h, scope=scope, timecontext=timecontext, **kwargs)
+                for h in op.having
             ),
         )
         assert len(predicate) == len(
@@ -476,9 +512,7 @@ def execute_aggregation_dataframe(
 
 
 @execute_node.register(ops.Reduction, SeriesGroupBy, type(None))
-def execute_reduction_series_groupby(
-    op, data, mask, aggcontext=None, **kwargs
-):
+def execute_reduction_series_groupby(op, data, mask, aggcontext=None, **kwargs):
     return aggcontext.agg(data, type(op).__name__.lower())
 
 
@@ -486,25 +520,21 @@ variance_ddof = {'pop': 0, 'sample': 1}
 
 
 @execute_node.register(ops.Variance, SeriesGroupBy, type(None))
-def execute_reduction_series_groupby_var(
-    op, data, _, aggcontext=None, **kwargs
-):
+def execute_reduction_series_groupby_var(op, data, _, aggcontext=None, **kwargs):
     return aggcontext.agg(data, 'var', ddof=variance_ddof[op.how])
 
 
 @execute_node.register(ops.StandardDev, SeriesGroupBy, type(None))
-def execute_reduction_series_groupby_std(
-    op, data, _, aggcontext=None, **kwargs
-):
+def execute_reduction_series_groupby_std(op, data, _, aggcontext=None, **kwargs):
     return aggcontext.agg(data, 'std', ddof=variance_ddof[op.how])
 
 
 @execute_node.register(
-    (ops.CountDistinct, ops.HLLCardinality), SeriesGroupBy, type(None)
+    (ops.CountDistinct, ops.ApproxCountDistinct),
+    SeriesGroupBy,
+    type(None),
 )
-def execute_count_distinct_series_groupby(
-    op, data, _, aggcontext=None, **kwargs
-):
+def execute_count_distinct_series_groupby(op, data, _, aggcontext=None, **kwargs):
     return aggcontext.agg(data, 'nunique')
 
 
@@ -515,10 +545,25 @@ def execute_arbitrary_series_groupby(op, data, _, aggcontext=None, **kwargs):
         how = 'first'
 
     if how not in {'first', 'last'}:
-        raise com.OperationNotDefinedError(
-            f'Arbitrary {how!r} is not supported'
-        )
+        raise com.OperationNotDefinedError(f'Arbitrary {how!r} is not supported')
     return aggcontext.agg(data, how)
+
+
+@execute_node.register(
+    (ops.ArgMin, ops.ArgMax),
+    SeriesGroupBy,
+    SeriesGroupBy,
+    type(None),
+)
+def execute_reduction_series_groupby_argidx(
+    op, data, key, _, aggcontext=None, **kwargs
+):
+    method = operator.methodcaller(op.__class__.__name__.lower())
+
+    def reduce(data, key=key.obj, method=method):
+        return data.iloc[method(key.loc[data.index])]
+
+    return aggcontext.agg(data, reduce)
 
 
 def _filtered_reduction(mask, method, data):
@@ -526,9 +571,7 @@ def _filtered_reduction(mask, method, data):
 
 
 @execute_node.register(ops.Reduction, SeriesGroupBy, SeriesGroupBy)
-def execute_reduction_series_gb_mask(
-    op, data, mask, aggcontext=None, **kwargs
-):
+def execute_reduction_series_gb_mask(op, data, mask, aggcontext=None, **kwargs):
     method = operator.methodcaller(type(op).__name__.lower())
     return aggcontext.agg(
         data, functools.partial(_filtered_reduction, mask.obj, method)
@@ -536,7 +579,9 @@ def execute_reduction_series_gb_mask(
 
 
 @execute_node.register(
-    (ops.CountDistinct, ops.HLLCardinality), SeriesGroupBy, SeriesGroupBy
+    (ops.CountDistinct, ops.ApproxCountDistinct),
+    SeriesGroupBy,
+    SeriesGroupBy,
 )
 def execute_count_distinct_series_groupby_mask(
     op, data, mask, aggcontext=None, **kwargs
@@ -567,8 +612,8 @@ def execute_std_series_groupby_mask(op, data, mask, aggcontext=None, **kwargs):
     )
 
 
-@execute_node.register(ops.Count, DataFrameGroupBy, type(None))
-def execute_count_frame_groupby(op, data, _, **kwargs):
+@execute_node.register(ops.CountStar, DataFrameGroupBy, type(None))
+def execute_count_star_frame_groupby(op, data, _, **kwargs):
     result = data.size()
     # FIXME(phillipc): We should not hard code this column name
     result.name = 'count'
@@ -582,11 +627,11 @@ def execute_reduction_series_mask(op, data, mask, aggcontext=None, **kwargs):
 
 
 @execute_node.register(
-    (ops.CountDistinct, ops.HLLCardinality), pd.Series, (pd.Series, type(None))
+    (ops.CountDistinct, ops.ApproxCountDistinct),
+    pd.Series,
+    (pd.Series, type(None)),
 )
-def execute_count_distinct_series_mask(
-    op, data, mask, aggcontext=None, **kwargs
-):
+def execute_count_distinct_series_mask(op, data, mask, aggcontext=None, **kwargs):
     return aggcontext.agg(data[mask] if mask is not None else data, 'nunique')
 
 
@@ -597,9 +642,7 @@ def execute_arbitrary_series_mask(op, data, mask, aggcontext=None, **kwargs):
     elif op.how == 'last':
         index = -1
     else:
-        raise com.OperationNotDefinedError(
-            f'Arbitrary {op.how!r} is not supported'
-        )
+        raise com.OperationNotDefinedError(f'Arbitrary {op.how!r} is not supported')
 
     data = data[mask] if mask is not None else data
     return data.iloc[index]
@@ -661,40 +704,78 @@ def execute_notall_series(op, data, aggcontext=None, **kwargs):
         return result
 
 
-@execute_node.register(ops.Count, pd.DataFrame, type(None))
-def execute_count_frame(op, data, _, **kwargs):
+@execute_node.register(ops.CountStar, pd.DataFrame, type(None))
+def execute_count_star_frame(op, data, _, **kwargs):
     return len(data)
 
 
-@execute_node.register(ops.Not, (bool, np.bool_))
-def execute_not_bool(op, data, **kwargs):
+@execute_node.register(ops.CountStar, pd.DataFrame, pd.Series)
+def execute_count_star_frame_filter(op, data, where, **kwargs):
+    return len(data) - (len(where) - where.sum())
+
+
+@execute_node.register(ops.BitAnd, pd.Series, (pd.Series, type(None)))
+def execute_bit_and_series(_, data, mask, aggcontext=None, **kwargs):
+    return aggcontext.agg(
+        data[mask] if mask is not None else data,
+        np.bitwise_and.reduce,
+    )
+
+
+@execute_node.register(ops.BitOr, pd.Series, (pd.Series, type(None)))
+def execute_bit_or_series(_, data, mask, aggcontext=None, **kwargs):
+    return aggcontext.agg(
+        data[mask] if mask is not None else data,
+        np.bitwise_or.reduce,
+    )
+
+
+@execute_node.register(ops.BitXor, pd.Series, (pd.Series, type(None)))
+def execute_bit_xor_series(_, data, mask, aggcontext=None, **kwargs):
+    return aggcontext.agg(
+        data[mask] if mask is not None else data,
+        np.bitwise_xor.reduce,
+    )
+
+
+@execute_node.register(
+    (ops.ArgMin, ops.ArgMax),
+    pd.Series,
+    pd.Series,
+    (pd.Series, type(None)),
+)
+def execute_argmin_series_mask(op, data, key, mask, aggcontext=None, **kwargs):
+    method_name = op.__class__.__name__.lower()
+    masked_key = key[mask] if mask is not None else key
+    idx = aggcontext.agg(masked_key, method_name)
+    masked = data[mask] if mask is not None else data
+    return masked.iloc[idx]
+
+
+@execute_node.register(ops.Mode, pd.Series, (pd.Series, type(None)))
+def execute_mode_series(_, data, mask, aggcontext=None, **kwargs):
+    return aggcontext.agg(
+        data[mask] if mask is not None else data, lambda x: x.mode().iloc[0]
+    )
+
+
+@execute_node.register(ops.Mode, SeriesGroupBy, (SeriesGroupBy, type(None)))
+def execute_mode_series_groupby(_, data, mask, aggcontext=None, **kwargs):
+    def mode(x):
+        return x.mode().iloc[0]
+
+    if mask is not None:
+        mode = functools.partial(_filtered_reduction, mask.obj, mode)
+
+    return aggcontext.agg(data, mode)
+
+
+@execute_node.register((ops.Not, ops.Negate), (bool, np.bool_))
+def execute_not_bool(_, data, **kwargs):
     return not data
 
 
-@execute_node.register(ops.BinaryOp, pd.Series, pd.Series)
-@execute_node.register(
-    (ops.NumericBinaryOp, ops.LogicalBinaryOp, ops.Comparison),
-    numeric_types,
-    pd.Series,
-)
-@execute_node.register(
-    (ops.NumericBinaryOp, ops.LogicalBinaryOp, ops.Comparison),
-    pd.Series,
-    numeric_types,
-)
-@execute_node.register(
-    (ops.NumericBinaryOp, ops.LogicalBinaryOp, ops.Comparison),
-    numeric_types,
-    numeric_types,
-)
-@execute_node.register((ops.Comparison, ops.Add, ops.Multiply), pd.Series, str)
-@execute_node.register((ops.Comparison, ops.Add, ops.Multiply), str, pd.Series)
-@execute_node.register((ops.Comparison, ops.Add), str, str)
-@execute_node.register(ops.Multiply, integer_types, str)
-@execute_node.register(ops.Multiply, str, integer_types)
-@execute_node.register(ops.Comparison, pd.Series, timestamp_types)
-@execute_node.register(ops.Comparison, timestamp_types, pd.Series)
-def execute_binary_op(op, left, right, **kwargs):
+def _execute_binary_op_impl(op, left, right, **_):
     op_type = type(op)
     try:
         operation = constants.BINARY_OPERATIONS[op_type]
@@ -706,35 +787,69 @@ def execute_binary_op(op, left, right, **kwargs):
         return operation(left, right)
 
 
-@execute_node.register(ops.BinaryOp, SeriesGroupBy, SeriesGroupBy)
+@execute_node.register(ops.Binary, pd.Series, pd.Series)
+@execute_node.register(
+    (ops.NumericBinary, ops.LogicalBinary, ops.Comparison),
+    numeric_types,
+    pd.Series,
+)
+@execute_node.register(
+    (ops.NumericBinary, ops.LogicalBinary, ops.Comparison),
+    pd.Series,
+    numeric_types,
+)
+@execute_node.register(
+    (ops.NumericBinary, ops.LogicalBinary, ops.Comparison),
+    numeric_types,
+    numeric_types,
+)
+@execute_node.register((ops.Comparison, ops.Add, ops.Multiply), pd.Series, str)
+@execute_node.register((ops.Comparison, ops.Add, ops.Multiply), str, pd.Series)
+@execute_node.register((ops.Comparison, ops.Add), str, str)
+@execute_node.register(ops.Multiply, integer_types, str)
+@execute_node.register(ops.Multiply, str, integer_types)
+@execute_node.register(ops.Comparison, pd.Series, timestamp_types)
+@execute_node.register(ops.Comparison, timedelta_types, pd.Series)
+def execute_binary_op(op, left, right, **kwargs):
+    return _execute_binary_op_impl(op, left, right, **kwargs)
+
+
+@execute_node.register(ops.Comparison, pd.Series, date_types)
+def execute_binary_op_date(op, left, right, **kwargs):
+    return _execute_binary_op_impl(
+        op, pd.to_datetime(left), pd.to_datetime(right), **kwargs
+    )
+
+
+@execute_node.register(ops.Binary, SeriesGroupBy, SeriesGroupBy)
 def execute_binary_op_series_group_by(op, left, right, **kwargs):
-    left_groupings = left.grouper.groupings
-    right_groupings = right.grouper.groupings
+    left_groupings = get_grouping(left.grouper.groupings)
+    right_groupings = get_grouping(right.grouper.groupings)
     if left_groupings != right_groupings:
         raise ValueError(
             'Cannot perform {} operation on two series with '
             'different groupings'.format(type(op).__name__)
         )
     result = execute_binary_op(op, left.obj, right.obj, **kwargs)
-    return result.groupby(left_groupings)
+    return result.groupby(left_groupings, group_keys=False)
 
 
-@execute_node.register(ops.BinaryOp, SeriesGroupBy, simple_types)
+@execute_node.register(ops.Binary, SeriesGroupBy, simple_types)
 def execute_binary_op_series_gb_simple(op, left, right, **kwargs):
     result = execute_binary_op(op, left.obj, right, **kwargs)
-    return result.groupby(left.grouper.groupings)
+    return result.groupby(get_grouping(left.grouper.groupings), group_keys=False)
 
 
-@execute_node.register(ops.BinaryOp, simple_types, SeriesGroupBy)
+@execute_node.register(ops.Binary, simple_types, SeriesGroupBy)
 def execute_binary_op_simple_series_gb(op, left, right, **kwargs):
     result = execute_binary_op(op, left, right.obj, **kwargs)
-    return result.groupby(right.grouper.groupings)
+    return result.groupby(get_grouping(right.grouper.groupings), group_keys=False)
 
 
-@execute_node.register(ops.UnaryOp, SeriesGroupBy)
+@execute_node.register(ops.Unary, SeriesGroupBy)
 def execute_unary_op_series_gb(op, operand, **kwargs):
     result = execute_node(op, operand.obj, **kwargs)
-    return result.groupby(operand.grouper.groupings)
+    return result.groupby(get_grouping(operand.grouper.groupings), group_keys=False)
 
 
 @execute_node.register(
@@ -744,13 +859,13 @@ def execute_unary_op_series_gb(op, operand, **kwargs):
 )
 def execute_log_series_gb_others(op, left, right, **kwargs):
     result = execute_node(op, left.obj, right, **kwargs)
-    return result.groupby(left.grouper.groupings)
+    return result.groupby(get_grouping(left.grouper.groupings), group_keys=False)
 
 
 @execute_node.register((ops.Log, ops.Round), SeriesGroupBy, SeriesGroupBy)
 def execute_log_series_gb_series_gb(op, left, right, **kwargs):
     result = execute_node(op, left.obj, right.obj, **kwargs)
-    return result.groupby(left.grouper.groupings)
+    return result.groupby(get_grouping(left.grouper.groupings), group_keys=False)
 
 
 @execute_node.register(ops.Not, pd.Series)
@@ -780,11 +895,6 @@ def execute_between(op, data, lower, upper, **kwargs):
     return data.between(lower, upper)
 
 
-@execute_node.register(ops.DistinctColumn, pd.Series)
-def execute_series_distinct(op, data, **kwargs):
-    return pd.Series(data.unique(), name=data.name)
-
-
 @execute_node.register(ops.Union, pd.DataFrame, pd.DataFrame, bool)
 def execute_union_dataframe_dataframe(
     op, left: pd.DataFrame, right: pd.DataFrame, distinct, **kwargs
@@ -793,22 +903,36 @@ def execute_union_dataframe_dataframe(
     return result.drop_duplicates() if distinct else result
 
 
-@execute_node.register(ops.Intersection, pd.DataFrame, pd.DataFrame)
+@execute_node.register(ops.Intersection, pd.DataFrame, pd.DataFrame, bool)
 def execute_intersection_dataframe_dataframe(
-    op, left: pd.DataFrame, right: pd.DataFrame, **kwargs
+    op,
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    distinct: bool,
+    **kwargs,
 ):
+    if not distinct:
+        raise NotImplementedError(
+            "`distinct=False` is not supported by the pandas backend"
+        )
     result = left.merge(right, on=list(left.columns), how="inner")
     return result
 
 
-@execute_node.register(ops.Difference, pd.DataFrame, pd.DataFrame)
+@execute_node.register(ops.Difference, pd.DataFrame, pd.DataFrame, bool)
 def execute_difference_dataframe_dataframe(
-    op, left: pd.DataFrame, right: pd.DataFrame, **kwargs
+    op,
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    distinct: bool,
+    **kwargs,
 ):
-    merged = left.merge(
-        right, on=list(left.columns), how='outer', indicator=True
-    )
-    result = merged[merged["_merge"] != "both"].drop("_merge", axis=1)
+    if not distinct:
+        raise NotImplementedError(
+            "`distinct=False` is not supported by the pandas backend"
+        )
+    merged = left.merge(right, on=list(left.columns), how="outer", indicator=True)
+    result = merged[merged["_merge"] == "left_only"].drop("_merge", axis=1)
     return result
 
 
@@ -824,7 +948,13 @@ def execute_series_notnnull(op, data, **kwargs):
 
 @execute_node.register(ops.IsNan, (pd.Series, floating_types))
 def execute_isnan(op, data, **kwargs):
-    return np.isnan(data)
+    try:
+        return np.isnan(data)
+    except (TypeError, ValueError):
+        # if `data` contains `None` np.isnan will complain
+        # so we take advantage of NaN not equaling itself
+        # to do the correct thing
+        return data != data
 
 
 @execute_node.register(ops.IsInf, (pd.Series, floating_types))
@@ -837,13 +967,20 @@ def execute_node_self_reference_dataframe(op, data, **kwargs):
     return data
 
 
-@execute_node.register(ops.ValueList, collections.abc.Sequence)
+@execute_node.register(ops.Alias, object)
+def execute_alias(op, data, **kwargs):
+    # just return the underlying argument because the naming is handled
+    # by the translator for the top level expression
+    return data
+
+
+@execute_node.register(ops.NodeList, collections.abc.Sequence)
 def execute_node_value_list(op, _, **kwargs):
     return [execute(arg, **kwargs) for arg in op.values]
 
 
-@execute_node.register(ops.StringConcat, collections.abc.Sequence)
-def execute_node_string_concat(op, args, **kwargs):
+@execute_node.register(ops.StringConcat, [object])
+def execute_node_string_concat(op, *args, **kwargs):
     return functools.reduce(operator.add, args)
 
 
@@ -853,70 +990,88 @@ def execute_node_string_join(op, args, **kwargs):
 
 
 @execute_node.register(
-    ops.Contains, pd.Series, (collections.abc.Sequence, collections.abc.Set)
+    ops.Contains,
+    object,
+    (collections.abc.Sequence, collections.abc.Set, np.ndarray),
+)
+def execute_node_contains_value_sequence(op, data, elements, **kwargs):
+    return data in elements
+
+
+@execute_node.register(
+    ops.Contains,
+    pd.Series,
+    (collections.abc.Sequence, collections.abc.Set, pd.Series),
 )
 def execute_node_contains_series_sequence(op, data, elements, **kwargs):
     return data.isin(elements)
 
 
 @execute_node.register(
-    ops.NotContains, pd.Series, (collections.abc.Sequence, collections.abc.Set)
+    ops.Contains,
+    SeriesGroupBy,
+    (collections.abc.Sequence, collections.abc.Set, pd.Series),
+)
+def execute_node_contains_series_group_by_sequence(op, data, elements, **kwargs):
+    return data.obj.isin(elements).groupby(
+        get_grouping(data.grouper.groupings), group_keys=False
+    )
+
+
+@execute_node.register(
+    ops.NotContains,
+    pd.Series,
+    (collections.abc.Sequence, collections.abc.Set, pd.Series),
 )
 def execute_node_not_contains_series_sequence(op, data, elements, **kwargs):
     return ~(data.isin(elements))
 
 
-# Series, Series, Series
-# Series, Series, scalar
-@execute_node.register(ops.Where, pd.Series, pd.Series, pd.Series)
-@execute_node.register(ops.Where, pd.Series, pd.Series, scalar_types)
-def execute_node_where_series_series_series(op, cond, true, false, **kwargs):
-    # No need to turn false into a series, pandas will broadcast it
-    return true.where(cond, other=false)
-
-
-# Series, scalar, Series
-def execute_node_where_series_scalar_scalar(op, cond, true, false, **kwargs):
-    return pd.Series(np.repeat(true, len(cond))).where(cond, other=false)
-
-
-# Series, scalar, scalar
-for scalar_type in scalar_types:
-    execute_node_where_series_scalar_scalar = execute_node.register(
-        ops.Where, pd.Series, scalar_type, scalar_type
-    )(execute_node_where_series_scalar_scalar)
-
-
-# scalar, Series, Series
-@execute_node.register(ops.Where, boolean_types, pd.Series, pd.Series)
-def execute_node_where_scalar_scalar_scalar(op, cond, true, false, **kwargs):
-    # Note that it is not necessary to check that true and false are also
-    # scalars. This allows users to do things like:
-    # ibis.where(even_or_odd_bool, [2, 4, 6], [1, 3, 5])
-    return true if cond else false
-
-
-# scalar, scalar, scalar
-for scalar_type in scalar_types:
-    execute_node_where_scalar_scalar_scalar = execute_node.register(
-        ops.Where, boolean_types, scalar_type, scalar_type
-    )(execute_node_where_scalar_scalar_scalar)
-
-
-# scalar, Series, scalar
-@execute_node.register(ops.Where, boolean_types, pd.Series, scalar_types)
-def execute_node_where_scalar_series_scalar(op, cond, true, false, **kwargs):
-    return (
-        true
-        if cond
-        else pd.Series(np.repeat(false, len(true)), index=true.index)
+@execute_node.register(
+    ops.NotContains,
+    SeriesGroupBy,
+    (collections.abc.Sequence, collections.abc.Set, pd.Series),
+)
+def execute_node_not_contains_series_group_by_sequence(op, data, elements, **kwargs):
+    return (~data.obj.isin(elements)).groupby(
+        get_grouping(data.grouper.groupings), group_keys=False
     )
 
 
-# scalar, scalar, Series
-@execute_node.register(ops.Where, boolean_types, scalar_types, pd.Series)
-def execute_node_where_scalar_scalar_series(op, cond, true, false, **kwargs):
-    return pd.Series(np.repeat(true, len(false))) if cond else false
+def pd_where(cond, true, false):
+    """Execute `where` following ibis's intended semantics."""
+    if isinstance(cond, pd.Series):
+        if not isinstance(true, pd.Series):
+            true = pd.Series(
+                np.repeat(true, len(cond)), name=cond.name, index=cond.index
+            )
+        return true.where(cond, other=false)
+    if cond:
+        if isinstance(false, pd.Series) and not isinstance(true, pd.Series):
+            return pd.Series(np.repeat(true, len(false)))
+        return true
+    else:
+        if isinstance(true, pd.Series) and not isinstance(false, pd.Series):
+            return pd.Series(np.repeat(false, len(true)), index=true.index)
+        return false
+
+
+@execute_node.register(ops.Where, (pd.Series, *boolean_types), pd.Series, pd.Series)
+@execute_node.register(ops.Where, (pd.Series, *boolean_types), pd.Series, simple_types)
+@execute_node.register(ops.Where, (pd.Series, *boolean_types), simple_types, pd.Series)
+@execute_node.register(ops.Where, (pd.Series, *boolean_types), type(None), type(None))
+def execute_node_where(op, cond, true, false, **kwargs):
+    return pd_where(cond, true, false)
+
+
+# For true/false as scalars, we only support identical type pairs + None to
+# limit the size of the dispatch table and not have to worry about type
+# promotion.
+for typ in (str, *scalar_types):
+    for cond_typ in (pd.Series, *boolean_types):
+        execute_node.register(ops.Where, cond_typ, typ, typ)(execute_node_where)
+        execute_node.register(ops.Where, cond_typ, type(None), typ)(execute_node_where)
+        execute_node.register(ops.Where, cond_typ, typ, type(None))(execute_node_where)
 
 
 @execute_node.register(PandasTable, PandasBackend)
@@ -965,7 +1120,10 @@ def execute_node_log_number_number(op, value, base, **kwargs):
 
 @execute_node.register(ops.DropNa, pd.DataFrame)
 def execute_node_dropna_dataframe(op, df, **kwargs):
-    subset = [col.get_name() for col in op.subset] if op.subset else None
+    if op.subset is not None:
+        subset = [col.name for col in op.subset]
+    else:
+        subset = None
     return df.dropna(how=op.how, subset=subset)
 
 
@@ -976,7 +1134,7 @@ def execute_node_fillna_dataframe_scalar(op, df, replacements, **kwargs):
 
 @execute_node.register(ops.FillNa, pd.DataFrame)
 def execute_node_fillna_dataframe_dict(op, df, **kwargs):
-    return df.fillna(op.replacements)
+    return df.fillna(dict(op.replacements))
 
 
 @execute_node.register(ops.IfNull, pd.Series, simple_types)
@@ -988,9 +1146,7 @@ def execute_node_ifnull_series(op, value, replacement, **kwargs):
 @execute_node.register(ops.IfNull, simple_types, pd.Series)
 def execute_node_ifnull_scalar_series(op, value, replacement, **kwargs):
     return (
-        replacement
-        if pd.isnull(value)
-        else pd.Series(value, index=replacement.index)
+        replacement if pd.isnull(value) else pd.Series(value, index=replacement.index)
     )
 
 
@@ -1022,35 +1178,41 @@ def execute_node_nullif_scalar_series(op, value, series, **kwargs):
 
 
 def coalesce(values):
-    return functools.reduce(lambda x, y: x if not pd.isnull(x) else y, values)
+    return functools.reduce(
+        lambda a1, a2: np.where(pd.isnull(a1), a2, a1),
+        values,
+    )
 
 
 @toolz.curry
 def promote_to_sequence(length, obj):
-    return obj.values if isinstance(obj, pd.Series) else np.repeat(obj, length)
+    try:
+        return obj.values
+    except AttributeError:
+        return np.repeat(obj, length)
 
 
-def compute_row_reduction(func, value, **kwargs):
-    final_sizes = {len(x) for x in value if isinstance(x, Sized)}
+def compute_row_reduction(func, values, **kwargs):
+    final_sizes = {len(x) for x in values if isinstance(x, Sized)}
     if not final_sizes:
-        return func(value)
+        return func(values)
     (final_size,) = final_sizes
-    raw = func(list(map(promote_to_sequence(final_size), value)), **kwargs)
+    raw = func(list(map(promote_to_sequence(final_size), values)), **kwargs)
     return pd.Series(raw).squeeze()
 
 
-@execute_node.register(ops.Greatest, collections.abc.Sequence)
-def execute_node_greatest_list(op, value, **kwargs):
-    return compute_row_reduction(np.maximum.reduce, value, axis=0)
+@execute_node.register(ops.Greatest, [object])
+def execute_node_greatest_list(op, *values, **kwargs):
+    return compute_row_reduction(np.maximum.reduce, values, axis=0)
 
 
-@execute_node.register(ops.Least, collections.abc.Sequence)
-def execute_node_least_list(op, value, **kwargs):
-    return compute_row_reduction(np.minimum.reduce, value, axis=0)
+@execute_node.register(ops.Least, [object])
+def execute_node_least_list(op, *values, **kwargs):
+    return compute_row_reduction(np.minimum.reduce, values, axis=0)
 
 
-@execute_node.register(ops.Coalesce, collections.abc.Sequence)
-def execute_node_coalesce(op, values, **kwargs):
+@execute_node.register(ops.Coalesce, [object])
+def execute_node_coalesce(op, *values, **kwargs):
     # TODO: this is slow
     return compute_row_reduction(coalesce, values)
 
@@ -1062,7 +1224,7 @@ def wrap_case_result(raw, expr):
     ----------
     raw : ndarray[T]
         The raw results of executing the ``CASE`` expression
-    expr : ValueExpr
+    expr : Value
         The expression from the which `raw` was computed
 
     Returns
@@ -1076,7 +1238,7 @@ def wrap_case_result(raw, expr):
         result = pd.Series(
             raw_1d, dtype=constants.IBIS_TYPE_TO_PANDAS_TYPE[expr.type()]
         )
-    if result.size == 1 and isinstance(expr, ir.ScalarExpr):
+    if result.size == 1 and isinstance(expr, ir.Scalar):
         return result.iloc[0].item()
     return result
 
@@ -1112,6 +1274,25 @@ def execute_distinct_dataframe(op, df, **kwargs):
 
 @execute_node.register(ops.RowID)
 def execute_rowid(op, *args, **kwargs):
-    raise com.UnsupportedOperationError(
-        'rowid is not supported in pandas backends'
-    )
+    raise com.UnsupportedOperationError('rowid is not supported in pandas backends')
+
+
+@execute_node.register(ops.TableArrayView, pd.DataFrame)
+def execute_table_array_view(op, _, **kwargs):
+    return execute(op.table).squeeze()
+
+
+@execute_node.register(ops.ZeroIfNull, pd.Series)
+def execute_zero_if_null_series(op, data, **kwargs):
+    zero = op.arg.output_dtype.to_pandas().type(0)
+    return data.replace({np.nan: zero, None: zero, pd.NA: zero})
+
+
+@execute_node.register(
+    ops.ZeroIfNull,
+    (type(None), type(pd.NA), numbers.Real, np.integer, np.floating),
+)
+def execute_zero_if_null_scalar(op, data, **kwargs):
+    if data is None or pd.isna(data) or math.isnan(data) or np.isnan(data):
+        return op.arg.output_dtype.to_pandas().type(0)
+    return data

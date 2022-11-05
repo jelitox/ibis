@@ -1,9 +1,9 @@
 import datetime
+from posixpath import join as pjoin
 
 import pandas as pd
 import pytest
 import pytz
-from thrift.transport.TTransport import TTransportException
 
 import ibis
 import ibis.common.exceptions as com
@@ -12,38 +12,13 @@ import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
 from ibis.tests.util import assert_equal
 
+pytest.importorskip("impala")
+thrift = pytest.importorskip("thrift")
+
 
 @pytest.fixture
 def db(con, test_data_db):
     return con.database(test_data_db)
-
-
-def test_kerberos_deps_installed(env, test_data_db):
-    # This test raises an AttributeError or TTransportException
-    # if the required dependencies are installed. Both are generic
-    # errors and occur, because there is no kerberos server in
-    # the CI pipeline, but they imply our imports have succeeded.
-    # See: https://github.com/ibis-project/ibis/issues/2342
-    excs = (AttributeError, TTransportException)
-    try:
-        # TLDR: puresasl is using kerberos, and not pykerberos
-        #
-        # see https://github.com/requests/requests-kerberos/issues/63
-        # for why both libraries exist
-        from kerberos import GSSError
-    except ImportError:
-        pass
-    else:
-        excs += (GSSError,)
-
-    with pytest.raises(excs):
-        ibis.impala.connect(
-            host=env.impala_host,
-            database=test_data_db,
-            port=env.impala_port,
-            auth_mechanism='GSSAPI',
-            hdfs_client=None,
-        )
 
 
 @pytest.mark.xfail(
@@ -62,8 +37,8 @@ def test_execute_exprs_default_backend(con_no_hdfs):
 
 def test_cursor_garbage_collection(con):
     for i in range(5):
-        con.raw_sql('select 1', True).fetchall()
-        con.raw_sql('select 1', True).fetchone()
+        con.raw_sql('select 1').fetchall()
+        con.raw_sql('select 1').fetchone()
 
 
 def test_raise_ibis_error_no_hdfs(con_no_hdfs):
@@ -73,20 +48,15 @@ def test_raise_ibis_error_no_hdfs(con_no_hdfs):
 
 
 def test_get_table_ref(db):
-    assert isinstance(db.functional_alltypes, ir.TableExpr)
-    assert isinstance(db['functional_alltypes'], ir.TableExpr)
+    assert isinstance(db.functional_alltypes, ir.Table)
+    assert isinstance(db['functional_alltypes'], ir.Table)
 
 
 def test_run_sql(con, test_data_db):
-    query = """SELECT li.*
-FROM {}.tpch_lineitem li
-""".format(
-        test_data_db
-    )
-    table = con.sql(query)
+    table = con.sql(f"SELECT li.* FROM {test_data_db}.tpch_lineitem li")
 
     li = con.table('tpch_lineitem')
-    assert isinstance(table, ir.TableExpr)
+    assert isinstance(table, ir.Table)
     assert_equal(table.schema(), li.schema())
 
     expr = table.limit(10)
@@ -95,18 +65,14 @@ FROM {}.tpch_lineitem li
 
 
 def test_sql_with_limit(con):
-    query = """\
-SELECT *
-FROM functional_alltypes
-LIMIT 10"""
-    table = con.sql(query)
+    table = con.sql("SELECT * FROM functional_alltypes LIMIT 10")
     ex_schema = con.get_schema('functional_alltypes')
     assert_equal(table.schema(), ex_schema)
 
 
 def test_raw_sql(con):
     query = 'SELECT * from functional_alltypes limit 10'
-    cur = con.raw_sql(query, results=True)
+    cur = con.raw_sql(query)
     rows = cur.fetchall()
     cur.release()
     assert len(rows) == 10
@@ -128,7 +94,7 @@ def test_get_schema(con, test_data_db):
 def test_result_as_dataframe(con, alltypes):
     expr = alltypes.limit(10)
 
-    ex_names = expr.schema().names
+    ex_names = list(expr.schema().names)
     result = con.execute(expr)
 
     assert isinstance(result, pd.DataFrame)
@@ -148,9 +114,7 @@ def test_adapt_scalar_array_results(con, alltypes):
         assert isinstance(result2, float)
 
     expr = (
-        table.group_by('string_col')
-        .aggregate([table.count().name('count')])
-        .string_col
+        table.group_by('string_col').aggregate([table.count().name('count')]).string_col
     )
 
     result = con.execute(expr)
@@ -164,15 +128,9 @@ def test_interactive_repr_call_failure(con):
 
     keys = [t.date.year().name('year'), 'l_linestatus']
     filt = t.l_linestatus.isin(['F'])
-    expr = (
-        t[filt]
-        .group_by(keys)
-        .aggregate(t.l_extendedprice.mean().name('avg_px'))
-    )
+    expr = t[filt].group_by(keys).aggregate(t.l_extendedprice.mean().name('avg_px'))
 
-    w2 = ibis.trailing_window(
-        9, group_by=expr.l_linestatus, order_by=expr.year
-    )
+    w2 = ibis.trailing_window(9, group_by=expr.l_linestatus, order_by=expr.year)
 
     metric = expr['avg_px'].mean().over(w2)
     enriched = expr[expr, metric]
@@ -221,23 +179,23 @@ def test_sql_query_limits(con, test_data_db):
     with config.option_context('sql.default_limit', 100000):
         # table has 25 rows
         assert len(table.execute()) == 25
-        # comply with limit arg for TableExpr
+        # comply with limit arg for Table
         assert len(table.execute(limit=10)) == 10
         # state hasn't changed
         assert len(table.execute()) == 25
-        # non-TableExpr ignores default_limit
+        # non-Table ignores default_limit
         assert table.count().execute() == 25
-        # non-TableExpr doesn't observe limit arg
+        # non-Table doesn't observe limit arg
         assert table.count().execute(limit=10) == 25
     with config.option_context('sql.default_limit', 20):
-        # TableExpr observes default limit setting
+        # Table observes default limit setting
         assert len(table.execute()) == 20
         # explicit limit= overrides default
         assert len(table.execute(limit=15)) == 15
         assert len(table.execute(limit=23)) == 23
-        # non-TableExpr ignores default_limit
+        # non-Table ignores default_limit
         assert table.count().execute() == 25
-        # non-TableExpr doesn't observe limit arg
+        # non-Table doesn't observe limit arg
         assert table.count().execute(limit=10) == 25
     # eliminating default_limit doesn't break anything
     with config.option_context('sql.default_limit', None):
@@ -258,8 +216,6 @@ def test_database_default_current_database(con):
 
 
 def test_close_drops_temp_tables(con, test_data_dir):
-    from posixpath import join as pjoin
-
     hdfs_path = pjoin(test_data_dir, 'parquet/tpch_region')
 
     table = con.parquet_file(hdfs_path)
@@ -307,9 +263,7 @@ def test_disable_codegen(con):
     assert opts2['DISABLE_CODEGEN'] == '1'
 
 
-def test_attr_name_conflict(
-    con, tmp_db, temp_parquet_table, temp_parquet_table2
-):
+def test_attr_name_conflict(con, tmp_db, temp_parquet_table, temp_parquet_table2):
     left = temp_parquet_table
     right = temp_parquet_table2
 
@@ -331,26 +285,6 @@ def con2(env):
     return con
 
 
-def test_rerelease_cursor(con2):
-    # we use a separate `con2` fixture here because any connection pool
-    # manipulation we want to happen independently of `con`
-    with con2.raw_sql('select 1', True) as cur1:
-        pass
-
-    cur1.release()
-
-    with con2.raw_sql('select 1', True) as cur2:
-        pass
-
-    cur2.release()
-
-    with con2.raw_sql('select 1', True) as cur3:
-        pass
-
-    assert cur1 == cur2
-    assert cur2 == cur3
-
-
 def test_day_of_week(con):
     date_var = ibis.literal(datetime.date(2017, 1, 1), type=dt.date)
     expr_index = date_var.day_of_week.index()
@@ -363,9 +297,7 @@ def test_day_of_week(con):
 
 
 def test_datetime_to_int_cast(con):
-    timestamp = pytz.utc.localize(
-        datetime.datetime(2021, 9, 12, 14, 45, 33, 0)
-    )
+    timestamp = pytz.utc.localize(datetime.datetime(2021, 9, 12, 14, 45, 33, 0))
     d = ibis.literal(timestamp)
     result = con.execute(d.cast('int64'))
     assert result == pd.Timestamp(timestamp).value // 1000
@@ -373,7 +305,7 @@ def test_datetime_to_int_cast(con):
 
 def test_set_option_with_dot(con):
     con.set_options({'request_pool': 'baz.quux'})
-    result = dict(row[:2] for row in con.raw_sql('set', True).fetchall())
+    result = dict(row[:2] for row in con.raw_sql('set').fetchall())
     assert result['REQUEST_POOL'] == 'baz.quux'
 
 

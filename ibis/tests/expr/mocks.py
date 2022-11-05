@@ -16,6 +16,7 @@ from typing import Optional
 
 import pytest
 
+import ibis.expr.types as ir
 from ibis.backends.base.sql import BaseSQLBackend
 from ibis.backends.base.sql.alchemy import (
     AlchemyCompiler,
@@ -31,8 +32,8 @@ MOCK_TABLES = {
         ('b', 'int16'),
         ('c', 'int32'),
         ('d', 'int64'),
-        ('e', 'float'),
-        ('f', 'double'),
+        ('e', 'float32'),
+        ('f', 'float64'),
         ('g', 'string'),
         ('h', 'boolean'),
         ('i', 'timestamp'),
@@ -123,8 +124,8 @@ MOCK_TABLES = {
         ('smallint_col', 'int16'),
         ('int_col', 'int32'),
         ('bigint_col', 'int64'),
-        ('float_col', 'float'),
-        ('double_col', 'double'),
+        ('float_col', 'float32'),
+        ('double_col', 'float64'),
         ('date_string_col', 'string'),
         ('string_col', 'string'),
         ('timestamp_col', 'timestamp'),
@@ -387,10 +388,21 @@ class MockBackend(BaseSQLBackend):
         return Schema.from_tuples(MOCK_TABLES[name])
 
     def execute(self, expr, limit=None, params=None, **kwargs):
+        import pandas as pd
+
         ast = self.compiler.to_ast_ensure_limit(expr, limit, params=params)
         for query in ast.queries:
             self.executed_queries.append(query.compile())
-        return None
+        try:
+            schema = expr.schema()
+        except AttributeError:
+            schema = expr.to_projection().schema()
+        df = schema.apply_to(pd.DataFrame([], columns=schema.names))
+        if isinstance(expr, ir.Scalar):
+            return None
+        elif isinstance(expr, ir.Column):
+            return df.iloc[:, 0]
+        return df
 
     def compile(
         self,
@@ -419,11 +431,13 @@ class MockAlchemyBackend(MockBackend):
 
     def _inject_table(self, name, schema):
         try:
-            table = self.meta.tables[name]
+            alchemy_table = self.meta.tables[name]
         except KeyError:
-            table = table_from_schema(name, self.meta, schema)
+            alchemy_table = table_from_schema(name, self.meta, schema)
 
-        return self.table_class(table, self).to_expr()
+        return self.table_class(
+            source=self, sqla_table=alchemy_table, schema=schema
+        ).to_expr()
 
 
 GEO_TABLE = {

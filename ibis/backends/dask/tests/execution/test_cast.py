@@ -1,14 +1,18 @@
 import decimal
 
 import pytest
-from dask.dataframe.utils import tm  # noqa: E402
 from pandas import Timestamp
 from pytest import param
 
 import ibis
-import ibis.expr.datatypes as dt  # noqa: E402
+import ibis.expr.datatypes as dt
 
-from ...execution import execute
+pytest.importorskip("dask.dataframe")
+from dask.dataframe.utils import tm  # noqa: E402
+
+from ibis.backends.dask.execution import execute  # noqa: E402
+
+TIMESTAMP = "2022-03-13 06:59:10.467417"
 
 
 @pytest.mark.parametrize('from_', ['plain_float64', 'plain_int64'])
@@ -19,7 +23,7 @@ from ...execution import execute
         ('float32', 'float32'),
         ('float64', 'float64'),
         ('double', 'float64'),
-        ('float', 'float32'),
+        ('float', 'float64'),
         ('int8', 'int8'),
         ('int16', 'int16'),
         ('int32', 'int32'),
@@ -86,10 +90,10 @@ def test_cast_timestamp_column(t, df, column, to, expected):
     ],
 )
 def test_cast_timestamp_scalar_naive(to, expected):
-    literal_expr = ibis.literal(Timestamp('now'))
+    literal_expr = ibis.literal(Timestamp(TIMESTAMP))
     value = literal_expr.cast(to)
-    result = execute(value)
-    raw = execute(literal_expr)
+    result = execute(value.op())
+    raw = execute(literal_expr.op())
     assert result == expected(raw)
 
 
@@ -107,10 +111,10 @@ def test_cast_timestamp_scalar_naive(to, expected):
 )
 @pytest.mark.parametrize('tz', ['UTC', 'America/New_York'])
 def test_cast_timestamp_scalar(to, expected, tz):
-    literal_expr = ibis.literal(Timestamp('now').tz_localize(tz))
+    literal_expr = ibis.literal(Timestamp(TIMESTAMP).tz_localize(tz))
     value = literal_expr.cast(to)
-    result = execute(value)
-    raw = execute(literal_expr)
+    result = execute(value.op())
+    raw = execute(literal_expr.op())
     assert result == expected(raw)
 
 
@@ -139,9 +143,7 @@ def test_cast_to_decimal(t, df, type):
     expected = df.float64_as_strings.apply(
         lambda x: context.create_decimal(x).quantize(
             decimal.Decimal(
-                '{}.{}'.format(
-                    '0' * (type.precision - type.scale), '0' * type.scale
-                )
+                '{}.{}'.format('0' * (type.precision - type.scale), '0' * type.scale)
             )
         ),
         meta=("float64_as_strings", "object"),
@@ -163,6 +165,4 @@ def test_cast_to_decimal(t, df, type):
 )
 def test_cast_to_category(t, df, column):
     test = t[column].cast('category').compile()
-    tm.assert_series_equal(
-        test.compute(), df[column].astype('category').compute()
-    )
+    tm.assert_series_equal(test.compute(), df[column].astype('category').compute())

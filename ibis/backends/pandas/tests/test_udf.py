@@ -4,12 +4,13 @@ import numpy as np
 import pandas as pd
 import pandas._testing as tm
 import pytest
+from packaging.version import parse as vparse
 
 import ibis
 import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
 from ibis.backends.pandas import Backend
-from ibis.backends.pandas.udf import nullable, udf
+from ibis.backends.pandas.udf import udf
 
 
 @pytest.fixture
@@ -28,10 +29,8 @@ def df():
 def df2():
     return pd.DataFrame(
         {
-            'a': np.arange(4, dtype=float).tolist()
-            + np.random.rand(3).tolist(),
-            'b': np.arange(4, dtype=float).tolist()
-            + np.random.rand(3).tolist(),
+            'a': np.arange(4, dtype=float).tolist() + np.random.rand(3).tolist(),
+            'b': np.arange(4, dtype=float).tolist() + np.random.rand(3).tolist(),
             'c': np.arange(7, dtype=int).tolist(),
             'key': list('ddeefff'),
         }
@@ -104,7 +103,7 @@ def quantiles(series, *, quantiles):
 def test_udf(t, df):
     expr = my_string_length(t.a)
 
-    assert isinstance(expr, ir.ColumnExpr)
+    assert isinstance(expr, ir.Column)
 
     result = expr.execute()
     expected = df.a.str.len().mul(2)
@@ -114,7 +113,7 @@ def test_udf(t, df):
 def test_multiple_argument_udf(con, t, df):
     expr = my_add(t.b, t.c)
 
-    assert isinstance(expr, ir.ColumnExpr)
+    assert isinstance(expr, ir.Column)
     assert isinstance(expr, ir.NumericColumn)
     assert isinstance(expr, ir.FloatingColumn)
 
@@ -124,10 +123,10 @@ def test_multiple_argument_udf(con, t, df):
 
 
 def test_multiple_argument_udf_group_by(con, t, df):
-    expr = t.groupby(t.key).aggregate(my_add=my_add(t.b, t.c).sum())
+    expr = t.group_by(t.key).aggregate(my_add=my_add(t.b, t.c).sum())
 
-    assert isinstance(expr, ir.TableExpr)
-    assert isinstance(expr.my_add, ir.ColumnExpr)
+    assert isinstance(expr, ir.Table)
+    assert isinstance(expr.my_add, ir.Column)
     assert isinstance(expr.my_add, ir.NumericColumn)
     assert isinstance(expr.my_add, ir.FloatingColumn)
 
@@ -141,7 +140,7 @@ def test_multiple_argument_udf_group_by(con, t, df):
 def test_udaf(con, t, df):
     expr = my_string_length_sum(t.a)
 
-    assert isinstance(expr, ir.ScalarExpr)
+    assert isinstance(expr, ir.Scalar)
 
     result = expr.execute()
     expected = t.a.execute().str.len().mul(2).sum()
@@ -151,7 +150,7 @@ def test_udaf(con, t, df):
 def test_udaf_analytic(con, t, df):
     expr = zscore(t.c)
 
-    assert isinstance(expr, ir.ColumnExpr)
+    assert isinstance(expr, ir.Column)
 
     result = expr.execute()
 
@@ -165,7 +164,7 @@ def test_udaf_analytic(con, t, df):
 def test_udaf_analytic_groupby(con, t, df):
     expr = zscore(t.c).over(ibis.window(group_by=t.key))
 
-    assert isinstance(expr, ir.ColumnExpr)
+    assert isinstance(expr, ir.Column)
 
     result = expr.execute()
 
@@ -180,19 +179,17 @@ def test_udaf_analytic_groupby(con, t, df):
 def test_udaf_groupby():
     df = pd.DataFrame(
         {
-            'a': np.arange(4, dtype=float).tolist()
-            + np.random.rand(3).tolist(),
-            'b': np.arange(4, dtype=float).tolist()
-            + np.random.rand(3).tolist(),
+            'a': np.arange(4, dtype=float).tolist() + np.random.rand(3).tolist(),
+            'b': np.arange(4, dtype=float).tolist() + np.random.rand(3).tolist(),
             'key': list('ddeefff'),
         }
     )
     con = Backend().connect({'df': df})
     t = con.table('df')
 
-    expr = t.groupby(t.key).aggregate(my_corr=my_corr(t.a, t.b))
+    expr = t.group_by(t.key).aggregate(my_corr=my_corr(t.a, t.b))
 
-    assert isinstance(expr, ir.TableExpr)
+    assert isinstance(expr, ir.Table)
 
     result = expr.execute().sort_values('key')
 
@@ -201,24 +198,13 @@ def test_udaf_groupby():
         {
             'key': list('def'),
             'my_corr': [
-                dfi.loc[value, 'a'].corr(dfi.loc[value, 'b'])
-                for value in 'def'
+                dfi.loc[value, 'a'].corr(dfi.loc[value, 'b']) for value in 'def'
             ],
         }
     )
 
     columns = ['key', 'my_corr']
     tm.assert_frame_equal(result[columns], expected[columns])
-
-
-def test_nullable():
-    t = ibis.table([('a', 'int64')])
-    assert nullable(t.a.type()) == (type(None),)
-
-
-def test_nullable_non_nullable_field():
-    t = ibis.table([('a', dt.String(nullable=False))])
-    assert nullable(t.a.type()) == ()
 
 
 def test_udaf_parameter_mismatch():
@@ -246,6 +232,21 @@ def test_udf_error(t):
         error_udf(t.c).execute()
 
 
+def test_udf_no_reexecution(t2):
+    execution_count = 0
+
+    @udf.elementwise(input_type=[dt.double], output_type=dt.double)
+    def times_two_count_executions(x):
+        nonlocal execution_count
+        execution_count += 1
+        return x * 2.0
+
+    expr = t2.mutate(doubled=times_two_count_executions(t2.a))
+    expr.execute()
+
+    assert execution_count == 1
+
+
 def test_compose_udfs(t2, df2):
     expr = times_two(add_one(t2.a))
     result = expr.execute()
@@ -266,15 +267,18 @@ def test_udaf_window(t2, df2):
     tm.assert_frame_equal(result, expected)
 
 
+@pytest.mark.xfail(
+    condition=vparse("1.4") <= vparse(pd.__version__) < vparse("1.4.2"),
+    raises=ValueError,
+    reason="https://github.com/pandas-dev/pandas/pull/44068",
+)
 def test_udaf_window_interval():
     df = pd.DataFrame(
         collections.OrderedDict(
             [
                 (
                     "time",
-                    pd.date_range(
-                        start='20190105', end='20190101', freq='-1D'
-                    ),
+                    pd.date_range(start='20190105', end='20190101', freq='-1D'),
                 ),
                 ("key", [1, 2, 1, 2, 1]),
                 ("value", np.arange(5)),
@@ -316,10 +320,8 @@ def test_multiple_argument_udaf_window():
         {
             'a': np.arange(4, 0, dtype=float, step=-1).tolist()
             + np.random.rand(3).tolist(),
-            'b': np.arange(4, dtype=float).tolist()
-            + np.random.rand(3).tolist(),
-            'c': np.arange(4, dtype=float).tolist()
-            + np.random.rand(3).tolist(),
+            'b': np.arange(4, dtype=float).tolist() + np.random.rand(3).tolist(),
+            'c': np.arange(4, dtype=float).tolist() + np.random.rand(3).tolist(),
             'd': np.repeat(1, 7),
             'key': list('deefefd'),
         }
@@ -408,11 +410,10 @@ def test_array_return_type_reduction_group_by(con, t, df, qs):
     """Tests reduction UDF returning an array, used in a grouped aggregation.
 
     Getting this use case to succeed required avoiding use of
-    `SeriesGroupBy.agg` in the `Summarize` aggcontext implementation (#2768).
+    `SeriesGroupBy.agg` in the `Summarize` aggcontext implementation
+    (#2768).
     """
-    expr = t.groupby(t.key).aggregate(
-        quantiles_col=quantiles(t.b, quantiles=qs)
-    )
+    expr = t.group_by(t.key).aggregate(quantiles_col=quantiles(t.b, quantiles=qs))
     result = expr.execute()
 
     expected_col = df.groupby(df.key).b.agg(lambda s: s.quantile(qs).tolist())

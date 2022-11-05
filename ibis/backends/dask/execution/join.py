@@ -1,44 +1,53 @@
-import operator
-
 import dask.dataframe as dd
 from pandas import Timedelta
 
 import ibis.expr.operations as ops
 import ibis.util
+from ibis.backends.dask.dispatch import execute_node
+from ibis.backends.dask.execution import constants
 from ibis.backends.pandas.execution.join import (
     _compute_join_column,
     _extract_predicate_names,
     _validate_columns,
 )
 
-from ..dispatch import execute_node
-from ..execution import constants
-
 
 @execute_node.register(
-    ops.AsOfJoin, dd.DataFrame, dd.DataFrame, (Timedelta, type(None))
+    ops.AsOfJoin,
+    dd.DataFrame,
+    dd.DataFrame,
+    tuple,
+    (Timedelta, type(None)),
+    tuple,
 )
-def execute_asof_join(op, left, right, tolerance, **kwargs):
+def execute_asof_join(op, left, right, by, tolerance, predicates, **kwargs):
     overlapping_columns = frozenset(left.columns) & frozenset(right.columns)
-    left_on, right_on = _extract_predicate_names(op.predicates)
-    left_by, right_by = _extract_predicate_names(op.by)
-    _validate_columns(
-        overlapping_columns, left_on, right_on, left_by, right_by
-    )
+    left_on, right_on = _extract_predicate_names(predicates)
+    left_by, right_by = _extract_predicate_names(by)
+    _validate_columns(overlapping_columns, left_on, right_on, left_by, right_by)
 
+    assert 0 <= len(left_on) <= 1, f"len(left_on) == {len(left_on)}"
+    assert 0 <= len(right_on) <= 1, f"len(right_on) == {len(right_on)}"
+
+    on = left_on if left_on == right_on else None
     return dd.merge_asof(
         left=left,
         right=right,
-        left_on=left_on,
-        right_on=right_on,
+        # NB: dask 2022.4.1 contains a bug from
+        # https://github.com/dask/dask/pull/8857 that keeps a column if `on` is
+        # non-empty without checking whether `left_on` is non-empty, this
+        # check works around that
+        on=on,
+        left_on=left_on if on is None else None,
+        right_on=right_on if on is None else None,
         left_by=left_by or None,
         right_by=right_by or None,
         tolerance=tolerance,
     )
 
 
-@execute_node.register(ops.CrossJoin, dd.DataFrame, dd.DataFrame)
-def execute_cross_join(op, left, right, **kwargs):
+@execute_node.register(ops.CrossJoin, dd.DataFrame, dd.DataFrame, tuple)
+def execute_cross_join(op, left, right, predicates, **kwargs):
     """Execute a cross join in dask.
 
     Notes
@@ -46,8 +55,8 @@ def execute_cross_join(op, left, right, **kwargs):
     We create a dummy column of all :data:`True` instances and use that as the
     join key. This results in the desired Cartesian product behavior guaranteed
     by cross join.
-
     """
+    assert not predicates, "cross join should have an empty predicate set"
     # generate a unique name for the temporary join key
     key = f"cross_join_{ibis.util.guid()}"
     join_key = {key: True}
@@ -70,8 +79,8 @@ def execute_cross_join(op, left, right, **kwargs):
 
 
 # TODO - execute_join - #2553
-@execute_node.register(ops.Join, dd.DataFrame, dd.DataFrame)
-def execute_join(op, left, right, **kwargs):
+@execute_node.register(ops.Join, dd.DataFrame, dd.DataFrame, tuple)
+def execute_join(op, left, right, predicates, **kwargs):
     op_type = type(op)
 
     try:
@@ -79,18 +88,11 @@ def execute_join(op, left, right, **kwargs):
     except KeyError:
         raise NotImplementedError(f'{op_type.__name__} not supported')
 
-    left_op = op.left.op()
-    right_op = op.right.op()
-
-    on = {left_op: [], right_op: []}
-    for predicate in map(operator.methodcaller('op'), op.predicates):
+    on = {op.left: [], op.right: []}
+    for predicate in predicates:
         if not isinstance(predicate, ops.Equals):
-            raise TypeError(
-                'Only equality join predicates supported with dask'
-            )
-        new_left_column, left_pred_root = _compute_join_column(
-            predicate.left, **kwargs
-        )
+            raise TypeError('Only equality join predicates supported with dask')
+        new_left_column, left_pred_root = _compute_join_column(predicate.left, **kwargs)
         on[left_pred_root].append(new_left_column)
 
         new_right_column, right_pred_root = _compute_join_column(
@@ -102,8 +104,8 @@ def execute_join(op, left, right, **kwargs):
         left,
         right,
         how=how,
-        left_on=on[left_op],
-        right_on=on[right_op],
+        left_on=on[op.left],
+        right_on=on[op.right],
         suffixes=constants.JOIN_SUFFIXES,
     )
     return df

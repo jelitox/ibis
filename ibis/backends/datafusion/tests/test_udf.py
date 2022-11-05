@@ -1,9 +1,12 @@
 import pandas.testing as tm
-import pyarrow.compute as pc
+import pytest
 
 import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
 from ibis.udf.vectorized import elementwise, reduction
+
+pytest.importorskip("datafusion")
+pc = pytest.importorskip("pyarrow.compute")
 
 
 @elementwise(input_type=['string'], output_type='int64')
@@ -27,14 +30,14 @@ def test_udf(alltypes):
     expected = data_string_col.str.len() * 2
 
     expr = my_string_length(alltypes.date_string_col)
-    assert isinstance(expr, ir.ColumnExpr)
+    assert isinstance(expr, ir.Column)
 
     result = expr.execute()
     tm.assert_series_equal(result, expected, check_names=False)
 
 
 def test_multiple_argument_udf(alltypes):
-    expr = my_add(alltypes.smallint_col, alltypes.int_col)
+    expr = my_add(alltypes.smallint_col, alltypes.int_col).name("tmp")
     result = expr.execute()
 
     df = alltypes[['smallint_col', 'int_col']].execute()

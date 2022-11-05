@@ -48,7 +48,7 @@ columns, or scalars.
 <!-- prettier-ignore-start -->
 Examples of expression types include
 [`StringValue`][ibis.expr.types.StringValue] and
-[`TableExpr`][ibis.expr.types.TableExpr].
+[`Table`][ibis.expr.types.Table].
 <!-- prettier-ignore-end -->
 
 <!-- prettier-ignore-start -->
@@ -74,12 +74,17 @@ An example of usage is a node that representats a logarithm operation:
 ```python
 
 import ibis.expr.rules as rlz
-from ibis.expr.operations import ValueOp
+from ibis.expr.operations import Value
 
-class Log(ValueOp):
-   arg = rlz.double  # A double scalar or column
-   base = rlz.optional(rlz.double)  # Optional argument, defaults to None
-   output_type = rlz.typeof('arg')
+class Log(Value):
+   # A double scalar or column
+   arg = rlz.double
+   # Optional argument, defaults to None
+   base = rlz.optional(rlz.double)
+   # Output expression's datatype will correspond to arg's datatype
+   output_dtype = rlz.dtype_like('arg')
+   # Output expression will be scalar if arg is scalar, column otherwise
+   output_shape = rlz.shape_like('arg')
 ```
 
 This class describes an operation called `Log` that takes one required
@@ -92,7 +97,7 @@ Similar objects are instantiated when you use ibis APIs:
 
 ```python
 import ibis
-t = ibis.table([('a', 'double')], name='t')
+t = ibis.table([('a', 'float')], name='t')
 log_1p = (1 + t.a).log()  # an Add and a Log are instantiated here
 ```
 

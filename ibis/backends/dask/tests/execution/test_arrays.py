@@ -1,15 +1,16 @@
 import operator
 
-import dask.dataframe as dd
 import numpy as np
 import pandas as pd
 import pytest
-from dask.dataframe.utils import tm
 
 import ibis
 
+dd = pytest.importorskip("dask.dataframe")
+from dask.dataframe.utils import tm  # noqa: E402
 
-def test_array_length(t, df):
+
+def test_array_length(t):
     expr = t.projection(
         [
             t.array_of_float64.length().name('array_of_float64_length'),
@@ -42,9 +43,7 @@ def test_array_length_scalar(client):
 
 
 def test_array_collect(t, df):
-    expr = t.group_by(t.dup_strings).aggregate(
-        collected=t.float64_with_zeros.collect()
-    )
+    expr = t.group_by(t.dup_strings).aggregate(collected=t.float64_with_zeros.collect())
     result = expr.compile()
     expected = (
         df.groupby('dup_strings')
@@ -131,7 +130,8 @@ def test_array_index(t, df, index):
         pd.DataFrame(
             {
                 'indexed': df.array_of_float64.apply(
-                    lambda x: x[index] if -len(x) <= index < len(x) else None
+                    lambda x: x[index] if -len(x) <= index < len(x) else None,
+                    meta=("array_of_float64", "object"),
                 )
             }
         ),

@@ -1,8 +1,10 @@
+import warnings
+
 import pytest
 from multipledispatch import Dispatcher
 from multipledispatch.conflict import AmbiguityWarning
 
-from ..trace import TwoLevelDispatcher
+from ibis.backends.dask.trace import TwoLevelDispatcher
 
 
 class A1:
@@ -31,7 +33,6 @@ class B3(B2):
 
 @pytest.fixture
 def foo_dispatchers():
-
     foo = TwoLevelDispatcher('foo', doc='Test dispatcher foo')
     foo_m = Dispatcher('foo_m', doc='Control dispatcher foo_m')
 
@@ -91,8 +92,8 @@ def test_cache(foo, mocker):
 
 
 def test_dispatch(foo, mocker):
-    """Test that calling dispatcher with a signature that is registered
-    does not trigger a linear search through dispatch_iter."""
+    """Test that calling dispatcher with a signature that is registered does
+    not trigger a linear search through dispatch_iter."""
 
     spy = mocker.spy(foo, 'dispatch_iter')
 
@@ -137,13 +138,9 @@ def test_funcs(foo, foo_m):
     assert foo.funcs == foo_m.funcs
 
 
-@pytest.mark.parametrize(
-    'args', [(B1(),), (B2(),), (A1(), A1()), (A1(), A2(), A3())]
-)
+@pytest.mark.parametrize('args', [(B1(),), (B2(),), (A1(), A1()), (A1(), A2(), A3())])
 def test_unregistered(foo, args):
-    with pytest.raises(
-        NotImplementedError, match="Could not find signature for foo.*"
-    ):
+    with pytest.raises(NotImplementedError, match="Could not find signature for foo.*"):
         foo(*args)
 
 
@@ -166,7 +163,6 @@ def test_ambiguities_no_warning():
     bar.register(A2, B1)(lambda a, b: 2)
     bar.register(A2, B2)(lambda a, b: 3)
 
-    with pytest.warns(None) as warnings:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         bar.reorder()
-
-    assert len(warnings) == 0

@@ -3,75 +3,79 @@ from __future__ import annotations
 from public import public
 
 import ibis.common.exceptions as com
-
-from .core import Expr
+import ibis.expr.operations as ops
+from ibis.expr.types.core import Expr
 
 
 @public
-class AnalyticExpr(Expr):
-    @property
-    def _factory(self):
-        def factory(arg):
-            return type(self)(arg)
+class Analytic(Expr):
 
-        return factory
-
-    def _type_display(self):
-        return str(self.type())
-
+    # TODO(kszucs): should be removed
     def type(self):
         return 'analytic'
 
 
 @public
-class ExistsExpr(AnalyticExpr):
-    def type(self):
-        return 'exists'
-
-
-@public
-class TopKExpr(AnalyticExpr):
+class TopK(Analytic):
     def type(self):
         return 'topk'
 
-    def _table_getitem(self):
-        return self.to_filter()
+    def _semi_join_components(self):
+        predicate = self._to_filter()
+        right = predicate.op().right.table
+        return predicate, right
 
-    def to_filter(self):
-        import ibis.expr.operations as ops
+    def _to_semi_join(self, left):
+        predicate, right = self._semi_join_components()
+        return left.semi_join(right, predicate)
 
-        return ops.SummaryFilter(self).to_expr()
+    def _to_filter(self):
+        op = self.op()
+
+        rank_set = self.to_aggregation(backup_metric_name='__tmp__')
+
+        # GH 1393: previously because of GH667 we were substituting parents,
+        # but that introduced a bug when comparing reductions to columns on the
+        # same relation, so we leave this alone.
+        arg = op.arg.to_expr()
+        return arg == getattr(rank_set, arg.get_name())
+
+    def __rich_console__(self, console, options):
+        return self.to_aggregation().__rich_console__(console, options)
 
     def to_aggregation(
         self, metric_name=None, parent_table=None, backup_metric_name=None
     ):
         """Convert the TopK operation to a table aggregation."""
-        from .relations import find_base_table
+        from ibis.expr.analysis import find_first_base_table
 
         op = self.op()
 
-        arg_table = find_base_table(op.arg)
+        arg_table = find_first_base_table(op.arg).to_expr()
 
         by = op.by
-        if not isinstance(by, Expr):
+        if callable(by):
             by = by(arg_table)
             by_table = arg_table
+        elif isinstance(by, ops.Value):
+            by_table = find_first_base_table(op.by).to_expr()
         else:
-            by_table = find_base_table(op.by)
+            raise com.IbisTypeError(f"Invalid `by` argument with type {type(by)}")
 
         if metric_name is None:
-            if by.get_name() == op.arg.get_name():
+            if by.name == op.arg.name:
                 by = by.name(backup_metric_name)
         else:
             by = by.name(metric_name)
 
         if arg_table.equals(by_table):
-            agg = arg_table.aggregate(by, by=[op.arg])
+            agg = arg_table.aggregate(by.to_expr(), by=[op.arg.to_expr()])
         elif parent_table is not None:
-            agg = parent_table.aggregate(by, by=[op.arg])
+            agg = parent_table.aggregate(by.to_expr(), by=[op.arg.to_expr()])
         else:
-            raise com.IbisError(
-                'Cross-table TopK; must provide a parent ' 'joined table'
-            )
+            raise com.IbisError('Cross-table TopK; must provide a parent joined table')
 
-        return agg.sort_by([(by.get_name(), False)]).limit(op.k)
+        return agg.order_by([(by.name, False)]).limit(op.k)
+
+
+public(AnalyticExpr=Analytic, TopKExpr=TopK)

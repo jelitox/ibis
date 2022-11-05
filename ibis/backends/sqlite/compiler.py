@@ -17,36 +17,40 @@ import sqlalchemy as sa
 import ibis
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-from ibis.backends.base.sql.alchemy import (
-    AlchemyCompiler,
-    AlchemyExprTranslator,
-)
-
-from .registry import operation_registry
+from ibis.backends.base.sql.alchemy import AlchemyCompiler, AlchemyExprTranslator
+from ibis.backends.sqlite.registry import operation_registry
 
 
 class SQLiteExprTranslator(AlchemyExprTranslator):
     _registry = operation_registry
     _rewrites = AlchemyExprTranslator._rewrites.copy()
     _type_map = AlchemyExprTranslator._type_map.copy()
-    _type_map.update({dt.Double: sa.types.REAL, dt.Float: sa.types.REAL})
+    _type_map.update(
+        {
+            dt.Float64: sa.types.REAL,
+            dt.Float16: sa.types.REAL,
+            dt.Float32: sa.types.REAL,
+        }
+    )
 
 
 rewrites = SQLiteExprTranslator.rewrites
 
 
 @rewrites(ops.DayOfWeekIndex)
-def day_of_week_index(expr):
-    return ((expr.op().arg.strftime('%w').cast(dt.int16) + 6) % 7).cast(
-        dt.int16
-    )
+def day_of_week_index(op):
+    # TODO(kszucs): avoid expr roundtrip
+    expr = op.arg.to_expr()
+    new_expr = ((expr.strftime('%w').cast(dt.int16) + 6) % 7).cast(dt.int16)
+    return new_expr.op()
 
 
 @rewrites(ops.DayOfWeekName)
-def day_of_week_name(expr):
-    return (
-        expr.op()
-        .arg.day_of_week.index()
+def day_of_week_name(op):
+    # TODO(kszucs): avoid expr roundtrip
+    expr = op.arg.to_expr()
+    new_expr = (
+        expr.day_of_week.index()
         .case()
         .when(0, 'Monday')
         .when(1, 'Tuesday')
@@ -58,6 +62,7 @@ def day_of_week_name(expr):
         .else_(ibis.NA)
         .end()
     )
+    return new_expr.op()
 
 
 class SQLiteCompiler(AlchemyCompiler):

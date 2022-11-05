@@ -1,32 +1,35 @@
 from __future__ import annotations
 
-from typing import Any, MutableMapping
+import importlib
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any, Mapping, MutableMapping
 
 import pandas as pd
-from pydantic import Field
 
 import ibis.common.exceptions as com
 import ibis.config
+import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis.backends.base import BaseBackend
+from ibis.backends.pandas.client import (
+    PandasDatabase,
+    PandasTable,
+    ibis_schema_to_pandas,
+)
 
-from .client import PandasDatabase, PandasTable, ibis_schema_to_pandas
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 
 class BasePandasBackend(BaseBackend):
-    """
-    Base class for backends based on pandas.
-    """
+    """Base class for backends based on pandas."""
 
     name = "pandas"
     backend_table_type = pd.DataFrame
 
-    class Options(ibis.config.BaseModel):
-        enable_trace: bool = Field(
-            default=False,
-            description="Enable tracing for execution.",
-        )
+    class Options(ibis.config.Config):
+        enable_trace: bool = False
 
     def do_connect(
         self,
@@ -37,16 +40,27 @@ class BasePandasBackend(BaseBackend):
         Parameters
         ----------
         dictionary
-            Dictionary mapping string table names to pandas DataFrames.
+            Mutable mapping of string table names to pandas DataFrames.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.pandas.connect({"t": pd.DataFrame({"a": [1, 2, 3]})})
+        <ibis.backends.pandas.Backend at 0x...>
         """
         # register dispatchers
-        from . import execution  # noqa F401
-        from . import udf  # noqa F401
+        from ibis.backends.pandas import execution  # noqa: F401
+        from ibis.backends.pandas import udf  # noqa: F401
 
         self.dictionary = dictionary
         self.schemas: MutableMapping[str, sch.Schema] = {}
 
-    def from_dataframe(self, df, name='df', client=None):
+    def from_dataframe(
+        self,
+        df: pd.DataFrame,
+        name: str = 'df',
+        client: BasePandasBackend | None = None,
+    ) -> ir.Table:
         """Construct an ibis table from a pandas DataFrame.
 
         Parameters
@@ -62,6 +76,7 @@ class BasePandasBackend(BaseBackend):
         Returns
         -------
         Table
+            A table expression
         """
         if client is None:
             return self.connect({name: df}).table(name)
@@ -99,9 +114,7 @@ class BasePandasBackend(BaseBackend):
         try:
             schema = schemas[table_name]
         except KeyError:
-            schemas[table_name] = schema = sch.infer(
-                self.dictionary[table_name]
-            )
+            schemas[table_name] = schema = sch.infer(self.dictionary[table_name])
         return schema
 
     def compile(self, expr, *args, **kwargs):
@@ -122,9 +135,7 @@ class BasePandasBackend(BaseBackend):
         else:
             pandas_schema = self._convert_schema(schema)
             dtypes = dict(pandas_schema)
-            df = self._from_pandas(
-                pd.DataFrame(columns=dtypes.keys()).astype(dtypes)
-            )
+            df = self._from_pandas(pd.DataFrame(columns=dtypes.keys()).astype(dtypes))
 
         self.dictionary[table_name] = df
 
@@ -147,16 +158,59 @@ class BasePandasBackend(BaseBackend):
     def _convert_object(cls, obj: Any) -> Any:
         return cls.backend_table_type(obj)
 
+    @classmethod
+    @lru_cache
+    def _get_operations(cls):
+        backend = f"ibis.backends.{cls.name}"
+
+        execution = importlib.import_module(f"{backend}.execution")
+        execute_node = execution.execute_node
+
+        # import UDF to pick up AnalyticVectorizedUDF and others
+        importlib.import_module(f"{backend}.udf")
+
+        dispatch = importlib.import_module(f"{backend}.dispatch")
+        pre_execute = dispatch.pre_execute
+
+        return frozenset(
+            op
+            for op, *_ in execute_node.funcs.keys() | pre_execute.funcs.keys()
+            if issubclass(op, ops.Value)
+        )
+
+    @classmethod
+    def has_operation(cls, operation: type[ops.Value]) -> bool:
+        op_classes = cls._get_operations()
+        return operation in op_classes or any(
+            issubclass(operation, op_impl) for op_impl in op_classes
+        )
+
 
 class Backend(BasePandasBackend):
     name = 'pandas'
     database_class = PandasDatabase
     table_class = PandasTable
 
-    def execute(self, query, params=None, limit='default', **kwargs):
-        from .core import execute_and_reset
+    def to_pyarrow(
+        self,
+        expr: ir.Expr,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        limit: int | str | None = None,
+    ) -> pa.Table:
+        pa = self._import_pyarrow()
+        output = self.execute(expr, params=params, limit=limit)
 
-        if limit != 'default':
+        if isinstance(output, pd.DataFrame):
+            return pa.Table.from_pandas(output)
+        elif isinstance(output, pd.Series):
+            return pa.Array.from_pandas(output)
+        else:
+            return pa.scalar(output)
+
+    def execute(self, query, params=None, limit='default', **kwargs):
+        from ibis.backends.pandas.core import execute_and_reset
+
+        if limit != 'default' and limit is not None:
             raise ValueError(
                 'limit parameter to execute is not yet implemented in the '
                 'pandas backend'
@@ -168,4 +222,12 @@ class Backend(BasePandasBackend):
                     type(query).__name__
                 )
             )
-        return execute_and_reset(query, params=params, **kwargs)
+
+        node = query.op()
+
+        if params is None:
+            params = {}
+        else:
+            params = {k.op() if hasattr(k, 'op') else k: v for k, v in params.items()}
+
+        return execute_and_reset(node, params=params, **kwargs)

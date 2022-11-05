@@ -14,14 +14,14 @@ def assert_equal(left, right):
             left, right
         )
     else:
-        assert left.equals(right), 'Objects unequal: {}\nvs\n{}'.format(
+        assert left.equals(right), 'Objects unequal: \n{}\nvs\n{}'.format(
             repr(left), repr(right)
         )
 
 
 def assert_pickle_roundtrip(obj):
-    """Assert that an ibis object remains the
-    same after pickling and unpickling."""
+    """Assert that an ibis object remains the same after pickling and
+    unpickling."""
     loaded = pickle.loads(pickle.dumps(obj))
     if hasattr(obj, "equals"):
         assert obj.equals(loaded)

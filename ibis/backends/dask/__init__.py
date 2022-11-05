@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Mapping, MutableMapping
 
 import dask
 import dask.dataframe as dd
@@ -13,10 +13,9 @@ import ibis.backends.pandas.execution  # noqa: F401
 import ibis.config
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
+from ibis.backends.dask.client import DaskDatabase, DaskTable, ibis_schema_to_dask
+from ibis.backends.dask.core import execute_and_reset
 from ibis.backends.pandas import BasePandasBackend
-
-from .client import DaskDatabase, DaskTable, ibis_schema_to_dask
-from .core import execute_and_reset
 
 # Make sure that the pandas backend options have been loaded
 ibis.pandas
@@ -28,10 +27,36 @@ class Backend(BasePandasBackend):
     table_class = DaskTable
     backend_table_type = dd.DataFrame
 
-    def do_connect(self, dictionary):
-        # register dispatchers
-        from . import udf  # noqa: F401
+    def do_connect(
+        self,
+        dictionary: MutableMapping[str, dd.DataFrame],
+    ) -> None:
+        """Construct a Dask backend client from a dictionary of data sources.
 
+        Parameters
+        ----------
+        dictionary
+            Mapping from `str` table names to Dask DataFrames.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> import dask.dataframe as dd
+        >>> data = {
+        ...     "t": dd.read_parquet("path/to/file.parquet"),
+        ...     "s": dd.read_csv("path/to/file.csv"),
+        ... }
+        >>> ibis.dask.connect(data)
+        """
+        # register dispatchers
+        from ibis.backends.dask import udf  # noqa: F401
+
+        for k, v in dictionary.items():
+            if not isinstance(v, (dd.DataFrame, pd.DataFrame)):
+                raise TypeError(
+                    f"Expected an instance of 'dask.dataframe.DataFrame' for {k!r},"
+                    f" got an instance of '{type(v).__name__}' instead."
+                )
         super().do_connect(dictionary)
 
     @property
@@ -45,7 +70,7 @@ class Backend(BasePandasBackend):
         limit: str = 'default',
         **kwargs,
     ):
-        if limit != 'default':
+        if limit != 'default' and limit is not None:
             raise ValueError(
                 'limit parameter to execute is not yet implemented in the '
                 'dask backend'
@@ -74,7 +99,14 @@ class Backend(BasePandasBackend):
         For the dask backend returns a dask graph that you can run ``.compute``
         on to get a pandas object.
         """
-        return execute_and_reset(query, params=params, **kwargs)
+        node = query.op()
+
+        if params is None:
+            params = {}
+        else:
+            params = {k.op() if hasattr(k, 'op') else k: v for k, v in params.items()}
+
+        return execute_and_reset(node, params=params, **kwargs)
 
     @classmethod
     def _supports_conversion(cls, obj: Any) -> bool:

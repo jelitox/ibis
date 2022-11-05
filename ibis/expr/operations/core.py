@@ -1,196 +1,170 @@
-import collections
-import functools
-import itertools
+from __future__ import annotations
 
-import toolz
+from abc import ABC, abstractmethod
+from typing import Sequence
+
 from public import public
 
-from ... import util
-from ...common import exceptions as com
-from .. import rules as rlz
-from ..signature import Annotable
-
-
-def _safe_repr(x, memo=None):
-    try:
-        return x._repr(memo=memo)
-    except AttributeError:
-        return repr(x)
+import ibis.expr.rules as rlz
+from ibis.common.annotations import attribute
+from ibis.common.grounds import Concrete
+from ibis.expr.rules import Shape
+from ibis.util import UnnamedMarker, deprecated
 
 
 @public
-def distinct_roots(*expressions):
-    # TODO: move to analysis
-    roots = toolz.concat(expr.op().root_tables() for expr in expressions)
-    return list(toolz.unique(roots))
-
-
-@public
-def all_equal(left, right, cache=None):
-    """Check whether two objects `left` and `right` are equal.
-
-    Parameters
-    ----------
-    left : Union[object, Expr, Node]
-    right : Union[object, Expr, Node]
-    cache : Optional[Dict[Tuple[Node, Node], bool]]
-        A dictionary indicating whether two Nodes are equal
-    """
-    if cache is None:
-        cache = {}
-
-    if util.is_iterable(left):
-        # check that left and right are equal length iterables and that all
-        # of their elements are equal
-        return (
-            util.is_iterable(right)
-            and len(left) == len(right)
-            and all(
-                itertools.starmap(
-                    functools.partial(all_equal, cache=cache), zip(left, right)
-                )
+class Node(Concrete):
+    def equals(self, other):
+        if not isinstance(other, Node):
+            raise TypeError(
+                "invalid equality comparison between Node and " f"{type(other)}"
             )
-        )
+        return self.__cached_equals__(other)
 
-    if hasattr(left, 'equals'):
-        return left.equals(right, cache=cache)
-    return left == right
+    @deprecated(version='4.0', instead='remove intermediate .op() calls')
+    def op(self):
+        'For a bit of backwards compatibility with code that uses Expr.op().'
+        return self
 
-
-def _maybe_get_op(value):
-    try:
-        return value.op()
-    except AttributeError:
-        return value
+    @abstractmethod
+    def to_expr(self):
+        ...
 
 
 @public
-class Node(Annotable):
-    __slots__ = '_expr_cached', '_hash'
+class Named(ABC):
 
-    def __repr__(self):
-        return self._repr()
-
-    def _repr(self, memo=None):
-        if memo is None:
-            from ibis.expr.format import FormatMemo
-
-            memo = FormatMemo()
-
-        opname = type(self).__name__
-        pprint_args = []
-
-        def _pp(x):
-            return _safe_repr(x, memo=memo)
-
-        for x in self.args:
-            if isinstance(x, (tuple, list)):
-                pp = repr(list(map(_pp, x)))
-            else:
-                pp = _pp(x)
-            pprint_args.append(pp)
-
-        return '{}({})'.format(opname, ', '.join(pprint_args))
+    __slots__ = tuple()
 
     @property
-    def inputs(self):
-        return tuple(self.args)
+    @abstractmethod
+    def name(self):
+        """Name of the operation.
+
+        Returns
+        -------
+        str
+        """
+
+
+@public
+class Value(Node, Named):
+
+    # TODO(kszucs): cover it with tests
+    # TODO(kszucs): figure out how to represent not named arguments
+    @property
+    def name(self):
+        args = ", ".join(arg.name for arg in self.__args__ if isinstance(arg, Named))
+        return f"{self.__class__.__name__}({args})"
 
     @property
-    def exprs(self):
-        from .. import types as ir
+    @abstractmethod
+    def output_dtype(self):
+        """Ibis datatype of the produced value expression.
 
-        return [arg for arg in self.args if isinstance(arg, ir.Expr)]
+        Returns
+        -------
+        dt.DataType
+        """
 
-    def blocks(self):
-        # The contents of this node at referentially distinct and may not be
-        # analyzed deeper
-        return False
+    @property
+    @abstractmethod
+    def output_shape(self):
+        """Shape of the produced value expression.
 
-    def flat_args(self):
-        for arg in self.args:
-            if not isinstance(arg, str) and isinstance(
-                arg, collections.abc.Iterable
-            ):
-                yield from arg
-            else:
-                yield arg
+        Possible values are: "scalar" and "columnar"
 
-    def __hash__(self):
-        if not hasattr(self, '_hash'):
-            self._hash = hash(
-                (type(self), *map(_maybe_get_op, self.flat_args()))
-            )
-        return self._hash
-
-    def __eq__(self, other):
-        return self.equals(other)
-
-    def equals(self, other, cache=None):
-        if cache is None:
-            cache = {}
-
-        key = self, other
-
-        try:
-            return cache[key]
-        except KeyError:
-            cache[key] = result = self is other or (
-                type(self) == type(other)
-                and all_equal(self.args, other.args, cache=cache)
-            )
-            return result
-
-    def compatible_with(self, other):
-        return self.equals(other)
-
-    def is_ancestor(self, other):
-        try:
-            other = other.op()
-        except AttributeError:
-            pass
-
-        return self.equals(other)
+        Returns
+        -------
+        rlz.Shape
+        """
 
     def to_expr(self):
-        if not hasattr(self, '_expr_cached'):
-            self._expr_cached = self._make_expr()
-        return self._expr_cached
-
-    def _make_expr(self):
-        klass = self.output_type()
-        return klass(self)
-
-    def output_type(self):
-        """
-        This function must resolve the output type of the expression and return
-        the node wrapped in the appropriate ValueExpr type.
-        """
-        raise NotImplementedError
+        if self.output_shape is Shape.COLUMNAR:
+            return self.output_dtype.column(self)
+        else:
+            return self.output_dtype.scalar(self)
 
 
 @public
-class ValueOp(Node):
-    def root_tables(self):
-        return distinct_roots(*self.exprs)
+class Variadic(Value):
+    output_shape = rlz.shape_like('arg')
+    output_dtype = rlz.dtype_like('arg')
 
-    def resolve_name(self):
-        raise com.ExpressionError(f'Expression is not named: {type(self)}')
+    @attribute.default
+    def output_shape(self):
+        return rlz.highest_precedence_shape(self.args)
 
-    def has_resolved_name(self):
-        return False
+    @property
+    def args(self):
+        return self.arg
 
 
 @public
-class UnaryOp(ValueOp):
+class Alias(Value):
+    arg = rlz.any
+    name = rlz.instance_of((str, UnnamedMarker))
+
+    output_shape = rlz.shape_like("arg")
+    output_dtype = rlz.dtype_like("arg")
+
+
+@public
+class Unary(Value):
     """A unary operation."""
 
     arg = rlz.any
 
+    @property
+    def output_shape(self):
+        return self.arg.output_shape
+
 
 @public
-class BinaryOp(ValueOp):
+class Binary(Value):
     """A binary operation."""
 
     left = rlz.any
     right = rlz.any
+
+    @property
+    def output_shape(self):
+        return max(self.left.output_shape, self.right.output_shape)
+
+
+@public
+class NodeList(Node, Sequence[Node]):
+    """Data structure for grouping arbitrary node objects."""
+
+    # https://peps.python.org/pep-0653/#additions-to-the-object-model
+    # TODO(kszucs): __match_container__ = MATCH_SEQUENCE
+    # TODO(kszucs): should be able to remove this class with some additional
+    # work on the pandas backend
+
+    values = rlz.variadic(rlz.instance_of(Node))
+
+    def __len__(self):
+        return len(self.values)
+
+    def __getitem__(self, index):
+        return self.values[index]
+
+    def __add__(self, other):
+        values = self.values + tuple(other)
+        return self.__class__(*values)
+
+    def __radd__(self, other):
+        values = tuple(other) + self.values
+        return self.__class__(*values)
+
+    def to_expr(self):
+        import ibis.expr.types as ir
+
+        return ir.List(self)
+
+    @property
+    def args(self):
+        return self.values
+
+
+public(ValueOp=Value, UnaryOp=Unary, BinaryOp=Binary, ValueList=NodeList)

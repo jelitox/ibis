@@ -3,8 +3,9 @@ import logging
 import traceback
 from datetime import datetime
 
+import ibis
 from ibis.backends.pandas.dispatcher import TwoLevelDispatcher
-from ibis.config import get_option, set_option
+from ibis.config import options
 from ibis.expr import types as ir
 
 """Module that adds tracing to dask execution.
@@ -65,13 +66,15 @@ _logger = logging.getLogger('ibis.dask.trace')
 
 # A list of funcs that is traced
 _trace_funcs = set()
-_trace_root = "main_execute"
-_TRACE_CONFIG = 'dask.enable_trace'
 
 
 def enable():
     """Enable tracing."""
-    set_option(_TRACE_CONFIG, True)
+    if options.dask is None:
+        # dask options haven't been registered yet - force module __getattr__
+        ibis.dask
+
+    options.dask.enable_trace = True
     logging.getLogger('ibis.dask.trace').setLevel(logging.DEBUG)
 
 
@@ -104,8 +107,7 @@ def _log_trace(func, start=None):
 
 def trace(func):
     """Return a function decorator that wraped the decorated function with
-    tracing.
-    """
+    tracing."""
     _trace_funcs.add(func.__name__)
 
     @functools.wraps(func)
@@ -117,9 +119,7 @@ def trace(func):
         # when tests are distributed across multiple processes, for example.
         ibis.dask
 
-        trace_enabled = get_option(_TRACE_CONFIG)
-
-        if not trace_enabled:
+        if not options.dask.enable_trace:
             return func(*args, **kwargs)
         else:
             start = datetime.now()
@@ -139,6 +139,7 @@ class TraceTwoLevelDispatcher(TwoLevelDispatcher):
 
     def register(self, *types, **kwargs):
         """Register a function with this Dispatcher.
+
         The function will also be wrapped with tracing information.
         """
 

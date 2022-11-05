@@ -13,9 +13,7 @@ def client():
     return ibis.pandas.connect(
         {
             'df': pd.DataFrame({'a': [1, 2, 3], 'b': list('abc')}),
-            'df_unknown': pd.DataFrame(
-                {'array_of_strings': [['a', 'b'], [], ['c']]}
-            ),
+            'df_unknown': pd.DataFrame({'array_of_strings': [['a', 'b'], [], ['c']]}),
         }
     )
 
@@ -27,9 +25,7 @@ def table(client):
 
 @pytest.fixture
 def test_data():
-    test_data = test_data = pd.DataFrame(
-        {"A": [1, 2, 3, 4, 5], "B": list("abcde")}
-    )
+    test_data = test_data = pd.DataFrame({"A": [1, 2, 3, 4, 5], "B": list("abcde")})
     return test_data
 
 
@@ -43,7 +39,6 @@ def test_client_table_repr(table):
 
 
 def test_load_data(client, test_data):
-
     client.load_data('testing', test_data)
     assert 'testing' in client.list_tables()
     assert client.get_schema('testing')
@@ -70,7 +65,7 @@ def test_list_tables(client):
 
 def test_drop(table):
     table = table.mutate(c=table.a)
-    expr = table.drop(['a'])
+    expr = table.drop('a')
     result = expr.execute()
     expected = table[['b', 'c']].execute()
     tm.assert_frame_equal(result, expected)

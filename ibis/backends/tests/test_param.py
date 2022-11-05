@@ -1,5 +1,3 @@
-import collections
-
 import pytest
 
 import ibis
@@ -15,10 +13,10 @@ import ibis.expr.datatypes as dt
         ('float_col', 2.2),
     ],
 )
-@pytest.mark.xfail_unsupported
+@pytest.mark.notimpl(["datafusion"])
 def test_floating_scalar_parameter(backend, alltypes, df, column, raw_value):
     value = ibis.param(dt.double)
-    expr = alltypes[column] + value
+    expr = (alltypes[column] + value).name('tmp')
     expected = df[column] + raw_value
     result = expr.execute(params={value: raw_value})
     expected = backend.default_series_rename(expected)
@@ -29,15 +27,13 @@ def test_floating_scalar_parameter(backend, alltypes, df, column, raw_value):
     ('start_string', 'end_string'),
     [('2009-03-01', '2010-07-03'), ('2014-12-01', '2017-01-05')],
 )
-@pytest.mark.xfail_unsupported
-def test_date_scalar_parameter(
-    backend, alltypes, df, start_string, end_string
-):
+@pytest.mark.notimpl(["datafusion", "pyspark"])
+def test_date_scalar_parameter(backend, alltypes, start_string, end_string):
     start, end = ibis.param(dt.date), ibis.param(dt.date)
 
     col = alltypes.timestamp_col.date()
-    expr = col.between(start, end)
-    expected_expr = col.between(start_string, end_string)
+    expr = col.between(start, end).name('output')
+    expected_expr = col.between(start_string, end_string).name('output')
 
     result = expr.execute(params={start: start_string, end: end_string})
     expected = expected_expr.execute()
@@ -45,8 +41,7 @@ def test_date_scalar_parameter(
     backend.assert_series_equal(result, expected)
 
 
-@pytest.mark.xfail_backends(['pyspark'])
-@pytest.mark.xfail_unsupported
+@pytest.mark.notimpl(["datafusion", "pyspark"])
 def test_timestamp_accepts_date_literals(backend, alltypes):
     date_string = '2009-03-01'
     param = ibis.param(dt.timestamp)
@@ -55,8 +50,20 @@ def test_timestamp_accepts_date_literals(backend, alltypes):
     assert expr.compile(params=params) is not None
 
 
-@pytest.mark.xfail_backends(['pyspark'])
-@pytest.mark.xfail_unsupported
+@pytest.mark.notimpl(
+    [
+        "dask",
+        "datafusion",
+        "impala",
+        "pandas",
+        "pyspark",
+        "snowflake",
+    ]
+)
+@pytest.mark.never(
+    ["mysql", "sqlite"],
+    reason="mysql and sqlite will never implement array types",
+)
 def test_scalar_param_array(backend, con):
     value = [1, 2, 3]
     param = ibis.param(dt.Array(dt.int64))
@@ -64,19 +71,44 @@ def test_scalar_param_array(backend, con):
     assert result == len(value)
 
 
-@pytest.mark.xfail_unsupported
+@pytest.mark.notimpl(
+    [
+        "clickhouse",
+        "datafusion",
+        "impala",
+        "postgres",
+        "pyspark",
+        "snowflake",
+    ]
+)
+@pytest.mark.never(
+    ["mysql", "sqlite"],
+    reason="mysql and sqlite will never implement struct types",
+)
 def test_scalar_param_struct(backend, con):
-    value = collections.OrderedDict([('a', 1), ('b', 'abc'), ('c', 3.0)])
-    param = ibis.param(
-        dt.Struct.from_tuples(
-            [('a', 'int64'), ('b', 'string'), ('c', 'float64')]
-        )
-    )
-    result = con.execute(param['a'], params={param: value})
-    assert result == value['a']
+    value = dict(a=1, b="abc", c=3.0)
+    param = ibis.param("struct<a: int64, b: string, c: float64>")
+    result = con.execute(param["a"], params={param: value})
+    assert result == value["a"]
 
 
-@pytest.mark.xfail_unsupported
+@pytest.mark.notimpl(
+    [
+        "clickhouse",
+        "datafusion",
+        # TODO: duckdb maps are tricky because they are multimaps
+        "duckdb",
+        "impala",
+        "pyspark",
+        "snowflake",
+        "polars",
+    ]
+)
+@pytest.mark.never(
+    ["mysql", "sqlite"],
+    reason="mysql and sqlite will never implement map types",
+)
+@pytest.mark.notyet(["postgres"])
 def test_scalar_param_map(backend, con):
     value = {'a': 'ghi', 'b': 'def', 'c': 'abc'}
     param = ibis.param(dt.Map(dt.string, dt.string))

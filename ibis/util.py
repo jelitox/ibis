@@ -1,33 +1,86 @@
-"""Ibis util functions."""
+"""Ibis utility functions."""
+from __future__ import annotations
+
+import abc
 import collections
 import functools
+import importlib.metadata as _importlib_metadata
 import itertools
 import logging
 import operator
 import os
+import sys
+import textwrap
 import types
 import warnings
 from numbers import Real
-from typing import (
-    Any,
-    Iterable,
-    Iterator,
-    List,
-    Optional,
-    Sequence,
-    Type,
-    TypeVar,
-    Union,
-)
+from typing import TYPE_CHECKING, Any, Hashable, Iterator, Mapping, Sequence, TypeVar
 from uuid import uuid4
 
 import toolz
 
-from ibis.config import options
+if TYPE_CHECKING:
+    import pandas as pd
+
+    import ibis.expr.operations as ops
+
+    Graph = Mapping[ops.Node, Sequence[ops.Node]]
 
 T = TypeVar("T", covariant=True)
 U = TypeVar("U", covariant=True)
 V = TypeVar("V")
+
+# https://www.compart.com/en/unicode/U+22EE
+VERTICAL_ELLIPSIS = "\u22EE"
+# https://www.compart.com/en/unicode/U+2026
+HORIZONTAL_ELLIPSIS = "\u2026"
+
+
+class frozendict(Mapping, Hashable):
+
+    __slots__ = ("_dict", "_hash")
+
+    def __init__(self, *args, **kwargs):
+        self._dict = dict(*args, **kwargs)
+        self._hash = hash(tuple(self._dict.items()))
+
+    def __str__(self):
+        return str(self._dict)
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}({self._dict!r})"
+
+    def __iter__(self):
+        return iter(self._dict)
+
+    def __len__(self):
+        return len(self._dict)
+
+    def __getitem__(self, key):
+        return self._dict[key]
+
+    def __hash__(self):
+        return self._hash
+
+
+class DotDict(dict):
+    __slots__ = ()
+
+    __setattr__ = dict.__setitem__
+    __delattr__ = dict.__delitem__
+
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError(key)
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}({super().__repr__()})"
+
+
+class UnnamedMarker:
+    pass
 
 
 def guid() -> str:
@@ -45,18 +98,21 @@ def indent(text: str, spaces: int) -> str:
 
     Parameters
     ----------
-    text : string
-    spaces : string
+    text
+        Text to indent
+    spaces
+        Number of leading spaces per line
 
     Returns
     -------
-    string
+    str
+        Indented text
     """
     prefix = ' ' * spaces
-    return ''.join(prefix + line for line in text.splitlines(True))
+    return textwrap.indent(text, prefix=prefix)
 
 
-def is_one_of(values: Sequence[T], t: Type[U]) -> Iterator[bool]:
+def is_one_of(values: Sequence[T], t: type[U]) -> Iterator[bool]:
     """Check if the type of each value is the same of the given type.
 
     Parameters
@@ -75,7 +131,7 @@ any_of = toolz.compose(any, is_one_of)
 all_of = toolz.compose(all, is_one_of)
 
 
-def promote_list(val: Union[V, Sequence[V]]) -> List[V]:
+def promote_list(val: V | Sequence[V]) -> list[V]:
     """Ensure that the value is a list.
 
     Parameters
@@ -86,9 +142,14 @@ def promote_list(val: Union[V, Sequence[V]]) -> List[V]:
     -------
     list
     """
-    if not isinstance(val, list):
-        val = [val]
-    return val
+    if isinstance(val, list):
+        return val
+    elif is_iterable(val):
+        return list(val)
+    elif val is None:
+        return []
+    else:
+        return [val]
 
 
 def is_function(v: Any) -> bool:
@@ -106,33 +167,6 @@ def is_function(v: Any) -> bool:
     return isinstance(v, (types.FunctionType, types.LambdaType))
 
 
-def adjoin(space: int, *lists: Iterable[str]) -> str:
-    """Glue together two sets of strings using `space`.
-
-    Parameters
-    ----------
-    space : int
-    lists : list or tuple
-
-    Returns
-    -------
-    str
-    """
-    lengths = [max(map(len, x)) + space for x in lists[:-1]]
-
-    # not the last one
-    lengths.append(max(map(len, lists[-1])))
-    max_len = max(map(len, lists))
-    chains = (
-        itertools.chain(
-            (x.ljust(length) for x in lst),
-            itertools.repeat(' ' * length, max_len - len(lst)),
-        )
-        for lst, length in zip(lists, lengths)
-    )
-    return '\n'.join(map(''.join, zip(*chains)))
-
-
 def log(msg: str) -> None:
     """Log `msg` using ``options.verbose_log`` if set, otherwise ``print``.
 
@@ -140,6 +174,8 @@ def log(msg: str) -> None:
     ----------
     msg : string
     """
+    from ibis.config import options
+
     if options.verbose:
         (options.verbose_log or print)(msg)
 
@@ -182,7 +218,6 @@ def safe_index(elements: Sequence[int], value: int) -> int:
     1
     >>> safe_index(sequence, 4)
     -1
-
     """
     try:
         return elements.index(value)
@@ -216,11 +251,8 @@ def is_iterable(o: Any) -> bool:
     False
     >>> is_iterable([])
     True
-
     """
-    return not isinstance(o, (str, bytes)) and isinstance(
-        o, collections.abc.Iterable
-    )
+    return not isinstance(o, (str, bytes)) and isinstance(o, collections.abc.Iterable)
 
 
 def convert_unit(value, unit, to, floor=True):
@@ -256,7 +288,6 @@ def convert_unit(value, unit, to, floor=True):
     Traceback (most recent call last):
         ...
     ValueError: Cannot convert to or from variable length interval
-
     """
     # Don't do anything if from and to units are equivalent
     if unit == to:
@@ -275,21 +306,17 @@ def convert_unit(value, unit, to, floor=True):
             i, j = monthly_units.index(unit), monthly_units.index(to)
             factors = monthly_factors
         except ValueError:
-            raise ValueError(
-                'Cannot convert to or from variable length interval'
-            )
+            raise ValueError('Cannot convert to or from variable length interval')
 
     factor = functools.reduce(operator.mul, factors[min(i, j) : max(i, j)], 1)
     assert factor > 1
 
     if i < j:
-        return value * factor
-
-    assert i > j
-    if floor:
-        return value // factor
+        op = operator.mul
     else:
-        return value / factor
+        assert i > j
+        op = operator.floordiv if floor else operator.truediv
+    return op(value.to_expr(), factor).op()
 
 
 def get_logger(
@@ -323,15 +350,14 @@ def get_logger(
     logger = logging.getLogger(name)
     logger.propagate = propagate
     logger.setLevel(
-        level
-        or getattr(logging, os.environ.get('LOGLEVEL', 'WARNING').upper())
+        level or getattr(logging, os.environ.get('LOGLEVEL', 'WARNING').upper())
     )
     logger.addHandler(handler)
     return logger
 
 
 # taken from the itertools documentation
-def consume(iterator: Iterator[T], n: Optional[int] = None) -> None:
+def consume(iterator: Iterator[T], n: int | None = None) -> None:
     """Advance the iterator n-steps ahead. If n is None, consume entirely.
 
     Parameters
@@ -348,6 +374,36 @@ def consume(iterator: Iterator[T], n: Optional[int] = None) -> None:
         next(itertools.islice(iterator, n, n), None)
 
 
+def recursive_get(obj, mapping):
+    if isinstance(obj, tuple):
+        return tuple(recursive_get(o, mapping) for o in obj)
+    elif isinstance(obj, dict):
+        return {k: recursive_get(v, mapping) for k, v in obj.items()}
+    else:
+        return mapping.get(obj, obj)
+
+
+def recursive_iter(obj):
+    """Flatten a tuple of tuples/dicts into a single tuple.
+
+    Parameters
+    ----------
+    iterable : tuple
+
+    Returns
+    -------
+    tuple
+    """
+    if isinstance(obj, tuple):
+        for item in obj:
+            yield from recursive_iter(item)
+    elif isinstance(obj, dict):
+        for item in obj.values():
+            yield from recursive_iter(item)
+    else:
+        yield obj
+
+
 def flatten_iterable(iterable):
     """Recursively flatten the iterable `iterable`."""
     if not is_iterable(iterable):
@@ -360,25 +416,42 @@ def flatten_iterable(iterable):
             yield item
 
 
+def deprecated_msg(name, *, instead, version=''):
+    msg = f'`{name}` is deprecated'
+    if version:
+        msg += f' as of v{version}'
+
+    msg += f'; {instead}'
+    return msg
+
+
 def warn_deprecated(name, *, instead, version='', stacklevel=1):
     """Warn about deprecated usage.
 
     The message includes a stacktrace and what to do instead.
     """
-    msg = f'"{name}" is deprecated'
-    if version:
-        msg += f' since v{version}'
 
-    msg += f'; use {instead}.'
-
+    msg = deprecated_msg(name, instead=instead, version=version)
     warnings.warn(msg, FutureWarning, stacklevel=stacklevel + 1)
 
 
 def deprecated(*, instead, version=''):
-    """Decorate deprecated function to warn of usage, with stacktrace, and
-    what to do instead."""
+    """Decorate deprecated function to warn of usage, with stacktrace, and what
+    to do instead."""
 
     def decorator(func):
+        msg = deprecated_msg(func.__name__, instead=instead, version=version)
+
+        docstr = func.__doc__ or ""
+        first, *rest = docstr.split("\n\n", maxsplit=1)
+        # count leading spaces and add them to the deprecation warning so the
+        # docstring parses correctly
+        leading_spaces = " " * sum(
+            1 for _ in itertools.takewhile(str.isspace, rest[0] if rest else [])
+        )
+        warning_doc = f'{leading_spaces}!!! warning "DEPRECATED: {msg}"'
+        func.__doc__ = "\n\n".join([first, warning_doc, *rest])
+
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             warn_deprecated(
@@ -389,3 +462,50 @@ def deprecated(*, instead, version=''):
         return wrapper
 
     return decorator
+
+
+def experimental(func):
+    """Decorate experimental function to add warning about potential API
+    instability in docstring."""
+
+    msg = "This API is experimental and subject to change."
+
+    if docstr := func.__doc__:
+        preamble, *rest = docstr.split("\n\n", maxsplit=1)
+
+        leading_spaces = " " * sum(
+            1 for _ in itertools.takewhile(str.isspace, rest[0] if rest else [])
+        )
+
+        warning_doc = f'{leading_spaces}!!! warning "{msg}"'
+
+        docstr = "\n\n".join([preamble, warning_doc, *rest])
+    else:
+        docstr = f'!!! warning "{msg}"'
+    func.__doc__ = docstr
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
+class ToFrame(abc.ABC):
+    """Interface for in-memory objects that can be converted to a DataFrame."""
+
+    __slots__ = ()
+
+    @abc.abstractmethod
+    def to_frame(self) -> pd.DataFrame:
+        ...
+
+
+def backend_entry_points() -> list[_importlib_metadata.EntryPoint]:
+    """Get the list of installed `ibis.backend` entrypoints."""
+
+    if sys.version_info < (3, 10):
+        eps = _importlib_metadata.entry_points()["ibis.backends"]
+    else:
+        eps = _importlib_metadata.entry_points(group="ibis.backends")
+    return sorted(eps)

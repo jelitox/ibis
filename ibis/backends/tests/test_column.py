@@ -1,41 +1,26 @@
+import operator
+
 import numpy as np
 import pandas as pd
 import pytest
 
 
-@pytest.mark.parametrize(
-    'column',
-    [
-        'string_col',
-        'double_col',
-        'date_string_col',
-        pytest.param('timestamp_col', marks=pytest.mark.skip(reason='hangs')),
-    ],
-)
-@pytest.mark.notimpl(["datafusion"])
-def test_distinct_column(backend, alltypes, df, column):
-    expr = alltypes[column].distinct()
-    result = expr.execute()
-    expected = df[column].unique()
-    assert set(result) == set(expected)
-
-
 @pytest.mark.notimpl(
     [
-        "postgres",
-        "mysql",
-        "hdf5",
-        "pandas",
-        "csv",
-        "parquet",
+        "clickhouse",
         "dask",
         "datafusion",
-        "clickhouse",
-        "pyspark",
+        "duckdb",
         "impala",
+        "mysql",
+        "pandas",
+        "postgres",
+        "pyspark",
+        "snowflake",
+        "polars",
     ]
 )
-def test_rowid(con, backend):
+def test_rowid(con):
     t = con.table('functional_alltypes')
     result = t[t.rowid()].execute()
     first_value = 1
@@ -49,20 +34,20 @@ def test_rowid(con, backend):
 
 @pytest.mark.notimpl(
     [
-        "postgres",
-        "mysql",
-        "hdf5",
-        "pandas",
-        "csv",
-        "parquet",
+        "clickhouse",
         "dask",
         "datafusion",
-        "clickhouse",
-        "pyspark",
+        "duckdb",
         "impala",
+        "mysql",
+        "pandas",
+        "postgres",
+        "pyspark",
+        "snowflake",
+        "polars",
     ]
 )
-def test_named_rowid(con, backend):
+def test_named_rowid(con):
     t = con.table('functional_alltypes')
     result = t[t.rowid().name('number')].execute()
     first_value = 1
@@ -72,3 +57,33 @@ def test_named_rowid(con, backend):
         name='number',
     )
     pd.testing.assert_series_equal(result.iloc[:, 0], expected)
+
+
+@pytest.mark.parametrize(
+    "column",
+    ["string_col", "double_col", "date_string_col", "timestamp_col"],
+)
+@pytest.mark.notimpl(["datafusion"])
+def test_distinct_column(alltypes, df, column):
+    expr = alltypes[[column]].distinct()
+    result = expr.execute()
+    expected = df[[column]].drop_duplicates()
+    assert set(result) == set(expected)
+
+
+@pytest.mark.parametrize(
+    ("opname", "expected"),
+    [
+        ("year", {2009, 2010}),
+        ("month", set(range(1, 13))),
+        ("day", set(range(1, 32))),
+    ],
+)
+@pytest.mark.notimpl(["datafusion"])
+@pytest.mark.notyet(["impala"])
+def test_date_extract_field(con, opname, expected):
+    op = operator.methodcaller(opname)
+    t = con.table("functional_alltypes")
+    expr = t[op(t.timestamp_col.cast("date")).name("date")].distinct()
+    result = expr.execute()["date"].astype(int)
+    assert set(result) == expected

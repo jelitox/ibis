@@ -1,5 +1,8 @@
 """The pandas client implementation."""
 
+import json
+from collections.abc import Mapping, Sequence
+
 import numpy as np
 import pandas as pd
 import toolz
@@ -7,8 +10,11 @@ from pandas.api.types import CategoricalDtype, DatetimeTZDtype
 
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
+import ibis.expr.rules as rlz
 import ibis.expr.schema as sch
+from ibis import util
 from ibis.backends.base import Database
+from ibis.common.grounds import Immutable
 
 infer_pandas_dtype = pd.api.types.infer_dtype
 
@@ -95,11 +101,7 @@ def from_numpy_dtype(value):
     try:
         return _numpy_dtypes[value]
     except KeyError:
-        raise TypeError(
-            'numpy dtype {!r} is not supported in the pandas backend'.format(
-                value
-            )
-        )
+        raise TypeError(f'numpy dtype {value!r} is not supported in the pandas backend')
 
 
 @dt.dtype.register(DatetimeTZDtype)
@@ -108,8 +110,13 @@ def from_pandas_tzdtype(value):
 
 
 @dt.dtype.register(CategoricalDtype)
-def from_pandas_categorical(value):
+def from_pandas_categorical(_):
     return dt.Category()
+
+
+@dt.dtype.register(pd.core.arrays.string_.StringDtype)
+def from_pandas_string(_):
+    return dt.String()
 
 
 @dt.infer.register(np.generic)
@@ -139,7 +146,7 @@ def _infer_pandas_series_contents(s: pd.Series) -> dt.DataType:
         if inferred_dtype == 'mixed':
             # We need to inspect an element to determine the Ibis dtype
             value = s.iloc[0]
-            if isinstance(value, (np.ndarray, list, pd.Series)):
+            if isinstance(value, (np.ndarray, pd.Series, Sequence, Mapping)):
                 # Defer to individual `infer` functions for these
                 return dt.infer(value)
             else:
@@ -154,10 +161,10 @@ def _infer_pandas_series_contents(s: pd.Series) -> dt.DataType:
 def infer_pandas_series(s):
     """Infer the type of a pd.Series.
 
-    Note that the returned datatype will be an array type, which corresponds
-    to the fact that a Series is a collection of elements. Please use
-    `_infer_pandas_series_contents` if you are interested in the datatype
-    of the **contents** of the Series.
+    Note that the returned datatype will be an array type, which
+    corresponds to the fact that a Series is a collection of elements.
+    Please use `_infer_pandas_series_contents` if you are interested in
+    the datatype of the **contents** of the Series.
     """
     return dt.Array(_infer_pandas_series_contents(s))
 
@@ -193,7 +200,7 @@ def infer_array(value):
 
 @sch.schema.register(pd.Series)
 def schema_from_series(s):
-    return sch.schema(tuple(s.iteritems()))
+    return sch.schema(tuple(s.items()))
 
 
 @sch.infer.register(pd.DataFrame)
@@ -201,11 +208,9 @@ def infer_pandas_schema(df, schema=None):
     schema = schema if schema is not None else {}
 
     pairs = []
-    for column_name, pandas_dtype in df.dtypes.iteritems():
+    for column_name in df.dtypes.keys():
         if not isinstance(column_name, str):
-            raise TypeError(
-                'Column names must be strings to use the pandas backend'
-            )
+            raise TypeError('Column names must be strings to use the pandas backend')
 
         if column_name in schema:
             ibis_dtype = dt.dtype(schema[column_name])
@@ -218,7 +223,7 @@ def infer_pandas_schema(df, schema=None):
 
 
 def ibis_dtype_to_pandas(ibis_dtype):
-    """Convert ibis dtype to the pandas / numpy alternative"""
+    """Convert ibis dtype to the pandas / numpy alternative."""
     assert isinstance(ibis_dtype, dt.DataType)
 
     if isinstance(ibis_dtype, dt.Timestamp) and ibis_dtype.timezone:
@@ -265,7 +270,9 @@ def convert_boolean_to_series(in_dtype, out_dtype, column):
     # XXX: this is a workaround until #1595 can be addressed
     in_dtype_type = in_dtype.type
     out_dtype_type = out_dtype.to_pandas().type
-    if in_dtype_type != np.object_ and in_dtype_type != out_dtype_type:
+    if column.empty or (
+        in_dtype_type != np.object_ and in_dtype_type != out_dtype_type
+    ):
         return column.astype(out_dtype_type)
     return column
 
@@ -275,8 +282,58 @@ def convert_any_to_any(_, out_dtype, column):
     return column.astype(out_dtype.to_pandas(), errors='ignore')
 
 
+@sch.convert.register(object, dt.Struct, pd.Series)
+def convert_struct_to_dict(_, out_dtype, column):
+    def convert_element(values, names=out_dtype.names):
+        if values is None or isinstance(values, dict) or pd.isna(values):
+            return values
+        return dict(zip(names, values))
+
+    return column.map(convert_element)
+
+
+@sch.convert.register(np.dtype, dt.Array, pd.Series)
+def convert_array_to_series(in_dtype, out_dtype, column):
+    return column.map(lambda x: x if x is None else list(x))
+
+
+@sch.convert.register(np.dtype, dt.JSON, pd.Series)
+def convert_json_to_series(in_, out, col: pd.Series):
+    def try_json(x):
+        if x is None:
+            return x
+        try:
+            return json.loads(x)
+        except (TypeError, json.JSONDecodeError):
+            return x
+
+    return pd.Series(list(map(try_json, col)), dtype="object")
+
+
 dt.DataType.to_pandas = ibis_dtype_to_pandas  # type: ignore
 sch.Schema.to_pandas = ibis_schema_to_pandas  # type: ignore
+
+
+class DataFrameProxy(Immutable, util.ToFrame):
+    __slots__ = ('_df', '_hash')
+
+    def __init__(self, df):
+        object.__setattr__(self, "_df", df)
+        object.__setattr__(self, "_hash", hash((type(df), id(df))))
+
+    def __hash__(self):
+        return self._hash
+
+    def __repr__(self):
+        df_repr = util.indent(repr(self._df), spaces=2)
+        return f"{self.__class__.__name__}:\n{df_repr}"
+
+    def to_frame(self):
+        return self._df
+
+
+class PandasInMemoryTable(ops.InMemoryTable):
+    data = rlz.instance_of(DataFrameProxy)
 
 
 class PandasTable(ops.DatabaseTable):

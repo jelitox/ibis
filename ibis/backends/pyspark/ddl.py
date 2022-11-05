@@ -8,8 +8,7 @@ from ibis.backends.base.sql.ddl import (
     RenameTable,
 )
 from ibis.backends.base.sql.registry import quote_identifier
-
-from .datatypes import type_to_sql_string
+from ibis.backends.pyspark.datatypes import type_to_sql_string
 
 _format_aliases = {'TEXTFILE': 'TEXT'}
 
@@ -50,7 +49,7 @@ def _format_properties(props):
 
 class CreateTable(CreateTable):
 
-    """Create a table"""
+    """Create a table."""
 
     def __init__(
         self,
@@ -81,9 +80,7 @@ class CreateTableWithSchema(CreateTableWithSchema):
 
 class CTAS(CTAS):
 
-    """
-    Create Table As Select
-    """
+    """Create Table As Select."""
 
     def __init__(
         self,
@@ -108,7 +105,7 @@ class CTAS(CTAS):
 
 class CreateView(CTAS):
 
-    """Create a view"""
+    """Create a view."""
 
     def __init__(
         self,
@@ -118,9 +115,7 @@ class CreateView(CTAS):
         can_exist=False,
         temporary=False,
     ):
-        super().__init__(
-            table_name, select, database=database, can_exist=can_exist
-        )
+        super().__init__(table_name, select, database=database, can_exist=can_exist)
         self.temporary = temporary
 
     @property
@@ -146,8 +141,7 @@ class CreateView(CTAS):
 
 def format_schema(schema):
     elements = [
-        _format_schema_element(name, t)
-        for name, t in zip(schema.names, schema.types)
+        _format_schema_element(name, t) for name, t in zip(schema.names, schema.types)
     ]
     return '({})'.format(',\n '.join(elements))
 
@@ -193,9 +187,7 @@ class DropFunction(DropObject):
 
 
 class InsertSelect(InsertSelect):
-    def __init__(
-        self, table_name, select_expr, database=None, overwrite=False
-    ):
+    def __init__(self, table_name, select_expr, database=None, overwrite=False):
         super().__init__(
             table_name,
             select_expr,
@@ -234,6 +226,4 @@ class AlterTable(AlterTable):
 
 class RenameTable(RenameTable):
     def __init__(self, old_name, new_name):
-        super().__init__(
-            old_name, new_name, old_database=None, new_database=None
-        )
+        super().__init__(old_name, new_name, old_database=None, new_database=None)

@@ -1,10 +1,10 @@
 import numpy as np
 import pandas as pd
 import pytest
-from pandas.util import testing as tm
+from pandas import testing as tm
 from pytest import param
 
-from ..aggcontext import Summarize, window_agg_udf
+from ibis.backends.pandas.aggcontext import Summarize, window_agg_udf
 
 df = pd.DataFrame(
     {
@@ -140,8 +140,7 @@ def test_window_agg_udf(param):
 
 def test_window_agg_udf_different_freq():
     """Test that window_agg_udf works when the window series and data series
-    have different frequencies.
-    """
+    have different frequencies."""
 
     time = pd.Series([pd.Timestamp('20200101'), pd.Timestamp('20200201')])
     data = pd.Series([1, 2, 3, 4, 5, 6])

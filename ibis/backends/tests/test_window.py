@@ -1,9 +1,9 @@
+import numpy as np
 import pandas as pd
 import pytest
 from pytest import param
 
 import ibis
-import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 from ibis.udf.vectorized import analytic, reduction
 
@@ -30,29 +30,44 @@ def calc_zscore(s):
             lambda t, win: t.float_col.lead().over(win),
             lambda t: t.float_col.shift(-1),
             id='lead',
+            marks=pytest.mark.broken(
+                ["clickhouse"],
+                reason="upstream is broken; returns all nulls",
+            ),
         ),
         param(
             lambda t, win: t.id.rank().over(win),
             lambda t: t.id.rank(method='min').astype('int64') - 1,
             id='rank',
+            marks=pytest.mark.min_server_version(clickhouse="22.8"),
         ),
         param(
             lambda t, win: t.id.dense_rank().over(win),
             lambda t: t.id.rank(method='dense').astype('int64') - 1,
             id='dense_rank',
+            marks=pytest.mark.min_server_version(clickhouse="22.8"),
         ),
         param(
-            # these can't be equivalent, because pandas doesn't have a way to
-            # compute percentile rank with a strict less-than ordering
-            #
-            # cume_dist() is the corresponding function in databases that
-            # support window functions
             lambda t, win: t.id.percent_rank().over(win),
-            lambda t: t.id.rank(pct=True),
+            lambda t: t.apply(
+                lambda df: (
+                    df.sort_values("id").id.rank(method="min").sub(1).div(len(df) - 1)
+                )
+            ).reset_index(drop=True, level=[0]),
             id='percent_rank',
-            marks=pytest.mark.xpass_backends(
-                ['pandas', 'pyspark'], raises=AssertionError
+            marks=pytest.mark.notyet(
+                ["clickhouse"],
+                reason="clickhouse doesn't implement percent_rank",
             ),
+        ),
+        param(
+            lambda t, win: t.id.cume_dist().over(win),
+            lambda t: t.id.rank(method='min') / t.id.transform(len),
+            id='cume_dist',
+            marks=[
+                pytest.mark.notimpl(["pyspark"]),
+                pytest.mark.notyet(["clickhouse"]),
+            ],
         ),
         param(
             lambda t, win: t.float_col.ntile(buckets=7).over(win),
@@ -71,13 +86,33 @@ def calc_zscore(s):
             id='last',
         ),
         param(
-            lambda t, win: ibis.row_number().over(win),
+            lambda t, win: t.float_col.nth(3).over(win),
+            lambda t: t.float_col.apply(
+                lambda s: pd.concat(
+                    [
+                        pd.Series(np.nan, index=s.index[:3], dtype="float32"),
+                        pd.Series(
+                            s.iloc[3],
+                            index=s.index[3:],
+                            dtype="float32",
+                        ),
+                    ]
+                )
+            ),
+            id="nth",
+            marks=[
+                pytest.mark.notimpl(["pandas", "snowflake"]),
+                pytest.mark.notyet(["impala"]),
+            ],
+        ),
+        param(
+            lambda _, win: ibis.row_number().over(win),
             lambda t: t.cumcount(),
             id='row_number',
-            marks=pytest.mark.xfail_backends(
-                ('pandas', 'dask'),
-                raises=(IndexError, com.UnboundExpressionError),
-            ),
+            marks=[
+                pytest.mark.notimpl(["pandas"]),
+                pytest.mark.min_server_version(clickhouse="22.8"),
+            ],
         ),
         param(
             lambda t, win: t.double_col.cumsum().over(win),
@@ -86,9 +121,7 @@ def calc_zscore(s):
         ),
         param(
             lambda t, win: t.double_col.cummean().over(win),
-            lambda t: (
-                t.double_col.expanding().mean().reset_index(drop=True, level=0)
-            ),
+            lambda t: (t.double_col.expanding().mean().reset_index(drop=True, level=0)),
             id='cummean',
         ),
         param(
@@ -120,8 +153,16 @@ def calc_zscore(s):
                 .astype(bool)
             ),
             id='cumnotany',
-            marks=pytest.mark.xfail_backends(
-                ('impala', 'postgres', 'mysql', 'sqlite'),
+            marks=pytest.mark.notyet(
+                (
+                    "clickhouse",
+                    "duckdb",
+                    'impala',
+                    'postgres',
+                    'mysql',
+                    'sqlite',
+                    'snowflake',
+                ),
                 reason="notany() over window not supported",
             ),
         ),
@@ -144,8 +185,16 @@ def calc_zscore(s):
                 .astype(bool)
             ),
             id='cumnotall',
-            marks=pytest.mark.xfail_backends(
-                ('impala', 'postgres', 'mysql', 'sqlite'),
+            marks=pytest.mark.notyet(
+                (
+                    "clickhouse",
+                    "duckdb",
+                    'impala',
+                    'postgres',
+                    'mysql',
+                    'sqlite',
+                    'snowflake',
+                ),
                 reason="notall() over window not supported",
             ),
         ),
@@ -157,9 +206,7 @@ def calc_zscore(s):
         param(
             lambda t, win: t.double_col.mean().over(win),
             lambda gb: (
-                gb.double_col.expanding()
-                .mean()
-                .reset_index(drop=True, level=0)
+                gb.double_col.expanding().mean().reset_index(drop=True, level=0)
             ),
             id='mean',
         ),
@@ -182,13 +229,10 @@ def calc_zscore(s):
         ),
     ],
 )
-@pytest.mark.xfail_unsupported
+@pytest.mark.notimpl(["dask", "datafusion", "polars"])
 def test_grouped_bounded_expanding_window(
-    backend, alltypes, df, con, result_fn, expected_fn
+    backend, alltypes, df, result_fn, expected_fn
 ):
-    if not backend.supports_window_operations:
-        pytest.skip(f'Backend {backend} does not support window operations')
-
     expr = alltypes.mutate(
         val=result_fn(
             alltypes,
@@ -201,7 +245,9 @@ def test_grouped_bounded_expanding_window(
     )
 
     result = expr.execute().set_index('id').sort_index()
-    column = expected_fn(df.sort_values('id').groupby('string_col'))
+    column = expected_fn(df.sort_values('id').groupby('string_col', group_keys=True))
+    if column.index.nlevels > 1:
+        column = column.droplevel(0)
     expected = df.assign(val=column).set_index('id').sort_index()
 
     left, right = result.val, expected.val
@@ -224,20 +270,26 @@ def test_grouped_bounded_expanding_window(
             lambda df: (df.double_col.expanding().mean()),
             id='mean_udf',
             marks=[
-                pytest.mark.udf,
-                pytest.mark.skip_backends(['pyspark']),
+                pytest.mark.notimpl(
+                    [
+                        "clickhouse",
+                        "duckdb",
+                        "impala",
+                        "mysql",
+                        "postgres",
+                        "sqlite",
+                        "snowflake",
+                    ]
+                )
             ],
         ),
     ],
 )
 # Some backends do not support non-grouped window specs
-@pytest.mark.xfail_unsupported
+@pytest.mark.notimpl(["dask", "datafusion", "polars"])
 def test_ungrouped_bounded_expanding_window(
-    backend, alltypes, df, con, result_fn, expected_fn
+    backend, alltypes, df, result_fn, expected_fn
 ):
-    if not backend.supports_window_operations:
-        pytest.skip(f'Backend {backend} does not support window operations')
-
     expr = alltypes.mutate(
         val=result_fn(
             alltypes,
@@ -254,11 +306,8 @@ def test_ungrouped_bounded_expanding_window(
     backend.assert_series_equal(left, right)
 
 
-@pytest.mark.xfail_unsupported
-def test_grouped_bounded_following_window(backend, alltypes, df, con):
-    if not backend.supports_window_operations:
-        pytest.skip(f'Backend {backend} does not support window operations')
-
+@pytest.mark.notimpl(["dask", "datafusion", "pandas", "polars"])
+def test_grouped_bounded_following_window(backend, alltypes, df):
     window = ibis.window(
         preceding=0,
         following=2,
@@ -312,13 +361,8 @@ def test_grouped_bounded_following_window(backend, alltypes, df, con):
         ),
     ],
 )
-@pytest.mark.xfail_unsupported
-def test_grouped_bounded_preceding_windows(
-    backend, alltypes, df, con, window_fn
-):
-    if not backend.supports_window_operations:
-        pytest.skip(f'Backend {backend} does not support window operations')
-
+@pytest.mark.notimpl(["dask", "datafusion", "polars"])
+def test_grouped_bounded_preceding_window(backend, alltypes, df, window_fn):
     window = window_fn(alltypes)
 
     expr = alltypes.mutate(val=alltypes.double_col.sum().over(window))
@@ -353,21 +397,38 @@ def test_grouped_bounded_preceding_windows(
             lambda t, win: mean_udf(t.double_col).over(win),
             lambda gb: (gb.double_col.transform('mean')),
             id='mean_udf',
-            marks=pytest.mark.udf,
+            marks=pytest.mark.notimpl(
+                [
+                    "clickhouse",
+                    "dask",
+                    "duckdb",
+                    "impala",
+                    "mysql",
+                    "postgres",
+                    "sqlite",
+                    "snowflake",
+                ]
+            ),
         ),
     ],
 )
 @pytest.mark.parametrize(
     ('ordered'),
-    [param(True, id='orderered'), param(False, id='unordered')],
+    [
+        param(True, id='ordered', marks=pytest.mark.notimpl(["dask", "pandas"])),
+        param(
+            False,
+            id='unordered',
+            marks=[
+                pytest.mark.notyet(["snowflake"], reason="snowflake requires ordering")
+            ],
+        ),
+    ],
 )
-@pytest.mark.xfail_unsupported
+@pytest.mark.notimpl(["datafusion", "polars"])
 def test_grouped_unbounded_window(
-    backend, alltypes, df, con, result_fn, expected_fn, ordered
+    backend, alltypes, df, result_fn, expected_fn, ordered
 ):
-    if not backend.supports_window_operations:
-        pytest.skip(f'Backend {backend} does not support window operations')
-
     # Define a window that is
     # 1) Grouped
     # 2) Ordered if `ordered` is True
@@ -396,71 +457,145 @@ def test_grouped_unbounded_window(
 
 
 @pytest.mark.parametrize(
-    ('result_fn', 'expected_fn'),
+    ("result_fn", "expected_fn", "ordered"),
     [
         # Reduction ops
         param(
             lambda t, win: t.double_col.mean().over(win),
             lambda df: pd.Series([df.double_col.mean()] * len(df.double_col)),
-            id='mean',
+            True,
+            id='ordered-mean',
+            marks=[
+                pytest.mark.notimpl(["dask", "impala", "pandas"]),
+                pytest.mark.broken(["clickhouse"], reason="upstream appears broken"),
+            ],
+        ),
+        param(
+            lambda t, win: t.double_col.mean().over(win),
+            lambda df: pd.Series([df.double_col.mean()] * len(df.double_col)),
+            False,
+            id='unordered-mean',
+            marks=[
+                pytest.mark.notyet(["snowflake"], reason="snowflake requires ordering")
+            ],
         ),
         param(
             lambda t, win: mean_udf(t.double_col).over(win),
             lambda df: pd.Series([df.double_col.mean()] * len(df.double_col)),
-            id='mean_udf',
-            marks=pytest.mark.udf,
+            True,
+            id='ordered-mean_udf',
+            marks=pytest.mark.notimpl(
+                [
+                    "clickhouse",
+                    "dask",
+                    "duckdb",
+                    "impala",
+                    "mysql",
+                    "pandas",
+                    "postgres",
+                    "sqlite",
+                    "snowflake",
+                ]
+            ),
+        ),
+        param(
+            lambda t, win: mean_udf(t.double_col).over(win),
+            lambda df: pd.Series([df.double_col.mean()] * len(df.double_col)),
+            False,
+            id='unordered-mean_udf',
+            marks=pytest.mark.notimpl(
+                [
+                    "clickhouse",
+                    "duckdb",
+                    "impala",
+                    "mysql",
+                    "postgres",
+                    "sqlite",
+                    "snowflake",
+                ]
+            ),
         ),
         # Analytic ops
         param(
             lambda t, win: t.float_col.lag().over(win),
             lambda df: df.float_col.shift(1),
-            id='lag',
+            True,
+            id='ordered-lag',
+            marks=[
+                pytest.mark.notimpl(["dask"]),
+            ],
+        ),
+        param(
+            lambda t, win: t.float_col.lag().over(win),
+            lambda df: df.float_col.shift(1),
+            False,
+            id='unordered-lag',
+            marks=[
+                pytest.mark.notimpl(["dask", "mysql", "pyspark"]),
+                pytest.mark.notyet(["snowflake"], reason="snowflake requires ordering"),
+            ],
         ),
         param(
             lambda t, win: t.float_col.lead().over(win),
             lambda df: df.float_col.shift(-1),
-            id='lead',
+            True,
+            id='ordered-lead',
+            marks=pytest.mark.notimpl(["clickhouse", "dask"]),
+        ),
+        param(
+            lambda t, win: t.float_col.lead().over(win),
+            lambda df: df.float_col.shift(-1),
+            False,
+            id='unordered-lead',
+            marks=pytest.mark.notimpl(
+                ["clickhouse", "dask", "mysql", "pyspark", "snowflake"]
+            ),
         ),
         param(
             lambda t, win: calc_zscore(t.double_col).over(win),
             lambda df: df.double_col.transform(calc_zscore.func),
-            id='zscore_udf',
-            marks=pytest.mark.udf,
-        ),
-    ],
-)
-@pytest.mark.parametrize(
-    ('ordered'),
-    [
-        param(
             True,
-            id='orderered',
-            marks=pytest.mark.skip_backends(
-                ['pyspark', 'impala'],
-                reason="Behavior inconsistent with other backends (see #2378)",
+            id='ordered-zscore_udf',
+            marks=pytest.mark.notimpl(
+                [
+                    "clickhouse",
+                    "dask",
+                    "duckdb",
+                    "impala",
+                    "mysql",
+                    "pandas",
+                    "postgres",
+                    "pyspark",
+                    "sqlite",
+                    "snowflake",
+                ]
             ),
         ),
         param(
+            lambda t, win: calc_zscore(t.double_col).over(win),
+            lambda df: df.double_col.transform(calc_zscore.func),
             False,
-            id='unordered',
-            marks=pytest.mark.skip_backends(
+            id='unordered-zscore_udf',
+            marks=pytest.mark.notimpl(
                 [
-                    'mysql',
-                    'pyspark',
-                ],
-                reason="requires a defined ordering for ops like lag and lead",
+                    "clickhouse",
+                    "duckdb",
+                    "impala",
+                    "mysql",
+                    "postgres",
+                    "pyspark",
+                    "sqlite",
+                    "snowflake",
+                ]
             ),
         ),
     ],
 )
 # Some backends do not support non-grouped window specs
-@pytest.mark.xfail_unsupported
+@pytest.mark.notimpl(["datafusion", "polars"])
 def test_ungrouped_unbounded_window(
     backend, alltypes, df, con, result_fn, expected_fn, ordered
 ):
-    if not backend.supports_window_operations:
-        pytest.skip(f'Backend {backend} does not support window operations')
-
     # Define a window that is
     # 1) Ungrouped
     # 2) Ordered if `ordered` is True
@@ -488,20 +623,12 @@ def test_ungrouped_unbounded_window(
     backend.assert_series_equal(left, right)
 
 
-@pytest.mark.xfail_unsupported
-@pytest.mark.xfail_backends(
-    [
-        (
-            'impala',
-            'Impala does not support range window bounded on both sides',
-        ),
-    ]
+@pytest.mark.notimpl(["dask", "datafusion", "impala", "pandas", "snowflake", "polars"])
+@pytest.mark.notyet(
+    ["clickhouse"],
+    reason="RANGE OFFSET frame for 'DB::ColumnNullable' ORDER BY column is not implemented",  # noqa: E501
 )
-@pytest.mark.skip_backends(['pandas', 'pyspark'], reason='Issue #2709')
-def test_grouped_bounded_range_window(backend, alltypes, df, con):
-    if not backend.supports_window_operations:
-        pytest.skip(f'Backend {backend} does not support window operations')
-
+def test_grouped_bounded_range_window(backend, alltypes, df):
     # Explanation of the range window spec below:
     #
     # `preceding=10, following=0, order_by='id'``:
@@ -510,9 +637,9 @@ def test_grouped_bounded_range_window(backend, alltypes, df, con):
     # `group_by='string_col'`:
     #     The window at a particular row will only contain other rows that
     #     have the same 'string_col' value.
-    #
+    preceding = 10
     window = ibis.range_window(
-        preceding=10,
+        preceding=preceding,
         following=0,
         order_by='id',
         group_by='string_col',
@@ -520,22 +647,77 @@ def test_grouped_bounded_range_window(backend, alltypes, df, con):
     expr = alltypes.mutate(val=alltypes.double_col.sum().over(window))
     result = expr.execute().set_index('id').sort_index()
 
+    def gb_fn(df):
+        indices = np.searchsorted(df.id, [df["prec"], df["foll"]], side="left")
+        double_col = df.double_col.values
+        return pd.Series(
+            [double_col[start:stop].sum() for start, stop in indices.T],
+            index=df.index,
+        )
+
+    res = (
+        # add 1 to get the upper bound without having to make two
+        # searchsorted calls
+        df.assign(prec=lambda t: t.id - preceding, foll=lambda t: t.id + 1)
+        .sort_values("id")
+        .groupby("string_col")
+        .apply(gb_fn)
+        .droplevel(0)
+    )
     expected = (
         df.assign(
             # Mimic our range window spec using .apply()
-            val=df.apply(
-                lambda x: df.double_col[
-                    (df.string_col == x.string_col)  # Grouping by string_col
-                    & ((x.id - 10) <= df.id)  # Corresponds to `preceding=10`
-                    & (df.id <= x.id)  # Corresponds to `following=0`
-                ].sum(),
-                axis=1,
-            )
+            val=res
         )
         .set_index('id')
         .sort_index()
     )
 
-    left, right = result.val, expected.val
+    backend.assert_series_equal(result.val, expected.val)
 
-    backend.assert_series_equal(left, right)
+
+@pytest.mark.notimpl(["clickhouse", "dask", "datafusion", "pyspark", "polars"])
+@pytest.mark.notyet(["clickhouse"], reason="clickhouse doesn't implement percent_rank")
+def test_percent_rank_whole_table_no_order_by(backend, alltypes, df):
+    expr = alltypes.mutate(val=lambda t: t.id.percent_rank())
+
+    result = expr.execute().set_index('id').sort_index()
+    column = df.id.rank(method="min").sub(1).div(len(df) - 1)
+    expected = df.assign(val=column).set_index('id').sort_index()
+
+    backend.assert_series_equal(result.val, expected.val)
+
+
+@pytest.mark.notimpl(["dask", "datafusion", "polars"])
+@pytest.mark.broken(["pandas"], reason="pandas returns incorrect results")
+def test_grouped_ordered_window_coalesce(backend, alltypes, df):
+    t = alltypes
+    expr = (
+        t.group_by("month")
+        .order_by("id")
+        .mutate(lagged_value=ibis.coalesce(t.bigint_col.lag(), 0))[
+            ["id", "lagged_value"]
+        ]
+    )
+    result = (
+        expr.execute()
+        .sort_values(["id"])
+        .lagged_value.reset_index(drop=True)
+        .astype("int64")
+    )
+
+    def agg(df):
+        df = df.sort_values(["id"])
+        df = df.assign(bigint_col=lambda df: df.bigint_col.shift())
+        return df
+
+    expected = (
+        df.groupby("month")
+        .apply(agg)
+        .sort_values(["id"])
+        .reset_index(drop=True)
+        .bigint_col.fillna(0.0)
+        .astype("int64")
+        .rename("lagged_value")
+    )
+    backend.assert_series_equal(result, expected)

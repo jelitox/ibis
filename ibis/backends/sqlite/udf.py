@@ -1,6 +1,10 @@
+from __future__ import annotations
+
 import functools
 import inspect
 import math
+import operator
+from typing import Callable
 
 import regex as re
 
@@ -220,6 +224,83 @@ def _ibis_sqlite_sqrt(arg):
     return None if arg is None or arg < 0.0 else math.sqrt(arg)
 
 
+def _trig_func_unary(func, arg):
+    if arg is None:
+        return None
+
+    return func(float(arg))
+
+
+def _trig_func_binary(func, arg1, arg2):
+    if arg1 is None or arg2 is None:
+        return None
+
+    return func(float(arg1), float(arg2))
+
+
+@udf
+def _ibis_sqlite_cot(arg):
+    return _trig_func_unary(
+        lambda arg: float("inf") if not arg else math.cos(arg) / math.sin(arg),
+        arg,
+    )
+
+
+@udf
+def _ibis_sqlite_sin(arg):
+    return _trig_func_unary(math.sin, arg)
+
+
+@udf
+def _ibis_sqlite_cos(arg):
+    return _trig_func_unary(math.cos, arg)
+
+
+@udf
+def _ibis_sqlite_tan(arg):
+    return _trig_func_unary(math.tan, arg)
+
+
+@udf
+def _ibis_sqlite_asin(arg):
+    return _trig_func_unary(math.asin, arg)
+
+
+@udf
+def _ibis_sqlite_acos(arg):
+    return _trig_func_unary(math.acos, arg)
+
+
+@udf
+def _ibis_sqlite_atan(arg):
+    return _trig_func_unary(math.atan, arg)
+
+
+@udf
+def _ibis_sqlite_atan2(y, x):
+    return _trig_func_binary(math.atan2, y, x)
+
+
+@udf
+def _ibis_sqlite_degrees(x):
+    return None if x is None else math.degrees(x)
+
+
+@udf
+def _ibis_sqlite_radians(x):
+    return None if x is None else math.radians(x)
+
+
+@udf
+def _ibis_sqlite_xor(x, y):
+    return None if x is None or y is None else x ^ y
+
+
+@udf
+def _ibis_sqlite_inv(x):
+    return None if x is None else ~x
+
+
 class _ibis_sqlite_var:
     def __init__(self, offset):
         self.mean = 0.0
@@ -253,6 +334,42 @@ class _ibis_sqlite_var_samp(_ibis_sqlite_var):
         super().__init__(1)
 
 
+class _ibis_sqlite_bit_agg:
+    def __init__(self, op):
+        self.value: int | None = None
+        self.count: int = 0
+        self.op: Callable[[int, int], int] = op
+
+    def step(self, value):
+        if value is not None:
+            if not self.count:
+                self.value = value
+            else:
+                self.value = self.op(self.value, value)
+            self.count += 1
+
+    def finalize(self) -> int | None:
+        return self.value
+
+
+@udaf
+class _ibis_sqlite_bit_or(_ibis_sqlite_bit_agg):
+    def __init__(self):
+        super().__init__(operator.or_)
+
+
+@udaf
+class _ibis_sqlite_bit_and(_ibis_sqlite_bit_agg):
+    def __init__(self):
+        super().__init__(operator.and_)
+
+
+@udaf
+class _ibis_sqlite_bit_xor(_ibis_sqlite_bit_agg):
+    def __init__(self):
+        super().__init__(operator.xor)
+
+
 def _number_of_arguments(callable):
     signature = inspect.signature(callable)
     parameters = signature.parameters.values()
@@ -271,31 +388,7 @@ def _number_of_arguments(callable):
     return len(parameters)
 
 
-def _register_function(func, con):
-    """Register a Python callable with a SQLite connection `con`.
-
-    Parameters
-    ----------
-    func : callable
-    con : sqlalchemy.Connection
-    """
-    nargs = _number_of_arguments(func)
-    con.connection.connection.create_function(func.__name__, nargs, func)
-
-
-def _register_aggregate(agg, con):
-    """Register a Python class that performs aggregation in SQLite.
-
-    Parameters
-    ----------
-    agg : type
-    con : sqlalchemy.Connection
-    """
-    nargs = _number_of_arguments(agg.step) - 1  # because self
-    con.connection.connection.create_aggregate(agg.__name__, nargs, agg)
-
-
-def register_all(con):
+def register_all(dbapi_connection):
     """Register all udf and udaf with the connection.
 
     All udf and udaf are defined in this file with the `udf` and `udaf`
@@ -306,7 +399,14 @@ def register_all(con):
     con : sqlalchemy.Connection
     """
     for func in _SQLITE_UDF_REGISTRY:
-        con.run_callable(functools.partial(_register_function, func))
+        dbapi_connection.create_function(
+            func.__name__, _number_of_arguments(func), func
+        )
 
     for agg in _SQLITE_UDAF_REGISTRY:
-        con.run_callable(functools.partial(_register_aggregate, agg))
+        dbapi_connection.create_aggregate(
+            agg.__name__,
+            # substract one to ignore the `self` argument of the step method
+            _number_of_arguments(agg.step) - 1,
+            agg,
+        )

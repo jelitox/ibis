@@ -1,3 +1,5 @@
+import operator
+
 import pandas as pd
 import sqlalchemy as sa
 
@@ -5,16 +7,14 @@ import ibis
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-import ibis.expr.types as ir
 from ibis.backends.base.sql.alchemy import (
     fixed_arity,
-    infix_op,
-    reduction,
     sqlalchemy_operation_registry,
     sqlalchemy_window_functions_registry,
+    to_sqla_type,
     unary,
-    variance_reduction,
 )
+from ibis.backends.base.sql.alchemy.registry import _gen_string_find
 
 operation_registry = sqlalchemy_operation_registry.copy()
 
@@ -22,45 +22,16 @@ operation_registry = sqlalchemy_operation_registry.copy()
 operation_registry.update(sqlalchemy_window_functions_registry)
 
 
-def _substr(t, expr):
-    f = sa.func.substr
-
-    arg, start, length = expr.op().args
-
-    sa_arg = t.translate(arg)
-    sa_start = t.translate(start)
-
-    if length is None:
-        return f(sa_arg, sa_start + 1)
-    else:
-        sa_length = t.translate(length)
-        return f(sa_arg, sa_start + 1, sa_length)
-
-
-def _string_find(t, expr):
-    arg, substr, start, _ = expr.op().args
-
-    if start is not None:
-        raise NotImplementedError
-
-    sa_arg = t.translate(arg)
-    sa_substr = t.translate(substr)
-
-    return sa.func.locate(sa_arg, sa_substr) - 1
-
-
-def _capitalize(t, expr):
-    (arg,) = expr.op().args
-    sa_arg = t.translate(arg)
+def _capitalize(t, op):
+    sa_arg = t.translate(op.arg)
     return sa.func.concat(
         sa.func.ucase(sa.func.left(sa_arg, 1)), sa.func.substring(sa_arg, 2)
     )
 
 
 def _extract(fmt):
-    def translator(t, expr):
-        (arg,) = expr.op().args
-        sa_arg = t.translate(arg)
+    def translator(t, op):
+        sa_arg = t.translate(op.arg)
         if fmt == 'millisecond':
             return sa.extract('microsecond', sa_arg) % 1000
         return sa.extract(fmt, sa_arg)
@@ -79,149 +50,128 @@ _truncate_formats = {
 }
 
 
-def _truncate(t, expr):
-    arg, unit = expr.op().args
-    sa_arg = t.translate(arg)
+def _truncate(t, op):
+    sa_arg = t.translate(op.arg)
     try:
-        fmt = _truncate_formats[unit]
+        fmt = _truncate_formats[op.unit]
     except KeyError:
-        raise com.UnsupportedOperationError(
-            f'Unsupported truncate unit {unit}'
-        )
+        raise com.UnsupportedOperationError(f'Unsupported truncate unit {op.unit}')
     return sa.func.date_format(sa_arg, fmt)
 
 
-def _cast(t, expr):
-    arg, typ = expr.op().args
-
-    sa_arg = t.translate(arg)
-    sa_type = t.get_sqla_type(typ)
-
-    # specialize going from an integer type to a timestamp
-    if isinstance(arg.type(), dt.Integer) and isinstance(sa_type, sa.DateTime):
-        return sa.func.timezone('UTC', sa.func.to_timestamp(sa_arg))
-
-    if arg.type().equals(dt.binary) and typ.equals(dt.string):
-        return sa.func.encode(sa_arg, 'escape')
-
-    if typ.equals(dt.binary):
-        #  decode yields a column of memoryview which is annoying to deal with
-        # in pandas. CAST(expr AS BYTEA) is correct and returns byte strings.
-        return sa.cast(sa_arg, sa.LargeBinary())
-
-    return sa.cast(sa_arg, sa_type)
-
-
-def _log(t, expr):
-    arg, base = expr.op().args
-    sa_arg = t.translate(arg)
-    sa_base = t.translate(base)
+def _log(t, op):
+    sa_arg = t.translate(op.arg)
+    sa_base = t.translate(op.base)
     return sa.func.log(sa_base, sa_arg)
 
 
-def _identical_to(t, expr):
-    left, right = args = expr.op().args
-    if left.equals(right):
-        return True
-    else:
-        left, right = map(t.translate, args)
-        return left.op('<=>')(right)
+def _round(t, op):
+    sa_arg = t.translate(op.arg)
 
-
-def _round(t, expr):
-    arg, digits = expr.op().args
-    sa_arg = t.translate(arg)
-
-    if digits is None:
+    if op.digits is None:
         sa_digits = 0
     else:
-        sa_digits = t.translate(digits)
+        sa_digits = t.translate(op.digits)
 
     return sa.func.round(sa_arg, sa_digits)
 
 
-def _floor_divide(t, expr):
-    left, right = map(t.translate, expr.op().args)
-    return sa.func.floor(left / right)
-
-
-def _string_join(t, expr):
-    sep, elements = expr.op().args
-    return sa.func.concat_ws(t.translate(sep), *map(t.translate, elements))
-
-
-def _interval_from_integer(t, expr):
-    arg, unit = expr.op().args
-    if unit in {'ms', 'ns'}:
+def _interval_from_integer(t, op):
+    if op.unit in {'ms', 'ns'}:
         raise com.UnsupportedOperationError(
-            'MySQL does not allow operation '
-            'with INTERVAL offset {}'.format(unit)
+            'MySQL does not allow operation ' 'with INTERVAL offset {}'.format(op.unit)
         )
 
-    sa_arg = t.translate(arg)
-    text_unit = expr.type().resolution.upper()
+    sa_arg = t.translate(op.arg)
+    text_unit = op.output_dtype.resolution.upper()
 
     # XXX: Is there a better way to handle this? I.e. can we somehow use
     # the existing bind parameter produced by translate and reuse its name in
     # the string passed to sa.text?
     if isinstance(sa_arg, sa.sql.elements.BindParameter):
-        return sa.text(f'INTERVAL :arg {text_unit}').bindparams(
-            arg=sa_arg.value
-        )
+        return sa.text(f'INTERVAL :arg {text_unit}').bindparams(arg=sa_arg.value)
     return sa.text(f'INTERVAL {sa_arg} {text_unit}')
 
 
-def _timestamp_diff(t, expr):
-    left, right = expr.op().args
-    sa_left = t.translate(left)
-    sa_right = t.translate(right)
+def _timestamp_diff(t, op):
+    sa_left = t.translate(op.left)
+    sa_right = t.translate(op.right)
     return sa.func.timestampdiff(sa.text('SECOND'), sa_right, sa_left)
 
 
-def _literal(t, expr):
-    if isinstance(expr, ir.IntervalScalar):
-        if expr.type().unit in {'ms', 'ns'}:
+def _string_to_timestamp(t, op):
+    sa_arg = t.translate(op.arg)
+    sa_format_str = t.translate(op.format_str)
+    if (op.timezone is not None) and op.timezone.value != "UTC":
+        raise com.UnsupportedArgumentError(
+            'MySQL backend only supports timezone UTC for converting'
+            'string to timestamp.'
+        )
+    return sa.func.str_to_date(sa_arg, sa_format_str)
+
+
+def _literal(_, op):
+    if isinstance(op.output_dtype, dt.Interval):
+        if op.output_dtype.unit in {'ms', 'ns'}:
             raise com.UnsupportedOperationError(
                 'MySQL does not allow operation '
-                'with INTERVAL offset {}'.format(expr.type().unit)
+                f'with INTERVAL offset {op.output_dtype.unit}'
             )
-        text_unit = expr.type().resolution.upper()
-        value = expr.op().value
-        return sa.text(f'INTERVAL :value {text_unit}').bindparams(value=value)
-    elif isinstance(expr, ir.SetScalar):
-        return list(map(sa.literal, expr.op().value))
+        text_unit = op.output_dtype.resolution.upper()
+        sa_text = sa.text(f'INTERVAL :value {text_unit}')
+        return sa_text.bindparams(value=op.value)
+    elif isinstance(op.output_dtype, dt.Set):
+        return list(map(sa.literal, op.value))
     else:
-        value = expr.op().value
+        value = op.value
         if isinstance(value, pd.Timestamp):
             value = value.to_pydatetime()
-        return sa.literal(value)
+
+        lit = sa.literal(value)
+        if isinstance(op.output_dtype, dt.Timestamp):
+            return sa.cast(lit, to_sqla_type(op.output_dtype))
+        return lit
 
 
-def _random(t, expr):
-    return sa.func.random()
-
-
-def _group_concat(t, expr):
-    op = expr.op()
-    arg, sep, where = op.args
-    if where is not None:
-        case = where.ifelse(arg, ibis.NA)
+def _group_concat(t, op):
+    if op.where is not None:
+        # TODO(kszucs): avoid the expression roundtrip
+        case = op.where.to_expr().ifelse(op.arg, ibis.NA).op()
         arg = t.translate(case)
     else:
-        arg = t.translate(arg)
-    return sa.func.group_concat(arg.op('SEPARATOR')(t.translate(sep)))
+        arg = t.translate(op.arg)
+    sep = t.translate(op.sep)
+    return sa.func.group_concat(arg.op('SEPARATOR')(sep))
 
 
-def _day_of_week_index(t, expr):
-    (arg,) = expr.op().args
-    left = sa.func.dayofweek(t.translate(arg)) - 2
+def _day_of_week_index(t, op):
+    left = sa.func.dayofweek(t.translate(op.arg)) - 2
     right = 7
-    return ((left % right) + right) % right
+    return (left % right + right) % right
 
 
-def _day_of_week_name(t, expr):
-    (arg,) = expr.op().args
-    return sa.func.dayname(t.translate(arg))
+def _day_of_week_name(t, op):
+    return sa.func.dayname(t.translate(op.arg))
+
+
+def _find_in_set(t, op):
+    return (
+        sa.func.find_in_set(
+            t.translate(op.needle),
+            sa.func.concat_ws(",", *map(t.translate, op.values.values)),
+        )
+        - 1
+    )
+
+
+def _json_get_item(t, op):
+    arg = t.translate(op.arg)
+    index = t.translate(op.index)
+    if isinstance(op.index.output_dtype, dt.Integer):
+        path = "$[" + sa.cast(index, sa.TEXT) + "]"
+    else:
+        path = "$." + index
+    return sa.func.json_extract(arg, path)
 
 
 operation_registry.update(
@@ -229,24 +179,23 @@ operation_registry.update(
         ops.Literal: _literal,
         ops.IfNull: fixed_arity(sa.func.ifnull, 2),
         # strings
-        ops.Substring: _substr,
-        ops.StringFind: _string_find,
+        ops.StringFind: _gen_string_find(sa.func.locate),
+        ops.FindInSet: _find_in_set,
         ops.Capitalize: _capitalize,
-        ops.RegexSearch: infix_op('REGEXP'),
+        ops.RegexSearch: fixed_arity(lambda x, y: x.op('REGEXP')(y), 2),
         # math
         ops.Log: _log,
         ops.Log2: unary(sa.func.log2),
         ops.Log10: unary(sa.func.log10),
         ops.Round: _round,
-        ops.RandomScalar: _random,
         # dates and times
-        ops.Date: unary(sa.func.date),
-        ops.DateAdd: infix_op('+'),
-        ops.DateSub: infix_op('-'),
+        ops.DateAdd: fixed_arity(operator.add, 2),
+        ops.DateSub: fixed_arity(operator.sub, 2),
         ops.DateDiff: fixed_arity(sa.func.datediff, 2),
-        ops.TimestampAdd: infix_op('+'),
-        ops.TimestampSub: infix_op('-'),
+        ops.TimestampAdd: fixed_arity(operator.add, 2),
+        ops.TimestampSub: fixed_arity(operator.sub, 2),
         ops.TimestampDiff: _timestamp_diff,
+        ops.StringToTimestamp: _string_to_timestamp,
         ops.DateTruncate: _truncate,
         ops.TimestampTruncate: _truncate,
         ops.IntervalFromInteger: _interval_from_integer,
@@ -254,25 +203,19 @@ operation_registry.update(
         ops.ExtractYear: _extract('year'),
         ops.ExtractMonth: _extract('month'),
         ops.ExtractDay: _extract('day'),
-        ops.ExtractDayOfYear: unary('dayofyear'),
+        ops.ExtractDayOfYear: unary(sa.func.dayofyear),
         ops.ExtractQuarter: _extract('quarter'),
-        ops.ExtractEpochSeconds: unary('UNIX_TIMESTAMP'),
-        ops.ExtractWeekOfYear: fixed_arity('weekofyear', 1),
+        ops.ExtractEpochSeconds: unary(sa.func.UNIX_TIMESTAMP),
+        ops.ExtractWeekOfYear: unary(sa.func.weekofyear),
         ops.ExtractHour: _extract('hour'),
         ops.ExtractMinute: _extract('minute'),
         ops.ExtractSecond: _extract('second'),
         ops.ExtractMillisecond: _extract('millisecond'),
-        # reductions
-        ops.BitAnd: reduction(sa.func.bit_and),
-        ops.BitOr: reduction(sa.func.bit_or),
-        ops.BitXor: reduction(sa.func.bit_xor),
-        ops.Variance: variance_reduction('var'),
-        ops.StandardDev: variance_reduction('stddev'),
-        ops.IdenticalTo: _identical_to,
         ops.TimestampNow: fixed_arity(sa.func.now, 0),
         # others
         ops.GroupConcat: _group_concat,
         ops.DayOfWeekIndex: _day_of_week_index,
         ops.DayOfWeekName: _day_of_week_name,
+        ops.JSONGetItem: _json_get_item,
     }
 )

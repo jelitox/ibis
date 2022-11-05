@@ -3,9 +3,8 @@ import operator
 import pytest
 
 import ibis
+from ibis.backends.impala.compiler import ImpalaCompiler
 from ibis.backends.impala.tests.mocks import MockImpalaConnection
-
-from ..compiler import ImpalaCompiler
 
 
 def test_relabel_projection():
@@ -77,15 +76,13 @@ FROM t0
 def test_nested_join_base():
     t = ibis.table([('uuid', 'string'), ('ts', 'timestamp')], name='t')
     counts = t.group_by('uuid').size()
-    max_counts = counts.group_by('uuid').aggregate(
-        max_count=lambda x: x['count'].max()
-    )
+    max_counts = counts.group_by('uuid').aggregate(max_count=lambda x: x['count'].max())
     result = max_counts.left_join(counts, 'uuid').projection([counts])
     compiled_result = ImpalaCompiler.to_sql(result)
 
     expected = """\
 WITH t0 AS (
-  SELECT `uuid`, count(*) AS `count`
+  SELECT `uuid`, count(1) AS `count`
   FROM t
   GROUP BY 1
 )
@@ -107,9 +104,7 @@ def test_nested_joins_single_cte():
 
     last_visit = t.group_by('uuid').aggregate(last_visit=t.ts.max())
 
-    max_counts = counts.group_by('uuid').aggregate(
-        max_count=counts['count'].max()
-    )
+    max_counts = counts.group_by('uuid').aggregate(max_count=counts['count'].max())
 
     main_kw = max_counts.left_join(
         counts, ['uuid', max_counts.max_count == counts['count']]
@@ -121,7 +116,7 @@ def test_nested_joins_single_cte():
 
     expected = """\
 WITH t0 AS (
-  SELECT `uuid`, count(*) AS `count`
+  SELECT `uuid`, count(1) AS `count`
   FROM t
   GROUP BY 1
 )
@@ -157,16 +152,12 @@ def test_nested_join_multiple_ctes():
         ],
         name='ratings',
     )
-    movies = ibis.table(
-        [('movieid', 'int64'), ('title', 'string')], name='movies'
-    )
+    movies = ibis.table([('movieid', 'int64'), ('title', 'string')], name='movies')
 
     expr = ratings.timestamp.cast('timestamp')
     ratings2 = ratings['userid', 'movieid', 'rating', expr.name('datetime')]
     joined2 = ratings2.join(movies, ['movieid'])[ratings2, movies['title']]
-    joined3 = joined2.filter(
-        [joined2.userid == 118205, joined2.datetime.year() > 2001]
-    )
+    joined3 = joined2.filter([joined2.userid == 118205, joined2.datetime.year() > 2001])
     top_user_old_movie_ids = joined3.filter(
         [joined3.userid == 118205, joined3.datetime.year() < 2009]
     )[['movieid']]
@@ -197,16 +188,19 @@ FROM (
 WHERE t2.`movieid` IN (
   SELECT `movieid`
   FROM (
-    SELECT t1.*
-    FROM t1
-    WHERE (t1.`userid` = 118205) AND
-          (extract(t1.`datetime`, 'year') > 2001) AND
-          (t1.`userid` = 118205) AND
-          (extract(t1.`datetime`, 'year') < 2009)
+    SELECT `movieid`
+    FROM (
+      SELECT t1.*
+      FROM t1
+      WHERE (t1.`userid` = 118205) AND
+            (extract(t1.`datetime`, 'year') > 2001) AND
+            (t1.`userid` = 118205) AND
+            (extract(t1.`datetime`, 'year') < 2009)
+    ) t5
   ) t4
 )"""
-    compiled_result = ImpalaCompiler.to_sql(result)
-    assert compiled_result == expected
+    result = ImpalaCompiler.to_sql(result)
+    assert result == expected
 
 
 def test_logically_negate_complex_boolean_expr():
@@ -218,8 +212,8 @@ def test_logically_negate_complex_boolean_expr():
     def f(t):
         return t.a.isin(['foo']) & t.c.notnull()
 
-    expr = f(t)
-    result = ImpalaCompiler.to_sql(~expr)
+    expr = (~f(t)).name('tmp')
+    result = ImpalaCompiler.to_sql(expr)
     expected = """\
 SELECT NOT (`a` IN ('foo') AND (`c` IS NOT NULL)) AS `tmp`
 FROM t"""
@@ -258,9 +252,7 @@ FROM t t0
     assert ImpalaCompiler.to_sql(expr) == expected
 
 
-@pytest.mark.parametrize(
-    ('method', 'sql'), [('isnull', 'IS'), ('notnull', 'IS NOT')]
-)
+@pytest.mark.parametrize(('method', 'sql'), [('isnull', 'IS'), ('notnull', 'IS NOT')])
 def test_is_parens(method, sql):
     t = ibis.table([('a', 'string'), ('b', 'string')], 'table')
     func = operator.methodcaller(method)
@@ -295,18 +287,14 @@ def test_join_aliasing():
     test = test.mutate(d=test.a + 20)
     test2 = test[test.d, test.c]
     idx = (test2.d / 15).cast('int64').name('idx')
-    test3 = test2.groupby([test2.d, idx, test2.c]).aggregate(
-        row_count=test2.count()
-    )
-    test3_totals = test3.groupby(test3.d).aggregate(
-        total=test3.row_count.sum()
-    )
+    test3 = test2.group_by([test2.d, idx, test2.c]).aggregate(row_count=test2.count())
+    test3_totals = test3.group_by(test3.d).aggregate(total=test3.row_count.sum())
     test4 = test3.join(test3_totals, test3.d == test3_totals.d)[
         test3, test3_totals.total
     ]
     test5 = test4[test4.row_count < test4.total / 2]
     agg = (
-        test.groupby([test.d, test.b])
+        test.group_by([test.d, test.b])
         .aggregate(count=test.count(), unique=test.c.nunique())
         .view()
     )
@@ -315,35 +303,35 @@ def test_join_aliasing():
     result = ImpalaCompiler.to_sql(result)
     expected = """\
 WITH t0 AS (
-  SELECT *, `a` + 20 AS `d`
-  FROM test_table
+  SELECT `d`, `c`
+  FROM t2
 ),
 t1 AS (
-  SELECT `d`, `c`
+  SELECT `d`, CAST(`d` / 15 AS bigint) AS `idx`, `c`, count(1) AS `row_count`
   FROM t0
+  GROUP BY 1, 2, 3
 ),
 t2 AS (
-  SELECT `d`, CAST(`d` / 15 AS bigint) AS `idx`, `c`, count(*) AS `row_count`
-  FROM t1
-  GROUP BY 1, 2, 3
+  SELECT *, `a` + 20 AS `d`
+  FROM test_table
 )
 SELECT t3.*, t4.`total`
 FROM (
-  SELECT `d`, `b`, count(*) AS `count`, count(DISTINCT `c`) AS `unique`
-  FROM t0
+  SELECT `d`, `b`, count(1) AS `count`, count(DISTINCT `c`) AS `unique`
+  FROM t2
   GROUP BY 1, 2
 ) t3
   INNER JOIN (
     SELECT t5.*
     FROM (
-      SELECT t2.*, t8.`total`
-      FROM t2
+      SELECT t1.*, t8.`total`
+      FROM t1
         INNER JOIN (
           SELECT `d`, sum(`row_count`) AS `total`
-          FROM t2
+          FROM t1
           GROUP BY 1
         ) t8
-          ON t2.`d` = t8.`d`
+          ON t1.`d` = t8.`d`
     ) t5
     WHERE t5.`row_count` < (t5.`total` / 2)
   ) t4
@@ -465,9 +453,7 @@ def tpch(region, nation, customer, orders):
     return (
         region.join(nation, region.r_regionkey == nation.n_regionkey)
         .join(customer, customer.c_nationkey == nation.n_nationkey)
-        .join(orders, orders.o_custkey == customer.c_custkey)[
-            fields_of_interest
-        ]
+        .join(orders, orders.o_custkey == customer.c_custkey)[fields_of_interest]
     )
 
 
@@ -480,9 +466,7 @@ def test_join_key_name(tpch):
     amount_filter = tpch.o_totalprice > conditional_avg
     post_sizes = tpch[amount_filter].group_by(year).size()
 
-    percent = (post_sizes['count'] / pre_sizes['count'].cast('double')).name(
-        'fraction'
-    )
+    percent = (post_sizes['count'] / pre_sizes['count'].cast('double')).name('fraction')
 
     expr = pre_sizes.join(post_sizes, pre_sizes.year == post_sizes.year)[
         pre_sizes.year,
@@ -506,12 +490,12 @@ WITH t0 AS (
 SELECT t1.`year`, t1.`count` AS `pre_count`, t2.`count` AS `post_count`,
        t2.`count` / CAST(t1.`count` AS double) AS `fraction`
 FROM (
-  SELECT extract(`odate`, 'year') AS `year`, count(*) AS `count`
+  SELECT extract(`odate`, 'year') AS `year`, count(1) AS `count`
   FROM t0
   GROUP BY 1
 ) t1
   INNER JOIN (
-    SELECT extract(t0.`odate`, 'year') AS `year`, count(*) AS `count`
+    SELECT extract(t0.`odate`, 'year') AS `year`, count(1) AS `count`
     FROM t0
     WHERE t0.`o_totalprice` > (
       SELECT avg(t7.`o_totalprice`) AS `mean`
@@ -549,7 +533,7 @@ WITH t0 AS (
       ON t6.`o_custkey` = t5.`c_custkey`
 ),
 t1 AS (
-  SELECT extract(`odate`, 'year') AS `year`, count(*) AS `count`
+  SELECT extract(`odate`, 'year') AS `year`, count(1) AS `count`
   FROM t0
   GROUP BY 1
 )
@@ -570,6 +554,6 @@ def test_group_by_with_window_preserves_range():
     result = ibis.impala.compile(expr)
     expected = """\
 SELECT *,
-       sum(`two`) OVER (PARTITION BY `three` ORDER BY `one` RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS `four`
+       sum(`two`) OVER (PARTITION BY `three` ORDER BY `one` ASC RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS `four`
 FROM my_data"""  # noqa: E501
     assert result == expected

@@ -1,6 +1,7 @@
 import itertools
+import json
 import operator
-from functools import reduce
+from functools import partial, reduce
 
 import numpy as np
 import pandas as pd
@@ -10,9 +11,9 @@ from pandas.core.groupby import SeriesGroupBy
 
 import ibis.expr.operations as ops
 import ibis.util
-
-from ..core import integer_types, scalar_types
-from ..dispatch import execute_node
+from ibis.backends.pandas.core import integer_types, scalar_types
+from ibis.backends.pandas.dispatch import execute_node
+from ibis.backends.pandas.execution.util import get_grouping
 
 
 @execute_node.register(ops.StringLength, pd.Series)
@@ -20,9 +21,14 @@ def execute_string_length_series(op, data, **kwargs):
     return data.str.len().astype('int32')
 
 
-@execute_node.register(ops.Substring, pd.Series, integer_types, integer_types)
+@execute_node.register(
+    ops.Substring, pd.Series, integer_types, (type(None), *integer_types)
+)
 def execute_substring_int_int(op, data, start, length, **kwargs):
-    return data.str[start : start + length]
+    if length is None:
+        return data.str[start:]
+    else:
+        return data.str[start : start + length]
 
 
 @execute_node.register(ops.Substring, pd.Series, pd.Series, integer_types)
@@ -119,6 +125,11 @@ def execute_string_repeat(op, data, times, **kwargs):
     return data.str.repeat(times)
 
 
+@execute_node.register(ops.StringContains, pd.Series, (pd.Series, str))
+def execute_string_contains(_, data, needle, **kwargs):
+    return data.str.contains(needle)
+
+
 @execute_node.register(
     ops.StringFind,
     pd.Series,
@@ -126,7 +137,7 @@ def execute_string_repeat(op, data, times, **kwargs):
     (pd.Series, type(None)) + integer_types,
     (pd.Series, type(None)) + integer_types,
 )
-def execute_string_contains(op, data, needle, start, end, **kwargs):
+def execute_string_find(op, data, needle, start, end, **kwargs):
     return data.str.find(needle, start, end)
 
 
@@ -193,26 +204,18 @@ def sql_like_to_regex(pattern, escape=None):
 @execute_node.register(ops.StringSQLLike, pd.Series, str, (str, type(None)))
 def execute_string_like_series_string(op, data, pattern, escape, **kwargs):
     new_pattern = re.compile(sql_like_to_regex(pattern, escape=escape))
-    return data.map(
-        lambda x, pattern=new_pattern: pattern.search(x) is not None
-    )
+    return data.map(lambda x, pattern=new_pattern: pattern.search(x) is not None)
 
 
 @execute_node.register(ops.StringSQLLike, SeriesGroupBy, str, str)
-def execute_string_like_series_groupby_string(
-    op, data, pattern, escape, **kwargs
-):
+def execute_string_like_series_groupby_string(op, data, pattern, escape, **kwargs):
     return execute_string_like_series_string(
         op, data.obj, pattern, escape, **kwargs
-    ).groupby(data.grouper.groupings)
+    ).groupby(get_grouping(data.grouper.groupings), group_keys=False)
 
 
-@execute_node.register(
-    ops.GroupConcat, pd.Series, str, (pd.Series, type(None))
-)
-def execute_group_concat_series_mask(
-    op, data, sep, mask, aggcontext=None, **kwargs
-):
+@execute_node.register(ops.GroupConcat, pd.Series, str, (pd.Series, type(None)))
+def execute_group_concat_series_mask(op, data, sep, mask, aggcontext=None, **kwargs):
     return aggcontext.agg(
         data[mask] if mask is not None else data,
         lambda series, sep=sep: sep.join(series.values),
@@ -220,26 +223,20 @@ def execute_group_concat_series_mask(
 
 
 @execute_node.register(ops.GroupConcat, SeriesGroupBy, str, type(None))
-def execute_group_concat_series_gb(
-    op, data, sep, _, aggcontext=None, **kwargs
-):
-    return aggcontext.agg(
-        data, lambda data, sep=sep: sep.join(data.values.astype(str))
-    )
+def execute_group_concat_series_gb(op, data, sep, _, aggcontext=None, **kwargs):
+    return aggcontext.agg(data, lambda data, sep=sep: sep.join(data.values.astype(str)))
 
 
 @execute_node.register(ops.GroupConcat, SeriesGroupBy, str, SeriesGroupBy)
-def execute_group_concat_series_gb_mask(
-    op, data, sep, mask, aggcontext=None, **kwargs
-):
+def execute_group_concat_series_gb_mask(op, data, sep, mask, aggcontext=None, **kwargs):
     def method(series, sep=sep):
+        if series.empty:
+            return pd.NA
         return sep.join(series.values.astype(str))
 
     return aggcontext.agg(
         data,
-        lambda data, mask=mask.obj, method=method: method(
-            data[mask[data.index]]
-        ),
+        lambda data, mask=mask.obj, method=method: method(data[mask[data.index]]),
     )
 
 
@@ -251,7 +248,7 @@ def execute_string_ascii(op, data, **kwargs):
 @execute_node.register(ops.StringAscii, SeriesGroupBy)
 def execute_string_ascii_group_by(op, data, **kwargs):
     return execute_string_ascii(op, data, **kwargs).groupby(
-        data.grouper.groupings
+        get_grouping(data.grouper.groupings), group_keys=False
     )
 
 
@@ -266,12 +263,10 @@ def execute_series_regex_search(op, data, pattern, **kwargs):
 def execute_series_regex_search_gb(op, data, pattern, **kwargs):
     return execute_series_regex_search(
         op, data, getattr(pattern, 'obj', pattern), **kwargs
-    ).groupby(data.grouper.groupings)
+    ).groupby(get_grouping(data.grouper.groupings), group_keys=False)
 
 
-@execute_node.register(
-    ops.RegexExtract, pd.Series, (pd.Series, str), integer_types
-)
+@execute_node.register(ops.RegexExtract, pd.Series, (pd.Series, str), integer_types)
 def execute_series_regex_extract(op, data, pattern, index, **kwargs):
     def extract(x, pattern=re.compile(pattern), index=index):
         match = pattern.match(x)
@@ -285,9 +280,9 @@ def execute_series_regex_extract(op, data, pattern, index, **kwargs):
 
 @execute_node.register(ops.RegexExtract, SeriesGroupBy, str, integer_types)
 def execute_series_regex_extract_gb(op, data, pattern, index, **kwargs):
-    return execute_series_regex_extract(
-        op, data.obj, pattern, index, **kwargs
-    ).groupby(data.grouper.groupings)
+    return execute_series_regex_extract(op, data.obj, pattern, index, **kwargs).groupby(
+        get_grouping(data.grouper.groupings), group_keys=False
+    )
 
 
 @execute_node.register(ops.RegexReplace, pd.Series, str, str)
@@ -302,13 +297,11 @@ def execute_series_regex_replace(op, data, pattern, replacement, **kwargs):
 def execute_series_regex_replace_gb(op, data, pattern, replacement, **kwargs):
     return execute_series_regex_replace(
         data.obj, pattern, replacement, **kwargs
-    ).groupby(data.grouper.groupings)
+    ).groupby(get_grouping(data.grouper.groupings), group_keys=False)
 
 
 @execute_node.register(ops.Translate, pd.Series, pd.Series, pd.Series)
-def execute_series_translate_series_series(
-    op, data, from_string, to_string, **kwargs
-):
+def execute_series_translate_series_series(op, data, from_string, to_string, **kwargs):
     to_string_iter = iter(to_string)
     table = from_string.apply(
         lambda x, y: str.maketrans(x, y=next(y)), args=(to_string_iter,)
@@ -317,25 +310,19 @@ def execute_series_translate_series_series(
 
 
 @execute_node.register(ops.Translate, pd.Series, pd.Series, str)
-def execute_series_translate_series_scalar(
-    op, data, from_string, to_string, **kwargs
-):
+def execute_series_translate_series_scalar(op, data, from_string, to_string, **kwargs):
     table = from_string.map(lambda x, y=to_string: str.maketrans(x=x, y=y))
     return data.str.translate(table)
 
 
 @execute_node.register(ops.Translate, pd.Series, str, pd.Series)
-def execute_series_translate_scalar_series(
-    op, data, from_string, to_string, **kwargs
-):
+def execute_series_translate_scalar_series(op, data, from_string, to_string, **kwargs):
     table = to_string.map(lambda y, x=from_string: str.maketrans(x=x, y=y))
     return data.str.translate(table)
 
 
 @execute_node.register(ops.Translate, pd.Series, str, str)
-def execute_series_translate_scalar_scalar(
-    op, data, from_string, to_string, **kwargs
-):
+def execute_series_translate_scalar_scalar(op, data, from_string, to_string, **kwargs):
     return data.str.translate(str.maketrans(from_string, to_string))
 
 
@@ -347,8 +334,13 @@ def execute_series_right(op, data, nchars, **kwargs):
 @execute_node.register(ops.StrRight, SeriesGroupBy, integer_types)
 def execute_series_right_gb(op, data, nchars, **kwargs):
     return execute_series_right(op, data.obj, nchars).groupby(
-        data.grouper.groupings
+        get_grouping(data.grouper.groupings), group_keys=False
     )
+
+
+@execute_node.register(ops.StringReplace, pd.Series, (pd.Series, str), (pd.Series, str))
+def execute_series_string_replace(_, data, needle, replacement, **kwargs):
+    return data.str.replace(needle, replacement)
 
 
 @execute_node.register(ops.StringJoin, (pd.Series, str), list)
@@ -386,9 +378,9 @@ def execute_series_find_in_set(op, needle, haystack, **kwargs):
 @execute_node.register(ops.FindInSet, SeriesGroupBy, list)
 def execute_series_group_by_find_in_set(op, needle, haystack, **kwargs):
     pieces = [getattr(piece, 'obj', piece) for piece in haystack]
-    return execute_series_find_in_set(
-        op, needle.obj, pieces, **kwargs
-    ).groupby(needle.grouper.groupings)
+    return execute_series_find_in_set(op, needle.obj, pieces, **kwargs).groupby(
+        get_grouping(needle.grouper.groupings), group_keys=False
+    )
 
 
 @execute_node.register(ops.FindInSet, scalar_types, list)
@@ -420,9 +412,50 @@ def execute_string_group_by_find_in_set(op, needle, haystack, **kwargs):
     assert issubclass(collection_type, SeriesGroupBy)
 
     return result.groupby(
-        toolz.first(
-            piece.grouper.groupings
-            for piece in haystack
-            if hasattr(piece, 'grouper')
-        )
+        get_grouping(
+            toolz.first(
+                piece.grouper.groupings
+                for piece in haystack
+                if hasattr(piece, 'grouper')
+            )
+        ),
+        group_keys=False,
+    )
+
+
+def try_getitem(value, key):
+    try:
+        # try to deserialize the value -> return None if it's None
+        if (js := json.loads(value)) is None:
+            return None
+    except (json.JSONDecodeError, TypeError):
+        # if there's an error related to decoding or a type error return None
+        return None
+
+    try:
+        # try to extract the value as an array element or mapping key
+        return js[key]
+    except (KeyError, IndexError, TypeError):
+        # KeyError: missing mapping key
+        # IndexError: missing sequence key
+        # TypeError: `js` doesn't implement __getitem__, either at all or for
+        # the type of `key`
+        return None
+
+
+@execute_node.register(ops.JSONGetItem, pd.Series, (str, int))
+def execute_json_getitem_series_str_int(_, data, key, **kwargs):
+    return pd.Series(list(map(partial(try_getitem, key=key), data)), dtype="object")
+
+
+@execute_node.register(ops.JSONGetItem, pd.Series, pd.Series)
+def execute_json_getitem_series_series(_, data, key, **kwargs):
+    return pd.Series(
+        list(
+            map(
+                lambda value, keyiter=iter(key): try_getitem(value, next(keyiter)),
+                data,
+            )
+        ),
+        dtype="object",
     )

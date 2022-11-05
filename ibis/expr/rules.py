@@ -1,35 +1,50 @@
+import builtins
 import enum
-import functools
-from contextlib import suppress
+import operator
 from itertools import product, starmap
-
-from toolz import compose, curry, identity
 
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.schema as sch
-import ibis.expr.signature as sig
 import ibis.expr.types as ir
 import ibis.util as util
-
-optional = sig.Optional
-
-
-class validator(curry, sig.Validator):
-    """
-    Enable convenient validator definition by decorating plain functions.
-    """
-
-    def __repr__(self):
-        return '{}({}{})'.format(
-            self.func.__name__,
-            repr(self.args)[1:-1],
-            ', '.join(f'{k}={v!r}' for k, v in self.keywords.items()),
-        )
+from ibis.common.annotations import attribute, optional, variadic  # noqa: F401
+from ibis.common.validators import (  # noqa: F401
+    bool_,
+    instance_of,
+    isin,
+    map_to,
+    one_of,
+    ref,
+    str_,
+    tuple_of,
+    validator,
+)
+from ibis.expr.deferred import Deferred
 
 
-def highest_precedence_dtype(exprs):
-    """Return the highest precedence type from the passed expressions
+# TODO(kszucs): consider to rename to datashape
+class Shape(enum.IntEnum):
+    SCALAR = 0
+    COLUMNAR = 1
+    # TABULAR = 2
+
+    def is_scalar(self):
+        return self == Shape.SCALAR
+
+    def is_columnar(self):
+        return self == Shape.COLUMNAR
+
+
+def highest_precedence_shape(nodes):
+    if builtins.any(node.output_shape is Shape.COLUMNAR for node in nodes):
+        return Shape.COLUMNAR
+    else:
+        return Shape.SCALAR
+
+
+def highest_precedence_dtype(nodes):
+    """Return the highest precedence type from the passed expressions.
 
     Also verifies that there are valid implicit casts between any of the types
     and the selected highest precedence type.
@@ -37,7 +52,7 @@ def highest_precedence_dtype(exprs):
 
     Parameters
     ----------
-    exprs : Iterable[ir.ValueExpr]
+    nodes : Iterable[ops.Value]
       A sequence of Expressions
 
     Returns
@@ -45,181 +60,148 @@ def highest_precedence_dtype(exprs):
     dtype: DataType
       The highest precedence datatype
     """
-    if not exprs:
-        raise ValueError('Must pass at least one expression')
-
-    return dt.highest_precedence(expr.type() for expr in exprs)
+    return dt.highest_precedence(node.output_dtype for node in nodes)
 
 
 def castable(source, target):
-    """Return whether source ir type is implicitly castable to target
+    """Return whether source ir type is implicitly castable to target.
 
     Based on the underlying datatypes and the value in case of Literals
     """
-    op = source.op()
-    value = getattr(op, 'value', None)
-    return dt.castable(source.type(), target.type(), value=value)
+    value = getattr(source, 'value', None)
+    return dt.castable(source.output_dtype, target.output_dtype, value=value)
 
 
 def comparable(left, right):
     return castable(left, right) or castable(right, left)
 
 
-def cast(source, target):
-    """Currently Literal to *Scalar implicit casts are allowed"""
-    import ibis.expr.operations as ops  # TODO: don't use ops here
+class rule(validator):
+    __slots__ = ()
 
-    if not castable(source, target):
-        raise com.IbisTypeError('Source is not castable to target type!')
+    def _erase_expr(self, value):
+        return value.op() if isinstance(value, ir.Expr) else value
 
-    # currently it prevents column -> scalar implicit castings
-    # however the datatypes are matching
-    op = source.op()
-    if not isinstance(op, ops.Literal):
-        raise com.IbisTypeError('Only able to implicitly cast literals!')
-
-    out_type = target.type().scalar_type()
-    return out_type(op)
+    def __call__(self, *args, **kwargs):
+        args = map(self._erase_expr, args)
+        kwargs = {k: self._erase_expr(v) for k, v in kwargs.items()}
+        result = super().__call__(*args, **kwargs)
+        assert not isinstance(result, ir.Expr)
+        return result
 
 
 # ---------------------------------------------------------------------
 # Input type validators / coercion functions
 
 
-@validator
-def noop(arg, **kwargs):
-    return arg
+@rule
+def just(arg):
+    return lambda **_: arg
 
 
-@validator
-def one_of(inners, arg, **kwargs):
-    """At least one of the inner validators must pass"""
-    for inner in inners:
-        with suppress(com.IbisTypeError, ValueError):
-            return inner(arg, **kwargs)
+@rule
+def nodes_of(inner, arg, **kwargs):
+    import ibis.expr.operations as ops
 
-    raise com.IbisTypeError(
-        "argument passes none of the following rules: "
-        f"{', '.join(map(repr, inners))}"
+    values = tuple_of(inner, arg, **kwargs)
+    return ops.NodeList(*values)
+
+
+@rule
+def sort_key_from(table_ref, key, **kwargs):
+    import ibis.expr.operations as ops
+
+    is_ascending = {
+        "asc": True,
+        "ascending": True,
+        "desc": False,
+        "descending": False,
+        0: False,
+        1: True,
+        False: False,
+        True: True,
+    }
+
+    if callable(key):
+        key = function_of(table_ref, key, **kwargs)
+
+    if isinstance(key, ops.SortKey):
+        return key
+    elif isinstance(key, tuple):
+        key, order = key
+    else:
+        key, order = key, True
+
+    key = one_of(
+        (function_of(table_ref), column_from(table_ref), any),
+        key,
+        **kwargs,
     )
 
+    if isinstance(order, str):
+        order = order.lower()
+    order = map_to(is_ascending, order)
 
-@validator
-def all_of(inners, arg, *, this):
-    """All of the inner validators must pass.
-
-    The order of inner validators matters.
-
-    Parameters
-    ----------
-    inners : List[validator]
-      Functions are applied from right to left so allof([rule1, rule2], arg) is
-      the same as rule1(rule2(arg)).
-    arg : Any
-      Value to be validated.
-
-    Returns
-    -------
-    arg : Any
-      Value maybe coerced by inner validators to the appropiate types
-    """
-    return compose(*inners)(arg, this=this)
+    return ops.SortKey(key, ascending=order)
 
 
-@validator
-def isin(values, arg, **kwargs):
-    if arg not in values:
-        raise ValueError(f'Value with type {type(arg)} is not in {values!r}')
-    if isinstance(values, dict):  # TODO check for mapping instead
-        return values[arg]
-    else:
-        return arg
-
-
-@validator
-def map_to(mapping, variant, **kwargs):
-    return mapping[variant]
-
-
-@validator
-def member_of(obj, arg, **kwargs):
-    if isinstance(arg, ir.EnumValue):
-        arg = arg.op().value
-    if isinstance(arg, enum.Enum):
-        enum.unique(obj)  # check that enum has unique values
-        arg = arg.name
-
-    if not hasattr(obj, arg):
-        raise com.IbisTypeError(
-            f'Value with type {type(arg)} is not a member of {obj}'
-        )
-    return getattr(obj, arg)
-
-
-@validator
-def container_of(inner, arg, *, type, min_length=0, flatten=False, **kwargs):
-    if not util.is_iterable(arg):
-        raise com.IbisTypeError('Argument must be a sequence')
-
-    if len(arg) < min_length:
-        raise com.IbisTypeError(
-            f'Arg must have at least {min_length} number of elements'
-        )
-
-    if flatten:
-        arg = util.flatten_iterable(arg)
-
-    return type(inner(item, **kwargs) for item in arg)
-
-
-list_of = container_of(type=list)
-tuple_of = container_of(type=tuple)
-
-
-@validator
-def value_list_of(inner, arg, **kwargs):
-    # TODO(kszucs): would be nice to remove ops.ValueList
-    # the main blocker is that some of the backends execution
-    # model depends on the wrapper operation, for example
-    # the dispatcher in pandas requires operation objects
-    import ibis.expr.operations as ops
-
-    values = list_of(inner, arg, **kwargs)
-    return ops.ValueList(values).to_expr()
-
-
-@validator
-def sort_key(key, *, from_=None, this):
-    import ibis.expr.operations as ops
-
-    table = getattr(this, from_) if from_ is not None else None
-    return ops.sortkeys._to_sort_key(key, table=table)
-
-
-@validator
+@rule
 def datatype(arg, **kwargs):
     return dt.dtype(arg)
 
 
-@validator
-def instance_of(klasses, arg, **kwargs):
-    """Require that a value has a particular Python type."""
-    if not isinstance(arg, klasses):
+# TODO(kszucs): make type argument the first and mandatory, similarly to the
+# value rule, move out the type inference to `ir.literal()` method
+# TODO(kszucs): may not make sense to support an explicit datatype here, we
+# could do the coercion in the API function ibis.literal()
+@rule
+def literal(dtype, value, **kwargs):
+    import ibis.expr.operations as ops
+
+    if isinstance(value, ops.Literal):
+        return value
+
+    try:
+        inferred_dtype = dt.infer(value)
+    except com.InputTypeError:
+        has_inferred = False
+    else:
+        has_inferred = True
+
+    if dtype is None:
+        has_explicit = False
+    else:
+        has_explicit = True
+        # TODO(kszucs): handle class-like dtype definitions here explicitly
+        explicit_dtype = dt.dtype(dtype)
+
+    if has_explicit and has_inferred:
+        try:
+            # ensure type correctness: check that the inferred dtype is
+            # implicitly castable to the explicitly given dtype and value
+            dtype = inferred_dtype.cast(explicit_dtype, value=value)
+        except com.IbisTypeError:
+            raise TypeError(f'Value {value!r} cannot be safely coerced to {type}')
+    elif has_explicit:
+        dtype = explicit_dtype
+    elif has_inferred:
+        dtype = inferred_dtype
+    else:
         raise com.IbisTypeError(
-            f'Given argument with type {type(arg)} '
-            f'is not an instance of {klasses}'
+            'The datatype of value {!r} cannot be inferred, try '
+            'passing it explicitly with the `type` keyword.'.format(value)
         )
-    return arg
+
+    if isinstance(dtype, dt.Null):
+        return ops.NullLiteral()
+
+    value = dt.normalize(dtype, value)
+    return ops.Literal(value, dtype=dtype)
 
 
-@validator
-def coerce_to(klass, arg, **kwargs):
-    return klass(arg)
-
-
-@validator
+@rule
 def value(dtype, arg, **kwargs):
-    """Validates that the given argument is a Value with a particular datatype
+    """Validates that the given argument is a Value with a particular datatype.
 
     Parameters
     ----------
@@ -230,61 +212,67 @@ def value(dtype, arg, **kwargs):
 
     Returns
     -------
-    arg : AnyValue
+    arg : Value
       An ibis value expression with the specified datatype
     """
-    if not isinstance(arg, ir.Expr):
+    import ibis.expr.operations as ops
+
+    if not isinstance(arg, ops.Value):
         # coerce python literal to ibis literal
-        arg = ir.literal(arg)
+        arg = literal(None, arg)
 
-    if not isinstance(arg, ir.AnyValue):
-        raise com.IbisTypeError(
-            f'Given argument with type {type(arg)} is not a value '
-            'expression'
-        )
-
-    # retrieve literal values for implicit cast check
-    value = getattr(arg.op(), 'value', None)
-
-    if isinstance(dtype, type) and isinstance(arg.type(), dtype):
-        # dtype class has been specified like dt.Interval or dt.Decimal
+    if dtype is None:
+        # no datatype restriction
         return arg
-    elif dt.castable(arg.type(), dt.dtype(dtype), value=value):
+    elif isinstance(dtype, type):
+        # dtype class has been specified like dt.Interval or dt.Decimal
+        if not issubclass(dtype, dt.DataType):
+            raise com.IbisTypeError(
+                f"Datatype specification {dtype} is not a subclass dt.DataType"
+            )
+        elif isinstance(arg.output_dtype, dtype):
+            return arg
+        else:
+            raise com.IbisTypeError(
+                f'Given argument with datatype {arg.output_dtype} is not '
+                f'subtype of {dtype}'
+            )
+    elif isinstance(dtype, (dt.DataType, str)):
         # dtype instance or string has been specified and arg's dtype is
         # implicitly castable to it, like dt.int8 is castable to dt.int64
+        dtype = dt.dtype(dtype)
+        # retrieve literal values for implicit cast check
+        value = getattr(arg, 'value', None)
+        if dt.castable(arg.output_dtype, dtype, value=value):
+            return arg
+        else:
+            raise com.IbisTypeError(
+                f'Given argument with datatype {arg.output_dtype} is not '
+                f'implicitly castable to {dtype}'
+            )
+    else:
+        raise com.IbisTypeError(f'Invalid datatype specification {dtype}')
+
+
+@rule
+def scalar(inner, arg, **kwargs):
+    arg = inner(arg, **kwargs)
+    if arg.output_shape is Shape.SCALAR:
         return arg
     else:
-        raise com.IbisTypeError(
-            f'Given argument with datatype {arg.type()} is not '
-            f'subtype of {dtype} nor implicitly castable to it'
-        )
+        raise com.IbisTypeError(f"{arg} it not a scalar")
 
 
-@validator
-def scalar(inner, arg, **kwargs):
-    return instance_of(ir.ScalarExpr, inner(arg, **kwargs))
-
-
-@validator
+@rule
 def column(inner, arg, **kwargs):
-    return instance_of(ir.ColumnExpr, inner(arg, **kwargs))
+    arg = inner(arg, **kwargs)
+    if arg.output_shape is Shape.COLUMNAR:
+        return arg
+    else:
+        raise com.IbisTypeError(f"{arg} it not a column")
 
 
-@validator
-def array_of(inner, arg, **kwargs):
-    val = arg if isinstance(arg, ir.Expr) else ir.literal(arg)
-    argtype = val.type()
-    if not isinstance(argtype, dt.Array):
-        raise com.IbisTypeError(
-            'Argument must be an array, '
-            f'got expression which is of type {val.type()}'
-        )
-    value_dtype = inner(val[0], **kwargs).type()
-    array_dtype = dt.Array(value_dtype)
-    return value(array_dtype, val, **kwargs)
-
-
-any = value(dt.any)
+any = value(None)
 double = value(dt.double)
 string = value(dt.string)
 boolean = value(dt.boolean)
@@ -296,6 +284,7 @@ time = value(dt.time)
 timestamp = value(dt.Timestamp)
 category = value(dt.category)
 temporal = one_of([timestamp, date, time])
+json = value(dt.json)
 
 strict_numeric = one_of([integer, floating, decimal])
 soft_numeric = one_of([integer, floating, decimal, boolean])
@@ -304,7 +293,7 @@ numeric = soft_numeric
 set_ = value(dt.Set)
 array = value(dt.Array)
 struct = value(dt.Struct)
-mapping = value(dt.Map(dt.any, dt.any))
+mapping = value(dt.Map)
 
 geospatial = value(dt.GeoSpatial)
 point = value(dt.Point)
@@ -315,10 +304,10 @@ multipoint = value(dt.MultiPoint)
 multipolygon = value(dt.MultiPolygon)
 
 
-@validator
+@rule
 def interval(arg, units=None, **kwargs):
     arg = value(dt.Interval, arg)
-    unit = arg.type().unit
+    unit = arg.output_dtype.unit
     if units is not None and unit not in units:
         msg = 'Interval unit `{}` is not among the allowed ones {}'
         raise com.IbisTypeError(msg.format(unit, units))
@@ -333,87 +322,135 @@ def client(arg, **kwargs):
 
 
 # ---------------------------------------------------------------------
-# Ouput type promoter functions
+# Ouput type functions
 
 
-def promoter(fn):
-    @functools.wraps(fn)
-    def wrapper(name_or_value, *args, **kwargs):
-        if isinstance(name_or_value, str):
-            return lambda self: fn(
-                getattr(self, name_or_value), *args, **kwargs
-            )
+def dtype_like(name):
+    @attribute.default
+    def output_dtype(self):
+        args = getattr(self, name)
+        args = args if util.is_iterable(args) else [args]
+        return highest_precedence_dtype(args)
+
+    return output_dtype
+
+
+def shape_like(name):
+    @attribute.default
+    def output_shape(self):
+        args = getattr(self, name)
+        args = args if util.is_iterable(args) else [args]
+        return highest_precedence_shape(args)
+
+    return output_shape
+
+
+# TODO(kszucs): might just use bounds instead of actual literal values
+# that could simplify interval binop output_type methods
+# TODO(kszucs): pre-generate mapping?
+
+
+def _promote_integral_binop(exprs, op):
+    bounds, dtypes = [], []
+    for arg in exprs:
+        dtypes.append(arg.output_dtype)
+        if hasattr(arg, 'value'):
+            # arg.op() is a literal
+            bounds.append([arg.value])
         else:
-            return fn(name_or_value, *args, **kwargs)
+            bounds.append(arg.output_dtype.bounds)
 
-    return wrapper
+    all_unsigned = dtypes and util.all_of(dtypes, dt.UnsignedInteger)
+    # In some cases, the bounding type might be int8, even though neither
+    # of the types are that small. We want to ensure the containing type is
+    # _at least_ as large as the smallest type in the expression.
+    values = list(starmap(op, product(*bounds)))
+    dtypes.extend(dt.infer(v, prefer_unsigned=all_unsigned) for v in values)
+    return dt.highest_precedence(dtypes)
 
 
-@promoter
-def shape_like(arg, dtype=None):
-    if util.is_iterable(arg):
-        datatype = dtype or highest_precedence_dtype(arg)
-        columnar = util.any_of(arg, ir.AnyColumn)
+def _promote_decimal_binop(args, op):
+    if len(args) != 2:
+        return highest_precedence_dtype(args)
+
+    # TODO: Add support for setting the maximum precision and maximum scale
+    left = args[0].output_dtype
+    right = args[1].output_dtype
+
+    max_prec = 31 if left.precision <= 31 and right.precision <= 31 else 63
+    max_scale = 31
+
+    if op is operator.mul:
+        return dt.Decimal(
+            min(max_prec, left.precision + right.precision),
+            min(max_scale, left.scale + right.scale),
+        )
+    elif op is operator.add or op is operator.sub:
+        return dt.Decimal(
+            min(
+                max_prec,
+                max(
+                    left.precision - left.scale,
+                    right.precision - right.scale,
+                )
+                + max(left.scale, right.scale)
+                + 1,
+            ),
+            max(left.scale, right.scale),
+        )
     else:
-        datatype = dtype or arg.type()
-        columnar = isinstance(arg, ir.AnyColumn)
-
-    dtype = dt.dtype(datatype)
-
-    if columnar:
-        return dtype.column_type()
-    else:
-        return dtype.scalar_type()
+        return highest_precedence_dtype(args)
 
 
-@promoter
-def scalar_like(arg):
-    output_dtype = arg.type()
-    return output_dtype.scalar_type()
+def numeric_like(name, op):
+    @attribute.default
+    def output_dtype(self):
+        args = getattr(self, name)
+        dtypes = [arg.output_dtype for arg in args]
+        if util.all_of(dtypes, dt.Integer):
+            result = _promote_integral_binop(args, op)
+        elif util.all_of(dtypes, dt.Decimal):
+            result = _promote_decimal_binop(args, op)
+        else:
+            result = highest_precedence_dtype(args)
+
+        return result
+
+    return output_dtype
 
 
-@promoter
-def array_like(arg):
-    output_dtype = arg.type()
-    return output_dtype.column_type()
-
-
-column_like = array_like
-
-
-@promoter
-def typeof(arg):
-    return arg._factory
-
-
-@validator
-def table(arg, *, schema=None, **kwargs):
+# TODO(kszucs): it could be as simple as rlz.instance_of(ops.TableNode)
+# we have a single test case testing the schema superset condition, not
+# used anywhere else
+@rule
+def table(arg, schema=None, **kwargs):
     """A table argument.
 
     Parameters
     ----------
-    schema : Union[sch.Schema, List[Tuple[str, dt.DataType], None]
+    schema
         A validator for the table's columns. Only column subset validators are
         currently supported. Accepts any arguments that `sch.schema` accepts.
         See the example for usage.
-    arg : The validatable argument.
+    arg
+        An argument
 
-    Examples
-    --------
-    The following op will accept an argument named ``'table'``. Note that the
-    ``schema`` argument specifies rules for columns that are required to be in
-    the table: ``time``, ``group`` and ``value1``. These must match the types
-    specified in the column rules. Column ``value2`` is optional, but if
-    present it must be of the specified type. The table may have extra columns
-    not specified in the schema.
+    The following op will accept an argument named `'table'`. Note that the
+    `schema` argument specifies rules for columns that are required to be in
+    the table: `time`, `group` and `value1`. These must match the types
+    specified in the column rules. Column `value2` is optional, but if present
+    it must be of the specified type. The table may have extra columns not
+    specified in the schema.
     """
-    if not isinstance(arg, ir.TableExpr):
+    import ibis.expr.operations as ops
+
+    if not isinstance(arg, ops.TableNode):
         raise com.IbisTypeError(
             f'Argument is not a table; got type {type(arg).__name__}'
         )
 
     if schema is not None:
-        if arg.schema() >= sch.schema(schema):
+        if arg.schema >= sch.schema(schema):
             return arg
 
         raise com.IbisTypeError(
@@ -422,8 +459,8 @@ def table(arg, *, schema=None, **kwargs):
     return arg
 
 
-@validator
-def column_from(name, column, *, this):
+@rule
+def column_from(table_ref, column, **kwargs):
     """A column from a named table.
 
     This validator accepts columns passed as string, integer, or column
@@ -431,61 +468,73 @@ def column_from(name, column, *, this):
     checks if the column in the table is equal to the column being
     passed.
     """
-    if not hasattr(this, name):
-        raise com.IbisTypeError(f"Could not get table {name} from {this}")
-    table = getattr(this, name)
+    import ibis.expr.operations as ops
 
-    if isinstance(column, (str, int)):
-        return table[column]
-    elif isinstance(column, ir.AnyColumn):
-        if not column.has_name():
-            raise com.IbisTypeError(f"Passed column {column} has no name")
+    # TODO(kszucs): should avoid converting to TableExpr
+    table = table_ref(**kwargs).to_expr()
 
-        maybe_column = column.get_name()
-        try:
-            if column.equals(table[maybe_column]):
-                return column
-            else:
-                raise com.IbisTypeError(
-                    f"Passed column is not a column in {type(table)}"
-                )
-        except com.IbisError:
-            raise com.IbisTypeError(
-                f"Cannot get column {maybe_column} from {type(table)}"
-            )
+    # TODO(kszucs): should avoid converting to a ColumnExpr
+    if isinstance(column, ops.Node):
+        column = column.to_expr()
 
-    raise com.IbisTypeError(
-        "value must be an int or str or AnyColumn, got "
-        f"{type(column).__name__}"
-    )
+    column = table._ensure_expr(column)
 
+    if not isinstance(column, ir.Column):
+        raise com.IbisTypeError(
+            "value must be an int or str or Column, got " f"{type(column).__name__}"
+        )
 
-@validator
-def function_of(
-    argument,
-    fn,
-    *,
-    output_rule=any,
-    preprocess=identity,
-    this,
-):
-    if not util.is_function(fn):
-        raise com.IbisTypeError('argument `fn` must be a function or lambda')
+    if not column.has_name():
+        raise com.IbisTypeError(f"Passed column {column} has no name")
 
-    return output_rule(fn(preprocess(getattr(this, argument))), this=this)
+    maybe_column = column.get_name()
+    try:
+        if column.equals(table[maybe_column]):
+            return column.op()
+        else:
+            raise com.IbisTypeError(f"Passed column is not a column in {type(table)}")
+    except com.IbisError:
+        raise com.IbisTypeError(f"Cannot get column {maybe_column} from {type(table)}")
 
 
-@validator
-def reduction(argument, **kwargs):
+@rule
+def base_table_of(table_ref, *, this, strict=True):
+    from ibis.expr.analysis import find_first_base_table
+
+    arg = table_ref(this=this)
+    base = find_first_base_table(arg)
+    if strict and base is None:
+        raise com.IbisTypeError(f"`{arg}` doesn't have a base table")
+    return base
+
+
+@rule
+def function_of(table_ref, fn, *, output_rule=any, this=None):
+    arg = table_ref(this=this).to_expr()
+
+    if util.is_function(fn):
+        arg = fn(arg)
+    elif isinstance(fn, Deferred):
+        arg = fn.resolve(arg)
+    else:
+        raise com.IbisTypeError(
+            'argument `fn` must be a function, lambda or deferred operation'
+        )
+
+    return output_rule(arg, this=this)
+
+
+@rule
+def reduction(arg, **kwargs):
     from ibis.expr.analysis import is_reduction
 
-    if not is_reduction(argument):
+    if not is_reduction(arg):
         raise com.IbisTypeError("`argument` must be a reduction")
 
-    return argument
+    return arg
 
 
-@validator
+@rule
 def non_negative_integer(arg, **kwargs):
     if not isinstance(arg, int):
         raise com.IbisTypeError(
@@ -496,76 +545,26 @@ def non_negative_integer(arg, **kwargs):
     return arg
 
 
-@validator
-def python_literal(value, arg, **kwargs):
-    if (
-        not isinstance(arg, type(value))
-        or not isinstance(value, type(arg))
-        or arg != value
-    ):
-        raise ValueError(
-            "arg must be a literal exactly equal in type and value to value "
-            f"{value} with type {type(value)}, got `arg` with type {type(arg)}"
-        )
-    return arg
+@rule
+def pair(inner_left, inner_right, arg, **kwargs):
+    try:
+        a, b = arg
+    except TypeError:
+        raise com.IbisTypeError(f"{arg} is not an iterable with two elements")
+    return inner_left(a[0], **kwargs), inner_right(b, **kwargs)
 
 
-@validator
-def is_computable_input(value, **kwargs):
-    from ibis.backends.pandas.core import (
-        is_computable_input as _is_computable_input,
-    )
-
-    if not _is_computable_input(value):
-        raise com.IbisTypeError(
-            f"object {value} is not a computable input; "
-            "did you register the type with "
-            "ibis.backends.pandas.core.is_computable_input?"
-        )
-    return value
-
-
-@validator
-def named_literal(value, **kwargs):
-    import ibis.expr.operations as ops
-
-    if not isinstance(value, ir.ScalarExpr):
-        raise com.IbisTypeError(
-            "`value` must be a scalar expression; "
-            f"got value of type {type(value).__name__}"
-        )
-
-    if not isinstance(value.op(), ops.Literal):
-        raise com.IbisTypeError(
-            "`value` must map to an ibis literal; "
-            f"got expr with op {type(value.op()).__name__}"
-        )
-
-    # check that the literal has a name
-    if not value.has_name():
-        raise com.IbisTypeError("`value` literal is not named")
-
-    return value
-
-
-@validator
-def pair(inner_left, inner_right, a, b, **kwargs):
-    return inner_left(a, **kwargs), inner_right(b, **kwargs)
-
-
-@validator
+@rule
 def analytic(arg, **kwargs):
     from ibis.expr.analysis import is_analytic
 
     if not is_analytic(arg):
-        raise com.IbisInputError(
-            'Expression does not contain a valid window operation'
-        )
+        raise com.IbisInputError('Expression does not contain a valid window operation')
     return arg
 
 
 @validator
-def window(win, *, from_base_table_of, this):
+def window_from(table_ref, win, **kwargs):
     from ibis.expr.window import Window
 
     if not isinstance(win, Window):
@@ -573,50 +572,25 @@ def window(win, *, from_base_table_of, this):
             "`win` argument should be of type `ibis.expr.window.Window`; "
             f"got type {type(win).__name__}"
         )
-    table = ir.relations.find_base_table(getattr(this, from_base_table_of))
+
+    table = table_ref(**kwargs)
     if table is not None:
-        win = win.bind(table)
+        win = win.bind(table.to_expr())
 
     if win.max_lookback is not None:
-        error_msg = (
-            "'max lookback' windows must be ordered " "by a timestamp column"
-        )
+        error_msg = "'max lookback' windows must be ordered " "by a timestamp column"
         if len(win._order_by) != 1:
             raise com.IbisInputError(error_msg)
-        order_var = win._order_by[0].op().args[0]
-        if not isinstance(order_var.type(), dt.Timestamp):
+        order_var = win._order_by[0].args[0]
+        if not isinstance(order_var.output_dtype, dt.Timestamp):
             raise com.IbisInputError(error_msg)
     return win
 
 
-# TODO: might just use bounds instead of actual literal values
-# that could simplify interval binop output_type methods
-def _promote_numeric_binop(exprs, op):
-    bounds, dtypes = [], []
-    for arg in exprs:
-        dtypes.append(arg.type())
-        if hasattr(arg.op(), 'value'):
-            # arg.op() is a literal
-            bounds.append([arg.op().value])
-        else:
-            bounds.append(arg.type().bounds)
+def _arg_type_error_format(op):
+    from ibis.expr.operations.generic import Literal
 
-    # In some cases, the bounding type might be int8, even though neither
-    # of the types are that small. We want to ensure the containing type is
-    # _at least_ as large as the smallest type in the expression.
-    values = starmap(op, product(*bounds))
-    dtypes += [dt.infer(value, allow_overflow=True) for value in values]
-
-    return dt.highest_precedence(dtypes)
-
-
-@promoter
-def numeric_like(args, op):
-    if util.all_of(args, ir.IntegerValue):
-        dtype = _promote_numeric_binop(args, op)
-        return shape_like(args, dtype=dtype)
+    if isinstance(op, Literal):
+        return f"Literal({op.value}):{op.output_dtype}"
     else:
-        return shape_like(args)
-
-
-# TODO: create varargs marker for impala udfs
+        return f"{op.name}:{op.output_dtype}"

@@ -6,13 +6,17 @@ on:
   push:
     paths:
       - "docs/**"
+      - "mkdocs.yml"
     branches:
       - master
+      - "*.x.x"
   pull_request:
     paths:
       - "docs/**"
+      - "mkdocs.yml"
     branches:
       - master
+      - "*.x.x"
 jobs:
   backends:
     runs-on: ubuntu-latest

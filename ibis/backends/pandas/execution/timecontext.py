@@ -1,4 +1,4 @@
-""" Implementation of compute_time_context for time context related operations
+"""Implementation of compute_time_context for time context related operations.
 
 Time context of a node is computed at the beginning of execution phase.
 
@@ -17,7 +17,7 @@ it as a filter in the database query.
 In some cases, data need to be trimmed in ``post_execute``.
 
 Note: In order to use the feature we implemented here, there must be a
-column of Timestamp type, and named as 'time' in TableExpr. And this 'time'
+column of Timestamp type, and named as 'time' in Table. And this 'time'
 column should be preserved across the expression tree. If 'time' column is
 dropped then execution will result in error.
 See ``execute_database_table_client`` in ``generic.py``.
@@ -33,11 +33,14 @@ from typing import List, Optional
 
 import ibis.expr.operations as ops
 from ibis.backends.base import BaseBackend
+from ibis.backends.pandas.core import (
+    compute_time_context,
+    get_node_arguments,
+    is_computable_input,
+)
 from ibis.expr.scope import Scope
 from ibis.expr.timecontext import adjust_context
 from ibis.expr.typing import TimeContext
-
-from ..core import compute_time_context, is_computable_input
 
 
 @compute_time_context.register(ops.AsOfJoin)
@@ -49,7 +52,7 @@ def compute_time_context_asof_join(
     **kwargs
 ):
     new_timecontexts = [
-        timecontext for arg in op.inputs if is_computable_input(arg)
+        timecontext for arg in get_node_arguments(op) if is_computable_input(arg)
     ]
 
     if not timecontext:
@@ -64,16 +67,16 @@ def compute_time_context_asof_join(
     return new_timecontexts
 
 
-@compute_time_context.register(ops.WindowOp)
+@compute_time_context.register(ops.Window)
 def compute_time_context_window(
-    op: ops.WindowOp,
+    op: ops.Window,
     scope: Scope,
     clients: List[BaseBackend],
     timecontext: Optional[TimeContext] = None,
     **kwargs
 ):
     new_timecontexts = [
-        timecontext for arg in op.inputs if is_computable_input(arg)
+        timecontext for arg in get_node_arguments(op) if is_computable_input(arg)
     ]
 
     if not timecontext:
@@ -82,6 +85,6 @@ def compute_time_context_window(
     result = adjust_context(op, scope, timecontext)
 
     new_timecontexts = [
-        result for arg in op.inputs if is_computable_input(arg)
+        result for arg in get_node_arguments(op) if is_computable_input(arg)
     ]
     return new_timecontexts

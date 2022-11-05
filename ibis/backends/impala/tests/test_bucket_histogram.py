@@ -1,8 +1,7 @@
 import pytest
 
 from ibis.backends.impala.compiler import ImpalaCompiler
-
-from .conftest import translate
+from ibis.backends.impala.tests.conftest import translate
 
 
 @pytest.fixture(scope="module")
@@ -152,9 +151,9 @@ END""",
         # Because the bucket result is an integer, no explicit cast is
         # necessary
         pytest.param(
-            lambda f: f.bucket(
-                [10], include_over=True, include_under=True
-            ).cast('int32'),
+            lambda f: f.bucket([10], include_over=True, include_under=True).cast(
+                'int32'
+            ),
             """\
 CASE
   WHEN `f` < 10 THEN 0
@@ -164,9 +163,9 @@ END""",
             id="include_over_include_under",
         ),
         pytest.param(
-            lambda f: f.bucket(
-                [10], include_over=True, include_under=True
-            ).cast('double'),
+            lambda f: f.bucket([10], include_over=True, include_under=True).cast(
+                'double'
+            ),
             """\
 CAST(CASE
   WHEN `f` < 10 THEN 0
@@ -210,7 +209,7 @@ FROM (
       WHEN (10 <= `f`) AND (`f` < 25) THEN 2
       WHEN (25 <= `f`) AND (`f` <= 50) THEN 3
       ELSE CAST(NULL AS tinyint)
-    END AS `tier`, count(*) AS `count`
+    END AS `tier`, count(1) AS `count`
   FROM alltypes
   GROUP BY 1
 ) t0"""

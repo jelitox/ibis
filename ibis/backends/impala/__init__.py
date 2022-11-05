@@ -1,18 +1,20 @@
-"""Impala backend"""
+"""Impala backend."""
 
 from __future__ import annotations
 
 import contextlib
 import io
 import operator
+import os
 import re
 import weakref
+from pathlib import Path
 from posixpath import join as pjoin
 from typing import Any, Literal
 
+import fsspec
 import numpy as np
 import pandas as pd
-from pydantic import Field
 
 import ibis.common.exceptions as com
 import ibis.config
@@ -33,20 +35,18 @@ from ibis.backends.base.sql.ddl import (
     fully_qualified_re,
     is_fully_qualified,
 )
-from ibis.config import options
-
-from . import ddl, udf
-from .client import ImpalaConnection, ImpalaDatabase, ImpalaTable
-from .compat import HS2Error, ImpylaError
-from .compiler import ImpalaCompiler
-from .hdfs import HDFS, WebHDFS, hdfs_connect
-from .pandas_interop import DataFrameWriter
-from .udf import (  # noqa F408
+from ibis.backends.impala import ddl, udf
+from ibis.backends.impala.client import ImpalaConnection, ImpalaDatabase, ImpalaTable
+from ibis.backends.impala.compat import HS2Error, ImpylaError
+from ibis.backends.impala.compiler import ImpalaCompiler
+from ibis.backends.impala.pandas_interop import DataFrameWriter
+from ibis.backends.impala.udf import (  # noqa F408
     aggregate_function,
     scalar_function,
     wrap_uda,
     wrap_udf,
 )
+from ibis.config import options
 
 _HS2_TTypeId_to_dtype = {
     'BOOLEAN': 'bool',
@@ -62,6 +62,8 @@ _HS2_TTypeId_to_dtype = {
     'BINARY': 'object',
     'VARCHAR': 'object',
     'CHAR': 'object',
+    'DATE': 'datetime64[ns]',
+    'VOID': None,
 }
 
 
@@ -165,39 +167,48 @@ def _column_batches_to_dataframe(names, batches):
 
 class Backend(BaseSQLBackend):
     name = 'impala'
+    # not 100% accurate, but very close
+    _sqlglot_dialect = "hive"
     database_class = ImpalaDatabase
     table_expr_class = ImpalaTable
-    HDFS = HDFS
-    WebHDFS = WebHDFS
     compiler = ImpalaCompiler
 
-    class Options(ibis.config.BaseModel):
-        temp_db: str = Field(
-            default="__ibis_tmp",
-            description="Database to use for temporary objects.",
-        )
-        temp_hdfs_path: str = Field(
-            default="/tmp/hdfs",
-            description="HDFS path for storage of temporary data",
-        )
+    class Options(ibis.config.Config):
+        """Impala specific options.
 
-    def hdfs_connect(self, *args, **kwargs):
-        return hdfs_connect(*args, **kwargs)
+        Parameters
+        ----------
+        temp_db : str, default "__ibis_tmp"
+            Database to use for temporary objects.
+        temp_hdfs_path : str, default "/tmp/ibis"
+            HDFS path for storage of temporary data.
+        """
+
+        temp_db: str = "__ibis_tmp"
+        temp_hdfs_path: str = "/tmp/hdfs"
+
+    @staticmethod
+    def hdfs_connect(
+        *args: Any,
+        protocol: str = "webhdfs",
+        **kwargs: Any,
+    ) -> fsspec.spec.AbstractFileSystem:
+        return fsspec.filesystem(protocol, *args, **kwargs)
 
     def do_connect(
-        new_backend,
-        host='localhost',
-        port=21050,
-        database='default',
-        timeout=45,
-        use_ssl=False,
-        ca_cert=None,
-        user=None,
-        password=None,
-        auth_mechanism='NOSASL',
-        kerberos_service_name='impala',
-        pool_size=8,
-        hdfs_client=None,
+        self,
+        host: str = "localhost",
+        port: int = 21050,
+        database: str = "default",
+        timeout: int = 45,
+        use_ssl: bool = False,
+        ca_cert: str | Path | None = None,
+        user: str | None = None,
+        password: str | None = None,
+        auth_mechanism: Literal["NOSASL", "PLAIN", "GSSAPI", "LDAP"] = "NOSASL",
+        kerberos_service_name: str = "impala",
+        pool_size: int = 8,
+        hdfs_client: fsspec.spec.AbstractFileSystem | None = None,
     ):
         """Create an Impala Backend for use with Ibis.
 
@@ -222,24 +233,24 @@ class Backend(BaseSQLBackend):
         password
             LDAP password to authenticate
         auth_mechanism
-            {'NOSASL' <- default, 'PLAIN', 'GSSAPI', 'LDAP'}.
-            Use NOSASL for non-secured Impala connections.  Use PLAIN for
-            non-secured Hive clusters.  Use LDAP for LDAP authenticated
-            connections.  Use GSSAPI for Kerberos-secured clusters.
+            |   Value    | Meaning                        |
+            | :--------: | :----------------------------- |
+            | `'NOSASL'` | insecure Impala connections    |
+            | `'PLAIN'`  | insecure Hive clusters         |
+            |  `'LDAP'`  | LDAP authenticated connections |
+            | `'GSSAPI'` | Kerberos-secured clusters      |
         kerberos_service_name
-            Specify particular impalad service principal.
+            Specify a particular `impalad` service principal.
 
         Examples
         --------
-        >>> import ibis
         >>> import os
+        >>> import ibis
         >>> hdfs_host = os.environ.get('IBIS_TEST_NN_HOST', 'localhost')
         >>> hdfs_port = int(os.environ.get('IBIS_TEST_NN_PORT', 50070))
         >>> impala_host = os.environ.get('IBIS_TEST_IMPALA_HOST', 'localhost')
         >>> impala_port = int(os.environ.get('IBIS_TEST_IMPALA_PORT', 21050))
         >>> hdfs = ibis.impala.hdfs_connect(host=hdfs_host, port=hdfs_port)
-        >>> hdfs  # doctest: +ELLIPSIS
-        <ibis.filesystems.WebHDFS object at 0x...>
         >>> client = ibis.impala.connect(
         ...     host=impala_host,
         ...     port=impala_port,
@@ -247,22 +258,9 @@ class Backend(BaseSQLBackend):
         ... )
         >>> client  # doctest: +ELLIPSIS
         <ibis.backends.impala.Backend object at 0x...>
-
-        Returns
-        -------
-        Backend
-            Impala backend
         """
-        import hdfs
-
-        new_backend._temp_objects = set()
-
-        if hdfs_client is None or isinstance(hdfs_client, HDFS):
-            new_backend._hdfs = hdfs_client
-        elif isinstance(hdfs_client, hdfs.Client):
-            new_backend._hdfs = WebHDFS(hdfs_client)
-        else:
-            raise TypeError(hdfs_client)
+        self._temp_objects = set()
+        self._hdfs = hdfs_client
 
         params = {
             'host': host,
@@ -270,15 +268,15 @@ class Backend(BaseSQLBackend):
             'database': database,
             'timeout': timeout,
             'use_ssl': use_ssl,
-            'ca_cert': ca_cert,
+            'ca_cert': str(ca_cert),
             'user': user,
             'password': password,
             'auth_mechanism': auth_mechanism,
             'kerberos_service_name': kerberos_service_name,
         }
-        new_backend.con = ImpalaConnection(pool_size=pool_size, **params)
+        self.con = ImpalaConnection(pool_size=pool_size, **params)
 
-        new_backend._ensure_temp_db_exists()
+        self._ensure_temp_db_exists()
 
     @property
     def version(self):
@@ -317,7 +315,8 @@ class Backend(BaseSQLBackend):
             return schema.apply_to(df)
         return df
 
-    def _get_hdfs(self):
+    @property
+    def hdfs(self):
         if self._hdfs is None:
             raise com.IbisError(
                 'No HDFS connection; must pass connection '
@@ -325,13 +324,6 @@ class Backend(BaseSQLBackend):
                 'ibis.impala.connect'
             )
         return self._hdfs
-
-    def _set_hdfs(self, hdfs):
-        if not isinstance(hdfs, HDFS):
-            raise TypeError('must be HDFS instance')
-        self._hdfs = hdfs
-
-    hdfs = property(fget=_get_hdfs, fset=_set_hdfs)
 
     @property
     def kudu(self):
@@ -372,7 +364,10 @@ class Backend(BaseSQLBackend):
         tuples = cur.fetchall()
         return list(map(operator.itemgetter(0), tuples))
 
-    @util.deprecated(version='2.0', instead='a new connection to database')
+    @util.deprecated(
+        version='2.0',
+        instead='use a new connection to the database',
+    )
     def set_database(self, name):
         # XXX The parent `Client` has a generic method that calls this same
         # method in the backend. But for whatever reason calling this code from
@@ -438,11 +433,7 @@ class Backend(BaseSQLBackend):
                     force=True,
                 )
             for func in udas:
-                util.log(
-                    'Dropping aggregate function {}({})'.format(
-                        func.name, func.inputs
-                    )
-                )
+                util.log(f'Dropping aggregate function {func.name}({func.inputs})')
                 self.drop_uda(
                     func.name,
                     input_types=func.inputs,
@@ -486,8 +477,6 @@ class Backend(BaseSQLBackend):
 
         names, types = zip(*pairs)
         ibis_types = [udf.parse_type(type.lower()) for type in types]
-        names = [name.lower() for name in names]
-
         return sch.Schema(names, ibis_types)
 
     @property
@@ -523,7 +512,7 @@ class Backend(BaseSQLBackend):
         ----------
         name
             View name
-        expr : ibis TableExpr
+        expr : ibis Table
             Ibis table expression
         database
             Database name
@@ -672,9 +661,7 @@ class Backend(BaseSQLBackend):
         ImpalaTable
             Impala table expression
         """
-        name, database = self._get_concrete_table_path(
-            name, database, persist=persist
-        )
+        name, database = self._get_concrete_table_path(name, database, persist=persist)
 
         stmt = ddl.CreateTableAvro(
             name, hdfs_dir, avro_schema, database=database, external=external
@@ -730,9 +717,7 @@ class Backend(BaseSQLBackend):
         ImpalaTable
             Impala table expression
         """
-        name, database = self._get_concrete_table_path(
-            name, database, persist=persist
-        )
+        name, database = self._get_concrete_table_path(name, database, persist=persist)
 
         stmt = ddl.CreateTableDelimited(
             name,
@@ -797,15 +782,26 @@ class Backend(BaseSQLBackend):
         ImpalaTable
             Impala table expression
         """
-        name, database = self._get_concrete_table_path(
-            name, database, persist=persist
-        )
+        name, database = self._get_concrete_table_path(name, database, persist=persist)
 
         # If no schema provided, need to find some absolute path to a file in
         # the HDFS directory
         if like_file is None and like_table is None and schema is None:
-            file_name = self.hdfs._find_any_file(hdfs_dir)
-            like_file = pjoin(hdfs_dir, file_name)
+            try:
+                file_name = next(
+                    fn
+                    for fn in (
+                        os.path.basename(f["name"])
+                        for f in self.hdfs.ls(hdfs_dir, detail=True)
+                        if f["type"].lower() == "file"
+                    )
+                    if not fn.startswith(("_", "."))
+                    if not fn.endswith((".tmp", ".copying"))
+                )
+            except StopIteration:
+                raise com.IbisError("No files found in the passed directory")
+            else:
+                like_file = pjoin(hdfs_dir, file_name)
 
         stmt = ddl.CreateTableParquet(
             name,
@@ -838,12 +834,7 @@ class Backend(BaseSQLBackend):
         # TODO: session memoize to avoid unnecessary `SHOW DATABASES` calls
         name, path = options.impala.temp_db, options.impala.temp_hdfs_path
         if name not in self.list_databases():
-            if self._hdfs is None:
-                print(
-                    'Without an HDFS connection, certain functionality'
-                    ' may be disabled'
-                )
-            else:
+            if self._hdfs is not None:
                 self.create_database(name, path=path, force=True)
 
     def _drop_table(self, name: str) -> None:
@@ -857,7 +848,10 @@ class Backend(BaseSQLBackend):
         t = self.table(qualified_name)
         if not persist:
             self._temp_objects.add(
-                weakref.finalize(t, self._drop_table, qualified_name)
+                # weakref the op instead of the expression because the table is
+                # potentially collected after subsequent use when `_erase_expr`
+                # unwraps the Expr layer
+                weakref.finalize(t.op(), self._drop_table, qualified_name)
             )
 
         # Compute number of rows in table for better default query planning
@@ -938,9 +932,7 @@ class Backend(BaseSQLBackend):
         >>> db = 'operations'
         >>> con.drop_table(table, database=db, force=True)  # doctest: +SKIP
         """
-        statement = DropTable(
-            table_name, database=database, must_exist=not force
-        )
+        statement = DropTable(table_name, database=database, must_exist=not force)
         self.raw_sql(statement)
 
     def truncate_table(self, table_name, database=None):
@@ -983,8 +975,8 @@ class Backend(BaseSQLBackend):
         >>> table = 'my_table'
         >>> db = 'operations'
         >>> pool = 'op_4GB_pool'
-        >>> con.cache_table('my_table', database=db, pool=pool)  # noqa: E501 # doctest: +SKIP
-        """
+        >>> con.cache_table('my_table', database=db, pool=pool)  # doctest: +SKIP
+        """  # noqa: E501
         statement = ddl.CacheTable(table_name, database=database, pool=pool)
         self.raw_sql(statement)
 
@@ -994,13 +986,6 @@ class Backend(BaseSQLBackend):
         cur.fetchall()
         names, ibis_types = self._adapt_types(cur.description)
         cur.release()
-
-        # per #321; most Impala tables will be lower case already, but Avro
-        # data, depending on the version of Impala, might have field names in
-        # the metastore cased according to the explicit case in the declared
-        # avro schema. This is very annoying, so it's easier to just conform on
-        # all lowercase fields from Impala.
-        names = [x.lower() for x in names]
 
         return sch.Schema(names, ibis_types)
 
@@ -1095,9 +1080,7 @@ class Backend(BaseSQLBackend):
             name, input_types=input_types, database=database, force=force
         )
 
-    def _drop_single_function(
-        self, name, input_types, database=None, aggregate=False
-    ):
+    def _drop_single_function(self, name, input_types, database=None, aggregate=False):
         stmt = ddl.DropFunction(
             name,
             input_types,
@@ -1184,7 +1167,7 @@ class Backend(BaseSQLBackend):
             return []
 
     def exists_udf(self, name: str, database: str | None = None) -> bool:
-        """Checks if a given UDF exists within a specified database"""
+        """Checks if a given UDF exists within a specified database."""
         return bool(self.list_udfs(database=database, like=name))
 
     def exists_uda(self, name: str, database: str | None = None) -> bool:
@@ -1270,11 +1253,9 @@ class Backend(BaseSQLBackend):
         database
             Database name
         """
-        from .metadata import parse_metadata
+        from ibis.backends.impala.metadata import parse_metadata
 
-        stmt = self._table_command(
-            'DESCRIBE FORMATTED', name, database=database
-        )
+        stmt = self._table_command('DESCRIBE FORMATTED', name, database=database)
         result = self._exec_statement(stmt)
 
         # Leave formatting to pandas
@@ -1313,15 +1294,11 @@ class Backend(BaseSQLBackend):
 
     def column_stats(self, name, database=None):
         """Return results of `SHOW COLUMN STATS` for the table `name`."""
-        stmt = self._table_command(
-            'SHOW COLUMN STATS', name, database=database
-        )
+        stmt = self._table_command('SHOW COLUMN STATS', name, database=database)
         return self._exec_statement(stmt)
 
     def _exec_statement(self, stmt):
-        return self.fetch_from_cursor(
-            self.raw_sql(stmt, results=True), schema=None
-        )
+        return self.fetch_from_cursor(self.raw_sql(stmt), schema=None)
 
     def _table_command(self, cmd, name, database=None):
         qualified_name = self._fully_qualified_name(name, database)

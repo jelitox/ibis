@@ -11,10 +11,8 @@ import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
 from ibis.backends.base import BaseBackend
-from ibis.backends.pandas.udf import nullable  # noqa
-
-from .dispatch import execute_node, pre_execute
-from .execution.util import (
+from ibis.backends.dask.dispatch import execute_node, pre_execute
+from ibis.backends.dask.execution.util import (
     assert_identical_grouping_keys,
     make_meta_series,
     make_selected_obj,
@@ -22,7 +20,7 @@ from .execution.util import (
 
 
 def make_struct_op_meta(op: ir.Expr) -> List[Tuple[str, np.dtype]]:
-    """Unpacks a dt.Struct into a DataFrame meta"""
+    """Unpacks a dt.Struct into a DataFrame meta."""
     return list(
         zip(
             op.return_type.names,
@@ -65,29 +63,29 @@ def pre_execute_elementwise_udf(op, *clients, scope=None, **kwargs):
     @execute_node.register(
         ops.ElementWiseVectorizedUDF, *(itertools.repeat(dd.Series, nargs))
     )
-    def execute_udf_node(op, *args, **kwargs):
+    def execute_udf_node(op, *args, cache=None, timecontext=None, **kwargs):
         # We have rewritten op.func to be a closure enclosing
         # the kwargs, and therefore, we do not need to pass
         # kwargs here. This is true for all udf execution in this
         # file.
         # See ibis.udf.vectorized.UserDefinedFunction
+        try:
+            return cache[(op, timecontext)]
+        except KeyError:
+            pass
+
         if isinstance(op.return_type, dt.Struct):
             meta = make_struct_op_meta(op)
 
             df = dd.map_partitions(op.func, *args, meta=meta)
-            return df
         else:
             name = args[0].name if len(args) == 1 else None
             meta = pandas.Series([], name=name, dtype=op.return_type.to_dask())
             df = dd.map_partitions(op.func, *args, meta=meta)
 
-            return df
+        cache[(op, timecontext)] = df
 
-    @execute_node.register(
-        ops.ElementWiseVectorizedUDF, *(itertools.repeat(object, nargs))
-    )
-    def execute_udf_node_non_dask(op, *args, **kwargs):
-        return op.func(*args)
+        return df
 
     return scope
 
@@ -132,9 +130,7 @@ def pre_execute_analytic_and_reduction_udf(op, *clients, scope=None, **kwargs):
 
             if args[0].known_divisions:
                 if not len({a.divisions for a in args}) == 1:
-                    raise ValueError(
-                        "Mixed divisions passed to AnalyticVectorized UDF"
-                    )
+                    raise ValueError("Mixed divisions passed to AnalyticVectorized UDF")
                 # result is going to be a single partitioned thing, but we
                 # need it to be able to dd.concat it with other data
                 # downstream. We know that this udf operation did not change
@@ -257,9 +253,7 @@ def pre_execute_analytic_and_reduction_udf(op, *clients, scope=None, **kwargs):
                 apply_wrapper,
                 func,
                 col_names,
-                meta=pandas.Series(
-                    meta_value, index=meta_index, dtype=out_type
-                ),
+                meta=pandas.Series(meta_value, index=meta_index, dtype=out_type),
             )
             # If you use the UDF directly (as in `test_udaf_analytic_groupby`)
             # we need to do some renaming/cleanup to get the result to

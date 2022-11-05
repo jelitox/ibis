@@ -1,48 +1,18 @@
 """APIs for creating user-defined element-wise, reduction and analytic
-functions.
-"""
+functions."""
 
-
-import collections
-import functools
 import itertools
 from typing import Tuple
 
-import numpy as np
 import pandas as pd
 from pandas.core.groupby import SeriesGroupBy
 
-import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.udf.vectorized
 from ibis.backends.base import BaseBackend
-
-from .aggcontext import Transform
-from .core import date_types, time_types, timedelta_types, timestamp_types
-from .dispatch import execute_node, pre_execute
-
-
-@functools.singledispatch
-def rule_to_python_type(datatype):
-    """Convert an ibis :class:`~ibis.expr.datatypes.DataType` into a pandas
-    backend friendly ``multipledispatch`` signature.
-
-    Parameters
-    ----------
-    rule : DataType
-        The :class:`~ibis.expr.datatypes.DataType` subclass to map to a pandas
-        friendly type.
-
-    Returns
-    -------
-    Union[Type[U], Tuple[Type[T], ...]]
-        A pandas-backend-friendly signature
-    """
-    raise NotImplementedError(
-        "Don't know how to convert type {} into a native Python type".format(
-            type(datatype)
-        )
-    )
+from ibis.backends.pandas.aggcontext import Transform
+from ibis.backends.pandas.dispatch import execute_node, pre_execute
+from ibis.backends.pandas.execution.util import get_grouping
 
 
 def create_gens_from_args_groupby(args: Tuple[SeriesGroupBy]):
@@ -60,76 +30,6 @@ def create_gens_from_args_groupby(args: Tuple[SeriesGroupBy]):
     """
     iters = ((data for _, data in arg) for arg in args)
     return iters
-
-
-@rule_to_python_type.register(dt.Array)
-def array_rule(rule):
-    return (list,)
-
-
-@rule_to_python_type.register(dt.Map)
-def map_rule(rule):
-    return (dict,)
-
-
-@rule_to_python_type.register(dt.Struct)
-def struct_rule(rule):
-    return (collections.OrderedDict,)
-
-
-@rule_to_python_type.register(dt.String)
-def string_rule(rule):
-    return (str,)
-
-
-@rule_to_python_type.register(dt.Integer)
-def int_rule(rule):
-    return int, np.integer
-
-
-@rule_to_python_type.register(dt.Floating)
-def float_rule(rule):
-    return float, np.floating
-
-
-@rule_to_python_type.register(dt.Boolean)
-def bool_rule(rule):
-    return bool, np.bool_
-
-
-@rule_to_python_type.register(dt.Interval)
-def interval_rule(rule):
-    return timedelta_types
-
-
-@rule_to_python_type.register(dt.Date)
-def date_rule(rule):
-    return date_types
-
-
-@rule_to_python_type.register(dt.Timestamp)
-def timestamp_rule(rule):
-    return timestamp_types
-
-
-@rule_to_python_type.register(dt.Time)
-def time_rule(rule):
-    return time_types
-
-
-def nullable(datatype):
-    """Return the signature of a scalar value that is allowed to be NULL (in
-    SQL parlance).
-
-    Parameters
-    ----------
-    datatype : ibis.expr.datatypes.DataType
-
-    Returns
-    -------
-    Tuple[Type]
-    """
-    return (type(None),) if datatype.nullable else ()
 
 
 class udf:
@@ -181,8 +81,8 @@ def pre_execute_elementwise_udf(op, *clients, scope=None, **kwargs):
         # perform the operation directly on the underlying Series
         # and regroup after it's finished
         args = [getattr(arg, 'obj', arg) for arg in args]
-        groupings = groupers[0].groupings
-        return func(*args).groupby(groupings)
+        groupings = get_grouping(groupers[0].groupings)
+        return func(*args).groupby(groupings, group_keys=False)
 
     # Define an execution rule for a simple elementwise Series
     # function
@@ -192,13 +92,20 @@ def pre_execute_elementwise_udf(op, *clients, scope=None, **kwargs):
     @execute_node.register(
         ops.ElementWiseVectorizedUDF, *(itertools.repeat(object, nargs))
     )
-    def execute_udf_node(op, *args, **kwargs):
+    def execute_udf_node(op, *args, cache=None, timecontext=None, **kwargs):
         # We have rewritten op.func to be a closure enclosing
         # the kwargs, and therefore, we do not need to pass
         # kwargs here. This is true for all udf execution in this
         # file.
         # See ibis.udf.vectorized.UserDefinedFunction
-        return op.func(*args)
+
+        # prevent executing UDFs multiple times on different execution branches
+        try:
+            result = cache[(op, timecontext)]
+        except KeyError:
+            result = cache[(op, timecontext)] = op.func(*args)
+
+        return result
 
     return scope
 

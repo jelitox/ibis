@@ -8,9 +8,7 @@ import numpy as np
 import pandas as pd
 import pandas.testing as tm
 import pytest
-import sqlalchemy as sa
 from pytest import param
-from sqlalchemy.dialects import postgresql
 
 import ibis
 import ibis.config as config
@@ -18,6 +16,11 @@ import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
 from ibis import literal as L
 from ibis.expr.window import rows_with_max_lookback
+
+pytest.importorskip("psycopg2")
+sa = pytest.importorskip("sqlalchemy")
+
+from sqlalchemy.dialects import postgresql  # noqa: E402
 
 
 @pytest.fixture
@@ -57,13 +60,13 @@ def guid2(con):
             id='string_to_double',
         ),
         param(
-            lambda t: t.string_col.cast('float'),
-            lambda at: sa.cast(at.c.string_col, sa.REAL),
+            lambda t: t.string_col.cast('float32'),
+            lambda at: sa.cast(at.c.string_col, postgresql.REAL),
             id='string_to_float',
         ),
         param(
             lambda t: t.string_col.cast('decimal'),
-            lambda at: sa.cast(at.c.string_col, sa.NUMERIC(9, 0)),
+            lambda at: sa.cast(at.c.string_col, sa.NUMERIC()),
             id='string_to_decimal_no_params',
         ),
         param(
@@ -76,13 +79,13 @@ def guid2(con):
 def test_cast(alltypes, at, translate, left_func, right_func):
     left = left_func(alltypes)
     right = right_func(at)
-    assert str(translate(left).compile()) == str(right.compile())
+    assert str(translate(left.op()).compile()) == str(right.compile())
 
 
 def test_date_cast(alltypes, at, translate):
     result = alltypes.date_string_col.cast('date')
     expected = sa.cast(at.c.date_string_col, sa.DATE)
-    assert str(translate(result)) == str(expected)
+    assert str(translate(result.op())) == str(expected)
 
 
 @pytest.mark.parametrize(
@@ -110,7 +113,7 @@ def test_noop_cast(alltypes, at, translate, column):
     result = col.cast(col.type())
     expected = at.c[column]
     assert result.equals(col)
-    assert str(translate(result)) == str(expected)
+    assert str(translate(result.op())) == str(expected)
 
 
 def test_timestamp_cast_noop(alltypes, at, translate):
@@ -122,33 +125,10 @@ def test_timestamp_cast_noop(alltypes, at, translate):
     assert isinstance(result2, ir.TimestampColumn)
 
     expected1 = at.c.timestamp_col
-    expected2 = sa.func.timezone('UTC', sa.func.to_timestamp(at.c.int_col))
+    expected2 = sa.func.to_timestamp(at.c.int_col)
 
-    assert str(translate(result1)) == str(expected1)
-    assert str(translate(result2)) == str(expected2)
-
-
-@pytest.mark.parametrize(
-    ('func', 'expected'),
-    [
-        param(operator.methodcaller('year'), 2015, id='year'),
-        param(operator.methodcaller('month'), 9, id='month'),
-        param(operator.methodcaller('day'), 1, id='day'),
-        param(operator.methodcaller('hour'), 14, id='hour'),
-        param(operator.methodcaller('minute'), 48, id='minute'),
-        param(operator.methodcaller('second'), 5, id='second'),
-        param(operator.methodcaller('millisecond'), 359, id='millisecond'),
-        param(lambda x: x.day_of_week.index(), 1, id='day_of_week_index'),
-        param(
-            lambda x: x.day_of_week.full_name(),
-            'Tuesday',
-            id='day_of_week_full_name',
-        ),
-    ],
-)
-def test_simple_datetime_operations(con, func, expected, translate):
-    value = ibis.timestamp('2015-09-01 14:48:05.359')
-    assert con.execute(func(value)) == expected
+    assert str(translate(result1.op())) == str(expected1)
+    assert str(translate(result2.op())) == str(expected2)
 
 
 @pytest.mark.parametrize(
@@ -197,31 +177,6 @@ def test_strftime(con, pattern):
         microsecond=359000,
     )
     assert con.execute(value.strftime(pattern)) == raw_value.strftime(pattern)
-
-
-@pytest.mark.parametrize(
-    ('func', 'left', 'right', 'expected'),
-    [
-        param(operator.add, L(3), L(4), 7, id='add'),
-        param(operator.sub, L(3), L(4), -1, id='sub'),
-        param(operator.mul, L(3), L(4), 12, id='mul'),
-        param(operator.truediv, L(12), L(4), 3, id='truediv_no_remainder'),
-        param(operator.pow, L(12), L(2), 144, id='pow'),
-        param(operator.mod, L(12), L(5), 2, id='mod'),
-        param(operator.truediv, L(7), L(2), 3.5, id='truediv_remainder'),
-        param(operator.floordiv, L(7), L(2), 3, id='floordiv'),
-        param(
-            lambda x, y: x.floordiv(y), L(7), 2, 3, id='floordiv_no_literal'
-        ),
-        param(
-            lambda x, y: x.rfloordiv(y), L(2), 7, 3, id='rfloordiv_no_literal'
-        ),
-    ],
-)
-def test_binary_arithmetic(con, func, left, right, expected):
-    expr = func(left, right)
-    result = con.execute(expr)
-    assert result == expected
 
 
 @pytest.mark.parametrize(
@@ -387,9 +342,7 @@ def test_isnull_notnull(con, raw_value, opname, expected):
         param(L('foobar').like(['%bar']), True, id='like_list_left_side'),
         param(L('foobar').like(['foo%']), True, id='like_list_right_side'),
         param(L('foobar').like(['%baz%']), False, id='like_list_both_sides'),
-        param(
-            L('foobar').like(['%bar', 'foo%']), True, id='like_list_multiple'
-        ),
+        param(L('foobar').like(['%bar', 'foo%']), True, id='like_list_multiple'),
         param(L('foobarfoo').replace('foo', 'H'), 'HbarH', id='replace'),
         param(L('a').ascii_str(), ord('a'), id='ascii_str'),
     ],
@@ -403,9 +356,7 @@ def test_string_functions(con, expr, expected):
     [
         param(L('abcd').re_search('[a-z]'), True, id='re_search_match'),
         param(L('abcd').re_search(r'[\d]+'), False, id='re_search_no_match'),
-        param(
-            L('1222').re_search(r'[\d]+'), True, id='re_search_match_number'
-        ),
+        param(L('1222').re_search(r'[\d]+'), True, id='re_search_match_number'),
     ],
 )
 def test_regexp(con, expr, expected):
@@ -415,12 +366,8 @@ def test_regexp(con, expr, expected):
 @pytest.mark.parametrize(
     ('expr', 'expected'),
     [
-        param(
-            L('abcd').re_extract('([a-z]+)', 0), 'abcd', id='re_extract_whole'
-        ),
-        param(
-            L('abcd').re_extract('(ab)(cd)', 1), 'cd', id='re_extract_first'
-        ),
+        param(L('abcd').re_extract('([a-z]+)', 0), 'abcd', id='re_extract_whole'),
+        param(L('abcd').re_extract('(ab)(cd)', 1), 'cd', id='re_extract_first'),
         # valid group number but no match => empty string
         param(L('abcd').re_extract(r'(\d)', 0), '', id='re_extract_no_match'),
         # match but not a valid group number => NULL
@@ -461,11 +408,6 @@ def test_coalesce(con, expr, expected):
     [
         param(ibis.coalesce(ibis.NA, ibis.NA), None, id='all_null'),
         param(
-            ibis.coalesce(ibis.NA, ibis.NA, ibis.NA.cast('double')),
-            None,
-            id='all_nulls_with_one_cast',
-        ),
-        param(
             ibis.coalesce(
                 ibis.NA.cast('int8'),
                 ibis.NA.cast('int8'),
@@ -477,14 +419,19 @@ def test_coalesce(con, expr, expected):
     ],
 )
 def test_coalesce_all_na(con, expr, expected):
-    assert con.execute(expr) == expected
+    assert con.execute(expr) is None
+
+
+def test_coalesce_all_na_double(con):
+    expr = ibis.coalesce(ibis.NA, ibis.NA, ibis.NA.cast('double'))
+    assert np.isnan(con.execute(expr))
 
 
 def test_numeric_builtins_work(alltypes, df):
     expr = alltypes.double_col.fillna(0)
     result = expr.execute()
     expected = df.double_col.fillna(0)
-    expected.name = 'tmp'
+    expected.name = 'IfNull(double_col, 0)'
     tm.assert_series_equal(result, expected)
 
 
@@ -493,9 +440,7 @@ def test_numeric_builtins_work(alltypes, df):
     [
         param(
             lambda t: (t.double_col > 20).ifelse(10, -20),
-            lambda df: pd.Series(
-                np.where(df.double_col > 20, 10, -20), dtype='int8'
-            ),
+            lambda df: pd.Series(np.where(df.double_col > 20, 10, -20), dtype='int8'),
             id='simple',
         ),
         param(
@@ -521,16 +466,12 @@ def test_ifelse(alltypes, df, op, pandas_op):
         # tier and histogram
         param(
             lambda d: d.bucket([0, 10, 25, 50, 100]),
-            lambda s: pd.cut(
-                s, [0, 10, 25, 50, 100], right=False, labels=False
-            ),
+            lambda s: pd.cut(s, [0, 10, 25, 50, 100], right=False, labels=False),
             id='include_over_false',
         ),
         param(
             lambda d: d.bucket([0, 10, 25, 50], include_over=True),
-            lambda s: pd.cut(
-                s, [0, 10, 25, 50, np.inf], right=False, labels=False
-            ),
+            lambda s: pd.cut(s, [0, 10, 25, 50, np.inf], right=False, labels=False),
             id='include_over_true',
         ),
         param(
@@ -539,9 +480,7 @@ def test_ifelse(alltypes, df, op, pandas_op):
             id='close_extreme_false',
         ),
         param(
-            lambda d: d.bucket(
-                [0, 10, 25, 50], closed='right', close_extreme=False
-            ),
+            lambda d: d.bucket([0, 10, 25, 50], closed='right', close_extreme=False),
             lambda s: pd.cut(
                 s,
                 [0, 10, 25, 50],
@@ -553,9 +492,7 @@ def test_ifelse(alltypes, df, op, pandas_op):
         ),
         param(
             lambda d: d.bucket([10, 25, 50, 100], include_under=True),
-            lambda s: pd.cut(
-                s, [0, 10, 25, 50, 100], right=False, labels=False
-            ),
+            lambda s: pd.cut(s, [0, 10, 25, 50, 100], right=False, labels=False),
             id='include_under_true',
         ),
     ],
@@ -589,45 +526,35 @@ def test_category_label(alltypes, df):
 
 
 @pytest.mark.parametrize(
-    ('distinct1', 'distinct2', 'expected1', 'expected2'),
-    [
-        (True, True, 'UNION', 'UNION'),
-        (True, False, 'UNION', 'UNION ALL'),
-        (False, True, 'UNION ALL', 'UNION'),
-        (False, False, 'UNION ALL', 'UNION ALL'),
-    ],
+    ('distinct', 'union'),
+    [(True, 'UNION'), (False, 'UNION ALL')],
 )
-def test_union_cte(alltypes, distinct1, distinct2, expected1, expected2):
+def test_union_cte(alltypes, distinct, union):
     t = alltypes
     expr1 = t.group_by(t.string_col).aggregate(metric=t.double_col.sum())
     expr2 = expr1.view()
     expr3 = expr1.view()
-    expr = expr1.union(expr2, distinct=distinct1).union(
-        expr3, distinct=distinct2
+    expr = expr1.union(expr2, distinct=distinct).union(expr3, distinct=distinct)
+    result = ' '.join(
+        line.strip()
+        for line in str(
+            expr.compile().compile(compile_kwargs={'literal_binds': True})
+        ).splitlines()
     )
-    result = '\n'.join(
-        map(
-            lambda line: line.rstrip(),  # strip trailing whitespace
-            str(
-                expr.compile().compile(compile_kwargs={'literal_binds': True})
-            ).splitlines(),
-        )
-    )
-    expected = """\
-WITH anon_1 AS
-(SELECT t0.string_col AS string_col, sum(t0.double_col) AS metric
-FROM functional_alltypes AS t0 GROUP BY t0.string_col),
-anon_2 AS
-(SELECT t0.string_col AS string_col, sum(t0.double_col) AS metric
-FROM functional_alltypes AS t0 GROUP BY t0.string_col),
-anon_3 AS
-(SELECT t0.string_col AS string_col, sum(t0.double_col) AS metric
-FROM functional_alltypes AS t0 GROUP BY t0.string_col)
- (SELECT anon_1.string_col, anon_1.metric
-FROM anon_1 {} SELECT anon_2.string_col, anon_2.metric
-FROM anon_2) {} SELECT anon_3.string_col, anon_3.metric
-FROM anon_3""".format(
-        expected1, expected2
+    expected = (
+        "WITH anon_1 AS "
+        "(SELECT t0.string_col AS string_col, sum(t0.double_col) AS metric "
+        "FROM functional_alltypes AS t0 GROUP BY t0.string_col), "
+        "anon_2 AS "
+        "(SELECT t0.string_col AS string_col, sum(t0.double_col) AS metric "
+        "FROM functional_alltypes AS t0 GROUP BY t0.string_col), "
+        "anon_3 AS "
+        "(SELECT t0.string_col AS string_col, sum(t0.double_col) AS metric "
+        "FROM functional_alltypes AS t0 GROUP BY t0.string_col) "
+        "SELECT anon_1.string_col, anon_1.metric "
+        f"FROM anon_1 {union} SELECT anon_2.string_col, anon_2.metric "
+        f"FROM anon_2 {union} SELECT anon_3.string_col, anon_3.metric "
+        "FROM anon_3"
     )
     assert str(result) == expected
 
@@ -791,9 +718,7 @@ def test_not_exists(alltypes, df):
     left, right = df, t2.execute()
     expected = left[left.string_col != right.string_col]
 
-    tm.assert_frame_equal(
-        result, expected, check_index_type=False, check_dtype=False
-    )
+    tm.assert_frame_equal(result, expected, check_index_type=False, check_dtype=False)
 
 
 def test_interactive_repr_shows_error(alltypes):
@@ -811,12 +736,7 @@ def test_interactive_repr_shows_error(alltypes):
 def test_subquery(alltypes, df):
     t = alltypes
 
-    expr = (
-        t.mutate(d=t.double_col.fillna(0))
-        .limit(1000)
-        .group_by('string_col')
-        .size()
-    )
+    expr = t.mutate(d=t.double_col.fillna(0)).limit(1000).group_by('string_col').size()
     result = expr.execute().sort_values('string_col').reset_index(drop=True)
     expected = (
         df.assign(d=df.double_col.fillna(0))
@@ -836,9 +756,7 @@ def test_simple_window(alltypes, func, df):
     f = getattr(t.double_col, func)
     df_f = getattr(df.double_col, func)
     result = (
-        t.projection([(t.double_col - f()).name('double_col')])
-        .execute()
-        .double_col
+        t.projection([(t.double_col - f()).name('double_col')]).execute().double_col
     )
     expected = df.double_col - df_f()
     tm.assert_series_equal(result, expected)
@@ -855,11 +773,7 @@ def test_rolling_window(alltypes, func, df):
     window = ibis.window(order_by=t.timestamp_col, preceding=6, following=0)
     f = getattr(t.double_col, func)
     df_f = getattr(df.double_col.rolling(7, min_periods=0), func)
-    result = (
-        t.projection([f().over(window).name('double_col')])
-        .execute()
-        .double_col
-    )
+    result = t.projection([f().over(window).name('double_col')]).execute().double_col
     expected = df_f()
     tm.assert_series_equal(result, expected)
 
@@ -896,9 +810,7 @@ def test_partitioned_window(alltypes, func, df):
     f = getattr(t.double_col, func)
     expr = f().over(window).name('double_col')
     result = t.projection([expr]).execute().double_col
-    expected = (
-        df.groupby('string_col').apply(roller(func)).reset_index(drop=True)
-    )
+    expected = df.groupby('string_col').apply(roller(func)).reset_index(drop=True)
     tm.assert_series_equal(result, expected)
 
 
@@ -943,16 +855,12 @@ def test_cumulative_ordered_window(alltypes, func, df):
 def test_cumulative_partitioned_ordered_window(alltypes, func, df):
     t = alltypes
     df = df.sort_values(['string_col', 'timestamp_col']).reset_index(drop=True)
-    window = ibis.cumulative_window(
-        order_by=t.timestamp_col, group_by=t.string_col
-    )
+    window = ibis.cumulative_window(order_by=t.timestamp_col, group_by=t.string_col)
     f = getattr(t.double_col, func)
     expr = t.projection([(t.double_col - f().over(window)).name('double_col')])
     result = expr.execute().double_col
     method = operator.methodcaller(f'cum{func}')
-    expected = df.groupby(df.string_col).double_col.transform(
-        lambda c: c - method(c)
-    )
+    expected = df.groupby(df.string_col).double_col.transform(lambda c: c - method(c))
     tm.assert_series_equal(result, expected)
 
 
@@ -965,11 +873,9 @@ def test_analytic_shift_functions(alltypes, df, func, shift_amount):
     tm.assert_series_equal(result, expected)
 
 
-@pytest.mark.parametrize(
-    ('func', 'expected_index'), [('first', -1), ('last', 0)]
-)
+@pytest.mark.parametrize(('func', 'expected_index'), [('first', -1), ('last', 0)])
 def test_first_last_value(alltypes, df, func, expected_index):
-    col = alltypes.sort_by(ibis.desc(alltypes.string_col)).double_col
+    col = alltypes.order_by(ibis.desc(alltypes.string_col)).double_col
     method = getattr(col, func)
     expr = method()
     result = expr.execute().rename('double_col')
@@ -1017,11 +923,7 @@ def test_window_with_arithmetic(alltypes, df):
     w = ibis.window(order_by=t.timestamp_col)
     expr = t.mutate(new_col=ibis.row_number().over(w) / 2)
 
-    df = (
-        df[['timestamp_col']]
-        .sort_values('timestamp_col')
-        .reset_index(drop=True)
-    )
+    df = df[['timestamp_col']].sort_values('timestamp_col').reset_index(drop=True)
     expected = df.assign(new_col=[x / 2.0 for x in range(len(df))])
     result = expr['timestamp_col', 'new_col'].execute()
     tm.assert_frame_equal(result, expected)
@@ -1213,8 +1115,10 @@ def test_semi_join(t, s):
     t_a, s_a = t.op().sqla_table.alias('t0'), s.op().sqla_table.alias('t1')
     expr = t.semi_join(s, t.id == s.id)
     result = expr.compile().compile(compile_kwargs={'literal_binds': True})
-    base = sa.select([t_a.c.id, t_a.c.name]).where(
-        sa.exists(sa.select([1]).where(t_a.c.id == s_a.c.id))
+    base = (
+        sa.select([t_a.c.id, t_a.c.name])
+        .where(sa.exists(sa.select([1]).where(t_a.c.id == s_a.c.id)))
+        .subquery()
     )
     expected = sa.select([base.c.id, base.c.name])
     assert str(result) == str(expected)
@@ -1224,8 +1128,10 @@ def test_anti_join(t, s):
     t_a, s_a = t.op().sqla_table.alias('t0'), s.op().sqla_table.alias('t1')
     expr = t.anti_join(s, t.id == s.id)
     result = expr.compile().compile(compile_kwargs={'literal_binds': True})
-    base = sa.select([t_a.c.id, t_a.c.name]).where(
-        ~sa.exists(sa.select([1]).where(t_a.c.id == s_a.c.id))
+    base = (
+        sa.select([t_a.c.id, t_a.c.name])
+        .where(~sa.exists(sa.select([1]).where(t_a.c.id == s_a.c.id)))
+        .subquery()
     )
     expected = sa.select([base.c.id, base.c.name])
     assert str(result) == str(expected)
@@ -1234,11 +1140,11 @@ def test_anti_join(t, s):
 def test_create_table_from_expr(con, trunc, guid2):
     con.create_table(guid2, expr=trunc)
     t = con.table(guid2)
-    assert list(t.name.execute()) == list('abc')
+    assert list(t['name'].execute()) == list('abc')
 
 
 def test_truncate_table(con, trunc):
-    assert list(trunc.name.execute()) == list('abc')
+    assert list(trunc['name'].execute()) == list('abc')
     con.truncate_table(trunc.op().name)
     assert not len(trunc.execute())
 
@@ -1265,11 +1171,11 @@ def test_identical_to(con, df):
 
 def test_rank(con):
     t = con.table('functional_alltypes')
-    expr = t.double_col.rank()
+    expr = t.double_col.rank().name('rank')
     sqla_expr = expr.compile()
     result = str(sqla_expr.compile(compile_kwargs={'literal_binds': True}))
     expected = (
-        "SELECT rank() OVER (ORDER BY t0.double_col) - 1 AS tmp \n"
+        "SELECT rank() OVER (ORDER BY t0.double_col) - 1 AS rank \n"
         "FROM functional_alltypes AS t0"
     )
     assert result == expected
@@ -1277,23 +1183,23 @@ def test_rank(con):
 
 def test_percent_rank(con):
     t = con.table('functional_alltypes')
-    expr = t.double_col.percent_rank()
+    expr = t.double_col.percent_rank().name("percent_rank")
     sqla_expr = expr.compile()
     result = str(sqla_expr.compile(compile_kwargs={'literal_binds': True}))
     expected = (
         "SELECT percent_rank() OVER (ORDER BY t0.double_col) AS "
-        "tmp \nFROM functional_alltypes AS t0"
+        "percent_rank \nFROM functional_alltypes AS t0"
     )
     assert result == expected
 
 
 def test_ntile(con):
     t = con.table('functional_alltypes')
-    expr = t.double_col.ntile(7)
+    expr = t.double_col.ntile(7).name('result')
     sqla_expr = expr.compile()
     result = str(sqla_expr.compile(compile_kwargs={'literal_binds': True}))
     expected = (
-        "SELECT ntile(7) OVER (ORDER BY t0.double_col) - 1 AS tmp \n"
+        "SELECT ntile(7) OVER (ORDER BY t0.double_col) - 1 AS result \n"
         "FROM functional_alltypes AS t0"
     )
     assert result == expected
@@ -1336,22 +1242,6 @@ def test_negate_boolean(con, df):
     result = expr.execute().bool_col
     expected = -df.head(10).bool_col
     tm.assert_series_equal(result, expected)
-
-
-@pytest.mark.parametrize(
-    ('opname', 'expected'),
-    [
-        ('year', {2009, 2010}),
-        ('month', set(range(1, 13))),
-        ('day', set(range(1, 32))),
-    ],
-)
-def test_date_extract_field(db, opname, expected):
-    op = operator.methodcaller(opname)
-    t = db.functional_alltypes
-    expr = op(t.timestamp_col.cast('date')).distinct()
-    result = expr.execute().astype(int)
-    assert set(result) == expected
 
 
 @pytest.mark.parametrize('opname', ['sum', 'mean', 'min', 'max', 'std', 'var'])
@@ -1420,9 +1310,7 @@ def tz(request):
 
 @pytest.fixture
 def tzone_compute(con, guid, tz):
-    schema = ibis.schema(
-        [('ts', dt.Timestamp(tz)), ('b', 'double'), ('c', 'string')]
-    )
+    schema = ibis.schema([('ts', dt.Timestamp(tz)), ('b', 'double'), ('c', 'string')])
     con.create_table(guid, schema=schema)
     t = con.table(guid)
 
@@ -1500,9 +1388,7 @@ def test_string_temporal_compare(con, opname, left, right, type):
     ('left', 'right'),
     [
         param(L('2017-03-31').cast(dt.date), date(2017, 4, 2), id='ibis_date'),
-        param(
-            date(2017, 3, 31), L('2017-04-02').cast(dt.date), id='python_date'
-        ),
+        param(date(2017, 3, 31), L('2017-04-02').cast(dt.date), id='python_date'),
         param(
             L('2017-03-31 00:02:33').cast(dt.timestamp),
             datetime(2017, 4, 1, 1, 3, 34),
@@ -1540,14 +1426,17 @@ def test_string_temporal_compare_between(con, op, left, right):
 
 
 def test_scalar_parameter(con):
+    start_string, end_string = '2009-03-01', '2010-07-03'
+
     start = ibis.param(dt.date)
     end = ibis.param(dt.date)
     t = con.table('functional_alltypes')
     col = t.date_string_col.cast('date')
-    expr = col.between(start, end)
-    start_string, end_string = '2009-03-01', '2010-07-03'
+    expr = col.between(start, end).name('res')
+    expected_expr = col.between(start_string, end_string).name('res')
+
     result = expr.execute(params={start: start_string, end: end_string})
-    expected = col.between(start_string, end_string).execute()
+    expected = expected_expr.execute()
     tm.assert_series_equal(result, expected)
 
 
@@ -1555,12 +1444,13 @@ def test_string_to_binary_cast(con):
     t = con.table('functional_alltypes').limit(10)
     expr = t.string_col.cast('binary')
     result = expr.execute()
+    name = expr.get_name()
     sql_string = (
-        "SELECT decode(string_col, 'escape') AS tmp "
+        f"SELECT decode(string_col, 'escape') AS \"{name}\" "
         "FROM functional_alltypes LIMIT 10"
     )
     raw_data = [row[0][0] for row in con.raw_sql(sql_string).fetchall()]
-    expected = pd.Series(raw_data, name='tmp')
+    expected = pd.Series(raw_data, name=name)
     tm.assert_series_equal(result, expected)
 
 
@@ -1568,11 +1458,14 @@ def test_string_to_binary_round_trip(con):
     t = con.table('functional_alltypes').limit(10)
     expr = t.string_col.cast('binary').cast('string')
     result = expr.execute()
+    name = expr.get_name()
     sql_string = (
-        "SELECT encode(decode(string_col, 'escape'), 'escape') AS tmp "
+        "SELECT encode(decode(string_col, 'escape'), 'escape') AS "
+        f"\"{name}\""
         "FROM functional_alltypes LIMIT 10"
     )
     expected = pd.Series(
-        [row[0][0] for row in con.raw_sql(sql_string).fetchall()], name='tmp'
+        [row[0][0] for row in con.raw_sql(sql_string).fetchall()],
+        name=name,
     )
     tm.assert_series_equal(result, expected)

@@ -25,22 +25,20 @@ from ibis.config import options
 
 
 class DataFrameWriter:
+    """Interface class for writing pandas objects to Impala tables.
 
-    """
-    Interface class for writing pandas objects to Impala tables
-
+    Notes
+    -----
     Class takes ownership of any temporary data written to HDFS
     """
 
-    def __init__(self, client, df, path=None):
+    def __init__(self, client, df):
         self.client = client
         self.df = df
         self.temp_hdfs_dirs = set()
 
     def write_temp_csv(self):
-        temp_hdfs_dir = pjoin(
-            options.impala.temp_hdfs_path, f'pandas_{util.guid()}'
-        )
+        temp_hdfs_dir = pjoin(options.impala.temp_hdfs_path, f'pandas_{util.guid()}')
         self.client.hdfs.mkdir(temp_hdfs_dir)
 
         # Keep track of the temporary HDFS file
@@ -61,11 +59,7 @@ class DataFrameWriter:
             # Write the DataFrame to the temporary file path
             tmp_file_path = os.path.join(f, 'impala_temp_file.csv')
             if options.verbose:
-                util.log(
-                    'Writing DataFrame to temporary directory {}'.format(
-                        tmp_file_path
-                    )
-                )
+                util.log(f'Writing DataFrame to temporary directory {tmp_file_path}')
 
             self.df.to_csv(
                 tmp_file_path,
@@ -80,21 +74,18 @@ class DataFrameWriter:
             if options.verbose:
                 util.log(f'Writing CSV to: {path}')
 
-            self.client.hdfs.put(path, tmp_file_path)
+            self.client.hdfs.put(tmp_file_path, path)
         return path
 
     def get_schema(self):
         # define a temporary table using delimited data
         return sch.infer(self.df)
 
-    def delimited_table(self, csv_dir, name=None, database=None):
-        temp_delimited_name = f'ibis_tmp_pandas_{util.guid()}'
-        schema = self.get_schema()
-
+    def delimited_table(self, csv_dir, database=None):
         return self.client.delimited_file(
             csv_dir,
-            schema,
-            name=temp_delimited_name,
+            self.get_schema(),
+            name=f'ibis_tmp_pandas_{util.guid()}',
             database=database,
             delimiter=',',
             na_rep='#NULL',
@@ -113,4 +104,4 @@ class DataFrameWriter:
 
     def cleanup(self):
         while self.temp_hdfs_dirs:
-            self.client.hdfs.rmdir(self.temp_hdfs_dirs.pop())
+            self.client.hdfs.rm(self.temp_hdfs_dirs.pop(), recursive=True)

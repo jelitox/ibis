@@ -7,16 +7,16 @@ from pandas.core.groupby import SeriesGroupBy
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 from ibis.backends.base import BaseBackend
-from ibis.expr.scope import Scope
-
-from ..core import (
+from ibis.backends.pandas.core import (
     date_types,
     integer_types,
     numeric_types,
     timedelta_types,
     timestamp_types,
 )
-from ..dispatch import execute_node, pre_execute
+from ibis.backends.pandas.dispatch import execute_node, pre_execute
+from ibis.backends.pandas.execution.util import get_grouping
+from ibis.expr.scope import Scope
 
 
 @execute_node.register(ops.Strftime, pd.Timestamp, str)
@@ -55,7 +55,11 @@ def execute_extract_millisecond_series(op, data, **kwargs):
 
 @execute_node.register(ops.ExtractEpochSeconds, (pd.Timestamp, pd.Series))
 def execute_epoch_seconds(op, data, **kwargs):
-    return data.astype('int64') // int(1e9)
+    # older versions of dask do not have a view method, so use astype
+    # instead
+    convert = getattr(data, "view", data.astype)
+    series = convert(np.int64)
+    return (series // 1_000_000_000).astype(np.int32)
 
 
 @execute_node.register(
@@ -101,9 +105,7 @@ def execute_interval_from_integer_series(op, data, **kwargs):
     # fast path for timedelta conversion
     if cls is None:
         return data.astype(f"timedelta64[{unit}]")
-    return data.apply(
-        lambda n, cls=cls, resolution=resolution: cls(**{resolution: n})
-    )
+    return data.apply(lambda n, cls=cls, resolution=resolution: cls(**{resolution: n}))
 
 
 @execute_node.register(ops.IntervalFromInteger, integer_types)
@@ -126,9 +128,7 @@ def execute_cast_integer_to_interval_series(op, data, type, **kwargs):
 
     if cls is None:
         return data.astype(f"timedelta64[{unit}]")
-    return data.apply(
-        lambda n, cls=cls, resolution=resolution: cls(**{resolution: n})
-    )
+    return data.apply(lambda n, cls=cls, resolution=resolution: cls(**{resolution: n}))
 
 
 @execute_node.register(ops.Cast, integer_types, dt.Interval)
@@ -166,16 +166,12 @@ def execute_interval_add_multiply_delta_series(op, left, right, **kwargs):
     return op.op(pd.Timedelta(left), right)
 
 
-@execute_node.register(
-    (ops.TimestampAdd, ops.IntervalAdd), pd.Series, timedelta_types
-)
+@execute_node.register((ops.TimestampAdd, ops.IntervalAdd), pd.Series, timedelta_types)
 def execute_timestamp_interval_add_series_delta(op, left, right, **kwargs):
     return left + pd.Timedelta(right)
 
 
-@execute_node.register(
-    (ops.TimestampAdd, ops.IntervalAdd), pd.Series, pd.Series
-)
+@execute_node.register((ops.TimestampAdd, ops.IntervalAdd), pd.Series, pd.Series)
 def execute_timestamp_interval_add_series_series(op, left, right, **kwargs):
     return left + right
 
@@ -216,9 +212,7 @@ def execute_timestamp_diff_series_datetime(op, left, right, **kwargs):
     return left - pd.Timestamp(right)
 
 
-@execute_node.register(
-    ops.IntervalMultiply, pd.Series, numeric_types + (pd.Series,)
-)
+@execute_node.register(ops.IntervalMultiply, pd.Series, numeric_types + (pd.Series,))
 @execute_node.register(
     ops.IntervalFloorDivide,
     (pd.Timedelta, pd.Series),
@@ -236,8 +230,9 @@ def execute_timestamp_from_unix(op, data, **kwargs):
 @pre_execute.register(ops.TimestampNow)
 @pre_execute.register(ops.TimestampNow, BaseBackend)
 def pre_execute_timestamp_now(op, *args, **kwargs):
-    timecontext = kwargs.get('timecontext', None)
-    return Scope({op: pd.Timestamp('now')}, timecontext)
+    timecontext = kwargs.get("timecontext", None)
+    now = pd.Timestamp("now", tz="UTC").tz_localize(None)
+    return Scope({op: now}, timecontext)
 
 
 @execute_node.register(ops.DayOfWeekIndex, (str, datetime.date))
@@ -252,8 +247,8 @@ def execute_day_of_week_index_series(op, data, **kwargs):
 
 @execute_node.register(ops.DayOfWeekIndex, SeriesGroupBy)
 def execute_day_of_week_index_series_group_by(op, data, **kwargs):
-    groupings = data.grouper.groupings
-    return data.obj.dt.dayofweek.astype(np.int16).groupby(groupings)
+    groupings = get_grouping(data.grouper.groupings)
+    return data.obj.dt.dayofweek.astype(np.int16).groupby(groupings, group_keys=False)
 
 
 def day_name(obj):
@@ -286,7 +281,9 @@ def execute_day_of_week_name_series(op, data, **kwargs):
 
 @execute_node.register(ops.DayOfWeekName, SeriesGroupBy)
 def execute_day_of_week_name_series_group_by(op, data, **kwargs):
-    return day_name(data.obj.dt).groupby(data.grouper.groupings)
+    return day_name(data.obj.dt).groupby(
+        get_grouping(data.grouper.groupings), group_keys=False
+    )
 
 
 @execute_node.register(ops.DateSub, date_types, timedelta_types)
