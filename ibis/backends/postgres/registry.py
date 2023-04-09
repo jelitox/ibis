@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import functools
 import itertools
 import locale
@@ -8,10 +10,12 @@ import string
 import warnings
 
 import sqlalchemy as sa
-from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects import postgresql as pg
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.sql.functions import GenericFunction
 
+import ibis.backends.base.sql.registry.geospatial as geo
 import ibis.common.exceptions as com
-import ibis.common.geospatial as geo
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 
@@ -19,40 +23,24 @@ import ibis.expr.operations as ops
 from ibis.backends.base.sql.alchemy import (
     fixed_arity,
     get_sqla_table,
+    reduction,
     sqlalchemy_operation_registry,
     sqlalchemy_window_functions_registry,
     unary,
 )
-from ibis.backends.base.sql.alchemy.datatypes import to_sqla_type
-from ibis.backends.base.sql.alchemy.registry import _bitwise_op, get_col_or_deferred_col
+from ibis.backends.base.sql.alchemy.geospatial import geospatial_supported
+from ibis.backends.base.sql.alchemy.registry import (
+    _bitwise_op,
+    _extract,
+    geospatial_functions,
+    get_col,
+)
 
 operation_registry = sqlalchemy_operation_registry.copy()
 operation_registry.update(sqlalchemy_window_functions_registry)
 
-
-def _extract(fmt, output_type=sa.SMALLINT):
-    def translator(t, op, output_type=output_type):
-        sa_arg = t.translate(op.arg)
-        return sa.cast(sa.extract(fmt, sa_arg), output_type)
-
-    return translator
-
-
-def _second(t, op):
-    # extracting the second gives us the fractional part as well, so smash that
-    # with a cast to SMALLINT
-    sa_arg = t.translate(op.arg)
-    return sa.cast(sa.func.FLOOR(sa.extract('second', sa_arg)), sa.SMALLINT)
-
-
-def _millisecond(t, op):
-    # we get total number of milliseconds including seconds with extract so we
-    # mod 1000
-    sa_arg = t.translate(op.arg)
-    return sa.cast(
-        sa.func.floor(sa.extract('millisecond', sa_arg)) % 1000,
-        sa.SMALLINT,
-    )
+if geospatial_supported:
+    operation_registry.update(geospatial_functions)
 
 
 _truncate_precisions = {
@@ -78,23 +66,6 @@ def _timestamp_truncate(t, op):
     return sa.func.date_trunc(precision, sa_arg)
 
 
-def _interval_from_integer(t, op):
-    sa_arg = t.translate(op.arg)
-    interval = sa.text(f"INTERVAL '1 {op.output_dtype.resolution}'")
-    return sa_arg * interval
-
-
-def _is_nan(t, op):
-    sa_arg = t.translate(op.arg)
-    return sa_arg == float('nan')
-
-
-def _is_inf(t, op):
-    sa_arg = t.translate(op.arg)
-    inf = float('inf')
-    return sa.or_(sa_arg == inf, sa_arg == -inf)
-
-
 def _typeof(t, op):
     sa_arg = t.translate(op.arg)
     typ = sa.cast(sa.func.pg_typeof(sa_arg), sa.TEXT)
@@ -102,10 +73,8 @@ def _typeof(t, op):
     # select pg_typeof('thing') returns unknown so we have to check the child's
     # type for nullness
     return sa.case(
-        [
-            ((typ == 'unknown') & (op.arg.output_dtype != dt.null), 'text'),
-            ((typ == 'unknown') & (op.arg.output_dtype == dt.null), 'null'),
-        ],
+        ((typ == 'unknown') & (op.arg.output_dtype != dt.null), 'text'),
+        ((typ == 'unknown') & (op.arg.output_dtype == dt.null), 'null'),
         else_=typ,
     )
 
@@ -246,16 +215,14 @@ def _reduce_tokens(tokens, arg):
         # uninteresting text
         else:
             curtokens.append(token)
-    else:
-        # append result to r if we had more tokens or if we have no
-        # blacklisted tokens
-        if curtokens:
-            reduced.append(sa.func.to_char(arg, ''.join(curtokens)))
+    # append result to r if we had more tokens or if we have no
+    # blacklisted tokens
+    if curtokens:
+        reduced.append(sa.func.to_char(arg, ''.join(curtokens)))
     return reduced
 
 
-def _strftime(t, op):
-    arg, pattern = map(t.translate, op.args)
+def _strftime(arg, pattern):
     tokens, _ = _scanner.scan(pattern.value)
     reduced = _reduce_tokens(tokens, arg)
     return functools.reduce(sa.sql.ColumnElement.concat, reduced)
@@ -268,20 +235,13 @@ def _find_in_set(t, op):
     return (
         sa.func.coalesce(
             sa.func.array_position(
-                postgresql.array(list(map(t.translate, op.values.values))),
+                pg.array(list(map(t.translate, op.values))),
                 t.translate(op.needle),
             ),
             0,
         )
         - 1
     )
-
-
-def _regex_replace(t, op):
-    string, pattern, replacement = map(t.translate, op.args)
-
-    # postgres defaults to replacing only the first occurrence
-    return sa.func.regexp_replace(string, pattern, replacement, 'g')
 
 
 def _log(t, op):
@@ -296,29 +256,14 @@ def _log(t, op):
     return sa.func.ln(sa_arg)
 
 
-def _regex_extract(t, op):
-    arg = t.translate(op.arg)
-    pattern = t.translate(op.pattern)
-    return sa.case(
-        [
-            (
-                sa.func.textregexeq(arg, pattern),
-                sa.func.regexp_match(
-                    arg,
-                    pattern,
-                    type_=postgresql.ARRAY(sa.TEXT),
-                )[t.translate(op.index) + 1],
-            )
-        ],
-        else_="",
-    )
-
-
-def _cardinality(array):
-    return sa.case(
-        [(array.is_(None), None)],  # noqa: E711
-        else_=sa.func.coalesce(sa.func.array_length(array, 1), 0),
-    )
+def _regex_extract(arg, pattern, index):
+    # wrap in parens to support 0th group being the whole string
+    pattern = "(" + pattern + ")"
+    # arrays are 1-based in postgres
+    index = index + 1
+    does_match = sa.func.textregexeq(arg, pattern)
+    matches = sa.func.regexp_match(arg, pattern, type_=pg.ARRAY(sa.TEXT))
+    return sa.case((does_match, matches[index]), else_=None)
 
 
 def _array_repeat(t, op):
@@ -326,31 +271,20 @@ def _array_repeat(t, op):
     arg = t.translate(op.arg)
     times = t.translate(op.times)
 
-    # SQLAlchemy uses our column's table in the FROM clause. We need a simpler
-    # expression to workaround this.
-    array = sa.column(arg.name, type_=arg.type)
-
-    # We still need to prefix the table name to the column name in the final
-    # query, so make sure the column knows its origin
-    array.table = arg.table
-
-    array_length = _cardinality(array)
+    array_length = sa.func.cardinality(arg)
+    array = sa.sql.elements.Grouping(arg) if isinstance(op.arg, ops.Literal) else arg
 
     # sequence from 1 to the total number of elements desired in steps of 1.
-    # the call to greatest isn't necessary, but it provides clearer intent
-    # rather than depending on the implicit postgres generate_series behavior
-    start = step = 1
-    stop = sa.func.greatest(times, 0) * array_length
-    series = sa.func.generate_series(start, stop, step).alias()
-    series_column = sa.column(series.name, type_=sa.INTEGER)
+    series = sa.func.generate_series(1, times * array_length).table_valued()
 
     # if our current index modulo the array's length is a multiple of the
     # array's length, then the index is the array's length
-    index_expression = series_column % array_length
-    index = sa.func.coalesce(sa.func.nullif(index_expression, 0), array_length)
+    index = sa.func.coalesce(
+        sa.func.nullif(series.column % array_length, 0), array_length
+    )
 
     # tie it all together in a scalar subquery and collapse that into an ARRAY
-    return sa.func.array(sa.select(array[index]).select_from(series).scalar_subquery())
+    return sa.func.array(sa.select(array[index]).scalar_subquery())
 
 
 def _table_column(t, op):
@@ -358,9 +292,9 @@ def _table_column(t, op):
     table = op.table
 
     sa_table = get_sqla_table(ctx, table)
-    out_expr = get_col_or_deferred_col(sa_table, op.name)
+    out_expr = get_col(sa_table, op)
 
-    if isinstance(op.output_dtype, dt.Timestamp):
+    if op.output_dtype.is_timestamp():
         timezone = op.output_dtype.timezone
         if timezone is not None:
             out_expr = out_expr.op('AT TIME ZONE')(timezone).label(op.name)
@@ -384,9 +318,9 @@ def _round(t, op):
     # number of digits (though simple truncation on doubles is allowed) so
     # we cast to numeric and then cast back if necessary
     result = sa.func.round(sa.cast(sa_arg, sa.NUMERIC), t.translate(digits))
-    if digits is not None and isinstance(arg.output_dtype, dt.Decimal):
+    if digits is not None and arg.output_dtype.is_decimal():
         return result
-    result = sa.cast(result, sa.dialects.postgresql.DOUBLE_PRECISION())
+    result = sa.cast(result, pg.DOUBLE_PRECISION())
     return result
 
 
@@ -395,72 +329,71 @@ def _mod(t, op):
 
     # postgres doesn't allow modulus of double precision values, so upcast and
     # then downcast later if necessary
-    if not isinstance(op.output_dtype, dt.Integer):
+    if not op.output_dtype.is_integer():
         left = sa.cast(left, sa.NUMERIC)
         right = sa.cast(right, sa.NUMERIC)
 
     result = left % right
-    if isinstance(op.output_dtype, dt.Float64):
-        return sa.cast(result, sa.dialects.postgresql.DOUBLE_PRECISION())
+    if op.output_dtype.is_float64():
+        return sa.cast(result, pg.DOUBLE_PRECISION())
     else:
         return result
 
 
 def _neg_idx_to_pos(array, idx):
-    return sa.case(
-        [
-            (array.is_(None), None),
-            (idx < 0, sa.func.array_length(array, 1) + idx),
-        ],
-        else_=idx,
-    )
+    return sa.case((idx < 0, sa.func.cardinality(array) + idx), else_=idx)
 
 
-def _array_slice(t, op):
-    arg, start, stop = op.args
-    sa_arg = t.translate(arg)
-    sa_start = t.translate(start)
+def _array_slice(*, index_converter, array_length, func):
+    def translate(t, op):
+        arg = t.translate(op.arg)
 
-    if stop is None:
-        sa_stop = _cardinality(sa_arg)
-    else:
-        sa_stop = t.translate(stop)
+        arg_length = array_length(arg)
 
-    sa_start = _neg_idx_to_pos(sa_arg, sa_start)
-    sa_stop = _neg_idx_to_pos(sa_arg, sa_stop)
-    return sa_arg[sa_start + 1 : sa_stop]
+        if (start := op.start) is None:
+            start = 0
+        else:
+            start = t.translate(start)
+            start = sa.func.least(arg_length, index_converter(arg, start))
+
+        if (stop := op.stop) is None:
+            stop = arg_length
+        else:
+            stop = index_converter(arg, t.translate(stop))
+
+        return func(arg, start + 1, stop)
+
+    return translate
 
 
-def _literal(_, op):
+def _array_index(*, index_converter, func):
+    def translate(t, op):
+        sa_array = t.translate(op.arg)
+        sa_index = t.translate(op.index)
+        if isinstance(op.arg, ops.Literal):
+            sa_array = sa.sql.elements.Grouping(sa_array)
+        return func(sa_array, index_converter(sa_array, sa_index) + 1)
+
+    return translate
+
+
+def _literal(t, op):
     dtype = op.output_dtype
     value = op.value
 
-    if isinstance(dtype, dt.Interval):
-        return sa.text(f"INTERVAL '{value} {dtype.resolution}'")
-    elif isinstance(dtype, dt.Set):
+    if dtype.is_interval():
+        return sa.literal_column(f"INTERVAL '{value} {dtype.resolution}'")
+    elif dtype.is_set():
         return list(map(sa.literal, value))
-    # geo spatial data type
-    elif isinstance(dtype, dt.GeoSpatial):
+    elif dtype.is_geospatial():
         # inline_metadata ex: 'SRID=4326;POINT( ... )'
         return sa.literal_column(geo.translate_literal(op, inline_metadata=True))
-    elif isinstance(value, tuple):
-        return sa.literal(value, type_=to_sqla_type(dtype))
+    elif dtype.is_array():
+        return pg.array(value)
+    elif dtype.is_map():
+        return pg.hstore(list(value.keys()), list(value.values()))
     else:
         return sa.literal(value)
-
-
-def _day_of_week_index(t, op):
-    sa_arg = t.translate(op.arg)
-    return sa.cast(sa.cast(sa.extract('dow', sa_arg) + 6, sa.SMALLINT) % 7, sa.SMALLINT)
-
-
-def _day_of_week_name(t, op):
-    sa_arg = t.translate(op.arg)
-    return sa.func.trim(sa.func.to_char(sa_arg, 'Day'))
-
-
-def _array_column(t, op):
-    return postgresql.array(list(map(t.translate, op.cols.values)))
 
 
 def _string_agg(t, op):
@@ -488,32 +421,127 @@ def _covar(t, op):
 
 def _mode(t, op):
     arg = op.arg
-    if op.where is not None:
-        arg = op.where.to_expr().ifelse(arg, None).op()
+    if (where := op.where) is not None:
+        arg = ops.Where(where, arg, None)
     return sa.func.mode().within_group(t.translate(arg))
+
+
+def _quantile(t, op):
+    if op.interpolation is not None:
+        warnings.warn(
+            f"`{t.__module__.rsplit(',', 1)[0]}` backend does not support the "
+            "`interpolation` argument"
+        )
+    arg = op.arg
+    if (where := op.where) is not None:
+        arg = ops.Where(where, arg, None)
+    return sa.func.percentile_cont(t.translate(op.quantile)).within_group(
+        t.translate(arg)
+    )
 
 
 def _binary_variance_reduction(func):
     def variance_compiler(t, op):
         x = op.left
-        if isinstance(x_type := x.output_dtype, dt.Boolean):
+        if (x_type := x.output_dtype).is_boolean():
             x = ops.Cast(x, dt.Int32(nullable=x_type.nullable))
 
         y = op.right
-        if isinstance(y_type := y.output_dtype, dt.Boolean):
+        if (y_type := y.output_dtype).is_boolean():
             y = ops.Cast(y, dt.Int32(nullable=y_type.nullable))
 
-        result = func(t.translate(x), t.translate(y))
+        if t._has_reduction_filter_syntax:
+            result = func(t.translate(x), t.translate(y))
 
-        if (where := op.where) is not None:
-            if t._has_reduction_filter_syntax:
-                result = result.filter(t.translate(where))
-            else:
-                result = sa.case((t.translate(where), result), else_=sa.null())
-
-        return result
+            if (where := op.where) is not None:
+                return result.filter(t.translate(where))
+            return result
+        else:
+            if (where := op.where) is not None:
+                x = ops.Where(where, x, None)
+                y = ops.Where(where, y, None)
+            return func(t.translate(x), t.translate(y))
 
     return variance_compiler
+
+
+def _arg_min_max(sort_func):
+    def translate(t, op: ops.ArgMin | ops.ArgMax) -> str:
+        arg = t.translate(op.arg)
+        key = t.translate(op.key)
+
+        conditions = [arg != sa.null(), key != sa.null()]
+
+        agg = sa.func.array_agg(pg.aggregate_order_by(arg, sort_func(key)))
+
+        if (where := op.where) is not None:
+            conditions.append(t.translate(where))
+        return agg.filter(sa.and_(*conditions))[1]
+
+    return translate
+
+
+def _arbitrary(t, op):
+    if (how := op.how) == "heavy":
+        raise com.UnsupportedOperationError(
+            f"postgres backend doesn't support how={how!r} for the arbitrary() aggregate"
+        )
+    func = getattr(sa.func.public, f"_ibis_{op.how}")
+    return t._reduction(func, op)
+
+
+class struct_field(GenericFunction):
+    inherit_cache = True
+
+
+@compiles(struct_field)
+def compile_struct_field_postgresql(element, compiler, **kw):
+    arg, field = element.clauses
+    return f"({compiler.process(arg, **kw)}).{field.name}"
+
+
+def _struct_field(t, op):
+    arg = op.arg
+    idx = arg.output_dtype.names.index(op.field) + 1
+    field_name = sa.literal_column(f"f{idx:d}")
+    return struct_field(
+        t.translate(arg), field_name, type_=t.get_sqla_type(op.output_dtype)
+    )
+
+
+def _struct_column(t, op):
+    types = op.output_dtype.types
+    return sa.func.row(
+        # we have to cast here, otherwise postgres refuses to allow the statement
+        *map(t.translate, map(ops.Cast, op.values, types)),
+        type_=t.get_sqla_type(
+            dt.Struct({f"f{i:d}": typ for i, typ in enumerate(types, start=1)})
+        ),
+    )
+
+
+def _unnest(t, op):
+    arg = op.arg
+    row_type = arg.output_dtype.value_type
+
+    types = getattr(row_type, "types", (row_type,))
+
+    is_struct = row_type.is_struct()
+    derived = (
+        sa.func.unnest(t.translate(arg))
+        .table_valued(
+            *(
+                sa.column(f"f{i:d}", stype)
+                for i, stype in enumerate(map(t.get_sqla_type, types), start=1)
+            )
+        )
+        .render_derived(with_types=is_struct)
+    )
+
+    # wrap in a row column so that we can return a single column from this rule
+    if not is_struct:
+        return derived.c[0]
+    return sa.func.row(*derived.c)
 
 
 operation_registry.update(
@@ -524,22 +552,30 @@ operation_registry.update(
         # types
         ops.TypeOf: _typeof,
         # Floating
-        ops.IsNan: _is_nan,
-        ops.IsInf: _is_inf,
+        ops.IsNan: fixed_arity(lambda arg: arg == float('nan'), 1),
+        ops.IsInf: fixed_arity(
+            lambda arg: sa.or_(arg == float('inf'), arg == float('-inf')), 1
+        ),
         # null handling
         ops.IfNull: fixed_arity(sa.func.coalesce, 2),
         # boolean reductions
-        ops.Any: unary(sa.func.bool_or),
-        ops.All: unary(sa.func.bool_and),
-        ops.NotAny: unary(lambda x: sa.not_(sa.func.bool_or(x))),
-        ops.NotAll: unary(lambda x: sa.not_(sa.func.bool_and(x))),
+        ops.Any: reduction(sa.func.bool_or),
+        ops.All: reduction(sa.func.bool_and),
+        ops.NotAny: reduction(lambda x: sa.not_(sa.func.bool_or(x))),
+        ops.NotAll: reduction(lambda x: sa.not_(sa.func.bool_and(x))),
         # strings
         ops.GroupConcat: _string_agg,
         ops.Capitalize: unary(sa.func.initcap),
         ops.RegexSearch: fixed_arity(lambda x, y: x.op("~")(y), 2),
-        ops.RegexReplace: _regex_replace,
-        ops.Translate: fixed_arity('translate', 3),
-        ops.RegexExtract: _regex_extract,
+        # postgres defaults to replacing only the first occurrence
+        ops.RegexReplace: fixed_arity(
+            lambda string, pattern, replacement: sa.func.regexp_replace(
+                string, pattern, replacement, 'g'
+            ),
+            3,
+        ),
+        ops.Translate: fixed_arity(sa.func.translate, 3),
+        ops.RegexExtract: fixed_arity(_regex_extract, 3),
         ops.StringSplit: fixed_arity(
             lambda col, sep: sa.func.string_to_array(
                 col, sep, type_=sa.ARRAY(col.type)
@@ -557,46 +593,109 @@ operation_registry.update(
         ops.DateFromYMD: fixed_arity(sa.func.make_date, 3),
         ops.DateTruncate: _timestamp_truncate,
         ops.TimestampTruncate: _timestamp_truncate,
-        ops.IntervalFromInteger: _interval_from_integer,
+        ops.IntervalFromInteger: (
+            lambda t, op: t.translate(op.arg)
+            * sa.text(f"INTERVAL '1 {op.output_dtype.resolution}'")
+        ),
         ops.DateAdd: fixed_arity(operator.add, 2),
         ops.DateSub: fixed_arity(operator.sub, 2),
         ops.DateDiff: fixed_arity(operator.sub, 2),
         ops.TimestampAdd: fixed_arity(operator.add, 2),
         ops.TimestampSub: fixed_arity(operator.sub, 2),
         ops.TimestampDiff: fixed_arity(operator.sub, 2),
-        ops.Strftime: _strftime,
-        ops.ExtractYear: _extract('year'),
-        ops.ExtractMonth: _extract('month'),
-        ops.ExtractDay: _extract('day'),
+        ops.Strftime: fixed_arity(_strftime, 2),
+        ops.ExtractEpochSeconds: fixed_arity(
+            lambda arg: sa.cast(sa.extract('epoch', arg), sa.INTEGER), 1
+        ),
         ops.ExtractDayOfYear: _extract('doy'),
-        ops.ExtractQuarter: _extract('quarter'),
-        ops.ExtractEpochSeconds: _extract('epoch', sa.Integer),
         ops.ExtractWeekOfYear: _extract('week'),
-        ops.ExtractHour: _extract('hour'),
-        ops.ExtractMinute: _extract('minute'),
-        ops.ExtractSecond: _second,
-        ops.ExtractMillisecond: _millisecond,
-        ops.DayOfWeekIndex: _day_of_week_index,
-        ops.DayOfWeekName: _day_of_week_name,
-        # now is in the timezone of the server, but we want UTC
-        ops.TimestampNow: lambda *_: sa.func.timezone('UTC', sa.func.now()),
+        # extracting the second gives us the fractional part as well, so smash that
+        # with a cast to SMALLINT
+        ops.ExtractSecond: fixed_arity(
+            lambda arg: sa.cast(sa.func.floor(sa.extract('second', arg)), sa.SMALLINT),
+            1,
+        ),
+        # we get total number of milliseconds including seconds with extract so we
+        # mod 1000
+        ops.ExtractMillisecond: fixed_arity(
+            lambda arg: sa.cast(
+                sa.func.floor(sa.extract('millisecond', arg)) % 1000,
+                sa.SMALLINT,
+            ),
+            1,
+        ),
+        ops.DayOfWeekIndex: fixed_arity(
+            lambda arg: sa.cast(
+                sa.cast(sa.extract('dow', arg) + 6, sa.SMALLINT) % 7, sa.SMALLINT
+            ),
+            1,
+        ),
+        ops.DayOfWeekName: fixed_arity(
+            lambda arg: sa.func.trim(sa.func.to_char(arg, 'Day')), 1
+        ),
         ops.TimeFromHMS: fixed_arity(sa.func.make_time, 3),
         ops.CumulativeAll: unary(sa.func.bool_and),
         ops.CumulativeAny: unary(sa.func.bool_or),
         # array operations
-        ops.ArrayLength: unary(_cardinality),
-        ops.ArrayCollect: unary(sa.func.array_agg),
-        ops.ArrayColumn: _array_column,
-        ops.ArraySlice: _array_slice,
-        ops.ArrayIndex: fixed_arity(
-            lambda array, index: array[_neg_idx_to_pos(array, index) + 1], 2
+        ops.ArrayLength: unary(sa.func.cardinality),
+        ops.ArrayCollect: reduction(sa.func.array_agg),
+        ops.ArrayColumn: (lambda t, op: pg.array(list(map(t.translate, op.cols)))),
+        ops.ArraySlice: _array_slice(
+            index_converter=_neg_idx_to_pos,
+            array_length=sa.func.cardinality,
+            func=lambda arg, start, stop: arg[start:stop],
+        ),
+        ops.ArrayIndex: _array_index(
+            index_converter=_neg_idx_to_pos, func=lambda arg, index: arg[index]
         ),
         ops.ArrayConcat: fixed_arity(sa.sql.expression.ColumnElement.concat, 2),
         ops.ArrayRepeat: _array_repeat,
-        ops.Unnest: unary(sa.func.unnest),
+        ops.Unnest: _unnest,
         ops.Covariance: _covar,
         ops.Correlation: _corr,
         ops.BitwiseXor: _bitwise_op("#"),
         ops.Mode: _mode,
+        ops.Quantile: _quantile,
+        ops.MultiQuantile: _quantile,
+        ops.TimestampNow: lambda t, op: sa.literal_column(
+            "CURRENT_TIMESTAMP", type_=t.get_sqla_type(op.output_dtype)
+        ),
+        ops.MapGet: fixed_arity(
+            lambda arg, key, default: sa.case(
+                (arg.has_key(key), arg[key]), else_=default
+            ),
+            3,
+        ),
+        ops.MapContains: fixed_arity(pg.HSTORE.Comparator.has_key, 2),
+        ops.MapKeys: unary(pg.HSTORE.Comparator.keys),
+        ops.MapValues: unary(pg.HSTORE.Comparator.vals),
+        ops.MapMerge: fixed_arity(operator.add, 2),
+        ops.MapLength: unary(lambda arg: sa.func.cardinality(arg.keys())),
+        ops.Map: fixed_arity(pg.hstore, 2),
+        ops.ArgMin: _arg_min_max(sa.asc),
+        ops.ArgMax: _arg_min_max(sa.desc),
+        ops.ToJSONArray: unary(
+            lambda arg: sa.case(
+                (
+                    sa.func.json_typeof(arg) == "array",
+                    sa.func.array(
+                        sa.select(
+                            sa.func.json_array_elements(arg).column_valued()
+                        ).scalar_subquery()
+                    ),
+                ),
+                else_=sa.null(),
+            )
+        ),
+        ops.ArrayStringJoin: fixed_arity(
+            lambda sep, arr: sa.func.array_to_string(arr, sep), 2
+        ),
+        ops.Strip: unary(lambda arg: sa.func.trim(arg, string.whitespace)),
+        ops.LStrip: unary(lambda arg: sa.func.ltrim(arg, string.whitespace)),
+        ops.RStrip: unary(lambda arg: sa.func.rtrim(arg, string.whitespace)),
+        ops.StartsWith: fixed_arity(lambda arg, prefix: arg.op("^@")(prefix), 2),
+        ops.Arbitrary: _arbitrary,
+        ops.StructColumn: _struct_column,
+        ops.StructField: _struct_field,
     }
 )

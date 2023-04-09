@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import operator
 from typing import Any, Collection
 
@@ -6,11 +8,13 @@ import pandas as pd
 from pandas.core.groupby import SeriesGroupBy
 
 import ibis.expr.operations as ops
+from ibis.backends.pandas.core import execute
 from ibis.backends.pandas.dispatch import execute_node
 
 
-@execute_node.register(ops.ArrayColumn, list)
+@execute_node.register(ops.ArrayColumn, tuple)
 def execute_array_column(op, cols, **kwargs):
+    cols = [execute(arg, **kwargs) for arg in cols]
     df = pd.concat(cols, axis=1)
     return df.apply(lambda row: np.array(row, dtype=object), axis=1)
 
@@ -56,8 +60,9 @@ def _concat_iterables_to_series(
     iter1: Collection[Any],
     iter2: Collection[Any],
 ) -> pd.Series:
-    """Concatenate two collections elementwise ("horizontally") to create a
-    Series. The two collections are assumed to have the same length.
+    """Concatenate two collections to create a Series.
+
+    The two collections are assumed to have the same length.
 
     Used for ArrayConcat implementation.
     """
@@ -96,12 +101,7 @@ def execute_array_concat_scalar(op, left, right, **kwargs):
 def execute_array_repeat(op, data, n, **kwargs):
     # Negative n will be treated as 0 (repeat will produce empty array)
     n = max(n, 0)
-    return pd.Series(
-        map(
-            lambda arr: np.tile(arr, n),
-            data,
-        )
-    )
+    return pd.Series(np.tile(arr, n) for arr in data)
 
 
 @execute_node.register(ops.ArrayRepeat, np.ndarray, int)
@@ -110,6 +110,23 @@ def execute_array_repeat_scalar(op, data, n, **kwargs):
     return np.tile(data, max(n, 0))
 
 
-@execute_node.register(ops.ArrayCollect, (pd.Series, SeriesGroupBy))
-def execute_array_collect(op, data, aggcontext=None, **kwargs):
-    return aggcontext.agg(data, np.array)
+@execute_node.register(ops.ArrayCollect, pd.Series, (type(None), pd.Series))
+def execute_array_collect(op, data, where, aggcontext=None, **kwargs):
+    return aggcontext.agg(data.loc[where] if where is not None else data, np.array)
+
+
+@execute_node.register(ops.ArrayCollect, SeriesGroupBy, (type(None), pd.Series))
+def execute_array_collect_groupby(op, data, where, aggcontext=None, **kwargs):
+    return aggcontext.agg(
+        (
+            data.obj.loc[where].groupby(data.grouping.grouper)
+            if where is not None
+            else data
+        ),
+        np.array,
+    )
+
+
+@execute_node.register(ops.Unnest, pd.Series)
+def execute_unnest(op, data, **kwargs):
+    return data.explode()

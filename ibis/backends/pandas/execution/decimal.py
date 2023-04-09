@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import decimal
 import math
 import numbers
@@ -8,6 +10,7 @@ import pandas as pd
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 from ibis.backends.pandas.dispatch import execute_node
+from ibis.common.exceptions import OperationNotDefinedError
 
 
 @execute_node.register(ops.Ln, decimal.Decimal)
@@ -54,13 +57,18 @@ def execute_decimal_log2(op, data, **kwargs):
 # exactly
 @execute_node.register((ops.Unary, ops.Negate), decimal.Decimal)
 def execute_decimal_unary(op, data, **kwargs):
-    operation_name = type(op).__name__.lower()
-    math_function = getattr(math, operation_name, None)
+    op_type = type(op)
+    operation_name = op_type.__name__.lower()
     function = getattr(
         decimal.Decimal,
         operation_name,
-        lambda x: decimal.Decimal(math_function(x)),
+        None,
     )
+    if function is None:
+        math_function = getattr(math, operation_name, None)
+        if math_function is None:
+            raise OperationNotDefinedError(f'{op_type.__name__} not supported')
+        function = lambda x: decimal.Decimal(math_function(x))
     try:
         return function(data)
     except decimal.InvalidOperation:
@@ -111,7 +119,17 @@ def execute_cast_series_to_decimal(op, data, type, **kwargs):
         '{}.{}'.format('0' * (precision - scale), '0' * scale)
     )
     return data.apply(
-        lambda x, context=context, places=places: (  # noqa: E501
+        lambda x, context=context, places=places: (
             context.create_decimal(x).quantize(places)
         )
     )
+
+
+@execute_node.register(ops.E)
+def execute_e(op, **kwargs):
+    return np.e
+
+
+@execute_node.register(ops.Pi)
+def execute_pi(op, **kwargs):
+    return np.pi

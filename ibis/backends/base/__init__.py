@@ -20,17 +20,17 @@ from typing import (
     MutableMapping,
 )
 
-if TYPE_CHECKING:
-    import pandas as pd
-    import pyarrow as pa
-    import ibis.expr.schema as sch
-
 import ibis
 import ibis.common.exceptions as exc
 import ibis.config
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
-import ibis.util as util
+from ibis import util
+from ibis.common.caching import RefCountedCache
+
+if TYPE_CHECKING:
+    import pandas as pd
+    import pyarrow as pa
 
 __all__ = ('BaseBackend', 'Database', 'connect')
 
@@ -147,15 +147,17 @@ class Database:
         qualified_name = self._qualify(name)
         return self.client.table(qualified_name, self.name)
 
-    def list_tables(self, like=None):
+    def list_tables(self, like=None, database=None):
         """List the tables in the database.
 
         Parameters
         ----------
         like
             A pattern to use for listing tables.
+        database
+            The database to perform the list against
         """
-        return self.client.list_tables(like, database=self.name)
+        return self.client.list_tables(like, database=database or self.name)
 
 
 class TablesAccessor(collections.abc.Mapping):
@@ -176,7 +178,7 @@ class TablesAccessor(collections.abc.Mapping):
     def __getitem__(self, name) -> ir.Table:
         try:
             return self._backend.table(name)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             raise KeyError(name) from exc
 
     def __getattr__(self, name) -> ir.Table:
@@ -184,7 +186,7 @@ class TablesAccessor(collections.abc.Mapping):
             raise AttributeError(name)
         try:
             return self._backend.table(name)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             raise AttributeError(name) from exc
 
     def __iter__(self) -> Iterator[str]:
@@ -203,32 +205,27 @@ class TablesAccessor(collections.abc.Mapping):
         )
         return list(o)
 
+    def __repr__(self) -> str:
+        tables = self._backend.list_tables()
+        rows = ["Tables", "------"]
+        rows.extend(f"- {name}" for name in sorted(tables))
+        return "\n".join(rows)
+
     def _ipython_key_completions_(self) -> list[str]:
         return self._backend.list_tables()
 
 
-# should have a better name
-class ResultHandler:
+class _FileIOHandler:
     @staticmethod
     def _import_pyarrow():
         try:
-            import pyarrow
+            import pyarrow  # noqa: ICN001
         except ImportError:
             raise ModuleNotFoundError(
-                "Exporting to arrow formats requires `pyarrow` but it is not installed"  # noqa: ignore
+                "Exporting to arrow formats requires `pyarrow` but it is not installed"
             )
         else:
             return pyarrow
-
-    @staticmethod
-    def _table_or_column_schema(expr: ir.Expr) -> sch.Schema:
-        from ibis.backends.pyarrow.datatypes import sch
-
-        if isinstance(expr, ir.Table):
-            return expr.schema()
-        else:
-            # ColumnExpr has no schema method, define single-column schema
-            return sch.schema([(expr.get_name(), expr.type())])
 
     @util.experimental
     def to_pyarrow(
@@ -253,6 +250,8 @@ class ResultHandler:
         limit
             An integer to effect a specific row limit. A value of `None` means
             "no limit". The default is in `ibis/config.py`.
+        kwargs
+            Keyword arguments
 
         Returns
         -------
@@ -270,7 +269,7 @@ class ResultHandler:
         except ValueError:
             # The pyarrow batches iterator is empty so pass in an empty
             # iterator and a pyarrow schema
-            schema = self._table_or_column_schema(expr)
+            schema = expr.as_table().schema()
             table = pa.Table.from_batches([], schema=schema.to_pyarrow())
 
         if isinstance(expr, ir.Table):
@@ -296,9 +295,8 @@ class ResultHandler:
         limit: int | str | None = None,
         chunk_size: int = 1_000_000,
         **kwargs: Any,
-    ) -> pa.RecordBatchReader:
-        """Execute expression and return results in an iterator of pyarrow
-        record batches.
+    ) -> pa.ipc.RecordBatchReader:
+        """Execute expression and return a RecordBatchReader.
 
         This method is eager and will execute the associated expression
         immediately.
@@ -313,17 +311,139 @@ class ResultHandler:
         params
             Mapping of scalar parameter expressions to value.
         chunk_size
-            Number of rows in each returned record batch.
+            Maximum number of rows in each returned record batch.
+        kwargs
+            Keyword arguments
 
         Returns
         -------
-        record_batches
-            An iterator of pyarrow record batches.
+        results
+            RecordBatchReader
         """
         raise NotImplementedError
 
+    def read_parquet(
+        self, path: str | Path, table_name: str | None = None, **kwargs: Any
+    ) -> ir.Table:
+        """Register a parquet file as a table in the current backend.
 
-class BaseBackend(abc.ABC, ResultHandler):
+        Parameters
+        ----------
+        path
+            The data source.
+        table_name
+            An optional name to use for the created table. This defaults to
+            a sequentially generated name.
+        **kwargs
+            Additional keyword arguments passed to the backend loading function.
+
+        Returns
+        -------
+        ir.Table
+            The just-registered table
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support direct registration of parquet data."
+        )
+
+    def read_csv(
+        self, path: str | Path, table_name: str | None = None, **kwargs: Any
+    ) -> ir.Table:
+        """Register a CSV file as a table in the current backend.
+
+        Parameters
+        ----------
+        path
+            The data source. A string or Path to the CSV file.
+        table_name
+            An optional name to use for the created table. This defaults to
+            a sequentially generated name.
+        **kwargs
+            Additional keyword arguments passed to the backend loading function.
+
+        Returns
+        -------
+        ir.Table
+            The just-registered table
+        """
+        raise NotImplementedError(
+            f"{self.name} does not support direct registration of CSV data."
+        )
+
+    @util.experimental
+    def to_parquet(
+        self,
+        expr: ir.Table,
+        path: str | Path,
+        *,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Write the results of executing the given expression to a parquet file.
+
+        This method is eager and will execute the associated expression
+        immediately.
+
+        Parameters
+        ----------
+        expr
+            The ibis expression to execute and persist to parquet.
+        path
+            The data source. A string or Path to the parquet file.
+        params
+            Mapping of scalar parameter expressions to value.
+        **kwargs
+            Additional keyword arguments passed to pyarrow.parquet.ParquetWriter
+
+        https://arrow.apache.org/docs/python/generated/pyarrow.parquet.ParquetWriter.html
+        """
+        self._import_pyarrow()
+        import pyarrow.parquet as pq
+
+        batch_reader = expr.to_pyarrow_batches(params=params)
+
+        with pq.ParquetWriter(path, batch_reader.schema) as writer:
+            for batch in batch_reader:
+                writer.write_batch(batch)
+
+    @util.experimental
+    def to_csv(
+        self,
+        expr: ir.Table,
+        path: str | Path,
+        *,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Write the results of executing the given expression to a CSV file.
+
+        This method is eager and will execute the associated expression
+        immediately.
+
+        Parameters
+        ----------
+        expr
+            The ibis expression to execute and persist to CSV.
+        path
+            The data source. A string or Path to the CSV file.
+        params
+            Mapping of scalar parameter expressions to value.
+        kwargs
+            Additional keyword arguments passed to pyarrow.csv.CSVWriter
+
+        https://arrow.apache.org/docs/python/generated/pyarrow.csv.CSVWriter.html
+        """
+        self._import_pyarrow()
+        import pyarrow.csv as pcsv
+
+        batch_reader = expr.to_pyarrow_batches(params=params)
+
+        with pcsv.CSVWriter(path, batch_reader.schema) as writer:
+            for batch in batch_reader:
+                writer.write_batch(batch)
+
+
+class BaseBackend(abc.ABC, _FileIOHandler):
     """Base backend class.
 
     All Ibis backends must subclass this class and implement all the
@@ -337,6 +457,14 @@ class BaseBackend(abc.ABC, ResultHandler):
     def __init__(self, *args, **kwargs):
         self._con_args: tuple[Any] = args
         self._con_kwargs: dict[str, Any] = kwargs
+        # expression cache
+        self._query_cache = RefCountedCache(
+            populate=self._load_into_cache,
+            lookup=lambda name: self.table(name).op(),
+            finalize=self._clean_up_cached_table,
+            generate_name=functools.partial(util.gen_name, "cache"),
+            key=lambda expr: expr.op(),
+        )
 
     def __getstate__(self):
         return dict(
@@ -345,6 +473,9 @@ class BaseBackend(abc.ABC, ResultHandler):
             _con_args=self._con_args,
             _con_kwargs=self._con_kwargs,
         )
+
+    def __rich_repr__(self):
+        yield "name", self.name
 
     def __hash__(self):
         return hash(self.db_identity)
@@ -377,10 +508,10 @@ class BaseBackend(abc.ABC, ResultHandler):
 
         Parameters
         ----------
-        args
+        *args
             Mandatory connection parameters, see the docstring of `do_connect`
             for details.
-        kwargs
+        **kwargs
             Extra connection parameters, see the docstring of `do_connect` for
             details.
 
@@ -399,7 +530,7 @@ class BaseBackend(abc.ABC, ResultHandler):
         new_backend.reconnect()
         return new_backend
 
-    def _from_url(self, url: str) -> BaseBackend:
+    def _from_url(self, url: str, **kwargs) -> BaseBackend:
         """Construct an ibis backend from a SQLAlchemy-conforming URL."""
         raise NotImplementedError(
             f"`_from_url` not implemented for the {self.name} backend"
@@ -516,6 +647,23 @@ class BaseBackend(abc.ABC, ResultHandler):
             The list of the table names that match the pattern `like`.
         """
 
+    @abc.abstractmethod
+    def table(self, name: str, database: str | None = None) -> ir.Table:
+        """Construct a table expression.
+
+        Parameters
+        ----------
+        name
+            Table name
+        database
+            Database name
+
+        Returns
+        -------
+        Table
+            Table expression
+        """
+
     @functools.cached_property
     def tables(self):
         """An accessor for tables in the database.
@@ -569,6 +717,14 @@ class BaseBackend(abc.ABC, ResultHandler):
         """Compile an expression."""
         return self.compiler.to_sql(expr, params=params)
 
+    def _to_sql(self, expr: ir.Expr, **kwargs) -> str:
+        """Convert an expression to a SQL string.
+
+        Called by `ibis.to_sql`/`ibis.show_sql`, gives the backend an
+        opportunity to generate nicer SQL for human consumption.
+        """
+        raise NotImplementedError(f"Backend '{self.name}' backend doesn't support SQL")
+
     def execute(self, expr: ir.Expr) -> Any:
         """Execute an expression."""
 
@@ -613,16 +769,18 @@ class BaseBackend(abc.ABC, ResultHandler):
             f'Backend "{self.name}" does not implement "create_database"'
         )
 
+    @abc.abstractmethod
     def create_table(
         self,
         name: str,
         obj: pd.DataFrame | ir.Table | None = None,
+        *,
         schema: ibis.Schema | None = None,
         database: str | None = None,
-    ) -> None:
+        temp: bool = False,
+        overwrite: bool = False,
+    ) -> ir.Table:
         """Create a new table.
-
-        Not all backends implement this method.
 
         Parameters
         ----------
@@ -638,14 +796,22 @@ class BaseBackend(abc.ABC, ResultHandler):
         database
             Name of the database where the table will be created, if not the
             default.
-        """
-        raise NotImplementedError(
-            f'Backend "{self.name}" does not implement "create_table"'
-        )
+        temp
+            Whether a table is temporary or not
+        overwrite
+            Whether to clobber existing data
 
+        Returns
+        -------
+        Table
+            The table that was created.
+        """
+
+    @abc.abstractmethod
     def drop_table(
         self,
         name: str,
+        *,
         database: str | None = None,
         force: bool = False,
     ) -> None:
@@ -664,31 +830,38 @@ class BaseBackend(abc.ABC, ResultHandler):
             f'Backend "{self.name}" does not implement "drop_table"'
         )
 
+    @abc.abstractmethod
     def create_view(
         self,
         name: str,
-        expr: ir.Table,
+        obj: ir.Table,
+        *,
         database: str | None = None,
-    ) -> None:
-        """Create a view.
+        overwrite: bool = False,
+    ) -> ir.Table:
+        """Create a new view from an expression.
 
         Parameters
         ----------
         name
-            Name for the new view.
-        expr
-            An Ibis table expression that will be used to extract the query
-            of the view.
+            Name of the new view.
+        obj
+            An Ibis table expression that will be used to create the view.
         database
-            Name of the database where the view will be created, if not the
-            default.
-        """
-        raise NotImplementedError(
-            f'Backend "{self.name}" does not implement "create_view"'
-        )
+            Name of the database where the view will be created, if not
+            provided the database's default is used.
+        overwrite
+            Whether to clobber an existing view with the same name
 
+        Returns
+        -------
+        Table
+            The view that was created.
+        """
+
+    @abc.abstractmethod
     def drop_view(
-        self, name: str, database: str | None = None, force: bool = False
+        self, name: str, *, database: str | None = None, force: bool = False
     ) -> None:
         """Drop a view.
 
@@ -701,9 +874,6 @@ class BaseBackend(abc.ABC, ResultHandler):
         force
             If `False`, an exception is raised if the view does not exist.
         """
-        raise NotImplementedError(
-            f'Backend "{self.name}" does not implement "drop_view"'
-        )
 
     @classmethod
     def has_operation(cls, operation: type[ops.Value]) -> bool:
@@ -732,6 +902,44 @@ class BaseBackend(abc.ABC, ResultHandler):
             f"{cls.name} backend has not implemented `has_operation` API"
         )
 
+    def _cached(self, expr: ir.Table):
+        """Cache the provided expression.
+
+        All subsequent operations on the returned expression will be performed on the cached data.
+
+        Parameters
+        ----------
+        expr
+            Table expression to cache
+
+        Returns
+        -------
+        Expr
+            Cached table
+
+        """
+        op = expr.op()
+        if (result := self._query_cache.get(op)) is None:
+            self._query_cache.store(expr)
+            result = self._query_cache[op]
+        return ir.CachedTable(result)
+
+    def _release_cached(self, expr: ir.CachedTable) -> None:
+        """Releases the provided cached expression.
+
+        Parameters
+        ----------
+        expr
+            Cached expression to release
+        """
+        del self._query_cache[expr.op()]
+
+    def _load_into_cache(self, name, expr):
+        raise NotImplementedError(self.name)
+
+    def _clean_up_cached_table(self, op):
+        raise NotImplementedError(self.name)
+
 
 @functools.lru_cache(maxsize=None)
 def _get_backend_names() -> frozenset[str]:
@@ -759,13 +967,11 @@ def connect(resource: Path | str, **kwargs: Any) -> BaseBackend:
     ----------
     resource
         A URL or path to the resource to be connected to.
+    kwargs
+        Backend specific keyword arguments
 
     Examples
     --------
-    Connect to an on-disk parquet or csv file (uses duckdb by default):
-    >>> con = ibis.connect("/path/to/data.parquet")
-    >>> con = ibis.connect("/path/to/data.csv")
-
     Connect to an in-memory duckdb database:
     >>> con = ibis.connect("duckdb://")
 
@@ -785,12 +991,14 @@ def connect(resource: Path | str, **kwargs: Any) -> BaseBackend:
     parsed = urllib.parse.urlparse(url)
     scheme = parsed.scheme or "file"
 
-    # Merge explicit kwargs with query string, explicit kwargs
-    # taking precedence
-    kwargs = dict(urllib.parse.parse_qsl(parsed.query), **kwargs)
+    orig_kwargs = kwargs.copy()
+    kwargs = dict(urllib.parse.parse_qsl(parsed.query))
 
     if scheme == "file":
         path = parsed.netloc + parsed.path
+        # Merge explicit kwargs with query string, explicit kwargs
+        # taking precedence
+        kwargs.update(orig_kwargs)
         if path.endswith(".duckdb"):
             return ibis.duckdb.connect(path, **kwargs)
         elif path.endswith((".sqlite", ".db")):
@@ -798,7 +1006,8 @@ def connect(resource: Path | str, **kwargs: Any) -> BaseBackend:
         elif path.endswith((".parquet", ".csv", ".csv.gz")):
             # Load parquet/csv/csv.gz files with duckdb by default
             con = ibis.duckdb.connect(**kwargs)
-            return con.register(path)
+            con.register(path)
+            return con
         else:
             raise ValueError(f"Don't know how to connect to {resource!r}")
 
@@ -831,4 +1040,4 @@ def connect(resource: Path | str, **kwargs: Any) -> BaseBackend:
     except AttributeError:
         raise ValueError(f"Don't know how to connect to {resource!r}") from None
 
-    return backend._from_url(url)
+    return backend._from_url(url, **orig_kwargs)

@@ -1,9 +1,13 @@
+from __future__ import annotations
+
 import ast
 import re
 
 import parsy
 
-_STRING_REGEX = """('[^\n'\\\\]*(?:\\\\.[^\n'\\\\]*)*'|"[^\n"\\\\"]*(?:\\\\.[^\n"\\\\]*)*")"""  # noqa: E501
+_STRING_REGEX = (
+    """('[^\n'\\\\]*(?:\\\\.[^\n'\\\\]*)*'|"[^\n"\\\\"]*(?:\\\\.[^\n"\\\\]*)*")"""
+)
 
 SPACES = parsy.regex(r'\s*', re.MULTILINE)
 
@@ -19,6 +23,7 @@ def spaceless_string(*strings: str):
 
 
 RAW_NUMBER = parsy.decimal_digit.at_least(1).concat()
+SINGLE_DIGIT = parsy.decimal_digit
 PRECISION = SCALE = NUMBER = RAW_NUMBER.map(int)
 
 LPAREN = spaceless_string("(")

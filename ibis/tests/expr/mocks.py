@@ -12,19 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
+from __future__ import annotations
 
 import pytest
+import sqlalchemy as sa
 
 import ibis.expr.types as ir
 from ibis.backends.base.sql import BaseSQLBackend
-from ibis.backends.base.sql.alchemy import (
-    AlchemyCompiler,
-    AlchemyTable,
-    table_from_schema,
-)
+from ibis.backends.base.sql.alchemy import AlchemyCompiler, AlchemyTable, to_sqla_type
+from ibis.backends.base.sql.alchemy.datatypes import _DEFAULT_DIALECT
 from ibis.expr.schema import Schema
-from ibis.expr.typing import TimeContext
 
 MOCK_TABLES = {
     'alltypes': [
@@ -396,7 +393,7 @@ class MockBackend(BaseSQLBackend):
         try:
             schema = expr.schema()
         except AttributeError:
-            schema = expr.to_projection().schema()
+            schema = expr.as_table().schema()
         df = schema.apply_to(pd.DataFrame([], columns=schema.names))
         if isinstance(expr, ir.Scalar):
             return None
@@ -409,11 +406,41 @@ class MockBackend(BaseSQLBackend):
         expr,
         limit=None,
         params=None,
-        timecontext: Optional[TimeContext] = None,
+        timecontext=None,
     ):
         ast = self.compiler.to_ast_ensure_limit(expr, limit, params=params)
         queries = [q.compile() for q in ast.queries]
         return queries[0] if len(queries) == 1 else queries
+
+    def create_table(self, *_, **__) -> ir.Table:
+        raise NotImplementedError(self.name)
+
+    def drop_table(self, *_, **__) -> ir.Table:
+        raise NotImplementedError(self.name)
+
+    def create_view(self, *_, **__) -> ir.Table:
+        raise NotImplementedError(self.name)
+
+    def drop_view(self, *_, **__) -> ir.Table:
+        raise NotImplementedError(self.name)
+
+    def _load_into_cache(self, *_):
+        raise NotImplementedError(self.name)
+
+    def _clean_up_cached_table(self, _):
+        raise NotImplementedError(self.name)
+
+
+def table_from_schema(name, meta, schema, *, database: str | None = None):
+    # Convert Ibis schema to SQLA table
+    columns = []
+
+    for colname, dtype in zip(schema.names, schema.types):
+        satype = to_sqla_type(_DEFAULT_DIALECT, dtype)
+        column = sa.Column(colname, satype, nullable=dtype.nullable)
+        columns.append(column)
+
+    return sa.Table(name, meta, *columns, schema=database)
 
 
 class MockAlchemyBackend(MockBackend):
@@ -422,8 +449,8 @@ class MockAlchemyBackend(MockBackend):
 
     def __init__(self):
         super().__init__()
-        sa = pytest.importorskip('sqlalchemy')
-        self.meta = sa.MetaData()
+        pytest.importorskip('sqlalchemy')
+        self.tables = {}
 
     def table(self, name, database=None):
         schema = self.get_schema(name)
@@ -431,9 +458,11 @@ class MockAlchemyBackend(MockBackend):
 
     def _inject_table(self, name, schema):
         try:
-            alchemy_table = self.meta.tables[name]
+            alchemy_table = self.tables[name]
         except KeyError:
-            alchemy_table = table_from_schema(name, self.meta, schema)
+            alchemy_table = self.tables[name] = table_from_schema(
+                name, sa.MetaData(), schema
+            )
 
         return self.table_class(
             source=self, sqla_table=alchemy_table, schema=schema

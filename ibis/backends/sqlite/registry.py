@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import functools
 import operator
 
@@ -18,8 +20,8 @@ from ibis.backends.base.sql.alchemy import (
     varargs,
     variance_reduction,
 )
-from ibis.backends.base.sql.alchemy.datatypes import to_sqla_type
-from ibis.backends.base.sql.alchemy.registry import _clip, _gen_string_find
+from ibis.backends.base.sql.alchemy.registry import _gen_string_find
+from ibis.backends.base.sql.alchemy.registry import _literal as base_literal
 
 operation_registry = sqlalchemy_operation_registry.copy()
 operation_registry.update(sqlalchemy_window_functions_registry)
@@ -29,61 +31,43 @@ sqlite_cast = Dispatcher("sqlite_cast")
 
 
 @sqlite_cast.register(object, dt.Integer, dt.Timestamp)
-def _unixepoch(arg, from_, to):
+def _unixepoch(arg, from_, to, **_):
     return sa.func.datetime(arg, "unixepoch")
 
 
 @sqlite_cast.register(object, dt.String, dt.Timestamp)
-def _string_to_timestamp(arg, from_, to):
+def _string_to_timestamp(arg, from_, to, **_):
     return sa.func.strftime('%Y-%m-%d %H:%M:%f', arg)
 
 
 @sqlite_cast.register(object, dt.Integer, dt.Date)
-def _integer_to_date(arg, from_, to):
+def _integer_to_date(arg, from_, to, **_):
     return sa.func.date(sa.func.datetime(arg, "unixepoch"))
 
 
 @sqlite_cast.register(object, (dt.String, dt.Timestamp), dt.Date)
-def _string_or_timestamp_to_date(arg, from_, to):
+def _string_or_timestamp_to_date(arg, from_, to, **_):
     return sa.func.date(arg)
 
 
+@sqlite_cast.register(object, dt.Timestamp, dt.Timestamp)
+def _timestamp_to_timestamp(arg, from_, to, **_):
+    if from_ == to:
+        return arg
+    if from_.timezone is None and to.timezone == 'UTC':
+        return arg
+    raise com.UnsupportedOperationError(f'Cannot cast from {from_} to {to}')
+
+
 @sqlite_cast.register(object, dt.DataType, (dt.Date, dt.Timestamp))
-def _value_to_temporal(arg, from_, to):
-    raise com.UnsupportedOperationError(type(arg))
-
-
-@sqlite_cast.register(object, dt.Category, dt.Int32)
-def _category_to_int(arg, from_, to):
-    return arg
+def _value_to_temporal(arg, from_, to, **_):
+    raise com.UnsupportedOperationError(f"Unable to cast from {from_!r} to {to!r}.")
 
 
 @sqlite_cast.register(object, dt.DataType, dt.DataType)
-def _default_cast_impl(arg, from_, to):
-    return sa.cast(arg, to_sqla_type(to))
-
-
-# TODO(kszucs): don't dispatch on op.arg since that should be always an
-# instance of ops.Value
-def _cast(t, op):
-    arg = t.translate(op.arg)
-
-    return sqlite_cast(arg, op.arg.output_dtype, op.to)
-
-
-def _string_right(t, op):
-    f = sa.func.substr
-
-    sa_arg = t.translate(op.arg)
-    sa_length = t.translate(op.nchars)
-
-    return f(sa_arg, -sa_length, sa_length)
-
-
-def _strftime(t, op):
-    sa_arg = t.translate(op.arg)
-    sa_format = t.translate(op.format_str)
-    return sa.func.strftime(sa_format, sa_arg)
+def _default_cast_impl(arg, from_, to, translator=None):
+    assert translator is not None, "translator is None"
+    return sa.cast(arg, translator.get_sqla_type(to))
 
 
 def _strftime_int(fmt):
@@ -108,12 +92,6 @@ def _extract_quarter(t, op):
     return sa.cast(t.translate(expr_new.op()), sa.Integer)
 
 
-def _extract_epoch_seconds(t, op):
-    # example: (julianday('now') - 2440587.5) * 86400.0
-    sa_expr = (sa.func.julianday(t.translate(op.arg)) - 2440587.5) * 86400.0
-    return sa.cast(sa_expr, sa.BigInteger)
-
-
 _truncate_modifiers = {
     'Y': 'start of year',
     'M': 'start of month',
@@ -136,24 +114,11 @@ def _truncate(func):
     return translator
 
 
-def _millisecond(t, op):
-    sa_arg = t.translate(op.arg)
-    fractional_second = sa.func.strftime('%f', sa_arg)
-    return (fractional_second * 1000) % 1000
-
-
 def _log(t, op):
     sa_arg = t.translate(op.arg)
     if op.base is None:
         return sa.func._ibis_sqlite_ln(sa_arg)
     return sa.func._ibis_sqlite_log(sa_arg, t.translate(op.base))
-
-
-def _repeat(t, op):
-    arg = t.translate(op.arg)
-    times = t.translate(op.times)
-    f = sa.func
-    return f.replace(f.substr(f.quote(f.zeroblob((times + 1) / 2)), 3, times), '0', arg)
 
 
 def _generic_pad(arg, length, pad):
@@ -170,16 +135,6 @@ def _generic_pad(arg, length, pad):
         1,
         length - f.length(arg),
     )
-
-
-def _lpad(t, op):
-    arg, length, pad = map(t.translate, op.args)
-    return _generic_pad(arg, length, pad) + arg
-
-
-def _rpad(t, op):
-    arg, length, pad = map(t.translate, op.args)
-    return arg + _generic_pad(arg, length, pad)
 
 
 def _extract_week_of_year(t, op):
@@ -229,83 +184,108 @@ def _extract_week_of_year(t, op):
 
 
 def _string_join(t, op):
-    # TODO(kszucs): use explicit argument names instead
-    sep, elements = op.args
     return functools.reduce(
         operator.add,
-        toolz.interpose(t.translate(sep), map(t.translate, elements.values)),
+        toolz.interpose(t.translate(op.sep), map(t.translate, op.arg)),
     )
 
 
-def _string_concat(t, op):
-    return functools.reduce(operator.add, map(t.translate, op.args))
+def _literal(t, op):
+    dtype = op.output_dtype
+    if dtype.is_array():
+        raise NotImplementedError(f"Unsupported type: {dtype!r}")
+    if dtype.is_uuid():
+        return sa.literal(str(op.value))
+    return base_literal(t, op)
 
 
-def _date_from_ymd(t, op):
-    ymdstr = sa.func.printf(
-        '%04d-%02d-%02d',
-        t.translate(op.year),
-        t.translate(op.month),
-        t.translate(op.day),
-    )
-    return sa.func.date(ymdstr)
+def _arbitrary(t, op):
+    if (how := op.how) == "heavy":
+        raise com.OperationNotDefinedError(
+            "how='heavy' not implemented for the SQLite backend"
+        )
 
-
-def _timestamp_from_ymdhms(t, op):
-    y, mo, d, h, m, s, *rest = (
-        t.translate(x) if x is not None else None for x in op.args
-    )
-    tz = rest[0] if rest else ''
-    timestr = sa.func.printf('%04d-%02d-%02d %02d:%02d:%02d%s', y, mo, d, h, m, s, tz)
-    return sa.func.datetime(timestr)
-
-
-def _time_from_hms(t, op):
-    timestr = sa.func.printf(
-        '%02d:%02d:%02d',
-        t.translate(op.hours),
-        t.translate(op.minutes),
-        t.translate(op.seconds),
-    )
-    return sa.func.time(timestr)
+    return reduction(getattr(sa.func, f"_ibis_sqlite_arbitrary_{how}"))(t, op)
 
 
 operation_registry.update(
     {
-        ops.Cast: _cast,
-        ops.DateFromYMD: _date_from_ymd,
-        ops.StrRight: _string_right,
+        # TODO(kszucs): don't dispatch on op.arg since that should be always an
+        # instance of ops.Value
+        ops.Cast: (
+            lambda t, op: sqlite_cast(
+                t.translate(op.arg), op.arg.output_dtype, op.to, translator=t
+            )
+        ),
+        ops.StrRight: fixed_arity(
+            lambda arg, nchars: sa.func.substr(arg, -nchars, nchars), 2
+        ),
         ops.StringFind: _gen_string_find(sa.func.instr),
         ops.StringJoin: _string_join,
-        ops.StringConcat: _string_concat,
+        ops.StringConcat: (
+            lambda t, op: functools.reduce(operator.add, map(t.translate, op.arg))
+        ),
         ops.Least: varargs(sa.func.min),
         ops.Greatest: varargs(sa.func.max),
         ops.IfNull: fixed_arity(sa.func.ifnull, 2),
-        ops.DateFromYMD: _date_from_ymd,
-        ops.TimeFromHMS: _time_from_hms,
-        ops.TimestampFromYMDHMS: _timestamp_from_ymdhms,
+        ops.DateFromYMD: fixed_arity(
+            lambda y, m, d: sa.func.date(sa.func.printf('%04d-%02d-%02d', y, m, d)), 3
+        ),
+        ops.TimeFromHMS: fixed_arity(
+            lambda h, m, s: sa.func.time(sa.func.printf('%02d:%02d:%02d', h, m, s)), 3
+        ),
+        ops.TimestampFromYMDHMS: fixed_arity(
+            lambda y, mo, d, h, m, s: sa.func.datetime(
+                sa.func.printf('%04d-%02d-%02d %02d:%02d:%02d%s', y, mo, d, h, m, s)
+            ),
+            6,
+        ),
         ops.DateTruncate: _truncate(sa.func.date),
         ops.Date: unary(sa.func.date),
+        ops.Time: unary(sa.func.time),
         ops.TimestampTruncate: _truncate(sa.func.datetime),
-        ops.Strftime: _strftime,
+        ops.Strftime: fixed_arity(
+            lambda arg, format_str: sa.func.strftime(format_str, arg), 2
+        ),
         ops.ExtractYear: _strftime_int('%Y'),
         ops.ExtractMonth: _strftime_int('%m'),
         ops.ExtractDay: _strftime_int('%d'),
         ops.ExtractWeekOfYear: _extract_week_of_year,
         ops.ExtractDayOfYear: _strftime_int('%j'),
         ops.ExtractQuarter: _extract_quarter,
-        ops.ExtractEpochSeconds: _extract_epoch_seconds,
+        # example: (julianday('now') - 2440587.5) * 86400.0
+        ops.ExtractEpochSeconds: fixed_arity(
+            lambda arg: sa.cast(
+                (sa.func.julianday(arg) - 2440587.5) * 86400.0, sa.BigInteger
+            ),
+            1,
+        ),
         ops.ExtractHour: _strftime_int('%H'),
         ops.ExtractMinute: _strftime_int('%M'),
         ops.ExtractSecond: _strftime_int('%S'),
-        ops.ExtractMillisecond: _millisecond,
+        ops.ExtractMillisecond: fixed_arity(
+            lambda arg: (sa.func.strftime('%f', arg) * 1000) % 1000, 1
+        ),
         ops.TimestampNow: fixed_arity(lambda: sa.func.datetime("now"), 0),
         ops.RegexSearch: fixed_arity(sa.func._ibis_sqlite_regex_search, 2),
         ops.RegexReplace: fixed_arity(sa.func._ibis_sqlite_regex_replace, 3),
         ops.RegexExtract: fixed_arity(sa.func._ibis_sqlite_regex_extract, 3),
-        ops.LPad: _lpad,
-        ops.RPad: _rpad,
-        ops.Repeat: _repeat,
+        ops.LPad: fixed_arity(
+            lambda arg, length, pad: _generic_pad(arg, length, pad) + arg, 3
+        ),
+        ops.RPad: fixed_arity(
+            lambda arg, length, pad: arg + _generic_pad(arg, length, pad), 3
+        ),
+        ops.Repeat: fixed_arity(
+            lambda arg, times: sa.func.replace(
+                sa.func.substr(
+                    sa.func.quote(sa.func.zeroblob((times + 1) / 2)), 3, times
+                ),
+                '0',
+                arg,
+            ),
+            2,
+        ),
         ops.Reverse: unary(sa.func._ibis_sqlite_reverse),
         ops.StringAscii: unary(sa.func._ibis_sqlite_string_ascii),
         ops.Capitalize: unary(sa.func._ibis_sqlite_capitalize),
@@ -340,9 +320,17 @@ operation_registry.update(
         ops.BitXor: reduction(sa.func._ibis_sqlite_bit_xor),
         ops.Degrees: unary(sa.func._ibis_sqlite_degrees),
         ops.Radians: unary(sa.func._ibis_sqlite_radians),
-        ops.Clip: _clip(min_func=sa.func.min, max_func=sa.func.max),
         # sqlite doesn't implement a native xor operator
         ops.BitwiseXor: fixed_arity(sa.func._ibis_sqlite_xor, 2),
         ops.BitwiseNot: unary(sa.func._ibis_sqlite_inv),
+        ops.Where: fixed_arity(sa.func.iif, 3),
+        ops.Pi: fixed_arity(sa.func._ibis_sqlite_pi, 0),
+        ops.E: fixed_arity(sa.func._ibis_sqlite_e, 0),
+        ops.TypeOf: unary(sa.func.typeof),
+        ops.Literal: _literal,
+        ops.RandomScalar: fixed_arity(
+            lambda: 0.5 + sa.func.random() / sa.cast(-1 << 64, sa.REAL), 0
+        ),
+        ops.Arbitrary: _arbitrary,
     }
 )

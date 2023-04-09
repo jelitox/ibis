@@ -1,9 +1,11 @@
 """Test utilities."""
 
+from __future__ import annotations
+
 import pickle
 
 import ibis
-import ibis.util as util
+from ibis import util
 
 
 def assert_equal(left, right):
@@ -27,3 +29,20 @@ def assert_pickle_roundtrip(obj):
         assert obj.equals(loaded)
     else:
         assert obj == loaded
+
+
+def assert_decompile_roundtrip(expr, snapshot=None, check_equality=True):
+    """Assert that an ibis expression remains the same after decompilation."""
+    rendered = ibis.decompile(expr, format=True)
+    if snapshot is not None:
+        snapshot.assert_match(rendered, "decompiled.py")
+
+    # execute the rendered python code
+    locals_ = {}
+    exec(rendered, {}, locals_)
+    restored = locals_['result']
+
+    if check_equality:
+        assert expr.unbind().equals(restored)
+    else:
+        assert expr.as_table().schema().equals(restored.as_table().schema())

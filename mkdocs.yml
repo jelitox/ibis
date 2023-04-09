@@ -1,6 +1,7 @@
 site_name: Ibis Project
 site_url: https://ibis-project.org
-strict: true
+strict: false # check for strictness when building the docs in CI
+edit_uri: ""
 repo_url: https://github.com/ibis-project/ibis
 extra_css:
   - stylesheets/extra.css
@@ -11,6 +12,8 @@ extra_javascript:
 theme:
   name: material
   features:
+    - navigation.tabs
+    - navigation.tabs.sticky
     - content.code.annotate
     - content.tabs.link
     - header.autohide
@@ -25,24 +28,37 @@ theme:
   logo: static/icons/ibis/logo.svg
   favicon: static/icons/ibis/logo.svg
   palette:
-    scheme: slate
-    primary: teal
-    accent: lime
+    # light mode toggle
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    # dark mode toggle
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
   custom_dir: docs/overrides
 plugins:
   - search
-  - mike
   - autorefs
-  - git-revision-date
+  - git-revision-date-localized
   - exclude:
       glob:
         - backends/template.md
-        - backends/support_matrix.csv
+        - backends/*_support_matrix.csv
+        - backends/app/*
         - CONTRIBUTING.md
   - gen-files:
       scripts:
         - gen_matrix.py
-  - table-reader
+        - gen_redirects.py
   - macros
   - mkdocstrings:
       enable_inventory: true
@@ -51,11 +67,11 @@ plugins:
           import:
             - https://docs.python.org/3/objects.inv
             - https://docs.sqlalchemy.org/objects.inv
-          selection:
+          options:
             docstring_style: numpy
             filters:
               - "!^_"
-              - "^__init__$"
+              - "__.+"
               - "!^ast_schema"
               - "!^backend_table_type"
               - "!^column$"
@@ -71,7 +87,8 @@ plugins:
               - "!^scalar$"
               - "!^column$"
               - "!^option_context$"
-          rendering:
+              - "!Selector$"
+              - "!^projection$"
             show_category_heading: true
             show_root_full_path: false
             show_root_heading: true
@@ -81,9 +98,10 @@ plugins:
       execute: true
       ignore:
         - "*.py"
-      execute_ignore: "tutorial/*Geospatial*.ipynb"
+      execute_ignore:
+        - "**/rendered/*.ipynb"
       include_source: true
-      theme: dark
+      allow_errors: false
   - literate-nav
 markdown_extensions:
   - admonition
@@ -115,24 +133,26 @@ markdown_extensions:
       permalink: true
       permalink_title: "Anchor link to this section for reference"
 extra:
-  version:
-    provider: mike
   project_name: "ibis"
+  # maybe version goes here?
   team:
-    - name: "Active maintainers"
+    - name: "Maintainers"
       members:
-        - jreback
-        - datapythonista
         - cpcloud
         - kszucs
-    - name: "Former maintainers"
-      members:
-        - wesm
+        - jreback
+        - gforsyth
+        - jcrist
+        - saulpw
   social:
     - icon: fontawesome/brands/twitter
       link: https://twitter.com/IbisData
     - icon: fontawesome/brands/github
-      link: https://github.com/ibis-project/ibis
+      link: https://github.com/ibis-project/ibis/discussions
+    - icon: fontawesome/brands/gitter
+      link: https://gitter.im/ibis-dev/Lobby
+    - icon: fontawesome/brands/stack-overflow
+      link: https://stackoverflow.com/questions/tagged/ibis
   support_levels:
     supported:
       icon: :material-check-decagram:{ .verified }
@@ -144,4 +164,4 @@ extra:
       icon: :material-cancel:{ .cancel }
       description: Unlikely to ever be supported or no upstream support.
 
-copyright: "Copyright &copy; 2014-2022, Ibis developers"
+copyright: "Copyright &copy; 2014-2022"

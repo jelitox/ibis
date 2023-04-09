@@ -11,6 +11,7 @@ import ibis.config
 import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
+from ibis import util
 from ibis.backends.base import BaseBackend
 from ibis.backends.pandas.client import (
     PandasDatabase,
@@ -33,14 +34,14 @@ class BasePandasBackend(BaseBackend):
 
     def do_connect(
         self,
-        dictionary: MutableMapping[str, pd.DataFrame],
+        dictionary: MutableMapping[str, pd.DataFrame] | None = None,
     ) -> None:
         """Construct a client from a dictionary of pandas DataFrames.
 
         Parameters
         ----------
         dictionary
-            Mutable mapping of string table names to pandas DataFrames.
+            An optional mapping of string table names to pandas DataFrames.
 
         Examples
         --------
@@ -49,10 +50,9 @@ class BasePandasBackend(BaseBackend):
         <ibis.backends.pandas.Backend at 0x...>
         """
         # register dispatchers
-        from ibis.backends.pandas import execution  # noqa: F401
-        from ibis.backends.pandas import udf  # noqa: F401
+        from ibis.backends.pandas import execution, udf  # noqa: F401
 
-        self.dictionary = dictionary
+        self.dictionary = dictionary or {}
         self.schemas: MutableMapping[str, sch.Schema] = {}
 
     def from_dataframe(
@@ -105,6 +105,9 @@ class BasePandasBackend(BaseBackend):
     def database(self, name=None):
         return self.database_class(name, self)
 
+    @util.deprecated(
+        as_of="5.0", removed_in="6.0", instead="Use create_table(overwrite=True)"
+    )
     def load_data(self, table_name, obj, **kwargs):
         # kwargs is a catch all for any options required by other backends.
         self.dictionary[table_name] = obj
@@ -120,10 +123,29 @@ class BasePandasBackend(BaseBackend):
     def compile(self, expr, *args, **kwargs):
         return expr
 
-    def create_table(self, table_name, obj=None, schema=None):
+    def create_table(
+        self,
+        name: str,
+        obj: pd.DataFrame | ir.Table | None = None,
+        *,
+        schema: sch.Schema | None = None,
+        database: str | None = None,
+        temp: bool | None = None,
+        overwrite: bool = False,
+    ) -> ir.Table:
         """Create a table."""
+        if temp:
+            com.IbisError(
+                "Passing `temp=True` to the Pandas backend create_table method has no "
+                "effect: all tables are in memory and temporary."
+            )
+        if database:
+            com.IbisError(
+                "Passing `database` to the Pandas backend create_table method has no "
+                "effect: Pandas cannot set a database."
+            )
         if obj is None and schema is None:
-            raise com.IbisError('Must pass expr or schema')
+            raise com.IbisError("The schema or obj parameter is required")
 
         if obj is not None:
             if not self._supports_conversion(obj):
@@ -137,10 +159,36 @@ class BasePandasBackend(BaseBackend):
             dtypes = dict(pandas_schema)
             df = self._from_pandas(pd.DataFrame(columns=dtypes.keys()).astype(dtypes))
 
-        self.dictionary[table_name] = df
+        if name in self.dictionary and not overwrite:
+            raise com.IbisError(f"Cannot overwrite existing table `{name}`")
+
+        self.dictionary[name] = df
 
         if schema is not None:
-            self.schemas[table_name] = schema
+            self.schemas[name] = schema
+        return self.table(name)
+
+    def create_view(
+        self,
+        name: str,
+        obj: ir.Table,
+        *,
+        database: str | None = None,
+        overwrite: bool = False,
+    ) -> ir.Table:
+        return self.create_table(
+            name, obj=obj, temp=None, database=database, overwrite=overwrite
+        )
+
+    def drop_view(self, name: str, *, force: bool = False) -> None:
+        self.drop_table(name, force=force)
+
+    def drop_table(self, name: str, *, force: bool = False) -> None:
+        if not force and name in self.dictionary:
+            raise com.IbisError(
+                "Cannot drop existing table. Call drop_table with force=True to drop existing table."
+            )
+        del self.dictionary[name]
 
     @classmethod
     def _supports_conversion(cls, obj: Any) -> bool:
@@ -180,10 +228,18 @@ class BasePandasBackend(BaseBackend):
 
     @classmethod
     def has_operation(cls, operation: type[ops.Value]) -> bool:
+        # Pandas doesn't support geospatial ops, but the dispatcher implements
+        # a common base class that makes it appear that it does. Explicitly
+        # exclude these operations.
+        if issubclass(operation, (ops.GeoSpatialUnOp, ops.GeoSpatialBinOp)):
+            return False
         op_classes = cls._get_operations()
         return operation in op_classes or any(
             issubclass(operation, op_impl) for op_impl in op_classes
         )
+
+    def _clean_up_cached_table(self, op):
+        del self.dictionary[op.name]
 
 
 class Backend(BasePandasBackend):
@@ -196,6 +252,7 @@ class Backend(BasePandasBackend):
         expr: ir.Expr,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
+        **kwargs: Any,
     ) -> pa.Table:
         pa = self._import_pyarrow()
         output = self.execute(expr, params=params, limit=limit)
@@ -206,6 +263,21 @@ class Backend(BasePandasBackend):
             return pa.Array.from_pandas(output)
         else:
             return pa.scalar(output)
+
+    def to_pyarrow_batches(
+        self,
+        expr: ir.Expr,
+        *,
+        params: Mapping[ir.Scalar, Any] | None = None,
+        limit: int | str | None = None,
+        chunk_size: int = 1000000,
+        **kwargs: Any,
+    ) -> pa.ipc.RecordBatchReader:
+        pa = self._import_pyarrow()
+        pa_table = self.to_pyarrow(expr, params=params, limit=limit)
+        return pa.RecordBatchReader.from_batches(
+            pa_table.schema, pa_table.to_batches(max_chunksize=chunk_size)
+        )
 
     def execute(self, query, params=None, limit='default', **kwargs):
         from ibis.backends.pandas.core import execute_and_reset
@@ -228,6 +300,11 @@ class Backend(BasePandasBackend):
         if params is None:
             params = {}
         else:
-            params = {k.op() if hasattr(k, 'op') else k: v for k, v in params.items()}
+            params = {
+                k.op() if isinstance(k, ir.Expr) else k: v for k, v in params.items()
+            }
 
         return execute_and_reset(node, params=params, **kwargs)
+
+    def _load_into_cache(self, name, expr):
+        self.create_table(name, expr.execute())

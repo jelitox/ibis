@@ -1,5 +1,8 @@
 # Backends
 
+See the [configuration guide](../user_guide/configuration.md#default-backend)
+to inspect or reconfigure the backend used by default.
+
 ## String Generating Backends
 
 The first category of backend translate Ibis expressions into string queries.
@@ -9,7 +12,7 @@ database through a driver API for execution.
 
 - [Apache Impala](Impala.md)
 - [ClickHouse](ClickHouse.md)
-- [Google BigQuery](https://github.com/ibis-project/ibis-bigquery/)
+- [Google BigQuery](BigQuery.md)
 - [HeavyAI](https://github.com/heavyai/ibis-heavyai)
 
 ## Expression Generating Backends
@@ -20,13 +23,18 @@ system's expressions, for example, SQLAlchemy.
 Instead of generating strings for each expression these backends produce
 another kind of expression and typically have high-level APIs for execution.
 
+- [Apache Arrow Datafusion](Datafusion.md)
+- [Apache Druid](Druid.md)
+- [Apache PySpark](PySpark.md)
 - [Dask](Dask.md)
-- [Datafusion](Datafusion.md)
+- [DuckDB](DuckDB.md)
+- [MS SQL Server](MSSQL.md)
 - [MySQL](MySQL.md)
+- [Polars](Polars.md)
 - [PostgreSQL](PostgreSQL.md)
-- [PySpark](PySpark.md)
 - [SQLite](SQLite.md)
 - [Snowflake](Snowflake.md)
+- [Trino](Trino.md)
 
 ## Direct Execution Backends
 

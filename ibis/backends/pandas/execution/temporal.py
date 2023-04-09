@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import datetime
 
 import numpy as np
@@ -7,6 +9,7 @@ from pandas.core.groupby import SeriesGroupBy
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 from ibis.backends.base import BaseBackend
+from ibis.backends.base.df.scope import Scope
 from ibis.backends.pandas.core import (
     date_types,
     integer_types,
@@ -16,7 +19,6 @@ from ibis.backends.pandas.core import (
 )
 from ibis.backends.pandas.dispatch import execute_node, pre_execute
 from ibis.backends.pandas.execution.util import get_grouping
-from ibis.expr.scope import Scope
 
 
 @execute_node.register(ops.Strftime, pd.Timestamp, str)
@@ -29,7 +31,7 @@ def execute_strftime_series_str(op, data, format_string, **kwargs):
     return data.dt.strftime(format_string)
 
 
-@execute_node.register(ops.ExtractTemporalField, pd.Timestamp)
+@execute_node.register(ops.ExtractTemporalField, datetime.datetime)
 def execute_extract_timestamp_field_timestamp(op, data, **kwargs):
     field_name = type(op).__name__.lower().replace('extract', '')
     return getattr(data, field_name)
@@ -43,17 +45,17 @@ def execute_extract_timestamp_field_series(op, data, **kwargs):
     return getattr(data.dt, field_name).astype(np.int32)
 
 
-@execute_node.register(ops.ExtractMillisecond, pd.Timestamp)
+@execute_node.register(ops.ExtractMillisecond, datetime.datetime)
 def execute_extract_millisecond_timestamp(op, data, **kwargs):
-    return int(data.microsecond // 1000.0)
+    return int(data.microsecond // 1_000)
 
 
 @execute_node.register(ops.ExtractMillisecond, pd.Series)
 def execute_extract_millisecond_series(op, data, **kwargs):
-    return (data.dt.microsecond // 1000).astype(np.int32)
+    return (data.dt.microsecond // 1_000).astype(np.int32)
 
 
-@execute_node.register(ops.ExtractEpochSeconds, (pd.Timestamp, pd.Series))
+@execute_node.register(ops.ExtractEpochSeconds, (datetime.datetime, pd.Series))
 def execute_epoch_seconds(op, data, **kwargs):
     # older versions of dask do not have a view method, so use astype
     # instead
@@ -69,7 +71,10 @@ def execute_epoch_seconds(op, data, **kwargs):
     (pd.Series, str, datetime.time),
 )
 def execute_between_time(op, data, lower, upper, **kwargs):
-    indexer = pd.DatetimeIndex(data).indexer_between_time(lower, upper)
+    idx = pd.DatetimeIndex(data)
+    if idx.tz is not None:
+        idx = idx.tz_convert(None)  # make naive because times are naive
+    indexer = idx.indexer_between_time(lower, upper)
     result = np.zeros(len(data), dtype=np.bool_)
     result[indexer] = True
     return pd.Series(result)
@@ -80,11 +85,20 @@ def execute_timestamp_date(op, data, **kwargs):
     return data.dt.floor('d')
 
 
+PANDAS_UNITS = {
+    "m": "Min",
+    "ms": "L",
+}
+
+
 @execute_node.register((ops.TimestampTruncate, ops.DateTruncate), pd.Series)
 def execute_timestamp_truncate(op, data, **kwargs):
-    dtype = f'datetime64[{op.unit}]'
-    array = data.values.astype(dtype)
-    return pd.Series(array, name=data.name)
+    dt = data.dt
+    unit = PANDAS_UNITS.get(op.unit, op.unit)
+    try:
+        return dt.floor(unit)
+    except ValueError:
+        return dt.to_period(unit).dt.to_timestamp()
 
 
 OFFSET_CLASS = {
@@ -251,12 +265,8 @@ def execute_day_of_week_index_series_group_by(op, data, **kwargs):
     return data.obj.dt.dayofweek.astype(np.int16).groupby(groupings, group_keys=False)
 
 
-def day_name(obj):
-    """Backwards compatible name of day getting function.
-
-    Parameters
-    ----------
-    obj : Union[Series, pd.Timestamp]
+def day_name(obj: pd.core.indexes.accessors.DatetimeProperties | pd.Timestamp) -> str:
+    """Backwards compatible name-of-day getting function.
 
     Returns
     -------
@@ -287,13 +297,21 @@ def execute_day_of_week_name_series_group_by(op, data, **kwargs):
 
 
 @execute_node.register(ops.DateSub, date_types, timedelta_types)
-@execute_node.register((ops.DateDiff, ops.DateSub), date_types, pd.Series)
 @execute_node.register(ops.DateSub, pd.Series, timedelta_types)
 @execute_node.register((ops.DateDiff, ops.DateSub), pd.Series, pd.Series)
 @execute_node.register(ops.DateDiff, date_types, date_types)
-@execute_node.register(ops.DateDiff, pd.Series, date_types)
 def execute_date_sub_diff(op, left, right, **kwargs):
     return left - right
+
+
+@execute_node.register((ops.DateDiff, ops.DateSub), date_types, pd.Series)
+def execute_date_sub_diff_date_series(op, left, right, **kwargs):
+    return pd.Timestamp(left, unit="D") - right
+
+
+@execute_node.register(ops.DateDiff, pd.Series, date_types)
+def execute_date_sub_diff_series_date(op, left, right, **kwargs):
+    return left - pd.Timestamp(right, unit="D")
 
 
 @execute_node.register(ops.DateAdd, pd.Series, timedelta_types)

@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import contextlib
 import os
 from pathlib import Path
 from typing import Callable
@@ -6,8 +9,12 @@ import pytest
 
 import ibis
 import ibis.expr.types as ir
-from ibis.backends.conftest import TEST_TABLES, read_tables
-from ibis.backends.tests.base import BackendTest, RoundHalfToEven, UnorderedComparator
+from ibis.backends.tests.base import (
+    RoundHalfToEven,
+    ServiceBackendTest,
+    ServiceSpec,
+    UnorderedComparator,
+)
 
 CLICKHOUSE_HOST = os.environ.get('IBIS_TEST_CLICKHOUSE_HOST', 'localhost')
 CLICKHOUSE_PORT = int(os.environ.get('IBIS_TEST_CLICKHOUSE_PORT', 9000))
@@ -16,14 +23,31 @@ CLICKHOUSE_PASS = os.environ.get('IBIS_TEST_CLICKHOUSE_PASSWORD', '')
 IBIS_TEST_CLICKHOUSE_DB = os.environ.get('IBIS_TEST_DATA_DB', 'ibis_testing')
 
 
-class TestConf(UnorderedComparator, BackendTest, RoundHalfToEven):
+class TestConf(UnorderedComparator, ServiceBackendTest, RoundHalfToEven):
     check_dtype = False
     supports_window_operations = False
     returned_timestamp_unit = 's'
     supported_to_timestamp_units = {'s'}
     supports_floating_modulus = False
-    bool_is_int = True
     supports_json = False
+
+    @property
+    def native_bool(self) -> bool:
+        [(value,)] = self.connection._client.execute("SELECT true")
+        return isinstance(value, bool)
+
+    @classmethod
+    def service_spec(cls, data_dir: Path) -> ServiceSpec:
+        files = [data_dir.joinpath("functional_alltypes.parquet")]
+        files.extend(
+            data_dir.joinpath("parquet", name, f"{name}.parquet")
+            for name in ("diamonds", "batting", "awards_players")
+        )
+        return ServiceSpec(
+            name=cls.name(),
+            data_volume="/var/lib/clickhouse/user_files/ibis",
+            files=files,
+        )
 
     @staticmethod
     def _load_data(
@@ -48,14 +72,15 @@ class TestConf(UnorderedComparator, BackendTest, RoundHalfToEven):
         clickhouse_driver = pytest.importorskip("clickhouse_driver")
 
         client = clickhouse_driver.Client(
-            host=host,
-            port=port,
-            user=user,
-            password=password,
+            host=host, port=port, user=user, password=password
         )
 
-        client.execute(f"DROP DATABASE IF EXISTS {database}")
-        client.execute(f"CREATE DATABASE {database} ENGINE = Atomic")
+        with contextlib.suppress(clickhouse_driver.errors.ServerException):
+            client.execute(f"CREATE DATABASE {database} ENGINE = Atomic")
+
+        client.execute("DROP DATABASE IF EXISTS tmptables")
+        client.execute("CREATE DATABASE tmptables ENGINE = Atomic")
+
         client.execute(f"USE {database}")
         client.execute("SET allow_experimental_object_type = 1")
         client.execute("SET output_format_json_named_tuples_as_objects = 1")
@@ -63,14 +88,6 @@ class TestConf(UnorderedComparator, BackendTest, RoundHalfToEven):
         with open(script_dir / 'schema' / 'clickhouse.sql') as schema:
             for stmt in filter(None, map(str.strip, schema.read().split(";"))):
                 client.execute(stmt)
-
-        for table, df in read_tables(TEST_TABLES, data_dir):
-            query = f"INSERT INTO {table} VALUES"
-            client.insert_dataframe(
-                query,
-                df.to_pandas(),
-                settings={"use_numpy": True},
-            )
 
     @staticmethod
     def connect(data_directory: Path):
@@ -127,10 +144,16 @@ def df(alltypes):
 
 @pytest.fixture
 def translate():
-    from ibis.backends.clickhouse.compiler import (
-        ClickhouseCompiler,
-        ClickhouseExprTranslator,
-    )
+    from ibis.backends.clickhouse.compiler.values import translate_val
 
-    context = ClickhouseCompiler.make_context()
-    return lambda expr: ClickhouseExprTranslator(expr, context).get_result()
+    def t(*args, **kwargs):
+        cache = kwargs.pop("cache", {})
+        # we don't care about table aliases for the purposes of testing
+        # individual function calls/expressions
+        res = translate_val(*args, aliases={}, cache=cache, **kwargs)
+        try:
+            return res.sql(dialect="clickhouse")
+        except AttributeError:
+            return res
+
+    return t

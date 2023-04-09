@@ -1,25 +1,39 @@
-import collections
-import numbers
+from __future__ import annotations
+
 import operator
+from functools import partial
+from typing import Any, Mapping
 
 import numpy as np
 import sqlalchemy as sa
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.sql.functions import GenericFunction
 
-import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-from ibis.backends.base.sql.alchemy import to_sqla_type, unary
+from ibis.backends.base.sql import alchemy
+from ibis.backends.base.sql.alchemy import unary
+from ibis.backends.base.sql.alchemy.datatypes import StructType
 from ibis.backends.base.sql.alchemy.registry import (
-    _geospatial_functions,
     _table_column,
+    array_filter,
+    array_map,
+    geospatial_functions,
     reduction,
 )
-from ibis.backends.postgres.registry import fixed_arity, operation_registry
+from ibis.backends.base.sql.alchemy.registry import (
+    _translate_case as _base_translate_case,
+)
+from ibis.backends.postgres.registry import (
+    _array_index,
+    _array_slice,
+    fixed_arity,
+    operation_registry,
+)
+from ibis.common.exceptions import UnsupportedOperationError
 
 operation_registry = {
     op: operation_registry[op]
-    # duckdb does not support geospatial operations, but shares most of the
-    # remaining postgres rules
-    for op in operation_registry.keys() - _geospatial_functions.keys()
+    for op in operation_registry.keys() - geospatial_functions.keys()
 }
 
 
@@ -39,113 +53,122 @@ _LOG_BASE_FUNCS = {
 }
 
 
-def _generic_log(arg, base):
-    return sa.func.ln(arg) / sa.func.ln(base)
+def _generic_log(arg, base, *, type_):
+    return sa.func.ln(arg, type_=type_) / sa.func.ln(base, type_=type_)
 
 
 def _log(t, op):
     arg, base = op.args
+    sqla_type = t.get_sqla_type(op.output_dtype)
     sa_arg = t.translate(arg)
     if base is not None:
         sa_base = t.translate(base)
         try:
             base_value = sa_base.value
         except AttributeError:
-            return _generic_log(sa_arg, sa_base)
+            return _generic_log(sa_arg, sa_base, type_=sqla_type)
         else:
             func = _LOG_BASE_FUNCS.get(base_value, _generic_log)
-            return func(sa_arg)
-    return sa.func.ln(sa_arg)
+            return func(sa_arg, type_=sqla_type)
+    return sa.func.ln(sa_arg, type_=sqla_type)
 
 
 def _timestamp_from_unix(t, op):
     arg, unit = op.args
     arg = t.translate(arg)
 
-    if unit in {"us", "ns"}:
-        raise ValueError(f"`{unit}` unit is not supported!")
-
     if unit == "ms":
         return sa.func.epoch_ms(arg)
     elif unit == "s":
         return sa.func.to_timestamp(arg)
+    else:
+        raise UnsupportedOperationError(f"{unit!r} unit is not supported!")
 
 
-def _literal(_, op):
+class struct_pack(GenericFunction):
+    def __init__(self, values: Mapping[str, Any], *, type: StructType) -> None:
+        super().__init__()
+        self.values = values
+        self.type = type
+
+
+@compiles(struct_pack, "duckdb")
+def compiles_struct_pack(element, compiler, **kw):
+    quote = compiler.preparer.quote
+    args = ", ".join(
+        "{key} := {value}".format(key=quote(key), value=compiler.process(value, **kw))
+        for key, value in element.values.items()
+    )
+    return f"struct_pack({args})"
+
+
+def _literal(t, op):
     dtype = op.output_dtype
-    sqla_type = to_sqla_type(dtype)
     value = op.value
 
-    if isinstance(dtype, dt.Interval):
-        return sa.text(f"INTERVAL '{value} {dtype.resolution}'")
-    elif isinstance(dtype, dt.Set) or (
-        isinstance(value, collections.abc.Sequence) and not isinstance(value, str)
-    ):
-        return sa.cast(sa.func.list_value(*value), sqla_type)
-    elif isinstance(value, np.ndarray):
-        return sa.cast(sa.func.list_value(*value.tolist()), sqla_type)
-    elif isinstance(value, (numbers.Real, np.floating)) and np.isnan(value):
-        return sa.cast(sa.literal("NaN"), sqla_type)
-    elif isinstance(value, collections.abc.Mapping):
-        if isinstance(dtype, dt.Struct):
-            placeholders = ", ".join(
-                f"{key} := :v{i}" for i, key in enumerate(value.keys())
-            )
-            text = sa.text(f"struct_pack({placeholders})")
-            bound_text = text.bindparams(
-                *(sa.bindparam(f"v{i:d}", val) for i, val in enumerate(value.values()))
-            )
-            name = op.name if isinstance(op, ops.Named) else "tmp"
-            params = {name: to_sqla_type(dtype)}
-            return bound_text.columns(**params).scalar_subquery()
+    if value is None:
+        return sa.null()
+
+    sqla_type = t.get_sqla_type(dtype)
+
+    if dtype.is_interval():
+        return sa.literal_column(f"INTERVAL '{value} {dtype.resolution}'")
+    elif dtype.is_set() or dtype.is_array():
+        values = value.tolist() if isinstance(value, np.ndarray) else value
+        return sa.cast(sa.func.list_value(*values), sqla_type)
+    elif dtype.is_floating():
+        if not np.isfinite(value):
+            if np.isnan(value):
+                value = "NaN"
+            else:
+                assert np.isinf(value), "value is neither finite, nan nor infinite"
+                prefix = "-" * (value < 0)
+                value = f"{prefix}Inf"
+        return sa.cast(sa.literal(value), sqla_type)
+    elif dtype.is_struct():
+        return struct_pack(
+            {
+                key: t.translate(ops.Literal(val, dtype=dtype[key]))
+                for key, val in value.items()
+            },
+            type=sqla_type,
+        )
+    elif dtype.is_string():
+        return sa.literal(value)
+    elif dtype.is_map():
         raise NotImplementedError(
             f"Ibis dtype `{dtype}` with mapping type "
             f"`{type(value).__name__}` isn't yet supported with the duckdb "
             "backend"
         )
-    return sa.cast(sa.literal(value), sqla_type)
+    else:
+        return sa.cast(sa.literal(value), sqla_type)
 
 
-def _array_column(t, op):
-    (arg,) = op.args
-    sqla_type = to_sqla_type(op.output_dtype)
-    return sa.cast(sa.func.list_value(*map(t.translate, arg.values)), sqla_type)
+def _neg_idx_to_pos(array, idx):
+    if_ = getattr(sa.func, "if")
+    arg_length = sa.func.array_length(array)
+    return if_(idx < 0, arg_length + sa.func.greatest(idx, -arg_length), idx)
 
 
-def _struct_field(t, op):
-    return sa.func.struct_extract(
-        t.translate(op.arg),
-        sa.text(repr(op.field)),
-        type_=to_sqla_type(op.output_dtype),
-    )
-
-
-def _regex_extract(t, op):
-    string, pattern, index = map(t.translate, op.args)
+def _regex_extract(string, pattern, index):
     result = sa.case(
-        [
-            (
-                sa.func.regexp_matches(string, pattern),
-                sa.func.regexp_extract(
-                    string,
-                    pattern,
-                    # DuckDB requires the index to be a constant so we compile
-                    # the value and inline it using sa.text
-                    sa.text(
-                        str(
-                            (index + 1).compile(compile_kwargs=dict(literal_binds=True))
-                        )
-                    ),
-                ),
-            )
-        ],
+        (
+            sa.func.regexp_matches(string, pattern),
+            sa.func.regexp_extract(
+                string,
+                pattern,
+                # DuckDB requires the index to be a constant so we compile
+                # the value and inline it using sa.text
+                sa.text(str(index.compile(compile_kwargs=dict(literal_binds=True)))),
+            ),
+        ),
         else_="",
     )
     return result
 
 
-def _json_get_item(t, op):
-    left, path = map(t.translate, op.args)
+def _json_get_item(left, path):
     # Workaround for https://github.com/duckdb/duckdb/issues/5063
     # In some situations duckdb silently does the wrong thing if
     # the path is parametrized.
@@ -156,21 +179,23 @@ def _json_get_item(t, op):
 def _strftime(t, op):
     format_str = op.format_str
     if not isinstance(format_str_op := format_str, ops.Literal):
-        raise TypeError(
-            "DuckDB format_str must be a literal `str`; " f"got {type(format_str)}"
+        raise UnsupportedOperationError(
+            f"DuckDB format_str must be a literal `str`; got {type(format_str)}"
         )
     return sa.func.strftime(t.translate(op.arg), sa.text(repr(format_str_op.value)))
 
 
 def _arbitrary(t, op):
     if (how := op.how) == "heavy":
-        raise ValueError(f"how={how!r} not supported in the DuckDB backend")
+        raise UnsupportedOperationError(
+            f"how={how!r} not supported in the DuckDB backend"
+        )
     return t._reduction(getattr(sa.func, how), op)
 
 
 def _string_agg(t, op):
     if not isinstance(op.sep, ops.Literal):
-        raise TypeError(
+        raise UnsupportedOperationError(
             "Separator argument to group_concat operation must be a constant"
         )
     agg = sa.func.string_agg(t.translate(op.arg), sa.text(repr(op.sep.value)))
@@ -180,20 +205,86 @@ def _string_agg(t, op):
 
 
 def _struct_column(t, op):
-    compile_kwargs = dict(literal_binds=True)
-    translated_pairs = (
-        (name, t.translate(value).compile(compile_kwargs=compile_kwargs))
-        for name, value in zip(op.names, op.values)
+    return struct_pack(
+        dict(zip(op.names, map(t.translate, op.values))),
+        type=t.get_sqla_type(op.output_dtype),
     )
-    return sa.func.struct_pack(
-        *(sa.text(f"{name} := {value}") for name, value in translated_pairs)
+
+
+def _simple_case(t, op):
+    return _translate_case(t, op, value=t.translate(op.base))
+
+
+def _searched_case(t, op):
+    return _translate_case(t, op, value=None)
+
+
+def _translate_case(t, op, *, value):
+    return sa.literal_column(
+        str(
+            _base_translate_case(t, op, value=value).compile(
+                dialect=sa.dialects.registry.load("duckdb")(),
+                compile_kwargs=dict(literal_binds=True),
+            )
+        ),
+        type_=t.get_sqla_type(op.output_dtype),
+    )
+
+
+@compiles(array_map, "duckdb")
+def compiles_list_apply(element, compiler, **kw):
+    *args, signature, result = map(partial(compiler.process, **kw), element.clauses)
+    return f"list_apply({', '.join(args)}, {signature} -> {result})"
+
+
+def _array_map(t, op):
+    return array_map(
+        t.translate(op.arg),
+        sa.literal_column(f"({op.parameter})"),
+        t.translate(op.result),
+    )
+
+
+@compiles(array_filter, "duckdb")
+def compiles_list_filter(element, compiler, **kw):
+    *args, signature, result = map(partial(compiler.process, **kw), element.clauses)
+    return f"list_filter({', '.join(args)}, {signature} -> {result})"
+
+
+def _array_filter(t, op):
+    return array_filter(
+        t.translate(op.arg),
+        sa.literal_column(f"({op.parameter})"),
+        t.translate(op.result),
     )
 
 
 operation_registry.update(
     {
-        ops.ArrayColumn: _array_column,
+        ops.ArrayColumn: (
+            lambda t, op: sa.cast(
+                sa.func.list_value(*map(t.translate, op.cols)),
+                t.get_sqla_type(op.output_dtype),
+            )
+        ),
         ops.ArrayConcat: fixed_arity(sa.func.array_concat, 2),
+        ops.ArrayRepeat: fixed_arity(
+            lambda arg, times: sa.func.flatten(
+                sa.func.array(
+                    sa.select(arg).select_from(sa.func.range(times)).scalar_subquery()
+                )
+            ),
+            2,
+        ),
+        ops.ArrayLength: unary(sa.func.array_length),
+        ops.ArraySlice: _array_slice(
+            index_converter=_neg_idx_to_pos,
+            array_length=sa.func.array_length,
+            func=sa.func.list_slice,
+        ),
+        ops.ArrayIndex: _array_index(
+            index_converter=_neg_idx_to_pos, func=sa.func.list_extract
+        ),
         ops.DayOfWeekName: unary(sa.func.dayname),
         ops.Literal: _literal,
         ops.Log2: unary(sa.func.log2),
@@ -203,24 +294,32 @@ operation_registry.update(
         # TODO: map operations, but DuckDB's maps are multimaps
         ops.Modulus: fixed_arity(operator.mod, 2),
         ops.Round: _round,
-        ops.StructField: _struct_field,
-        ops.TableColumn: _table_column,
-        ops.TimestampDiff: fixed_arity(sa.func.age, 2),
-        ops.TimestampFromUNIX: _timestamp_from_unix,
-        ops.Translate: fixed_arity(sa.func.replace, 3),
-        ops.TimestampNow: fixed_arity(sa.func.now, 0),
-        ops.RegexExtract: _regex_extract,
-        ops.RegexReplace: fixed_arity(sa.func.regexp_replace, 3),
-        ops.StringContains: fixed_arity(sa.func.contains, 2),
-        ops.CMSMedian: reduction(
-            lambda arg: sa.func.approx_quantile(arg, sa.text(str(0.5)))
+        ops.StructField: (
+            lambda t, op: sa.func.struct_extract(
+                t.translate(op.arg),
+                sa.text(repr(op.field)),
+                type_=t.get_sqla_type(op.output_dtype),
+            )
         ),
+        ops.TableColumn: _table_column,
+        ops.TimestampFromUNIX: _timestamp_from_unix,
+        ops.TimestampNow: fixed_arity(
+            # duckdb 0.6.0 changes now to be a tiemstamp with time zone force
+            # it back to the original for backwards compatibility
+            lambda *_: sa.cast(sa.func.now(), sa.TIMESTAMP),
+            0,
+        ),
+        ops.RegexExtract: fixed_arity(_regex_extract, 3),
+        ops.RegexReplace: fixed_arity(
+            lambda *args: sa.func.regexp_replace(*args, sa.text("'g'")), 3
+        ),
+        ops.RegexSearch: fixed_arity(lambda x, y: x.op("SIMILAR TO")(y), 2),
+        ops.StringContains: fixed_arity(sa.func.contains, 2),
         ops.ApproxMedian: reduction(
             # without inline text, duckdb fails with
-            # RuntimeError: INTERNAL Error: Invalid PhysicalType for GetTypeIdSize # noqa: E501
+            # RuntimeError: INTERNAL Error: Invalid PhysicalType for GetTypeIdSize
             lambda arg: sa.func.approx_quantile(arg, sa.text(str(0.5)))
         ),
-        ops.HLLCardinality: reduction(sa.func.approx_count_distinct),
         ops.ApproxCountDistinct: reduction(sa.func.approx_count_distinct),
         ops.Mode: reduction(sa.func.mode),
         ops.Strftime: _strftime,
@@ -230,23 +329,48 @@ operation_registry.update(
         ops.ArgMin: reduction(sa.func.min_by),
         ops.ArgMax: reduction(sa.func.max_by),
         ops.BitwiseXor: fixed_arity(sa.func.xor, 2),
-        ops.JSONGetItem: _json_get_item,
+        ops.JSONGetItem: fixed_arity(_json_get_item, 2),
+        ops.RowID: lambda *_: sa.literal_column('rowid'),
+        ops.StringToTimestamp: fixed_arity(sa.func.strptime, 2),
+        ops.Quantile: reduction(sa.func.quantile_cont),
+        ops.MultiQuantile: reduction(sa.func.quantile_cont),
+        ops.TypeOf: unary(sa.func.typeof),
+        ops.IntervalAdd: fixed_arity(operator.add, 2),
+        ops.IntervalSubtract: fixed_arity(operator.sub, 2),
+        ops.Capitalize: alchemy.sqlalchemy_operation_registry[ops.Capitalize],
+        ops.ArrayStringJoin: fixed_arity(
+            lambda sep, arr: sa.func.array_aggr(arr, sa.text("'string_agg'"), sep), 2
+        ),
+        ops.SearchedCase: _searched_case,
+        ops.SimpleCase: _simple_case,
+        ops.StartsWith: fixed_arity(sa.func.prefix, 2),
+        ops.EndsWith: fixed_arity(sa.func.suffix, 2),
+        ops.ArrayMap: _array_map,
+        ops.ArrayFilter: _array_filter,
+        ops.Argument: lambda _, op: sa.literal_column(op.name),
+        ops.Unnest: unary(sa.func.unnest),
     }
 )
 
-try:
-    import duckdb
-except ImportError:  # pragma: no cover
-    pass
-else:
-    from packaging.version import parse as vparse
 
-    # 0.3.2 has zero-based array indexing, 0.3.3 has one-based array indexing
-    #
-    # 0.3.2: we pass in the user's arguments unchanged
-    # 0.3.3: use the postgres implementation which is also one-based
-    if vparse(duckdb.__version__) < vparse("0.3.3"):  # pragma: no cover
-        operation_registry[ops.ArrayIndex] = fixed_arity("list_element", 2)
+_invalid_operations = {
+    # ibis.expr.operations.analytic
+    ops.CumulativeAll,
+    ops.CumulativeAny,
+    ops.CumulativeOp,
+    ops.NTile,
+    # ibis.expr.operations.strings
+    ops.Translate,
+    # ibis.expr.operations.maps
+    ops.MapGet,
+    ops.MapContains,
+    ops.MapKeys,
+    ops.MapValues,
+    ops.MapMerge,
+    ops.MapLength,
+    ops.Map,
+}
 
-    # don't export these
-    del duckdb, vparse  # pragma: no cover
+operation_registry = {
+    k: v for k, v in operation_registry.items() if k not in _invalid_operations
+}

@@ -26,30 +26,45 @@ _to_pyarrow_types = {
     dt.Boolean: pa.bool_(),
     dt.Timestamp: pa.timestamp('ns'),
     dt.Date: pa.date64(),
+    dt.JSON: pa.string(),
+    dt.Null: pa.null(),
+    # assume unknown types can be converted into strings
+    dt.Unknown: pa.string(),
 }
 
 
 @functools.singledispatch
-def to_pyarrow_type(dtype):
-    return _to_pyarrow_types[dtype.__class__]
+def to_pyarrow_type(dtype: dt.DataType):
+    arrow_type = _to_pyarrow_types.get(dtype.__class__)
+    if not arrow_type:
+        raise NotImplementedError(f'Unsupported type: {dtype!r}')
+    return arrow_type
 
 
 @to_pyarrow_type.register(dt.Array)
-def from_ibis_array(dtype):
-    return pa.list_(to_pyarrow_type(dtype.value_type))
-
-
 @to_pyarrow_type.register(dt.Set)
-def from_ibis_set(dtype):
+def from_ibis_collection(dtype: dt.Array | dt.Set):
     return pa.list_(to_pyarrow_type(dtype.value_type))
 
 
-@to_pyarrow_type.register(dt.Interval)
-def from_ibis_interval(dtype):
+@to_pyarrow_type.register
+def from_ibis_interval(dtype: dt.Interval):
     try:
         return pa.duration(dtype.unit)
     except ValueError:
         raise com.IbisTypeError(f"Unsupported interval unit: {dtype.unit}")
+
+
+@to_pyarrow_type.register
+def from_ibis_struct(dtype: dt.Struct):
+    return pa.struct(
+        pa.field(name, to_pyarrow_type(typ)) for name, typ in dtype.fields.items()
+    )
+
+
+@to_pyarrow_type.register
+def from_ibis_map(dtype: dt.Map):
+    return pa.map_(to_pyarrow_type(dtype.key_type), to_pyarrow_type(dtype.value_type))
 
 
 _to_ibis_dtypes = {
@@ -138,7 +153,3 @@ def ibis_to_pyarrow_struct(schema: sch.Schema) -> pa.StructType:
 
 def ibis_to_pyarrow_schema(schema: sch.Schema) -> pa.Schema:
     return pa.schema(_schema_to_pyarrow_schema_fields(schema))
-
-
-dt.DataType.to_pyarrow = to_pyarrow_type  # type: ignore
-sch.Schema.to_pyarrow = ibis_to_pyarrow_schema  # type: ignore

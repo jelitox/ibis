@@ -4,6 +4,8 @@ import pytest
 from pytest import param
 
 import ibis
+from ibis.common.exceptions import IbisTypeError
+from ibis.expr import datatypes as dt
 
 pyspark = pytest.importorskip("pyspark")
 
@@ -57,7 +59,7 @@ def test_aggregation_col(client):
 
 def test_aggregation(client):
     table = client.table('basic_table')
-    result = table.aggregate(table['id'].max()).compile()
+    result = table.aggregate(max=table['id'].max()).compile()
     expected = table.compile().agg(F.max('id').alias('max'))
 
     tm.assert_frame_equal(result.toPandas(), expected.toPandas())
@@ -65,7 +67,7 @@ def test_aggregation(client):
 
 def test_group_by(client):
     table = client.table('basic_table')
-    result = table.group_by('id').aggregate(table['id'].max()).compile()
+    result = table.group_by('id').aggregate(max=table['id'].max()).compile()
     expected = table.compile().groupby('id').agg(F.max('id').alias('max'))
 
     tm.assert_frame_equal(result.toPandas(), expected.toPandas())
@@ -211,3 +213,32 @@ def test_can_be_replaced_by_column_name(selection_fn, selection_idx, expected):
     selection_to_test = table.op().selections[selection_idx]
     result = _can_be_replaced_by_column_name(selection_to_test, table.op().table)
     assert result == expected
+
+
+def test_interval_columns(client):
+    table = client.table('interval_table')
+    assert table.schema() == ibis.schema(
+        pairs=[
+            ('interval_day', dt.Interval('D')),
+            ('interval_hour', dt.Interval('h')),
+            ('interval_minute', dt.Interval('m')),
+            ('interval_second', dt.Interval('s')),
+        ]
+    )
+
+    expected = pd.DataFrame(
+        {
+            "interval_day": [pd.Timedelta("10d")],
+            "interval_hour": [pd.Timedelta("10h")],
+            "interval_minute": [pd.Timedelta("10m")],
+            "interval_second": [pd.Timedelta("10s")],
+        }
+    )
+    tm.assert_frame_equal(table.execute(), expected)
+
+
+def test_interval_columns_invalid(client):
+    with pytest.raises(
+        IbisTypeError, match="DayTimeIntervalType couldn't be converted to Interval"
+    ):
+        client.table('invalid_interval_table')

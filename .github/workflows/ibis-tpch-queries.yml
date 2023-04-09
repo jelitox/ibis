@@ -1,15 +1,23 @@
-# vim: filetype=yaml
 name: TPC-H
 
 on:
   push:
+    paths-ignore:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "**/*.md"
     branches:
       - master
       - "*.x.x"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "**/*.md"
     branches:
       - master
       - "*.x.x"
+  merge_group:
 
 concurrency:
   group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
@@ -33,9 +41,7 @@ jobs:
         uses: actions/setup-python@v4
         id: install_python
         with:
-          python-version: "3.10"
-
-      - run: python -m pip install --upgrade pip 'coverage[toml]'
+          python-version: "3.11"
 
       - name: install tpc-queries dependencies
         working-directory: tpc-queries
@@ -48,20 +54,8 @@ jobs:
 
       - name: generate tpc-h data
         working-directory: tpc-queries
-        run: python -c "import duckdb; con = duckdb.connect('tpch.ddb'); con.execute('CALL dbgen(sf=0.1);')"
+        run: python -c "import duckdb; duckdb.connect('tpch.ddb').execute('CALL dbgen(sf=0.1)')"
 
       - name: run tpc-h queries
         working-directory: tpc-queries
-        run: coverage run --rcfile=../pyproject.toml ./runtpc -i ibis -i duckdb -d 'tpch.ddb' -b 'duckdb'
-
-      - name: generate coverage report
-        working-directory: tpc-queries
-        run: coverage xml --rcfile=../pyproject.toml -o ./junit.xml
-
-      - name: upload code coverage
-        if: success()
-        uses: codecov/codecov-action@v3
-        with:
-          files: ./tpc-queries/junit.xml
-          fail_ci_if_error: true
-          flags: tpc,tpch,duckdb,${{ runner.os }},python-${{ steps.install_python.outputs.python-version }}
+        run: ./runtpc -i ibis -i duckdb -d 'tpch.ddb' -b 'duckdb'

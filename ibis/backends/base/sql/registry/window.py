@@ -1,12 +1,9 @@
-from operator import add, mul, sub
-from typing import Optional, Union
+from __future__ import annotations
 
-import ibis
 import ibis.common.exceptions as com
-import ibis.expr.analysis as L
+import ibis.expr.analysis as an
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-import ibis.expr.types as ir
 
 _map_interval_to_microseconds = {
     'W': 604800000000,
@@ -16,18 +13,6 @@ _map_interval_to_microseconds = {
     's': 1000000,
     'ms': 1000,
     'us': 1,
-    'ns': 0.001,
-}
-
-
-_map_interval_op_to_op = {
-    # Literal Intervals have two args, i.e.
-    # Literal(1, Interval(value_type=int8, unit='D', nullable=True))
-    # Parse both args and multipy 1 * _map_interval_to_microseconds['D']
-    ops.Literal: mul,
-    ops.IntervalMultiply: mul,
-    ops.IntervalAdd: add,
-    ops.IntervalSubtract: sub,
 }
 
 
@@ -41,234 +26,140 @@ _cumulative_to_reduction = {
 }
 
 
-def _replace_interval_with_scalar(expr: Union[ir.Expr, dt.Interval, float]):
-    """Good old Depth-First Search to identify the Interval and IntervalValue
-    components of the expression and return a comparable scalar expression.
-
-    Parameters
-    ----------
-    expr : float or expression of intervals
-        For example, ``ibis.interval(days=1) + ibis.interval(hours=5)``
-
-    Returns
-    -------
-    preceding : float or ir.FloatingScalar, depending upon the expr
-    """
-    if isinstance(expr, ir.Expr):
-        expr_op = expr.op()
-    else:
-        expr_op = None
-
-    if not isinstance(expr, (dt.Interval, ir.IntervalValue)):
-        # Literal expressions have op method but native types do not.
-        if isinstance(expr_op, ops.Literal):
-            return expr_op.value
-        else:
-            return expr
-    elif isinstance(expr, dt.Interval):
-        try:
-            microseconds = _map_interval_to_microseconds[expr.unit]
-            return microseconds
-        except KeyError:
-            raise ValueError(
-                "Expected preceding values of week(), "
-                + "day(), hour(), minute(), second(), millisecond(), "
-                + f"microseconds(), nanoseconds(); got {expr}"
-            )
-    elif expr_op.args and isinstance(expr, ir.IntervalValue):
-        if len(expr_op.args) > 2:
-            raise NotImplementedError("'preceding' argument cannot be parsed.")
-        left_arg = _replace_interval_with_scalar(expr_op.args[0])
-        right_arg = _replace_interval_with_scalar(expr_op.args[1])
-        method = _map_interval_op_to_op[type(expr_op)]
-        return method(left_arg, right_arg)
-    else:
-        raise TypeError(f'expr has unknown type {type(expr).__name__}')
-
-
-def cumulative_to_window(translator, op, window):
-    klass = _cumulative_to_reduction[type(op)]
-    new_op = klass(*op.args)
+def cumulative_to_window(translator, func, frame):
+    klass = _cumulative_to_reduction[type(func)]
+    func = klass(*func.args)
 
     try:
-        rule = translator._rewrites[type(new_op)]
+        rule = translator._rewrites[type(func)]
     except KeyError:
         pass
     else:
-        new_op = rule(new_op)
+        func = rule(func)
 
-    win = ibis.cumulative_window().group_by(window._group_by).order_by(window._order_by)
-    new_expr = L.windowize_function(new_op.to_expr(), win)
-    return new_expr.op()
+    frame = frame.copy(start=None, end=0)
+    expr = an.windowize_function(func.to_expr(), frame)
+    return expr.op()
 
 
-def time_range_to_range_window(_, window):
-    # Check that ORDER BY column is a single time column:
-    order_by_vars = [x.op().args[0] for x in window._order_by]
-    if len(order_by_vars) > 1:
+def interval_boundary_to_integer(boundary):
+    if boundary is None:
+        return None
+    elif boundary.output_dtype.is_numeric():
+        return boundary
+
+    value = boundary.value
+    try:
+        multiplier = _map_interval_to_microseconds[value.output_dtype.unit]
+    except KeyError:
         raise com.IbisInputError(
-            f"Expected 1 order-by variable, got {len(order_by_vars)}"
+            f"Unsupported interval unit: {value.output_dtype.unit}"
         )
 
-    order_var = window._order_by[0].op().args[0]
-    timestamp_order_var = order_var.cast('int64')
-    window = window._replace(order_by=timestamp_order_var, how='range')
+    if isinstance(value, ops.Literal):
+        value = ops.Literal(value.value * multiplier, dt.int64)
+    else:
+        left = ops.Cast(value, to=dt.int64)
+        value = ops.Multiply(left, multiplier)
 
-    # Need to change preceding interval expression to scalars
-    preceding = window.preceding
-    if isinstance(preceding, ir.IntervalScalar):
-        new_preceding = _replace_interval_with_scalar(preceding)
-        window = window._replace(preceding=new_preceding)
-
-    return window
+    return boundary.copy(value=value)
 
 
-def format_window(translator, op, window):
+def time_range_to_range_window(frame):
+    # Check that ORDER BY column is a single time column:
+    if len(frame.order_by) > 1:
+        raise com.IbisInputError(
+            f"Expected 1 order-by variable, got {len(frame.order_by)}"
+        )
+
+    order_by = frame.order_by[0]
+    order_by = order_by.copy(expr=ops.Cast(order_by.expr, dt.int64))
+    start = interval_boundary_to_integer(frame.start)
+    end = interval_boundary_to_integer(frame.end)
+
+    return frame.copy(order_by=(order_by,), start=start, end=end)
+
+
+def format_window_boundary(translator, boundary):
+    if isinstance(boundary.value, ops.Literal) and boundary.value.value == 0:
+        return "CURRENT ROW"
+
+    value = translator.translate(boundary.value)
+    direction = "PRECEDING" if boundary.preceding else "FOLLOWING"
+
+    return f'{value} {direction}'
+
+
+def format_window_frame(translator, func, frame):
     components = []
 
-    if window.max_lookback is not None:
-        raise NotImplementedError(
-            'Rows with max lookback is not implemented ' 'for Impala-based backends.'
-        )
-
-    if window._group_by:
-        partition_args = ', '.join(map(translator.translate, window._group_by))
+    if frame.group_by:
+        partition_args = ', '.join(map(translator.translate, frame.group_by))
         components.append(f'PARTITION BY {partition_args}')
 
-    if window._order_by:
-        order_args = ', '.join(map(translator.translate, window._order_by))
+    if frame.order_by:
+        order_args = ', '.join(map(translator.translate, frame.order_by))
         components.append(f'ORDER BY {order_args}')
 
-    p, f = window.preceding, window.following
-
-    def _prec(p: Optional[int]) -> str:
-        assert p is None or p >= 0
-
-        if p is None:
-            prefix = 'UNBOUNDED'
-        else:
-            if not p:
-                return 'CURRENT ROW'
-            prefix = str(p)
-        return f'{prefix} PRECEDING'
-
-    def _foll(f: Optional[int]) -> str:
-        assert f is None or f >= 0
-
-        if f is None:
-            prefix = 'UNBOUNDED'
-        else:
-            if not f:
-                return 'CURRENT ROW'
-            prefix = str(f)
-
-        return f'{prefix} FOLLOWING'
-
-    frame_clause_not_allowed = (
-        ops.Lag,
-        ops.Lead,
-        ops.DenseRank,
-        ops.MinRank,
-        ops.NTile,
-        ops.PercentRank,
-        ops.CumeDist,
-        ops.RowNumber,
-    )
-
-    if isinstance(op.expr, frame_clause_not_allowed):
-        frame = None
-    elif p is not None and f is not None:
-        frame = f'{window.how.upper()} BETWEEN {_prec(p)} AND {_foll(f)}'
-
-    elif p is not None:
-        if isinstance(p, tuple):
-            start, end = p
-            frame = '{} BETWEEN {} AND {}'.format(
-                window.how.upper(), _prec(start), _prec(end)
-            )
-        else:
-            kind = 'ROWS' if p > 0 else 'RANGE'
-            frame = f'{kind} BETWEEN {_prec(p)} AND UNBOUNDED FOLLOWING'
-    elif f is not None:
-        if isinstance(f, tuple):
-            start, end = f
-            frame = '{} BETWEEN {} AND {}'.format(
-                window.how.upper(), _foll(start), _foll(end)
-            )
-        else:
-            kind = 'ROWS' if f > 0 else 'RANGE'
-            frame = f'{kind} BETWEEN UNBOUNDED PRECEDING AND {_foll(f)}'
-    else:
+    if frame.start is None and frame.end is None:
         # no-op, default is full sample
-        frame = None
+        pass
+    elif not isinstance(func, translator._forbids_frame_clause):
+        if frame.start is None:
+            start = 'UNBOUNDED PRECEDING'
+        else:
+            start = format_window_boundary(translator, frame.start)
 
-    if frame is not None:
+        if frame.end is None:
+            end = 'UNBOUNDED FOLLOWING'
+        else:
+            end = format_window_boundary(translator, frame.end)
+
+        frame = f'{frame.how.upper()} BETWEEN {start} AND {end}'
         components.append(frame)
 
     return 'OVER ({})'.format(' '.join(components))
 
 
-_subtract_one = '({} - 1)'.format
-
-
-_expr_transforms = {
-    ops.RowNumber: _subtract_one,
-    ops.DenseRank: _subtract_one,
-    ops.MinRank: _subtract_one,
-    ops.NTile: _subtract_one,
-}
-
-
 def window(translator, op):
-    arg, window = op.args
-
-    _require_order_by = (
-        ops.Lag,
-        ops.Lead,
-        ops.DenseRank,
-        ops.MinRank,
-        ops.FirstValue,
-        ops.LastValue,
-        ops.PercentRank,
-        ops.CumeDist,
-        ops.NTile,
-    )
-
     _unsupported_reductions = (
         ops.ApproxMedian,
         ops.GroupConcat,
         ops.ApproxCountDistinct,
     )
 
-    if isinstance(arg, _unsupported_reductions):
+    if isinstance(op.func, _unsupported_reductions):
         raise com.UnsupportedOperationError(
-            f'{type(arg)} is not supported in window functions'
+            f'{type(op.func)} is not supported in window functions'
         )
 
-    if isinstance(arg, ops.CumulativeOp):
-        arg = cumulative_to_window(translator, arg, window)
+    if isinstance(op.func, ops.CumulativeOp):
+        arg = cumulative_to_window(translator, op.func, op.frame)
         return translator.translate(arg)
 
     # Some analytic functions need to have the expression of interest in
     # the ORDER BY part of the window clause
-    if isinstance(arg, _require_order_by) and not window._order_by:
-        window = window.order_by(arg.args[0])
+    frame = op.frame
+    if isinstance(op.func, translator._require_order_by) and not frame.order_by:
+        frame = frame.copy(order_by=(op.func.arg,))
 
     # Time ranges need to be converted to microseconds.
-    # FIXME(kszucs): avoid the expression roundtrip
-    if window.how == 'range':
-        order_by_types = [type(x.op().args[0]) for x in window._order_by]
-        time_range_types = (ir.TimeColumn, ir.DateColumn, ir.TimestampColumn)
-        if any(col_type in time_range_types for col_type in order_by_types):
-            window = time_range_to_range_window(translator, window)
+    if isinstance(frame, ops.RangeWindowFrame):
+        if any(c.output_dtype.is_temporal() for c in frame.order_by):
+            frame = time_range_to_range_window(frame)
+    elif isinstance(frame, ops.RowsWindowFrame):
+        if frame.max_lookback is not None:
+            raise NotImplementedError(
+                'Rows with max lookback is not implemented for SQL-based backends.'
+            )
 
-    window_formatted = format_window(translator, op, window)
+    window_formatted = format_window_frame(translator, op.func, frame)
 
-    arg_formatted = translator.translate(arg)
+    arg_formatted = translator.translate(op.func)
     result = f'{arg_formatted} {window_formatted}'
 
-    if type(arg) in _expr_transforms:
-        return _expr_transforms[type(arg)](result)
+    if isinstance(op.func, ops.RankBase):
+        return f'({result} - 1)'
     else:
         return result
 

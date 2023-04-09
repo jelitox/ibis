@@ -1,7 +1,8 @@
 """Constants for the pandas backend."""
 
+from __future__ import annotations
+
 import operator
-from typing import Dict, Type, Union
 
 import numpy as np
 import pandas as pd
@@ -27,7 +28,7 @@ ALTERNATE_SUFFIXES = {
 }
 
 
-IBIS_TYPE_TO_PANDAS_TYPE: Dict[dt.DataType, Union[Type, str]] = {
+IBIS_TYPE_TO_PANDAS_TYPE: dict[dt.DataType, type | str] = {
     dt.float16: np.float16,
     dt.float32: np.float32,
     dt.float64: np.float64,
@@ -40,7 +41,6 @@ IBIS_TYPE_TO_PANDAS_TYPE: Dict[dt.DataType, Union[Type, str]] = {
     dt.string: str,
     dt.timestamp: 'datetime64[ns]',
     dt.boolean: np.bool_,
-    dt.category: 'category',
     dt.json: str,
 }
 
@@ -76,4 +76,9 @@ BINARY_OPERATIONS = {
     ops.Modulus: operator.mod,
     ops.Power: operator.pow,
     ops.IdenticalTo: lambda x, y: (x == y) | (pd.isnull(x) & pd.isnull(y)),
+    ops.BitwiseXor: lambda x, y: np.bitwise_xor(x, y),
+    ops.BitwiseOr: lambda x, y: np.bitwise_or(x, y),
+    ops.BitwiseAnd: lambda x, y: np.bitwise_and(x, y),
+    ops.BitwiseLeftShift: lambda x, y: np.left_shift(x, y),
+    ops.BitwiseRightShift: lambda x, y: np.right_shift(x, y),
 }

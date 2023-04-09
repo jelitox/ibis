@@ -1,14 +1,19 @@
+from __future__ import annotations
+
+import functools
 import itertools
+import operator
 
 import dask.dataframe as dd
 import dask.dataframe.groupby as ddgb
 import numpy as np
-import pandas
+import pandas as pd
 import toolz
 from pandas import isnull
 
 import ibis
 import ibis.expr.operations as ops
+from ibis.backends.dask.core import execute
 from ibis.backends.dask.dispatch import execute_node
 from ibis.backends.dask.execution.util import (
     TypeRegistrationDict,
@@ -19,7 +24,6 @@ from ibis.backends.pandas.core import integer_types, scalar_types
 from ibis.backends.pandas.execution.strings import (
     execute_json_getitem_series_series,
     execute_json_getitem_series_str_int,
-    execute_series_join_scalar_sep,
     execute_series_regex_extract,
     execute_series_regex_replace,
     execute_series_regex_search,
@@ -160,9 +164,6 @@ DASK_DISPATCH_TYPES: TypeRegistrationDict = {
         ((dd.Series, str, str), execute_series_translate_scalar_scalar),
     ],
     ops.StrRight: [((dd.Series, integer_types), execute_series_right)],
-    ops.StringJoin: [
-        (((dd.Series, str), list), execute_series_join_scalar_sep),
-    ],
     ops.JSONGetItem: [
         ((dd.Series, (str, int)), execute_json_getitem_series_str_int),
         ((dd.Series, dd.Series), execute_json_getitem_series_series),
@@ -195,7 +196,10 @@ def execute_substring_series_series(op, data, start, length, **kwargs):
     end = start + length
 
     # TODO - this is broken
-    def iterate(value, start_iter=start.items(), end_iter=end.items()):
+    start_iter = start.items()
+    end_iter = end.items()
+
+    def iterate(value, start_iter=start_iter, end_iter=end_iter):
         _, begin = next(start_iter)
         _, end = next(end_iter)
         if (begin is not None and isnull(begin)) or (end is not None and isnull(end)):
@@ -203,6 +207,12 @@ def execute_substring_series_series(op, data, start, length, **kwargs):
         return value[begin:end]
 
     return data.map(iterate)
+
+
+@execute_node.register(ops.StringConcat, tuple)
+def execute_node_string_concat(op, values, **kwargs):
+    values = [execute(arg, **kwargs) for arg in values]
+    return functools.reduce(operator.add, values)
 
 
 @execute_node.register(ops.StringSQLLike, ddgb.SeriesGroupBy, str, str)
@@ -249,7 +259,7 @@ def execute_group_concat_series_gb_mask(op, data, sep, mask, aggcontext=None, **
 
 @execute_node.register(ops.StringAscii, dd.Series)
 def execute_string_ascii(op, data, **kwargs):
-    output_meta = pandas.Series([], dtype=np.dtype('int32'), name=data.name)
+    output_meta = pd.Series([], dtype=np.dtype('int32'), name=data.name)
     return data.map(ord, meta=output_meta)
 
 
@@ -289,16 +299,23 @@ def execute_series_right_gb(op, data, nchars, **kwargs):
     return execute_series_right(op, make_selected_obj(data), nchars).groupby(data.index)
 
 
+@execute_node.register(ops.StringJoin, (dd.Series, str), tuple)
+def execute_series_join_scalar_sep(op, sep, args, **kwargs):
+    data = [execute(arg, **kwargs) for arg in args]
+    return functools.reduce(lambda x, y: x + sep + y, data)
+
+
 def haystack_to_dask_series_of_lists(haystack, index=None):
     pieces = haystack_to_series_of_lists(haystack, index)
     return dd.from_pandas(pieces, npartitions=1)
 
 
-@execute_node.register(ops.FindInSet, dd.Series, list)
+@execute_node.register(ops.FindInSet, dd.Series, tuple)
 def execute_series_find_in_set(op, needle, haystack, **kwargs):
     def find_in_set(index, elements):
         return ibis.util.safe_index(elements, index)
 
+    haystack = [execute(arg, **kwargs) for arg in haystack]
     return needle.apply(find_in_set, args=(haystack,))
 
 

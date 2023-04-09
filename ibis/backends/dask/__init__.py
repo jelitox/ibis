@@ -9,16 +9,17 @@ from dask.base import DaskMethodsMixin
 
 # import the pandas execution module to register dispatched implementations of
 # execute_node that the dask backend will later override
-import ibis.backends.pandas.execution  # noqa: F401
+import ibis.backends.pandas.execution
 import ibis.config
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis.backends.dask.client import DaskDatabase, DaskTable, ibis_schema_to_dask
 from ibis.backends.dask.core import execute_and_reset
 from ibis.backends.pandas import BasePandasBackend
+from ibis.backends.pandas.core import _apply_schema
 
 # Make sure that the pandas backend options have been loaded
-ibis.pandas
+ibis.pandas  # noqa: B018
 
 
 class Backend(BasePandasBackend):
@@ -29,14 +30,14 @@ class Backend(BasePandasBackend):
 
     def do_connect(
         self,
-        dictionary: MutableMapping[str, dd.DataFrame],
+        dictionary: MutableMapping[str, dd.DataFrame] | None = None,
     ) -> None:
         """Construct a Dask backend client from a dictionary of data sources.
 
         Parameters
         ----------
         dictionary
-            Mapping from `str` table names to Dask DataFrames.
+            An optional mapping from `str` table names to Dask DataFrames.
 
         Examples
         --------
@@ -50,6 +51,9 @@ class Backend(BasePandasBackend):
         """
         # register dispatchers
         from ibis.backends.dask import udf  # noqa: F401
+
+        if dictionary is None:
+            dictionary = {}
 
         for k, v in dictionary.items():
             if not isinstance(v, (dd.DataFrame, pd.DataFrame)):
@@ -83,30 +87,29 @@ class Backend(BasePandasBackend):
                 )
             )
 
-        result = self.compile(query, params, **kwargs)
-        if isinstance(result, DaskMethodsMixin):
-            return result.compute()
+        compiled = self.compile(query, params, **kwargs)
+        if isinstance(compiled, DaskMethodsMixin):
+            result = compiled.compute()
         else:
-            return result
+            result = compiled
+        return _apply_schema(query.op(), result)
 
     def compile(
         self, query: ir.Expr, params: Mapping[ir.Expr, object] = None, **kwargs
     ):
         """Compile `expr`.
 
-        Notes
-        -----
-        For the dask backend returns a dask graph that you can run ``.compute``
-        on to get a pandas object.
+        Returns
+        -------
+        dask.dataframe.core.DataFrame | dask.dataframe.core.Series | das.dataframe.core.Scalar
+            Dask graph.
         """
-        node = query.op()
+        params = {
+            k.op() if isinstance(k, ir.Expr) else k: v
+            for k, v in ({} if params is None else params).items()
+        }
 
-        if params is None:
-            params = {}
-        else:
-            params = {k.op() if hasattr(k, 'op') else k: v for k, v in params.items()}
-
-        return execute_and_reset(node, params=params, **kwargs)
+        return execute_and_reset(query.op(), params=params, **kwargs)
 
     @classmethod
     def _supports_conversion(cls, obj: Any) -> bool:
@@ -124,11 +127,5 @@ class Backend(BasePandasBackend):
     def _convert_object(cls, obj: dd.DataFrame) -> dd.DataFrame:
         return obj
 
-    def create_table(
-        self,
-        table_name: str,
-        obj: dd.DataFrame | None = None,
-        schema: sch.Schema | None = None,
-    ):
-        """Create a table."""
-        super().create_table(table_name, obj=obj, schema=schema)
+    def _load_into_cache(self, name, expr):
+        self.create_table(name, self.compile(expr).persist())

@@ -3,10 +3,13 @@ import functools
 import inspect
 import itertools
 import string
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
+import sqlalchemy as sa
 from packaging.version import parse as vparse
 
 import ibis
@@ -151,8 +154,6 @@ def test_builtins(benchmark, expr_fn, builtin, t, base, large_expr):
 
 
 _backends = set(_get_backend_names())
-# spark is a duplicate of pyspark
-_backends.remove("spark")
 # compile is a no-op
 _backends.remove("pandas")
 
@@ -188,7 +189,10 @@ def test_compile(benchmark, module, expr_fn, t, base, large_expr):
         pytest.skip(str(e))
     else:
         expr = expr_fn(t, base, large_expr)
-        benchmark(mod.compile, expr)
+        try:
+            benchmark(mod.compile, expr)
+        except sa.exc.NoSuchModuleError as e:
+            pytest.skip(str(e))
 
 
 @pytest.fixture(scope="module")
@@ -530,9 +534,7 @@ def test_op_args(benchmark):
 def test_complex_datatype_parse(benchmark):
     type_str = "array<struct<a: array<string>, b: map<string, array<int64>>>>"
     expected = dt.Array(
-        dt.Struct.from_dict(
-            dict(a=dt.Array(dt.string), b=dt.Map(dt.string, dt.Array(dt.int64)))
-        )
+        dt.Struct(dict(a=dt.Array(dt.string), b=dt.Map(dt.string, dt.Array(dt.int64))))
     )
     assert dt.parse(type_str) == expected
     benchmark(dt.parse, type_str)
@@ -542,9 +544,7 @@ def test_complex_datatype_parse(benchmark):
 @pytest.mark.parametrize("func", [str, hash])
 def test_complex_datatype_builtins(benchmark, func):
     datatype = dt.Array(
-        dt.Struct.from_dict(
-            dict(a=dt.Array(dt.string), b=dt.Map(dt.string, dt.Array(dt.int64)))
-        )
+        dt.Struct(dict(a=dt.Array(dt.string), b=dt.Map(dt.string, dt.Array(dt.int64))))
     )
     benchmark(func, datatype)
 
@@ -570,7 +570,7 @@ def test_large_expr_equals(benchmark, tpc_h02):
         ),
         pytest.param(
             dt.Array(
-                dt.Struct.from_dict(
+                dt.Struct(
                     dict(
                         a=dt.Array(dt.string),
                         b=dt.Map(dt.string, dt.Array(dt.int64)),
@@ -602,3 +602,123 @@ def test_multiple_joins(benchmark, num_joins, num_columns):
         name="t",
     )
     benchmark(multiple_joins, table, num_joins)
+
+
+@pytest.fixture
+def customers():
+    return ibis.table(
+        dict(
+            customerid="int32",
+            name="string",
+            address="string",
+            citystatezip="string",
+            birthdate="date",
+            phone="string",
+            timezone="string",
+            lat="float64",
+            long="float64",
+        ),
+        name="customers",
+    )
+
+
+@pytest.fixture
+def orders():
+    return ibis.table(
+        dict(
+            orderid="int32",
+            customerid="int32",
+            ordered="timestamp",
+            shipped="timestamp",
+            items="string",
+            total="float64",
+        ),
+        name="orders",
+    )
+
+
+@pytest.fixture
+def orders_items():
+    return ibis.table(
+        dict(orderid="int32", sku="string", qty="int32", unit_price="float64"),
+        name="orders_items",
+    )
+
+
+@pytest.fixture
+def products():
+    return ibis.table(
+        dict(
+            sku="string",
+            desc="string",
+            weight_kg="float64",
+            cost="float64",
+            dims_cm="string",
+        ),
+        name="products",
+    )
+
+
+@pytest.mark.benchmark(group="compilation")
+@pytest.mark.parametrize(
+    "module",
+    [
+        pytest.param(
+            mod,
+            marks=pytest.mark.xfail(
+                condition=mod in _XFAIL_COMPILE_BACKENDS,
+                reason=f"{mod} backend doesn't support compiling UnboundTable",
+            ),
+        )
+        for mod in _backends
+    ],
+)
+def test_compile_with_drops(
+    benchmark, module, customers, orders, orders_items, products
+):
+    expr = (
+        customers.join(orders, "customerid")
+        .join(orders_items, "orderid")
+        .join(products, "sku")
+        .drop("customerid", "qty", "total", "items")
+        .drop("dims_cm", "cost")
+        .mutate(o_date=lambda t: t.shipped.date())
+        .filter(lambda t: t.ordered == t.shipped)
+    )
+
+    try:
+        mod = getattr(ibis, module)
+    except (AttributeError, ImportError) as e:
+        pytest.skip(str(e))
+    else:
+        try:
+            benchmark(mod.compile, expr)
+        except sa.exc.NoSuchModuleError as e:
+            pytest.skip(str(e))
+
+
+def test_repr_join(benchmark, customers, orders, orders_items, products):
+    expr = (
+        customers.join(orders, "customerid")
+        .join(orders_items, "orderid")
+        .join(products, "sku")
+        .drop("customerid", "qty", "total", "items")
+    )
+    op = expr.op()
+    benchmark(repr, op)
+
+
+@pytest.mark.parametrize("overwrite", [True, False], ids=["overwrite", "no_overwrite"])
+def test_insert_duckdb(benchmark, overwrite):
+    pytest.importorskip("duckdb")
+    pytest.importorskip("duckdb_engine")
+
+    n_rows = int(1e4)
+    table_name = "t"
+    schema = ibis.schema(dict(a="int64", b="int64", c="int64"))
+    t = ibis.memtable(dict.fromkeys(list("abc"), range(n_rows)), schema=schema)
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        con = ibis.duckdb.connect(Path(d, "test_insert.ddb"))
+        con.create_table(table_name, schema=schema)
+        benchmark(con.insert, table_name, t, overwrite=overwrite)

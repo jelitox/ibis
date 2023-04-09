@@ -1,9 +1,11 @@
+from __future__ import annotations
+
 from public import public
 
 import ibis.expr.datatypes as dt
 import ibis.expr.rules as rlz
 from ibis.common.annotations import attribute
-from ibis.expr.operations.core import Unary, Value, Variadic
+from ibis.expr.operations.core import Unary, Value
 
 
 @public
@@ -117,7 +119,7 @@ class RPad(Value):
 @public
 class FindInSet(Value):
     needle = rlz.string
-    values = rlz.nodes_of(rlz.string, min_length=1)
+    values = rlz.tuple_of(rlz.string, min_length=1)
 
     output_shape = rlz.shape_like("needle")
     output_dtype = dt.int64
@@ -126,13 +128,22 @@ class FindInSet(Value):
 @public
 class StringJoin(Value):
     sep = rlz.string
-    arg = rlz.nodes_of(rlz.string, min_length=1)
+    arg = rlz.tuple_of(rlz.string, min_length=1)
 
     output_dtype = dt.string
 
     @attribute.default
     def output_shape(self):
-        return rlz.highest_precedence_shape(self.arg.values)
+        return rlz.highest_precedence_shape(self.arg)
+
+
+@public
+class ArrayStringJoin(Value):
+    sep = rlz.string
+    arg = rlz.value(dt.Array(dt.string))
+
+    output_dtype = dt.string
+    output_shape = rlz.shape_like("args")
 
 
 @public
@@ -216,29 +227,58 @@ class StringSplit(Value):
 
 
 @public
-class StringConcat(Variadic):
-    arg = rlz.variadic(rlz.string)
+class StringConcat(Value):
+    arg = rlz.tuple_of(rlz.string)
+    output_shape = rlz.shape_like('arg')
+    output_dtype = rlz.dtype_like('arg')
 
 
 @public
-class ParseURL(Value):
+class ExtractURLField(Value):
     arg = rlz.string
-    extract = rlz.isin(
-        {
-            'PROTOCOL',
-            'HOST',
-            'PATH',
-            'REF',
-            'AUTHORITY',
-            'FILE',
-            'USERINFO',
-            'QUERY',
-        }
-    )
-    key = rlz.optional(rlz.string)
 
     output_shape = rlz.shape_like("arg")
     output_dtype = dt.string
+
+
+@public
+class ExtractProtocol(ExtractURLField):
+    pass
+
+
+@public
+class ExtractAuthority(ExtractURLField):
+    pass
+
+
+@public
+class ExtractUserInfo(ExtractURLField):
+    pass
+
+
+@public
+class ExtractHost(ExtractURLField):
+    pass
+
+
+@public
+class ExtractFile(ExtractURLField):
+    pass
+
+
+@public
+class ExtractPath(ExtractURLField):
+    pass
+
+
+@public
+class ExtractQuery(ExtractURLField):
+    key = rlz.optional(rlz.string)
+
+
+@public
+class ExtractFragment(ExtractURLField):
+    pass
 
 
 @public

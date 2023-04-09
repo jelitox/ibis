@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import collections
 import decimal
 import functools
@@ -6,6 +8,7 @@ import numbers
 import dask.dataframe as dd
 import dask.dataframe.groupby as ddgb
 import numpy as np
+import pandas as pd
 
 import ibis.expr.operations as ops
 from ibis.backends.dask.dispatch import execute_node
@@ -36,7 +39,11 @@ def call_numpy_ufunc(func, op, data, **kwargs):
 
 @execute_node.register(ops.Unary, dd.Series)
 def execute_series_unary_op(op, data, **kwargs):
-    function = getattr(np, type(op).__name__.lower())
+    op_type = type(op)
+    if op_type == ops.BitwiseNot:
+        function = np.bitwise_not
+    else:
+        function = getattr(np, op_type.__name__.lower())
     return call_numpy_ufunc(function, op, data, **kwargs)
 
 
@@ -57,7 +64,7 @@ def execute_series_atan(_, data, **kwargs):
 
 @execute_node.register(ops.Cot, dd.Series)
 def execute_series_cot(_, data, **kwargs):
-    return np.cos(data) / np.sin(data)
+    return 1.0 / np.tan(data)
 
 
 @execute_node.register(ops.Atan2, dd.Series, dd.Series)
@@ -78,12 +85,13 @@ def vectorize_object(op, arg, *args, **kwargs):
     # TODO - this works for now, but I think we can do something much better
     func = np.vectorize(functools.partial(execute_node, op, **kwargs))
     out = dd.from_array(func(arg, *args), columns=arg.name)
-    out.index = arg.index
     return out
 
 
 @execute_node.register(
-    ops.Log, dd.Series, (dd.Series, numbers.Real, decimal.Decimal, type(None))
+    ops.Log,
+    dd.Series,
+    (dd.Series, pd.Series, numbers.Real, decimal.Decimal, type(None)),
 )
 def execute_series_log_with_base(op, data, base, **kwargs):
     if data.dtype == np.dtype(np.object_):
@@ -104,26 +112,45 @@ def execute_series_natural_log(op, data, **kwargs):
     return np.log(data)
 
 
-@execute_node.register(ops.Quantile, (dd.Series, ddgb.SeriesGroupBy), numeric_types)
-def execute_series_quantile(op, data, quantile, aggcontext=None, **kwargs):
+@execute_node.register(
+    ops.Quantile, dd.Series, numeric_types, type(None), (dd.Series, type(None))
+)
+def execute_series_quantile(op, data, quantile, _, mask, **kwargs):
+    if mask is not None:
+        data = data.loc[mask]
     return data.quantile(q=quantile)
 
 
-@execute_node.register(ops.MultiQuantile, dd.Series, collections.abc.Sequence)
-def execute_series_quantile_sequence(op, data, quantile, aggcontext=None, **kwargs):
+@execute_node.register(
+    ops.Quantile, ddgb.SeriesGroupBy, numeric_types, type(None), type(None)
+)
+def execute_series_quantile_group_by(op, data, quantile, *_, **kwargs):
+    return data.quantile(q=quantile)
+
+
+@execute_node.register(
+    ops.MultiQuantile, dd.Series, collections.abc.Sequence, type(None), type(None)
+)
+def execute_series_quantile_sequence(_, data, quantile, **kwargs):
     return list(data.quantile(q=quantile))
 
 
 # TODO - aggregations - #2553
-@execute_node.register(ops.MultiQuantile, ddgb.SeriesGroupBy, collections.abc.Sequence)
-def execute_series_quantile_groupby(op, data, quantile, aggcontext=None, **kwargs):
+@execute_node.register(
+    ops.MultiQuantile,
+    ddgb.SeriesGroupBy,
+    collections.abc.Sequence,
+    (str, type(None)),
+    type(None),
+)
+def execute_series_quantile_groupby(
+    op, data, quantile, interpolation, _, aggcontext=None, **kwargs
+):
     def q(x, quantile, interpolation):
         result = x.quantile(quantile, interpolation=interpolation).tolist()
-        res = [result for _ in range(len(x))]
-        return res
+        return [result for _ in range(len(x))]
 
-    result = aggcontext.agg(data, q, quantile, op.interpolation)
-    return result
+    return aggcontext.agg(data, q, quantile, interpolation or "linear")
 
 
 @execute_node.register(ops.Round, dd.Series, (dd.Series, np.integer, type(None), int))

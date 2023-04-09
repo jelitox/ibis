@@ -7,9 +7,9 @@ from public import public
 
 if TYPE_CHECKING:
     import pandas as pd
+
     from ibis.expr import types as ir
 
-import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 from ibis.expr.types.core import _binop
 from ibis.expr.types.generic import Column, Scalar, Value
@@ -38,12 +38,12 @@ class TemporalValue(Value):
 
 @public
 class TemporalScalar(Scalar, TemporalValue):
-    pass  # noqa: E701,E302
+    pass
 
 
 @public
 class TemporalColumn(Column, TemporalValue):
-    pass  # noqa: E701,E302
+    pass
 
 
 class _DateComponentMixin:
@@ -60,15 +60,15 @@ class _DateComponentMixin:
 
     def year(self) -> ir.IntegerValue:
         """Extract the year component."""
-        return ops.ExtractYear(self).to_expr().name("year")
+        return ops.ExtractYear(self).to_expr()
 
     def month(self) -> ir.IntegerValue:
         """Extract the month component."""
-        return ops.ExtractMonth(self).to_expr().name("month")
+        return ops.ExtractMonth(self).to_expr()
 
     def day(self) -> ir.IntegerValue:
         """Extract the day component."""
-        return ops.ExtractDay(self).to_expr().name("day")
+        return ops.ExtractDay(self).to_expr()
 
     @property
     def day_of_week(self) -> DayOfWeek:
@@ -115,19 +115,19 @@ class _TimeComponentMixin:
 
     def hour(self) -> ir.IntegerValue:
         """Extract the hour component."""
-        return ops.ExtractHour(self).to_expr().name("hour")
+        return ops.ExtractHour(self).to_expr()
 
     def minute(self) -> ir.IntegerValue:
         """Extract the minute component."""
-        return ops.ExtractMinute(self).to_expr().name("minute")
+        return ops.ExtractMinute(self).to_expr()
 
     def second(self) -> ir.IntegerValue:
         """Extract the second component."""
-        return ops.ExtractSecond(self).to_expr().name("second")
+        return ops.ExtractSecond(self).to_expr()
 
     def millisecond(self) -> ir.IntegerValue:
         """Extract the millisecond component."""
-        return ops.ExtractMillisecond(self).to_expr().name("millisecond")
+        return ops.ExtractMillisecond(self).to_expr()
 
     def between(
         self,
@@ -217,7 +217,7 @@ class TimeValue(_TimeComponentMixin, TemporalValue):
 
         other = rlz.any(other)
 
-        if isinstance(other.output_dtype, dt.Time):
+        if other.output_dtype.is_time():
             op = ops.TimeDiff
         else:
             op = ops.TimeSub  # let the operation validate
@@ -235,7 +235,7 @@ class TimeValue(_TimeComponentMixin, TemporalValue):
 
         other = rlz.any(other)
 
-        if isinstance(other.output_dtype, dt.Time):
+        if other.output_dtype.is_time():
             op = ops.TimeDiff
         else:
             op = ops.TimeSub  # let the operation validate
@@ -247,12 +247,12 @@ class TimeValue(_TimeComponentMixin, TemporalValue):
 
 @public
 class TimeScalar(TemporalScalar, TimeValue):
-    pass  # noqa: E701,E302
+    pass
 
 
 @public
 class TimeColumn(TemporalColumn, TimeValue):
-    pass  # noqa: E701,E302
+    pass
 
 
 @public
@@ -294,7 +294,7 @@ class DateValue(TemporalValue, _DateComponentMixin):
 
         other = rlz.one_of([rlz.date, rlz.interval], other)
 
-        if isinstance(other.output_dtype, dt.Date):
+        if other.output_dtype.is_date():
             op = ops.DateDiff
         else:
             op = ops.DateSub  # let the operation validate
@@ -316,7 +316,7 @@ class DateValue(TemporalValue, _DateComponentMixin):
 
         other = rlz.one_of([rlz.date, rlz.interval], other)
 
-        if isinstance(other.output_dtype, dt.Date):
+        if other.output_dtype.is_date():
             op = ops.DateDiff
         else:
             op = ops.DateSub  # let the operation validate
@@ -328,12 +328,12 @@ class DateValue(TemporalValue, _DateComponentMixin):
 
 @public
 class DateScalar(TemporalScalar, DateValue):
-    pass  # noqa: E701,E302
+    pass
 
 
 @public
 class DateColumn(TemporalColumn, DateValue):
-    pass  # noqa: E701,E302
+    pass
 
 
 @public
@@ -389,7 +389,7 @@ class TimestampValue(_DateComponentMixin, _TimeComponentMixin, TemporalValue):
 
         right = rlz.any(other)
 
-        if isinstance(right.output_dtype, dt.Timestamp):
+        if right.output_dtype.is_timestamp():
             op = ops.TimestampDiff
         else:
             op = ops.TimestampSub  # let the operation validate
@@ -412,7 +412,7 @@ class TimestampValue(_DateComponentMixin, _TimeComponentMixin, TemporalValue):
 
         right = rlz.any(other)
 
-        if isinstance(right.output_dtype, dt.Timestamp):
+        if right.output_dtype.is_timestamp():
             op = ops.TimestampDiff
         else:
             op = ops.TimestampSub  # let the operation validate
@@ -424,12 +424,12 @@ class TimestampValue(_DateComponentMixin, _TimeComponentMixin, TemporalValue):
 
 @public
 class TimestampScalar(TemporalScalar, TimestampValue):
-    pass  # noqa: E701,E302
+    pass
 
 
 @public
 class TimestampColumn(TemporalColumn, TimestampValue):
-    pass  # noqa: E701,E302
+    pass
 
 
 @public
@@ -561,18 +561,17 @@ class IntervalValue(Value):
 
     @staticmethod
     def __negate_op__():
-
         return ops.Negate
 
 
 @public
 class IntervalScalar(Scalar, IntervalValue):
-    pass  # noqa: E701,E302
+    pass
 
 
 @public
 class IntervalColumn(Column, IntervalValue):
-    pass  # noqa: E701,E302
+    pass
 
 
 @public
@@ -591,7 +590,7 @@ class DayOfWeek:
             The index of the day of the week.
 
             !!! note "Ibis follows pandas' conventions for day numbers: Monday = 0 and Sunday = 6."
-        """  # noqa: E501
+        """
         return ops.DayOfWeekIndex(self._expr).to_expr()
 
     def full_name(self):

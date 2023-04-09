@@ -1,25 +1,23 @@
-# vim: filetype=yaml
 name: Nix
 
 on:
   push:
-    paths:
-      - "**/*.nix"
-      - "pyproject.toml"
-      - "poetry.lock"
-      - "nix/**"
+    paths-ignore:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "**/*.md"
     branches:
       - master
       - "*.x.x"
   pull_request:
-    paths:
-      - "**/*.nix"
-      - "pyproject.toml"
-      - "poetry.lock"
-      - "nix/**"
+    paths-ignore:
+      - "docs/**"
+      - "mkdocs.yml"
+      - "**/*.md"
     branches:
       - master
       - "*.x.x"
+  merge_group:
 
 concurrency:
   group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
@@ -33,19 +31,27 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-          - macos-latest
         python-version:
           - "3.8"
           - "3.9"
           - "3.10"
+          - "3.11"
+        include:
+          - os: macos-latest
+            python-version: "3.10"
     steps:
       - name: checkout
         uses: actions/checkout@v3
 
       - name: install nix
-        uses: cachix/install-nix-action@v18
+        uses: cachix/install-nix-action@v20
         with:
-          nix_path: nixpkgs=./nix
+          nix_path: nixpkgs=channel:nixos-unstable-small
+          extra_nix_config: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - name: check poetry version
+        run: nix run '.#check-poetry-version' -- "1.3"
 
       - name: setup cachix
         uses: cachix/cachix-action@v12
@@ -53,7 +59,19 @@ jobs:
           name: ibis
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           extraPullNames: nix-community,poetry2nix
+      - name: nix build and test
+        run: |
+          set -euo pipefail
 
-      - name: nix build and run tests
-        continue-on-error: ${{ matrix.os == 'macos-latest' && matrix.python-version == '3.8' }}
-        run: nix build --fallback --keep-going --print-build-logs --file . --argstr python ${{ matrix.python-version }}
+          version='${{ matrix.python-version }}'
+          nix build ".#ibis${version//./}" --fallback --keep-going --print-build-logs
+
+      - name: nix build devShell
+        if: github.event_name == 'push' && matrix.os != 'macos-latest'
+        run: |
+          set -euo pipefail
+
+          version='${{ matrix.python-version }}'
+          host_system="$(nix eval --raw 'nixpkgs#stdenv.hostPlatform.system')"
+          flake=".#devShells.${host_system}.ibis${version//./}"
+          nix build "$flake" --fallback --keep-going --print-build-logs

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import sys
 from importlib.metadata import EntryPoint
 from typing import NamedTuple
@@ -7,28 +8,31 @@ from typing import NamedTuple
 import pytest
 
 import ibis
-from ibis.backends.base import BaseBackend
 
 
 def test_backends_are_cached():
-    assert isinstance(ibis.sqlite, BaseBackend)
+    assert ibis.sqlite is ibis.sqlite
     del ibis.sqlite  # delete to force recreation
-    assert isinstance(ibis.sqlite, BaseBackend)
     assert ibis.sqlite is ibis.sqlite
 
 
 def test_backends_tab_completion():
-    assert isinstance(ibis.sqlite, BaseBackend)
+    assert hasattr(ibis, "sqlite")
     del ibis.sqlite  # delete to ensure not real attr
     assert "sqlite" in dir(ibis)
-    assert isinstance(ibis.sqlite, BaseBackend)
+    assert ibis.sqlite is ibis.sqlite
     assert "sqlite" in dir(ibis)  # in dir even if already created
+
+
+def test_public_backend_methods():
+    public = {m for m in dir(ibis.sqlite) if not m.startswith("_")}
+    assert public == {"connect", "compile", "has_operation", "add_operation", "name"}
 
 
 def test_missing_backend():
     msg = "module 'ibis' has no attribute 'foo'."
     with pytest.raises(AttributeError, match=msg):
-        ibis.foo
+        ibis.foo  # noqa: B018
 
 
 def test_multiple_backends(mocker):
@@ -56,4 +60,14 @@ def test_multiple_backends(mocker):
 
     msg = r"\d+ packages found for backend 'foo'"
     with pytest.raises(RuntimeError, match=msg):
-        ibis.foo
+        ibis.foo  # noqa: B018
+
+
+def test_no_import_pandas():
+    script = """\
+import ibis
+import sys
+
+assert "pandas" not in sys.modules"""
+
+    subprocess.check_call([sys.executable], text=script)

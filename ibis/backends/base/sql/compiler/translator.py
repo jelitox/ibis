@@ -1,14 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 import itertools
 from typing import Callable, Iterable, Iterator
 
 import ibis
 import ibis.common.exceptions as com
-import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 from ibis.backends.base.sql.registry import operation_registry, quote_identifier
-from ibis.expr.types.core import unnamed
 
 
 class QueryContext:
@@ -25,9 +24,10 @@ class QueryContext:
         self.subquery_memo = {}
         self.indent = indent
         self.parent = parent
-        self.always_alias = False
+        self.always_alias = True
         self.query = None
         self.params = params if params is not None else {}
+        self._alias_counter = getattr(parent, "_alias_counter", 0)
 
     def _compile_subquery(self, op):
         sub_ctx = self.subcontext()
@@ -62,10 +62,8 @@ class QueryContext:
         self.always_alias = True
 
     def get_compiled_expr(self, node):
-        try:
+        with contextlib.suppress(KeyError):
             return self.top_context.subquery_memo[node]
-        except KeyError:
-            pass
 
         if isinstance(node, (ops.SQLQueryResult, ops.SQLStringView)):
             result = node.query
@@ -75,28 +73,19 @@ class QueryContext:
         self.top_context.subquery_memo[node] = result
         return result
 
-    def make_alias(self, node):
-        i = len(self.table_refs)
+    def _next_alias(self) -> str:
+        alias = self._alias_counter
+        self._alias_counter += 1
+        return f"t{alias:d}"
 
-        # Get total number of aliases up and down the tree at this point; if we
-        # find the table prior-aliased along the way, however, we reuse that
-        # alias
+    def make_alias(self, node):
+        # check for existing tables that we're referencing from a parent context
         for ctx in itertools.islice(self._contexts(), 1, None):
-            try:
-                alias = ctx.table_refs[node]
-            except KeyError:
-                pass
-            else:
+            if (alias := ctx.table_refs.get(node)) is not None:
                 self.set_ref(node, alias)
                 return
 
-            i += len(ctx.table_refs)
-
-        alias = f't{i:d}'
-        self.set_ref(node, alias)
-
-    def need_aliases(self, expr=None):
-        return self.always_alias or len(self.table_refs) > 1
+        self.set_ref(node, self._next_alias())
 
     def _contexts(
         self,
@@ -117,14 +106,20 @@ class QueryContext:
     def set_ref(self, node, alias):
         self.table_refs[node] = alias
 
-    def get_ref(self, node):
+    def get_ref(self, node, search_parents=False):
         """Return the alias used to refer to an expression."""
-        assert isinstance(node, ops.Node)
+        assert isinstance(node, ops.Node), type(node)
 
         if self.is_extracted(node):
             return self.top_context.table_refs.get(node)
 
-        return self.table_refs.get(node)
+        if (ref := self.table_refs.get(node)) is not None:
+            return ref
+
+        if search_parents and (parent := self.parent) is not None:
+            return parent.get_ref(node, search_parents=search_parents)
+
+        return None
 
     def is_extracted(self, node):
         return node in self.top_context.extracted_subexprs
@@ -163,6 +158,25 @@ class ExprTranslator:
 
     _registry = operation_registry
     _rewrites: dict[ops.Node, Callable] = {}
+    _forbids_frame_clause = (
+        ops.DenseRank,
+        ops.MinRank,
+        ops.NTile,
+        ops.PercentRank,
+        ops.CumeDist,
+        ops.RowNumber,
+    )
+    _require_order_by = (
+        ops.Lag,
+        ops.Lead,
+        ops.DenseRank,
+        ops.MinRank,
+        ops.FirstValue,
+        ops.LastValue,
+        ops.PercentRank,
+        ops.CumeDist,
+        ops.NTile,
+    )
 
     def __init__(self, node, context, named=False, permit_subquery=False):
         self.node = node
@@ -182,7 +196,7 @@ class ExprTranslator:
             # This column has been given an explicitly different name
             return False
 
-        return op.name is not unnamed
+        return bool(op.name)
 
     def name(self, translated, name, force=True):
         return f'{translated} AS {quote_identifier(name, force=force)}'
@@ -228,10 +242,10 @@ class ExprTranslator:
     def _trans_param(self, op):
         raw_value = self.context.params[op]
         dtype = op.output_dtype
-        if isinstance(dtype, dt.Struct):
+        if dtype.is_struct():
             literal = ibis.struct(raw_value, type=dtype)
-        elif isinstance(dtype, dt.Map):
-            literal = ibis.map(raw_value, type=dtype)
+        elif dtype.is_map():
+            literal = ibis.map(list(raw_value.keys()), list(raw_value.values()))
         else:
             literal = ibis.literal(raw_value, type=dtype)
         return self.translate(literal.op())
@@ -307,24 +321,6 @@ def _bucket(op):
     return result.op()
 
 
-@rewrites(ops.CategoryLabel)
-def _category_label(op):
-    # TODO(kszucs): avoid the expression roundtrip
-    expr = op.to_expr()
-    stmt = op.args[0].to_expr().case()
-    for i, label in enumerate(op.labels):
-        stmt = stmt.when(i, label)
-
-    if op.nulls is not None:
-        stmt = stmt.else_(op.nulls)
-
-    result = stmt.end()
-    if expr.has_name():
-        result = result.name(expr.get_name())
-
-    return result.op()
-
-
 @rewrites(ops.Any)
 def _any_expand(op):
     return ops.Max(op.arg)
@@ -348,7 +344,7 @@ def _notall_expand(op):
 @rewrites(ops.Cast)
 def _rewrite_cast(op):
     # TODO(kszucs): avoid the expression roundtrip
-    if isinstance(op.to, dt.Interval) and isinstance(op.arg.output_dtype, dt.Integer):
+    if op.to.is_interval() and op.arg.output_dtype.is_integer():
         return op.arg.to_expr().to_interval(unit=op.to.unit).op()
     return op
 
@@ -356,3 +352,16 @@ def _rewrite_cast(op):
 @rewrites(ops.StringContains)
 def _rewrite_string_contains(op):
     return ops.GreaterEqual(ops.StringFind(op.haystack, op.needle), 0)
+
+
+@rewrites(ops.Clip)
+def _rewrite_clip(op):
+    arg = ops.Cast(op.arg, op.output_dtype)
+
+    if (upper := op.upper) is not None:
+        arg = ops.Least((arg, ops.Cast(upper, op.output_dtype)))
+
+    if (lower := op.lower) is not None:
+        arg = ops.Greatest((arg, ops.Cast(lower, op.output_dtype)))
+
+    return arg

@@ -1,10 +1,9 @@
 """Ibis utility functions."""
 from __future__ import annotations
 
-import abc
 import collections
 import functools
-import importlib.metadata as _importlib_metadata
+import importlib.metadata
 import itertools
 import logging
 import operator
@@ -12,15 +11,25 @@ import os
 import sys
 import textwrap
 import types
+import uuid
 import warnings
 from numbers import Real
-from typing import TYPE_CHECKING, Any, Hashable, Iterator, Mapping, Sequence, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterator,
+    Mapping,
+    Sequence,
+    TypeVar,
+)
 from uuid import uuid4
 
+import numpy as np
 import toolz
 
 if TYPE_CHECKING:
-    import pandas as pd
+    from pathlib import Path
 
     import ibis.expr.operations as ops
 
@@ -28,7 +37,9 @@ if TYPE_CHECKING:
 
 T = TypeVar("T", covariant=True)
 U = TypeVar("U", covariant=True)
+K = TypeVar("K")
 V = TypeVar("V")
+
 
 # https://www.compart.com/en/unicode/U+22EE
 VERTICAL_ELLIPSIS = "\u22EE"
@@ -36,60 +47,8 @@ VERTICAL_ELLIPSIS = "\u22EE"
 HORIZONTAL_ELLIPSIS = "\u2026"
 
 
-class frozendict(Mapping, Hashable):
-
-    __slots__ = ("_dict", "_hash")
-
-    def __init__(self, *args, **kwargs):
-        self._dict = dict(*args, **kwargs)
-        self._hash = hash(tuple(self._dict.items()))
-
-    def __str__(self):
-        return str(self._dict)
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}({self._dict!r})"
-
-    def __iter__(self):
-        return iter(self._dict)
-
-    def __len__(self):
-        return len(self._dict)
-
-    def __getitem__(self, key):
-        return self._dict[key]
-
-    def __hash__(self):
-        return self._hash
-
-
-class DotDict(dict):
-    __slots__ = ()
-
-    __setattr__ = dict.__setitem__
-    __delattr__ = dict.__delitem__
-
-    def __getattr__(self, key):
-        try:
-            return self[key]
-        except KeyError:
-            raise AttributeError(key)
-
-    def __repr__(self):
-        return f"{self.__class__.__name__}({super().__repr__()})"
-
-
-class UnnamedMarker:
-    pass
-
-
 def guid() -> str:
-    """Return a uuid4 hexadecimal value.
-
-    Returns
-    -------
-    string
-    """
+    """Return a uuid4 hexadecimal value."""
     return uuid4().hex
 
 
@@ -108,7 +67,7 @@ def indent(text: str, spaces: int) -> str:
     str
         Indented text
     """
-    prefix = ' ' * spaces
+    prefix = " " * spaces
     return textwrap.indent(text, prefix=prefix)
 
 
@@ -117,8 +76,10 @@ def is_one_of(values: Sequence[T], t: type[U]) -> Iterator[bool]:
 
     Parameters
     ----------
-    values : list or tuple
-    t : type
+    values
+        Input values
+    t
+        Type to check against
 
     Returns
     -------
@@ -136,7 +97,8 @@ def promote_list(val: V | Sequence[V]) -> list[V]:
 
     Parameters
     ----------
-    val : list or object
+    val
+        Value to promote
 
     Returns
     -------
@@ -152,12 +114,30 @@ def promote_list(val: V | Sequence[V]) -> list[V]:
         return [val]
 
 
-def is_function(v: Any) -> bool:
-    """Check if the given object is a function.
+def promote_tuple(val: V | Sequence[V]) -> tuple[V]:
+    """Ensure that the value is a tuple.
 
     Parameters
     ----------
-    v : object
+    val
+        Value to promote
+
+    Returns
+    -------
+    tuple
+    """
+    if isinstance(val, tuple):
+        return val
+    elif is_iterable(val):
+        return tuple(val)
+    elif val is None:
+        return ()
+    else:
+        return (val,)
+
+
+def is_function(v: Any) -> bool:
+    """Check if the given object is a function.
 
     Returns
     -------
@@ -168,12 +148,7 @@ def is_function(v: Any) -> bool:
 
 
 def log(msg: str) -> None:
-    """Log `msg` using ``options.verbose_log`` if set, otherwise ``print``.
-
-    Parameters
-    ----------
-    msg : string
-    """
+    """Log `msg` using ``options.verbose_log`` if set, otherwise ``print``."""
     from ibis.config import options
 
     if options.verbose:
@@ -182,12 +157,6 @@ def log(msg: str) -> None:
 
 def approx_equal(a: Real, b: Real, eps: Real):
     """Return whether the difference between `a` and `b` is less than `eps`.
-
-    Parameters
-    ----------
-    a : real
-    b : real
-    eps : real
 
     Raises
     ------
@@ -203,7 +172,8 @@ def safe_index(elements: Sequence[int], value: int) -> int:
 
     Parameters
     ----------
-    elements : list or tuple
+    elements
+        Elements to index into
     value : int
         Index of the given sequence/elements
 
@@ -255,7 +225,7 @@ def is_iterable(o: Any) -> bool:
     return not isinstance(o, (str, bytes)) and isinstance(o, collections.abc.Iterable)
 
 
-def convert_unit(value, unit, to, floor=True):
+def convert_unit(value, unit, to, floor: bool = True):
     """Convert a value between different units.
 
     Convert `value`, is assumed to be in units of `unit`, to units of `to`.
@@ -263,13 +233,19 @@ def convert_unit(value, unit, to, floor=True):
 
     Parameters
     ----------
-    value : Union[numbers.Real, ibis.expr.types.NumericValue]
-    floor : Boolean
-        Flags whether or not to use floor division on `value` if necessary.
+    value
+        Number or numeric ibis expression
+    unit
+        Unit of `value`
+    to
+        Unit to convert to
+    floor
+        Whether or not to use floor division on `value` if necessary.
 
     Returns
     -------
     Union[numbers.Integral, ibis.expr.types.NumericValue]
+        Integer converted unit
 
     Examples
     --------
@@ -316,20 +292,30 @@ def convert_unit(value, unit, to, floor=True):
     else:
         assert i > j
         op = operator.floordiv if floor else operator.truediv
-    return op(value.to_expr(), factor).op()
+    try:
+        return op(value.to_expr(), factor).op()
+    except AttributeError:
+        return op(value, factor)
 
 
 def get_logger(
-    name: str, level: str = None, format: str = None, propagate: bool = False
+    name: str,
+    level: str | None = None,
+    format: str | None = None,
+    propagate: bool = False,
 ) -> logging.Logger:
     """Get a logger.
 
     Parameters
     ----------
-    name : string
-    level : string
-    format : string
-    propagate : bool, default False
+    name
+        Logger name
+    level
+        Logging level
+    format
+        Format string
+    propagate
+        Propagate the logger
 
     Returns
     -------
@@ -358,13 +344,7 @@ def get_logger(
 
 # taken from the itertools documentation
 def consume(iterator: Iterator[T], n: int | None = None) -> None:
-    """Advance the iterator n-steps ahead. If n is None, consume entirely.
-
-    Parameters
-    ----------
-    iterator : list or tuple
-    n : int, optional
-    """
+    """Advance `iterator` n-steps ahead. If `n` is `None`, consume entirely."""
     # Use functions that consume iterators at C speed.
     if n is None:
         # feed the entire iterator into a zero-length deque
@@ -374,6 +354,7 @@ def consume(iterator: Iterator[T], n: int | None = None) -> None:
         next(itertools.islice(iterator, n, n), None)
 
 
+# TODO(kszucs): make it a more robust to better align with graph._flatten_collections()
 def recursive_get(obj, mapping):
     if isinstance(obj, tuple):
         return tuple(recursive_get(o, mapping) for o in obj)
@@ -381,27 +362,6 @@ def recursive_get(obj, mapping):
         return {k: recursive_get(v, mapping) for k, v in obj.items()}
     else:
         return mapping.get(obj, obj)
-
-
-def recursive_iter(obj):
-    """Flatten a tuple of tuples/dicts into a single tuple.
-
-    Parameters
-    ----------
-    iterable : tuple
-
-    Returns
-    -------
-    tuple
-    """
-    if isinstance(obj, tuple):
-        for item in obj:
-            yield from recursive_iter(item)
-    elif isinstance(obj, dict):
-        for item in obj.values():
-            yield from recursive_iter(item)
-    else:
-        yield obj
 
 
 def flatten_iterable(iterable):
@@ -416,46 +376,78 @@ def flatten_iterable(iterable):
             yield item
 
 
-def deprecated_msg(name, *, instead, version=''):
-    msg = f'`{name}` is deprecated'
-    if version:
-        msg += f' as of v{version}'
+def deprecated_msg(name, *, instead, as_of="", removed_in=""):
+    msg = f"`{name}` is deprecated"
 
+    msgs = []
+
+    if as_of:
+        msgs.append(f"as of v{as_of}")
+
+    if removed_in:
+        msgs.append(f"removed in v{removed_in}")
+
+    if msgs:
+        msg += f" {', '.join(msgs)}"
     msg += f'; {instead}'
     return msg
 
 
-def warn_deprecated(name, *, instead, version='', stacklevel=1):
+def warn_deprecated(name, *, instead, as_of="", removed_in="", stacklevel=1):
     """Warn about deprecated usage.
 
     The message includes a stacktrace and what to do instead.
     """
 
-    msg = deprecated_msg(name, instead=instead, version=version)
+    msg = deprecated_msg(name, instead=instead, as_of=as_of, removed_in=removed_in)
     warnings.warn(msg, FutureWarning, stacklevel=stacklevel + 1)
 
 
-def deprecated(*, instead, version=''):
-    """Decorate deprecated function to warn of usage, with stacktrace, and what
-    to do instead."""
+def append_admonition(
+    func: Callable, *, msg: str, body: str = "", kind: str = "warning"
+) -> str:
+    """Append a `kind` admonition with `msg` to `func`'s docstring."""
+    if docstr := func.__doc__:
+        preamble, *rest = docstr.split("\n\n", maxsplit=1)
 
-    def decorator(func):
-        msg = deprecated_msg(func.__name__, instead=instead, version=version)
-
-        docstr = func.__doc__ or ""
-        first, *rest = docstr.split("\n\n", maxsplit=1)
         # count leading spaces and add them to the deprecation warning so the
         # docstring parses correctly
         leading_spaces = " " * sum(
             1 for _ in itertools.takewhile(str.isspace, rest[0] if rest else [])
         )
-        warning_doc = f'{leading_spaces}!!! warning "DEPRECATED: {msg}"'
-        func.__doc__ = "\n\n".join([first, warning_doc, *rest])
+
+        admonition_doc = f'{leading_spaces}!!! {kind} "{msg}"'
+
+        if body:
+            rest = [indent(body, spaces=len(leading_spaces) + 4), *rest]
+
+        docstr = "\n\n".join([preamble, admonition_doc, *rest])
+    else:
+        admonition_doc = f'!!! {kind} "{msg}"'
+        if body:
+            admonition_doc += f"\n\n{indent(body, spaces=4)}"
+        docstr = admonition_doc
+    return docstr
+
+
+def deprecated(*, instead: str, as_of: str = "", removed_in: str = ""):
+    """Decorate to warn of deprecated usage and what to do instead."""
+
+    def decorator(func):
+        msg = deprecated_msg(
+            func.__qualname__, instead=instead, as_of=as_of, removed_in=removed_in
+        )
+
+        func.__doc__ = append_admonition(func, msg=f"DEPRECATED: {msg}")
 
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             warn_deprecated(
-                func.__name__, instead=instead, version=version, stacklevel=2
+                func.__qualname__,
+                instead=instead,
+                as_of=as_of,
+                removed_in=removed_in,
+                stacklevel=2,
             )
             return func(*args, **kwargs)
 
@@ -464,48 +456,88 @@ def deprecated(*, instead, version=''):
     return decorator
 
 
-def experimental(func):
-    """Decorate experimental function to add warning about potential API
-    instability in docstring."""
+def backend_sensitive(
+    *,
+    msg: str = "This operation differs between backends.",
+    why: str = "",
+):
+    """Indicate that an API may be sensitive to a backend."""
 
-    msg = "This API is experimental and subject to change."
-
-    if docstr := func.__doc__:
-        preamble, *rest = docstr.split("\n\n", maxsplit=1)
-
-        leading_spaces = " " * sum(
-            1 for _ in itertools.takewhile(str.isspace, rest[0] if rest else [])
-        )
-
-        warning_doc = f'{leading_spaces}!!! warning "{msg}"'
-
-        docstr = "\n\n".join([preamble, warning_doc, *rest])
-    else:
-        docstr = f'!!! warning "{msg}"'
-    func.__doc__ = docstr
-
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        return func(*args, **kwargs)
+    def wrapper(func):
+        func.__doc__ = append_admonition(func, msg=msg, body=why, kind="info")
+        return func
 
     return wrapper
 
 
-class ToFrame(abc.ABC):
-    """Interface for in-memory objects that can be converted to a DataFrame."""
+def experimental(func):
+    """Decorate a callable to add warning about API instability in docstring."""
 
-    __slots__ = ()
+    func.__doc__ = append_admonition(
+        func, msg="This API is experimental and subject to change."
+    )
+    return func
 
-    @abc.abstractmethod
-    def to_frame(self) -> pd.DataFrame:
-        ...
 
-
-def backend_entry_points() -> list[_importlib_metadata.EntryPoint]:
+def backend_entry_points() -> list[importlib.metadata.EntryPoint]:
     """Get the list of installed `ibis.backend` entrypoints."""
 
     if sys.version_info < (3, 10):
-        eps = _importlib_metadata.entry_points()["ibis.backends"]
+        eps = importlib.metadata.entry_points()["ibis.backends"]
     else:
-        eps = _importlib_metadata.entry_points(group="ibis.backends")
+        eps = importlib.metadata.entry_points(group="ibis.backends")
     return sorted(eps)
+
+
+def import_object(qualname: str) -> Any:
+    """Attempt to import an object given its full qualname.
+
+    Examples
+    --------
+    >>> ex = import_object("ibis.examples")
+
+    Is the same as
+
+    >>> from ibis import examples as ex
+    """
+    mod_name, name = qualname.rsplit(".", 1)
+    mod = importlib.import_module(mod_name)
+    try:
+        return getattr(mod, name)
+    except AttributeError:
+        raise ImportError(f"cannot import name {name!r} from {mod_name!r}") from None
+
+
+def normalize_filename(source: str | Path) -> str:
+    def _removeprefix(text, prefix):
+        # TODO: remove when we drop Python 3.8
+        try:
+            return text.removeprefix(prefix)
+        except AttributeError:
+            return text[text.startswith(prefix) and len(prefix) :]
+
+    source = str(source)
+    for prefix in (
+        "parquet",
+        "csv",
+        "csv.gz",
+        "txt",
+        "txt.gz",
+        "tsv",
+        "tsv.gz",
+        "file",
+    ):
+        source = _removeprefix(source, f"{prefix}://")
+
+    def _absolufy_paths(name):
+        if not name.startswith(("http", "s3")):
+            return os.path.abspath(name)
+        return name
+
+    source = _absolufy_paths(source)
+    return source
+
+
+def gen_name(namespace: str) -> str:
+    """Create a case-insensitive uuid4 unique table name."""
+    return f"_ibis_{namespace}_{np.base_repr(uuid.uuid4().int, 36)}".lower()

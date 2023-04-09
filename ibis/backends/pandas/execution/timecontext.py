@@ -29,27 +29,26 @@ This is an optional feature. The result of executing an expression without time
 context is conceptually the same as executing an expression with (-inf, inf)
 time context.
 """
-from typing import List, Optional
+from __future__ import annotations
 
 import ibis.expr.operations as ops
 from ibis.backends.base import BaseBackend
+from ibis.backends.base.df.scope import Scope
+from ibis.backends.base.df.timecontext import TimeContext, adjust_context
 from ibis.backends.pandas.core import (
     compute_time_context,
     get_node_arguments,
     is_computable_input,
 )
-from ibis.expr.scope import Scope
-from ibis.expr.timecontext import adjust_context
-from ibis.expr.typing import TimeContext
 
 
 @compute_time_context.register(ops.AsOfJoin)
 def compute_time_context_asof_join(
     op: ops.AsOfJoin,
     scope: Scope,
-    clients: List[BaseBackend],
-    timecontext: Optional[TimeContext] = None,
-    **kwargs
+    clients: list[BaseBackend],
+    timecontext: TimeContext | None = None,
+    **kwargs,
 ):
     new_timecontexts = [
         timecontext for arg in get_node_arguments(op) if is_computable_input(arg)
@@ -71,9 +70,9 @@ def compute_time_context_asof_join(
 def compute_time_context_window(
     op: ops.Window,
     scope: Scope,
-    clients: List[BaseBackend],
-    timecontext: Optional[TimeContext] = None,
-    **kwargs
+    clients: list[BaseBackend],
+    timecontext: TimeContext | None = None,
+    **kwargs,
 ):
     new_timecontexts = [
         timecontext for arg in get_node_arguments(op) if is_computable_input(arg)

@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import collections
 import enum
 import functools
+import operator
 
-import pandas as pd
 import pyspark
 import pyspark.sql.functions as F
 import pyspark.sql.types as pt
@@ -15,20 +17,16 @@ import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
 from ibis import interval
-from ibis.backends.pandas.client import PandasInMemoryTable
+from ibis.backends.base.df.timecontext import adjust_context
 from ibis.backends.pandas.execution import execute
-from ibis.backends.pyspark.datatypes import (
-    ibis_array_dtype_to_spark_dtype,
-    ibis_dtype_to_spark_dtype,
-    spark_dtype,
-)
+from ibis.backends.pyspark.datatypes import spark_dtype
 from ibis.backends.pyspark.timecontext import (
     combine_time_context,
     filter_by_time_context,
 )
+from ibis.common.collections import frozendict
 from ibis.config import options
-from ibis.expr.timecontext import adjust_context
-from ibis.util import frozendict, guid
+from ibis.util import any_of, guid
 
 
 class PySparkDatabaseTable(ops.DatabaseTable):
@@ -59,17 +57,29 @@ class PySparkExprTranslator:
         found within scope, it's returned. Otherwise, the it's translated and
         cached for future reference.
 
-        :param expr: ibis expression
-        :param scope: dictionary mapping from operation to translated result
-        :param timecontext: time context associated with expr
-        :param kwargs: parameters passed as keyword args (e.g. window)
-        :return: translated PySpark DataFrame or Column object
+        Parameters
+        ----------
+        op
+            An ibis operation.
+        scope
+            dictionary mapping from operation to translated result
+        timecontext
+            time context associated with expr
+        kwargs
+            parameters passed as keyword args
+
+        Returns
+        -------
+        pyspark.sql.DataFrame
+            translated PySpark DataFrame or Column object
         """
-        result = scope.get_value(op, timecontext)
-        if result is not None:
+
+        if (
+            not isinstance(op, ops.ScalarParameter)
+            and (result := scope.get_value(op, timecontext)) is not None
+        ):
             return result
-        elif type(op) in self._registry:
-            formatter = self._registry[type(op)]
+        elif (formatter := self._registry.get(type(op))) is not None:
             result = formatter(self, op, scope=scope, timecontext=timecontext, **kwargs)
             scope.set_value(op, timecontext, result)
             return result
@@ -97,9 +107,10 @@ def compile_sql_query_result(t, op, **kwargs):
 
 
 def _can_be_replaced_by_column_name(column, table):
-    """Return whether the given column_expr can be replaced by its literal
-    name, which is True when column_expr and table[column_expr.get_name()] is
-    semantically the same."""
+    """Return whether the given `column` can be replaced by its literal name.
+
+    `True` when `column` and `table[column.get_name()]` are semantically equivalent.
+    """
     # Each check below is necessary to distinguish a pure projection from
     # other valid selections, such as a mutation that assigns a new column
     # or changes the value of an existing column.
@@ -225,6 +236,16 @@ def compile_struct_field(t, op, **kwargs):
     return arg[op.field]
 
 
+@compiles(ops.StructColumn)
+def compile_struct_column(t, op, **kwargs):
+    return F.struct(
+        *(
+            t.translate(col, **kwargs).alias(name)
+            for name, col in zip(op.names, op.values)
+        )
+    )
+
+
 @compiles(ops.SelfReference)
 def compile_self_reference(t, op, **kwargs):
     return t.translate(op.table, **kwargs)
@@ -232,7 +253,7 @@ def compile_self_reference(t, op, **kwargs):
 
 @compiles(ops.Cast)
 def compile_cast(t, op, **kwargs):
-    if isinstance(op.to, dt.Interval):
+    if op.to.is_interval():
         if isinstance(op.arg, ops.Literal):
             return interval(op.arg.value, op.to.unit).op()
         else:
@@ -241,10 +262,7 @@ def compile_cast(t, op, **kwargs):
                 'in the PySpark backend. {} not allowed.'.format(type(op.arg))
             )
 
-    if isinstance(op.to, dt.Array):
-        cast_type = ibis_array_dtype_to_spark_dtype(op.to)
-    else:
-        cast_type = ibis_dtype_to_spark_dtype(op.to)
+    cast_type = spark_dtype(op.to)
 
     src_column = t.translate(op.arg, **kwargs)
     return src_column.cast(cast_type)
@@ -313,6 +331,14 @@ def compile_less_equal(t, op, **kwargs):
     return t.translate(op.left, **kwargs) <= t.translate(op.right, **kwargs)
 
 
+@compiles(ops.Between)
+def compile_between(t, op, **kwargs):
+    arg = t.translate(op.arg, **kwargs)
+    lower_bound = t.translate(op.lower_bound, **kwargs)
+    upper_bound = t.translate(op.upper_bound, **kwargs)
+    return arg.between(lower_bound, upper_bound)
+
+
 @compiles(ops.Multiply)
 def compile_multiply(t, op, **kwargs):
     return t.translate(op.left, **kwargs) * t.translate(op.right, **kwargs)
@@ -326,14 +352,18 @@ def compile_subtract(t, op, **kwargs):
 @compiles(ops.Literal)
 @compile_nan_as_null
 def compile_literal(t, op, *, raw=False, **kwargs):
-    """If raw is True, don't wrap the result with F.lit()"""
+    """If raw is True, don't wrap the result with F.lit()."""
+
     value = op.value
     dtype = op.dtype
+
+    if value is None:
+        return F.lit(value)
 
     if raw:
         return value
 
-    if isinstance(dtype, dt.Interval):
+    if dtype.is_interval():
         # execute returns a Timedelta and value is nanoseconds
         return execute(op).value
 
@@ -344,17 +374,26 @@ def compile_literal(t, op, *, raw=False, **kwargs):
             return set(value)
         else:
             return value
-    elif isinstance(value, tuple):
+    elif dtype.is_array():
         return F.array(*map(F.lit, value))
+    elif dtype.is_struct():
+        return F.struct(*(F.lit(val).alias(name) for name, val in value.items()))
+    elif dtype.is_timestamp():
+        return F.from_utc_timestamp(F.lit(str(value)), tz="UTC")
     else:
-        if isinstance(value, pd.Timestamp) and value.tz is None:
-            value = value.tz_localize("UTC").to_pydatetime()
         return F.lit(value)
 
 
 @compiles(ops.Aggregation)
 def compile_aggregation(t, op, **kwargs):
     src_table = t.translate(op.table, **kwargs)
+
+    if op.having:
+        raise com.UnsupportedOperationError(
+            "The PySpark backend does not support `having` because the underlying "
+            "PySpark API does not support it. Use a filter on the aggregation "
+            "expression instead."
+        )
 
     if op.predicates:
         predicate = functools.reduce(ops.And, op.predicates)
@@ -396,13 +435,21 @@ def compile_difference(t, op, **kwargs):
 @compiles(ops.Contains)
 def compile_contains(t, op, **kwargs):
     col = t.translate(op.value, **kwargs)
-    return col.isin(t.translate(op.options, **kwargs))
+    if isinstance(op.options, tuple):
+        options = [t.translate(option, **kwargs) for option in op.options]
+    else:
+        options = t.translate(op.options, **kwargs)
+    return col.isin(options)
 
 
 @compiles(ops.NotContains)
 def compile_not_contains(t, op, **kwargs):
     col = t.translate(op.value, **kwargs)
-    return ~(col.isin(t.translate(op.options, **kwargs)))
+    if isinstance(op.options, tuple):
+        options = [t.translate(option, **kwargs) for option in op.options]
+    else:
+        options = t.translate(op.options, **kwargs)
+    return ~col.isin(options)
 
 
 @compiles(ops.StartsWith)
@@ -416,7 +463,7 @@ def compile_startswith(t, op, **kwargs):
 def compile_endswith(t, op, **kwargs):
     col = t.translate(op.arg, **kwargs)
     end = t.translate(op.end, **kwargs)
-    return col.startswith(end)
+    return col.endswith(end)
 
 
 def _is_table(table):
@@ -427,22 +474,32 @@ def _is_table(table):
         return False
 
 
-def compile_aggregator(t, op, *, fn, aggcontext=None, **kwargs):
-    if (where := getattr(op, 'where', None)) is not None:
+def compile_aggregator(
+    t, op, *, fn, aggcontext=None, where_excludes: tuple[str, ...] = (), **kwargs
+):
+    if (where := getattr(op, "where", None)) is not None:
         condition = t.translate(where, **kwargs)
     else:
         condition = None
 
-    def translate_arg(arg):
+    def translate_arg(arg, include_where: bool):
         src_col = t.translate(arg, **kwargs)
 
-        if condition is not None:
+        if include_where and condition is not None:
             src_col = F.when(condition, src_col)
         return src_col
 
-    src_inputs = tuple(arg for arg in op.args if arg is not getattr(op, "where", None))
+    src_inputs = tuple(
+        (argname, arg)
+        for argname, arg in zip(op.argnames, op.args)
+        if argname != "where"
+    )
     src_cols = tuple(
-        translate_arg(arg) for arg in src_inputs if isinstance(arg, ops.Node)
+        translate_arg(
+            arg, include_where=(not where_excludes) or argname not in where_excludes
+        )
+        for argname, arg in src_inputs
+        if isinstance(arg, ops.Node)
     )
 
     col = fn(*src_cols)
@@ -520,6 +577,11 @@ def compile_notall(t, op, *, aggcontext=None, **kwargs):
 @compiles(ops.Count)
 def compile_count(t, op, **kwargs):
     return compile_aggregator(t, op, fn=F.count, **kwargs)
+
+
+@compiles(ops.CountDistinct)
+def compile_count_distinct(t, op, **kwargs):
+    return compile_aggregator(t, op, fn=F.count_distinct, **kwargs)
 
 
 @compiles(ops.CountStar)
@@ -608,7 +670,7 @@ def compile_covariance(t, op, **kwargs):
 
     fn = {"sample": F.covar_samp, "pop": F.covar_pop}[how]
 
-    pyspark_double_type = ibis_dtype_to_spark_dtype(dt.double)
+    pyspark_double_type = spark_dtype(dt.double)
     new_op = op.__class__(
         left=ops.Cast(op.left, to=pyspark_double_type),
         right=ops.Cast(op.right, to=pyspark_double_type),
@@ -623,7 +685,7 @@ def compile_correlation(t, op, **kwargs):
     if (how := op.how) == "pop":
         raise ValueError("PySpark only implements sample correlation")
 
-    pyspark_double_type = ibis_dtype_to_spark_dtype(dt.double)
+    pyspark_double_type = spark_dtype(dt.double)
     new_op = op.__class__(
         left=ops.Cast(op.left, to=pyspark_double_type),
         right=ops.Cast(op.right, to=pyspark_double_type),
@@ -642,14 +704,17 @@ def compile_arbitrary(t, op, **kwargs):
     elif how == 'last':
         fn = functools.partial(F.last, ignorenulls=True)
     else:
-        raise NotImplementedError(f"Does not support 'how': {how}")
+        raise com.UnsupportedOperationError(
+            f"PySpark backend does not support how={how!r}"
+        )
 
     return compile_aggregator(t, op, fn=fn, **kwargs)
 
 
 @compiles(ops.Coalesce)
 def compile_coalesce(t, op, **kwargs):
-    src_columns = t.translate(ops.NodeList(*op.args), **kwargs)
+    kwargs["raw"] = False  # override to force column literals
+    src_columns = [t.translate(col, **kwargs) for col in op.arg]
     if len(src_columns) == 1:
         return src_columns[0]
     else:
@@ -658,7 +723,8 @@ def compile_coalesce(t, op, **kwargs):
 
 @compiles(ops.Greatest)
 def compile_greatest(t, op, **kwargs):
-    src_columns = t.translate(ops.NodeList(*op.args), **kwargs)
+    kwargs["raw"] = False  # override to force column literals
+    src_columns = [t.translate(col, **kwargs) for col in op.arg]
     if len(src_columns) == 1:
         return src_columns[0]
     else:
@@ -667,7 +733,8 @@ def compile_greatest(t, op, **kwargs):
 
 @compiles(ops.Least)
 def compile_least(t, op, **kwargs):
-    src_columns = t.translate(ops.NodeList(*op.args), **kwargs)
+    kwargs["raw"] = False  # override to force column literals
+    src_columns = [t.translate(col, **kwargs) for col in op.arg]
     if len(src_columns) == 1:
         return src_columns[0]
     else:
@@ -682,25 +749,22 @@ def compile_abs(t, op, **kwargs):
 
 @compiles(ops.Clip)
 def compile_clip(t, op, **kwargs):
-    spark_dtype = ibis_dtype_to_spark_dtype(op.output_dtype)
     col = t.translate(op.arg, **kwargs)
     upper = t.translate(op.upper, **kwargs) if op.upper is not None else float('inf')
     lower = t.translate(op.lower, **kwargs) if op.lower is not None else float('-inf')
 
     def column_min(value, limit):
-        """Given the minimum limit, return values that are greater than or
-        equal to this limit."""
+        """Return values greater than or equal to `limit`."""
         return F.when(value < limit, limit).otherwise(value)
 
     def column_max(value, limit):
-        """Given the maximum limit, return values that are less than or equal
-        to this limit."""
+        """Return values less than or equal to `limit`."""
         return F.when(value > limit, limit).otherwise(value)
 
     def clip(column, lower_value, upper_value):
         return column_max(column_min(column, F.lit(lower_value)), F.lit(upper_value))
 
-    return clip(col, lower, upper).cast(spark_dtype)
+    return clip(col, lower, upper).cast(spark_dtype(op.output_dtype))
 
 
 @compiles(ops.Round)
@@ -786,7 +850,7 @@ def compile_modulus(t, op, **kwargs):
 @compiles(ops.Negate)
 def compile_negate(t, op, **kwargs):
     src_column = t.translate(op.arg, **kwargs)
-    if isinstance(op.output_dtype, dt.Boolean):
+    if op.output_dtype.is_boolean():
         return ~src_column
     return -src_column
 
@@ -821,14 +885,20 @@ def compile_power(t, op, **kwargs):
 
 @compiles(ops.IsNan)
 def compile_isnan(t, op, **kwargs):
-    src_column = t.translate(op.arg, **kwargs)
-    return F.isnan(src_column) | F.isnull(src_column)
+    arg = op.arg
+    if arg.output_dtype.is_floating():
+        src_column = t.translate(arg, **kwargs)
+        return F.isnull(src_column) | F.isnan(src_column)
+    return F.lit(False)
 
 
 @compiles(ops.IsInf)
 def compile_isinf(t, op, **kwargs):
-    src_column = t.translate(op.arg, **kwargs)
-    return (src_column == float('inf')) | (src_column == float('-inf'))
+    arg = op.arg
+    if arg.output_dtype.is_floating():
+        inf = float("inf")
+        return t.translate(arg, **kwargs).isin([inf, -inf])
+    return F.lit(False)
 
 
 @compiles(ops.Uppercase)
@@ -874,15 +944,18 @@ def compile_capitalize(t, op, **kwargs):
 
 
 @compiles(ops.Substring)
-def compile_substring(t, op, **kwargs):
-    src_column = t.translate(op.arg, **kwargs)
+def compile_substring(t, op, raw: bool = False, **kwargs):
+    src_column = t.translate(op.arg, raw=raw, **kwargs)
     start = t.translate(op.start, **kwargs, raw=True) + 1
     length = t.translate(op.length, **kwargs, raw=True)
 
-    if isinstance(start, pyspark.sql.Column) or isinstance(length, pyspark.sql.Column):
+    if any_of((start, length), pyspark.sql.Column):
         raise NotImplementedError(
-            "Specifiying Start and length with column expressions " "are not supported."
+            "Specifiying `start` or `length` with column expressions is not supported."
         )
+
+    if start < 0:
+        raise NotImplementedError("`start < 0` is not supported.")
 
     return src_column.substr(start, length)
 
@@ -959,7 +1032,7 @@ def compile_string_join(t, op, **kwargs):
         return sep.join(arr)
 
     sep_column = t.translate(op.sep, **kwargs)
-    arg = t.translate(op.arg, **kwargs)
+    arg = [t.translate(arg, **kwargs) for arg in op.arg]
     return join(sep_column, F.array(arg))
 
 
@@ -969,7 +1042,7 @@ def compile_regex_search(t, op, **kwargs):
 
     @F.udf('boolean')
     def regex_search(s, pattern):
-        return True if re.search(pattern, s) else False
+        return re.search(pattern, s) is not None
 
     src_column = t.translate(op.arg, **kwargs)
     pattern = t.translate(op.pattern, **kwargs)
@@ -1006,7 +1079,8 @@ def compile_string_split(t, op, **kwargs):
 
 @compiles(ops.StringConcat)
 def compile_string_concat(t, op, **kwargs):
-    src_columns = [t.translate(arg, **kwargs) for arg in op.args]
+    kwargs["raw"] = False  # override to force column literals
+    src_columns = [t.translate(arg, **kwargs) for arg in op.arg]
     return F.concat(*src_columns)
 
 
@@ -1021,12 +1095,6 @@ def compile_string_like(t, op, **kwargs):
     src_column = t.translate(op.arg, **kwargs)
     pattern = op.pattern.value
     return src_column.like(pattern)
-
-
-@compiles(ops.ValueList)
-def compile_value_list(t, op, **kwargs):
-    kwargs["raw"] = False  # override to force column literals
-    return [t.translate(col, **kwargs) for col in op.values]
 
 
 @compiles(ops.InnerJoin)
@@ -1087,9 +1155,9 @@ def _canonicalize_interval(t, interval, **kwargs):
     correspondingly.
     """
     if isinstance(interval, ir.IntervalScalar):
-        value = t.translate(interval.op(), **kwargs)
-        # value is in nanoseconds and spark uses seconds since epoch
-        return int(value / 1e9)
+        t.translate(interval.op(), **kwargs)
+        return None
+
     elif isinstance(interval, int):
         return interval
     else:
@@ -1099,58 +1167,63 @@ def _canonicalize_interval(t, interval, **kwargs):
         )
 
 
-@compiles(ops.Window)
-def compile_window_op(t, op, **kwargs):
-    window = op.window
-    operand = op.expr
+@compiles(ops.WindowBoundary)
+def compile_window_boundary(t, boundary, **kwargs):
+    if boundary.value.output_dtype.is_interval():
+        value = t.translate(boundary.value, **kwargs)
+        # TODO(kszucs): the value can be a literal which is a bug
+        value = value.value if isinstance(value, ops.Literal) else value
+        # value is in nanoseconds and spark uses seconds since epoch
+        value = int(value / 1e9)
+    else:
+        value = boundary.value.value
 
+    return -value if boundary.preceding else value
+
+
+@compiles(ops.WindowFunction)
+def compile_window_function(t, op, **kwargs):
     grouping_keys = [
         key.name if isinstance(key, ops.TableColumn) else t.translate(key, **kwargs)
-        for key in window._group_by
+        for key in op.frame.group_by
     ]
 
     # Timestamp needs to be cast to long for window bounds in spark
     ordering_keys = [
-        F.col(sort.name).cast('long')
-        if isinstance(sort.output_dtype, dt.Timestamp)
-        else sort.name
-        for sort in window._order_by
+        F.col(sort.name).cast('long') if sort.output_dtype.is_timestamp() else sort.name
+        for sort in op.frame.order_by
     ]
     aggcontext = AggregationContext.WINDOW
     pyspark_window = Window.partitionBy(grouping_keys).orderBy(ordering_keys)
 
     # If the operand is a shift op (e.g. lead, lag), Spark will set the window
     # bounds. Only set window bounds here if not a shift operation.
-    if not isinstance(operand, ops.ShiftBase):
-        if window.preceding is None:
-            start = Window.unboundedPreceding
+    if not isinstance(op.func, ops.ShiftBase):
+        if op.frame.start is None:
+            win_start = Window.unboundedPreceding
         else:
-            start = -_canonicalize_interval(t, window.preceding, **kwargs)
-        if window.following is None:
-            end = Window.unboundedFollowing
+            win_start = t.translate(op.frame.start, **kwargs)
+        if op.frame.end is None:
+            win_end = Window.unboundedFollowing
         else:
-            end = _canonicalize_interval(t, window.following, **kwargs)
+            win_end = t.translate(op.frame.end, **kwargs)
 
-        if (
-            isinstance(window.preceding, ir.IntervalScalar)
-            or isinstance(window.following, ir.IntervalScalar)
-            or window.how == "range"
-        ):
-            pyspark_window = pyspark_window.rangeBetween(start, end)
+        if op.frame.how == 'range':
+            pyspark_window = pyspark_window.rangeBetween(win_start, win_end)
         else:
-            pyspark_window = pyspark_window.rowsBetween(start, end)
+            pyspark_window = pyspark_window.rowsBetween(win_start, win_end)
 
-    res_op = operand
-    if isinstance(res_op, (ops.NotAll, ops.NotAny)):
+    func = op.func
+    if isinstance(func, (ops.NotAll, ops.NotAny)):
         # For NotAll and NotAny, negation must be applied after .over(window)
         # Here we rewrite node to be its negation, and negate it back after
         # translation and window operation
-        operand = res_op.negate()
-    result = t.translate(operand, **kwargs, aggcontext=aggcontext).over(pyspark_window)
+        func = func.negate()
+    result = t.translate(func, **kwargs, aggcontext=aggcontext).over(pyspark_window)
 
-    if isinstance(res_op, (ops.NotAll, ops.NotAny)):
+    if isinstance(op.func, (ops.NotAll, ops.NotAny)):
         return ~result
-    elif isinstance(res_op, (ops.MinRank, ops.DenseRank, ops.RowNumber)):
+    elif isinstance(op.func, ops.RankBase):
         # result must be cast to long type for Rank / RowNumber
         return result.astype('long') - 1
     else:
@@ -1369,13 +1442,6 @@ def compile_timestamp_now(t, op, **kwargs):
 def compile_string_to_timestamp(t, op, **kwargs):
     src_column = t.translate(op.arg, **kwargs)
     fmt = op.format_str.value
-
-    if op.timezone is not None and op.timezone.value != "UTC":
-        raise com.UnsupportedArgumentError(
-            'PySpark backend only supports timezone UTC for converting string '
-            'to timestamp.'
-        )
-
     return F.to_timestamp(src_column, fmt)
 
 
@@ -1400,8 +1466,10 @@ def compiles_day_of_week_name(t, op, **kwargs):
 
 
 def _get_interval_col(t, op, allowed_units=None, **kwargs):
+    import pandas as pd
+
     dtype = op.output_dtype
-    if not isinstance(dtype, dt.Interval):
+    if not dtype.is_interval():
         raise com.UnsupportedArgumentError(
             f'{dtype} expression cannot be converted to interval column. '
             'Must be Interval dtype.'
@@ -1453,7 +1521,7 @@ def compile_date_add(t, op, **kwargs):
     return _compile_datetime_binop(
         t,
         op,
-        fn=(lambda l, r: (l + r).cast('timestamp')),
+        fn=lambda lhs, rhs: (lhs + rhs).cast('timestamp'),
         allowed_units=allowed_units,
         **kwargs,
     )
@@ -1465,7 +1533,7 @@ def compile_date_sub(t, op, **kwargs):
     return _compile_datetime_binop(
         t,
         op,
-        fn=(lambda l, r: (l - r).cast('timestamp')),
+        fn=lambda lhs, rhs: (lhs - rhs).cast('timestamp'),
         allowed_units=allowed_units,
         **kwargs,
     )
@@ -1473,8 +1541,11 @@ def compile_date_sub(t, op, **kwargs):
 
 @compiles(ops.DateDiff)
 def compile_date_diff(t, op, **kwargs):
-    raise com.UnsupportedOperationError(
-        'PySpark backend does not support DateDiff as there is no ' 'timedelta type.'
+    left = t.translate(op.left, **kwargs)
+    right = t.translate(op.right, **kwargs)
+
+    return F.concat(F.lit("INTERVAL '"), F.datediff(left, right), F.lit("' DAY")).cast(
+        pt.DayTimeIntervalType(pt.DayTimeIntervalType.DAY, pt.DayTimeIntervalType.DAY)
     )
 
 
@@ -1484,7 +1555,7 @@ def compile_timestamp_add(t, op, **kwargs):
     return _compile_datetime_binop(
         t,
         op,
-        fn=(lambda l, r: (l + r).cast('timestamp')),
+        fn=lambda lhs, rhs: (lhs + rhs).cast('timestamp'),
         allowed_units=allowed_units,
         **kwargs,
     )
@@ -1496,7 +1567,7 @@ def compile_timestamp_sub(t, op, **kwargs):
     return _compile_datetime_binop(
         t,
         op,
-        fn=(lambda l, r: (l - r).cast('timestamp')),
+        fn=lambda lhs, rhs: (lhs - rhs).cast('timestamp'),
         allowed_units=allowed_units,
         **kwargs,
     )
@@ -1519,12 +1590,12 @@ def _compile_interval_binop(t, op, fn, **kwargs):
 
 @compiles(ops.IntervalAdd)
 def compile_interval_add(t, op, **kwargs):
-    return _compile_interval_binop(t, op, fn=(lambda l, r: l + r), **kwargs)
+    return _compile_interval_binop(t, op, fn=operator.add, **kwargs)
 
 
 @compiles(ops.IntervalSubtract)
 def compile_interval_subtract(t, op, **kwargs):
-    return _compile_interval_binop(t, op, fn=(lambda l, r: l - r), **kwargs)
+    return _compile_interval_binop(t, op, fn=operator.sub, **kwargs)
 
 
 @compiles(ops.IntervalFromInteger)
@@ -1539,7 +1610,7 @@ def compile_interval_from_integer(t, op, **kwargs):
 
 @compiles(ops.ArrayColumn)
 def compile_array_column(t, op, **kwargs):
-    cols = t.translate(op.cols, **kwargs)
+    cols = [t.translate(col, **kwargs) for col in op.cols]
     return F.array(cols)
 
 
@@ -1553,7 +1624,7 @@ def compile_array_length(t, op, **kwargs):
 def compile_array_slice(t, op, **kwargs):
     start = op.start.value if op.start is not None else op.start
     stop = op.stop.value if op.stop is not None else op.stop
-    spark_type = ibis_array_dtype_to_spark_dtype(op.arg.output_dtype)
+    spark_type = spark_dtype(op.arg.output_dtype)
 
     @F.udf(spark_type)
     def array_slice(array):
@@ -1587,7 +1658,32 @@ def compile_array_repeat(t, op, **kwargs):
 @compiles(ops.ArrayCollect)
 def compile_array_collect(t, op, **kwargs):
     src_column = t.translate(op.arg, **kwargs)
+    if (where := op.where) is not None:
+        src_column = F.when(t.translate(where, **kwargs), src_column)
     return F.collect_list(src_column)
+
+
+@compiles(ops.Argument)
+def compile_argument(t, op, arg_columns, **kwargs):
+    return arg_columns[op.name]
+
+
+@compiles(ops.ArrayFilter)
+def compile_array_filter(t, op, **kwargs):
+    src_column = t.translate(op.arg, **kwargs)
+    return F.filter(
+        src_column,
+        lambda x: t.translate(op.result, arg_columns={op.parameter: x}, **kwargs),
+    )
+
+
+@compiles(ops.ArrayMap)
+def compile_array_map(t, op, **kwargs):
+    src_column = t.translate(op.arg, **kwargs)
+    return F.transform(
+        src_column,
+        lambda x: t.translate(op.result, arg_columns={op.parameter: x}, **kwargs),
+    )
 
 
 # --------------------------- Null Operations -----------------------------
@@ -1600,9 +1696,13 @@ def compile_null_literal(t, op, **kwargs):
 
 @compiles(ops.IfNull)
 def compile_if_null(t, op, **kwargs):
-    col = t.translate(op.arg, **kwargs)
+    arg = op.arg
+    col = t.translate(arg, **kwargs)
     ifnull_col = t.translate(op.ifnull_expr, **kwargs)
-    return F.when(col.isNull() | F.isnan(col), ifnull_col).otherwise(col)
+    result = F.isnull(col)
+    if arg.output_dtype.is_floating():
+        result |= F.isnan(col)
+    return F.when(result, ifnull_col).otherwise(col)
 
 
 @compiles(ops.NullIf)
@@ -1614,14 +1714,22 @@ def compile_null_if(t, op, **kwargs):
 
 @compiles(ops.IsNull)
 def compile_is_null(t, op, **kwargs):
-    col = t.translate(op.arg, **kwargs)
-    return F.isnull(col) | F.isnan(col)
+    arg = op.arg
+    col = t.translate(arg, **kwargs)
+    result = F.isnull(col)
+    if arg.output_dtype.is_floating():
+        result |= F.isnan(col)
+    return result
 
 
 @compiles(ops.NotNull)
 def compile_not_null(t, op, **kwargs):
-    col = t.translate(op.arg, **kwargs)
-    return ~F.isnull(col) & ~F.isnan(col)
+    arg = op.arg
+    col = t.translate(arg, **kwargs)
+    result = ~F.isnull(col)
+    if arg.output_dtype.is_floating():
+        result &= ~F.isnan(col)
+    return result
 
 
 @compiles(ops.DropNa)
@@ -1678,7 +1786,7 @@ def compile_reduction_udf(t, op, *, aggcontext=None, **kwargs):
 def compile_searched_case(t, op, **kwargs):
     existing_when = None
 
-    for case, result in zip(op.cases.values, op.results.values):
+    for case, result in zip(op.cases, op.results):
         if existing_when is not None:
             # Spark allowed chained when statement
             when = existing_when.when
@@ -1751,7 +1859,7 @@ def compile_trig(t, op, **kwargs):
 @compiles(ops.Cot)
 def compile_cot(t, op, **kwargs):
     arg = t.translate(op.arg, **kwargs)
-    return F.cos(arg) / F.sin(arg)
+    return 1.0 / F.tan(arg)
 
 
 @compiles(ops.Atan2)
@@ -1772,8 +1880,12 @@ def compile_radians(t, op, **kwargs):
 
 @compiles(ops.ZeroIfNull)
 def compile_zero_if_null(t, op, **kwargs):
-    col = t.translate(op.arg, **kwargs)
-    return F.when(col.isNull() | F.isnan(col), F.lit(0)).otherwise(col)
+    arg = op.arg
+    col = t.translate(arg, **kwargs)
+    result = F.isnull(col)
+    if arg.output_dtype.is_floating():
+        result |= F.isnan(col)
+    return F.when(result, F.lit(0)).otherwise(col)
 
 
 @compiles(ops.Where)
@@ -1790,10 +1902,9 @@ def compile_random(*args, **kwargs):
 
 
 @compiles(ops.InMemoryTable)
-@compiles(PandasInMemoryTable)
 def compile_in_memory_table(t, op, session, **kwargs):
     fields = [
-        pt.StructField(name, ibis_dtype_to_spark_dtype(dtype), dtype.nullable)
+        pt.StructField(name, spark_dtype(dtype), dtype.nullable)
         for name, dtype in op.schema.items()
     ]
     schema = pt.StructType(fields)
@@ -1834,8 +1945,57 @@ def compile_bitwise_not(t, op, **kwargs):
 def compile_json_getitem(t, op, **kwargs):
     arg = t.translate(op.arg, **kwargs)
     index = t.translate(op.index, raw=True, **kwargs)
-    if isinstance(op.index.output_dtype, dt.Integer):
+    if op.index.output_dtype.is_integer():
         path = f"$[{index}]"
     else:
         path = f"$.{index}"
     return F.get_json_object(arg, path)
+
+
+@compiles(ops.DummyTable)
+def compile_dummy_table(t, op, session=None, **kwargs):
+    return session.range(0, 1).select(
+        *(t.translate(value, **kwargs) for value in op.values)
+    )
+
+
+@compiles(ops.ScalarParameter)
+def compile_scalar_parameter(t, op, timecontext=None, scope=None, **kwargs):
+    assert scope is not None, "scope is None"
+    raw_value = scope.get_value(op, timecontext)
+    return F.lit(raw_value).cast(spark_dtype(op.output_dtype))
+
+
+@compiles(ops.E)
+def compile_e(t, op, **kwargs):
+    return F.exp(F.lit(1))
+
+
+@compiles(ops.Pi)
+def compile_pi(t, op, **kwargs):
+    return F.acos(F.lit(-1))
+
+
+@compiles(ops.Quantile)
+@compiles(ops.MultiQuantile)
+def compile_quantile(t, op, **kwargs):
+    return compile_aggregator(
+        t, op, fn=F.percentile_approx, where_excludes=("quantile",), **kwargs
+    )
+
+
+@compiles(ops.ArgMin)
+def compile_argmin(t, op, **kwargs):
+    return compile_aggregator(t, op, fn=F.min_by, **kwargs)
+
+
+@compiles(ops.ArgMax)
+def compile_argmax(t, op, **kwargs):
+    return compile_aggregator(t, op, fn=F.max_by, **kwargs)
+
+
+@compiles(ops.ArrayStringJoin)
+def compile_array_string_join(t, op, **kwargs):
+    arg = t.translate(op.arg, **kwargs)
+    sep = t.translate(op.sep, raw=True, **kwargs)
+    return F.concat_ws(sep, arg)

@@ -4,16 +4,12 @@ from decimal import Decimal
 import numpy as np
 import pandas as pd
 import pytest
-from multipledispatch.conflict import ambiguities
+from packaging.version import parse as vparse
 from pandas.api.types import CategoricalDtype, DatetimeTZDtype
 
 import ibis
 import ibis.expr.datatypes as dt
 import ibis.expr.schema as sch
-
-
-def test_no_infer_ambiguities():
-    assert not ambiguities(dt.infer.funcs)
 
 
 @pytest.mark.parametrize(
@@ -115,11 +111,17 @@ def test_infer_np_array(value, expected_dtypes):
         (np.double, dt.double),
         (np.str_, dt.string),
         (np.datetime64, dt.timestamp),
-        (np.timedelta64, dt.interval),
     ],
 )
 def test_numpy_dtype(numpy_dtype, ibis_dtype):
     assert dt.dtype(np.dtype(numpy_dtype)) == ibis_dtype
+
+
+def test_numpy_dtype_timedelta():
+    if vparse(pytest.importorskip("pyarrow").__version__) < vparse("9"):
+        pytest.skip("pyarrow < 9 globally mutates the timedelta64 numpy dtype")
+
+    assert dt.dtype(np.dtype(np.timedelta64)) == dt.interval
 
 
 @pytest.mark.parametrize(
@@ -129,7 +131,7 @@ def test_numpy_dtype(numpy_dtype, ibis_dtype):
             DatetimeTZDtype(tz='US/Eastern', unit='ns'),
             dt.Timestamp('US/Eastern'),
         ),
-        (CategoricalDtype(), dt.Category()),
+        (CategoricalDtype(), dt.String()),
         (pd.Series([], dtype="string").dtype, dt.String()),
     ],
 )
@@ -169,7 +171,7 @@ def test_pandas_dtype(pandas_dtype, ibis_dtype):
             "interval('ns')",
         ),
         (['foo', 'bar', 'hello'], "string"),
-        (pd.Series(['a', 'b', 'c', 'a']).astype('category'), dt.Category()),
+        (pd.Series(['a', 'b', 'c', 'a']).astype('category'), dt.String()),
         (pd.Series([b'1', b'2', b'3']), dt.string),
         # mixed-integer
         (pd.Series([1, 2, '3']), dt.binary),
@@ -206,7 +208,7 @@ def test_pandas_dtype(pandas_dtype, ibis_dtype):
         # mixed
         (pd.Series([b'1', '2', 3.0]), dt.binary),
         # empty
-        (pd.Series([], dtype='object'), dt.binary),
+        (pd.Series([], dtype='object'), dt.null),
         (pd.Series([], dtype="string"), dt.string),
     ],
 )
@@ -219,7 +221,7 @@ def test_schema_infer(col_data, schema_type):
 
 
 def test_pyarrow_string():
-    pytest.importorskip("pyarrow")
+    pytest.importorskip("pa")
 
     s = pd.Series([], dtype="string[pyarrow]")
     assert dt.dtype(s.dtype) == dt.String()

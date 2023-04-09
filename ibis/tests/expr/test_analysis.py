@@ -1,10 +1,8 @@
-import time
-
 import pytest
 
 import ibis
 import ibis.common.exceptions as com
-import ibis.expr.analysis as L
+import ibis.expr.analysis as an
 import ibis.expr.operations as ops
 from ibis.tests.util import assert_equal
 
@@ -37,7 +35,7 @@ def test_rewrite_join_projection_without_other_ops(con):
     ex_pred2 = table['bar_id'] == table3['bar_id']
     ex_expr = table.left_join(table2, [pred1]).inner_join(table3, [ex_pred2])
 
-    rewritten_proj = L.substitute_parents(view.op())
+    rewritten_proj = an.substitute_parents(view.op())
 
     assert not rewritten_proj.table.equals(ex_expr.op())
 
@@ -143,7 +141,7 @@ def test_filter_self_join():
 
     metric = (left.total - right.total).name('diff')
     what = [left.region, metric]
-    projected = joined.projection(what)
+    projected = joined.select(what)
 
     proj_exprs = projected.op().selections
 
@@ -156,7 +154,7 @@ def test_no_rewrite(con):
     table = con.table('test1')
     table4 = table[['c', (table['c'] * 2).name('foo')]]
     expr = table4['c'] == table4['foo']
-    result = L.substitute_parents(expr.op()).to_expr()
+    result = an.substitute_parents(expr.op()).to_expr()
     expected = expr
     assert result.equals(expected)
 
@@ -167,7 +165,7 @@ def test_join_table_choice():
     t = x.aggregate(cnt=x.n.count())
     predicate = t.cnt > 0
 
-    result = L.sub_for(predicate.op(), {t.op(): t.op().table})
+    result = an.sub_for(predicate.op(), {t.op(): t.op().table})
     assert result == predicate.op()
 
 
@@ -266,7 +264,6 @@ def test_select_filter_mutate_fusion():
 
     second_selection = result.op()
     first_selection = second_selection.table
-
     assert len(second_selection.selections) == 1
 
     col = first_selection.to_expr()['col'].cast('int32').name('col').op()
@@ -306,19 +303,3 @@ def test_agg_selection_does_not_share_roots():
 
     with pytest.raises(com.RelationError, match="Selection expressions"):
         gb.aggregate(n=n)
-
-
-@pytest.mark.parametrize("num_joins", [1, 10])
-def test_large_compile(num_joins):
-    num_columns = 20
-    table = ibis.table({f"col_{i:d}": "string" for i in range(num_columns)}, name="t")
-    for _ in range(num_joins):
-        start = time.time()
-        table = table.mutate(dummy=ibis.literal(""))
-        stop = time.time()
-        assert stop - start < 1.0
-
-        start = time.time()
-        table = table.left_join(table, ["dummy"])[[table]]
-        stop = time.time()
-        assert stop - start < 1.0

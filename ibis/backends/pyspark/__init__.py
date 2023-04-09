@@ -1,22 +1,21 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any
 
-import pandas as pd
 import pyspark
 import sqlalchemy as sa
 from pyspark import SparkConf
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql.column import Column
 
 import ibis.common.exceptions as com
 import ibis.config
 import ibis.expr.operations as ops
 import ibis.expr.schema as sch
-import ibis.expr.types as types
 import ibis.expr.types as ir
-import ibis.util as util
+from ibis import util
+from ibis.backends.base.df.scope import Scope
+from ibis.backends.base.df.timecontext import canonicalize_context, localize_context
 from ibis.backends.base.sql import BaseSQLBackend
 from ibis.backends.base.sql.compiler import Compiler, TableSetFormatter
 from ibis.backends.base.sql.ddl import (
@@ -28,9 +27,9 @@ from ibis.backends.base.sql.ddl import (
 from ibis.backends.pyspark import ddl
 from ibis.backends.pyspark.client import PySparkTable, spark_dataframe_schema
 from ibis.backends.pyspark.compiler import PySparkDatabaseTable, PySparkExprTranslator
-from ibis.backends.pyspark.datatypes import spark_dtype
-from ibis.expr.scope import Scope
-from ibis.expr.timecontext import canonicalize_context, localize_context
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 _read_csv_defaults = {
     'header': True,
@@ -38,6 +37,13 @@ _read_csv_defaults = {
     'mode': 'FAILFAST',
     'escape': '"',
 }
+
+
+def normalize_filenames(source_list):
+    # Promote to list
+    source_list = util.promote_list(source_list)
+
+    return list(map(util.normalize_filename, source_list))
 
 
 class _PySparkCursor:
@@ -112,7 +118,7 @@ class Backend(BaseSQLBackend):
 
         treat_nan_as_null: bool = False
 
-    def _from_url(self, url: str) -> Backend:
+    def _from_url(self, url: str, **kwargs) -> Backend:
         """Construct a PySpark backend from a URL `url`."""
         url = sa.engine.make_url(url)
 
@@ -126,7 +132,11 @@ class Backend(BaseSQLBackend):
 
         builder = SparkSession.builder.config(conf=conf)
         session = builder.getOrCreate()
-        return self.connect(session)
+        return self.connect(session, **kwargs)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._cached_dataframes = {}
 
     def do_connect(self, session: SparkSession) -> None:
         """Create a PySpark `Backend` for use with Ibis.
@@ -158,13 +168,6 @@ class Backend(BaseSQLBackend):
     def version(self):
         return pyspark.__version__
 
-    @util.deprecated(
-        version='2.0',
-        instead='use a new connection to the database',
-    )
-    def set_database(self, name):
-        self._catalog.setCurrentDatabase(name)
-
     @property
     def current_database(self):
         return self._catalog.currentDatabase()
@@ -192,45 +195,31 @@ class Backend(BaseSQLBackend):
             )
 
         # Insert params in scope
-        if params is None:
-            scope = Scope()
-        else:
-            scope = Scope(
-                {param.op(): raw_value for param, raw_value in params.items()},
-                timecontext,
-            )
+        scope = Scope(
+            {
+                param.op(): raw_value
+                for param, raw_value in ({} if params is None else params).items()
+            },
+            timecontext,
+        )
         return PySparkExprTranslator().translate(
             expr.op(),
             scope=scope,
             timecontext=timecontext,
-            session=self._session,
+            session=getattr(self, "_session", None),
         )
 
-    def execute(
-        self,
-        expr: ir.Expr,
-        timecontext: Mapping | None = None,
-        params: Mapping[ir.Scalar, Any] | None = None,
-        limit: str = 'default',
-        **kwargs: Any,
-    ) -> Any:
+    def execute(self, expr: ir.Expr, **kwargs: Any) -> Any:
         """Execute an expression."""
-        if isinstance(expr, types.Table):
-            return self.compile(expr, timecontext, params, **kwargs).toPandas()
-        elif isinstance(expr, types.Column):
-            # expression must be named for the projection
-            if not expr.has_name():
-                expr = expr.name("tmp")
-            return self.compile(
-                expr.to_projection(), timecontext, params, **kwargs
-            ).toPandas()[expr.get_name()]
-        elif isinstance(expr, types.Scalar):
-            compiled = self.compile(expr, timecontext, params, **kwargs)
-            if isinstance(compiled, Column):
-                # attach result column to a fake DataFrame and
-                # select the result
-                compiled = self._session.range(0, 1).select(compiled)
-            return compiled.toPandas().iloc[0, 0]
+        table_expr = expr.as_table()
+        df = self.compile(table_expr, **kwargs).toPandas()
+        result = table_expr.schema().apply_to(df)
+        if isinstance(expr, ir.Table):
+            return result
+        elif isinstance(expr, ir.Column):
+            return result.iloc[:, 0]
+        elif isinstance(expr, ir.Scalar):
+            return result.iloc[0, 0]
         else:
             raise com.IbisError(f"Cannot execute expression of type: {type(expr)}")
 
@@ -255,7 +244,7 @@ class Backend(BaseSQLBackend):
         return _PySparkCursor(query)
 
     def _get_schema_using_query(self, query):
-        cur = self.raw_sql(query)
+        cur = self.raw_sql(f"SELECT * FROM ({query}) t0 LIMIT 0")
         return spark_dataframe_schema(cur.query)
 
     def _get_jtable(self, name, database=None):
@@ -305,6 +294,8 @@ class Backend(BaseSQLBackend):
             Database name
         path
             Path where to store the database data; otherwise uses Spark default
+        force
+            Whether to append `IF EXISTS` to the database creation SQL
         """
         statement = CreateDatabase(name, path=path, can_exist=force)
         return self.raw_sql(statement.compile())
@@ -345,111 +336,66 @@ class Backend(BaseSQLBackend):
         """
         if database is not None:
             raise com.UnsupportedArgumentError(
-                'Spark does not support the `database` argument for ' '`get_schema`'
+                'Spark does not support the `database` argument for `get_schema`'
             )
 
         df = self._session.table(table_name)
 
         return sch.infer(df)
 
-    def _schema_from_csv(self, path, **kwargs):
-        """Return a Schema object for the indicated csv file. Spark goes
-        through the file once to determine the schema. See documentation for
-        `pyspark.sql.DataFrameReader` for kwargs.
-
-        Parameters
-        ----------
-        path
-            Path to CSV
-
-        Returns
-        -------
-        schema : ibis Schema
-        """
-        options = _read_csv_defaults.copy()
-        options.update(kwargs)
-        options['inferSchema'] = True
-
-        df = self._session.read.csv(path, **options)
-        return spark_dataframe_schema(df)
-
-    def _create_table_or_temp_view_from_csv(
-        self,
-        name: str,
-        path: Path,
-        schema: sch.Schema | None = None,
-        database: str | None = None,
-        force: bool = False,
-        temp_view: bool = False,
-        format: str = 'parquet',
-        **kwargs: Any,
-    ):
-        options = _read_csv_defaults.copy()
-        options.update(kwargs)
-
-        if schema:
-            assert ('inferSchema', True) not in options.items()
-            schema = spark_dtype(schema)
-            options['schema'] = schema
-        else:
-            options['inferSchema'] = True
-
-        df = self._session.read.csv(path, **options)
-
-        if temp_view:
-            if force:
-                df.createOrReplaceTempView(name)
-            else:
-                df.createTempView(name)
-        else:
-            qualified_name = self._fully_qualified_name(
-                name, database or self.current_database
-            )
-            mode = 'error'
-            if force:
-                mode = 'overwrite'
-            df.write.saveAsTable(qualified_name, format=format, mode=mode)
-
     def create_table(
         self,
-        table_name: str,
+        name: str,
         obj: ir.Table | pd.DataFrame | None = None,
+        *,
         schema: sch.Schema | None = None,
         database: str | None = None,
-        force: bool = False,
-        # HDFS options
-        format: str = 'parquet',
-    ):
+        temp: bool | None = None,
+        overwrite: bool = False,
+        format: str = "parquet",
+    ) -> ir.Table:
         """Create a new table in Spark.
 
         Parameters
         ----------
-        table_name
-            Table name
+        name
+            Name of the new table.
         obj
-            If passed, creates table from select statement results
+            If passed, creates table from `SELECT` statement results
         schema
-            Mutually exclusive with obj, creates an empty table with a
-            schema
+            Mutually exclusive with `obj`, creates an empty table with a schema
         database
             Database name
-        force
-            If true, create table if table with indicated name already exists
+        temp
+            Whether the new table is temporary
+        overwrite
+            If `True`, overwrite existing data
         format
-            Table format
+            Format of the table on disk
+
+        Returns
+        -------
+        Table
+            The newly created table.
 
         Examples
         --------
         >>> con.create_table('new_table_name', table_expr)  # doctest: +SKIP
         """
+        import pandas as pd
+
+        if obj is None and schema is None:
+            raise com.IbisError("The schema or obj parameter is required")
+        if temp is True:
+            raise NotImplementedError(
+                "PySpark backend does not yet support temporary tables"
+            )
         if obj is not None:
             if isinstance(obj, pd.DataFrame):
                 spark_df = self._session.createDataFrame(obj)
-                mode = 'error'
-                if force:
-                    mode = 'overwrite'
-                spark_df.write.saveAsTable(table_name, format=format, mode=mode)
-                return
+                mode = "overwrite" if overwrite else "error"
+                spark_df.write.saveAsTable(name, format=format, mode=mode)
+                return None
             else:
                 self._register_in_memory_tables(obj)
 
@@ -457,84 +403,85 @@ class Backend(BaseSQLBackend):
             select = ast.queries[0]
 
             statement = ddl.CTAS(
-                table_name,
+                name,
                 select,
                 database=database,
-                can_exist=force,
+                can_exist=overwrite,
                 format=format,
             )
-        elif schema is not None:
+        else:
             statement = ddl.CreateTableWithSchema(
-                table_name,
+                name,
                 schema,
                 database=database,
                 format=format,
-                can_exist=force,
+                can_exist=overwrite,
             )
-        else:
-            raise com.IbisError('Must pass expr or schema')
 
-        return self.raw_sql(statement.compile())
+        self.raw_sql(statement.compile())
+        return self.table(name, database=database)
 
-    def _register_in_memory_table(self, table_op):
-        spark_df = self.compile(table_op.to_expr())
-        spark_df.createOrReplaceTempView(table_op.name)
+    def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
+        self.compile(op.to_expr()).createOrReplaceTempView(op.name)
 
     def create_view(
         self,
         name: str,
-        expr: ir.Table,
+        obj: ir.Table,
+        *,
         database: str | None = None,
-        can_exist: bool = False,
-        temporary: bool = False,
-    ):
+        overwrite: bool = False,
+    ) -> ir.Table:
         """Create a Spark view from a table expression.
 
         Parameters
         ----------
         name
             View name
-        expr
+        obj
             Expression to use for the view
         database
             Database name
-        can_exist
+        overwrite
             Replace an existing view of the same name if it exists
-        temporary
-            Whether the table is temporary
+
+        Returns
+        -------
+        Table
+            The created view
         """
-        ast = self.compiler.to_ast(expr)
+        ast = self.compiler.to_ast(obj)
         select = ast.queries[0]
         statement = ddl.CreateView(
-            name,
-            select,
-            database=database,
-            can_exist=can_exist,
-            temporary=temporary,
+            name, select, database=database, can_exist=overwrite, temporary=True
         )
-        return self.raw_sql(statement.compile())
+        self.raw_sql(statement.compile())
+        return self.table(name, database=database)
 
     def drop_table(
         self,
         name: str,
+        *,
         database: str | None = None,
         force: bool = False,
     ) -> None:
         """Drop a table."""
-        self.drop_table_or_view(name, database, force)
+        self.drop_table_or_view(name, database=database, force=force)
 
     def drop_view(
         self,
         name: str,
+        *,
         database: str | None = None,
         force: bool = False,
     ):
         """Drop a view."""
-        self.drop_table_or_view(name, database, force)
+        self.drop_table_or_view(name, database=database, force=force)
 
     def drop_table_or_view(
         self,
         name: str,
+        *,
         database: str | None = None,
         force: bool = False,
     ) -> None:
@@ -558,21 +505,17 @@ class Backend(BaseSQLBackend):
         statement = DropTable(name, database=database, must_exist=not force)
         self.raw_sql(statement.compile())
 
-    def truncate_table(
-        self,
-        table_name: str,
-        database: str | None = None,
-    ) -> None:
+    def truncate_table(self, name: str, database: str | None = None) -> None:
         """Delete all rows from an existing table.
 
         Parameters
         ----------
-        table_name
+        name
             Table name
         database
             Database name
         """
-        statement = TruncateTable(table_name, database=database)
+        statement = TruncateTable(name, database=database)
         self.raw_sql(statement.compile())
 
     def insert(
@@ -614,14 +557,149 @@ class Backend(BaseSQLBackend):
         database
             Database name
         noscan
-            If True, collect only basic statistics for the table (number of
+            If `True`, collect only basic statistics for the table (number of
             rows, size in bytes).
         """
-        maybe_noscan = ' NOSCAN' if noscan else ''
-        stmt = 'ANALYZE TABLE {} COMPUTE STATISTICS{}'.format(
-            self._fully_qualified_name(name, database), maybe_noscan
-        )
-        return self.raw_sql(stmt)
+        maybe_noscan = " NOSCAN" * noscan
+        name = self._fully_qualified_name(name, database)
+        return self.raw_sql(f"ANALYZE TABLE {name} COMPUTE STATISTICS{maybe_noscan}")
 
     def has_operation(cls, operation: type[ops.Value]) -> bool:
-        return operation in PySparkExprTranslator._registry.keys()
+        return operation in PySparkExprTranslator._registry
+
+    def _load_into_cache(self, name, expr):
+        t = expr.compile().cache()
+        assert t.is_cached
+        t.createOrReplaceTempView(name)
+        # store the underlying spark dataframe so we can release memory when
+        # asked to, instead of when the session ends
+        self._cached_dataframes[name] = t
+
+    def _clean_up_cached_table(self, op):
+        name = op.name
+        self._session.catalog.dropTempView(name)
+        t = self._cached_dataframes.pop(name)
+        assert t.is_cached
+        t.unpersist()
+        assert not t.is_cached
+
+    def read_parquet(
+        self,
+        source: str | Path,
+        table_name: str | None = None,
+        **kwargs: Any,
+    ) -> ir.Table:
+        """Register a parquet file as a table in the current database.
+
+        Parameters
+        ----------
+        source
+            The data source. May be a path to a file or directory of parquet files.
+        table_name
+            An optional name to use for the created table. This defaults to
+            a sequentially generated name.
+        kwargs
+            Additional keyword arguments passed to PySpark.
+            https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.parquet.html
+
+        Returns
+        -------
+        ir.Table
+            The just-registered table
+        """
+        source = util.normalize_filename(source)
+        spark_df = self._session.read.parquet(source, **kwargs)
+        table_name = table_name or util.gen_name("read_parquet")
+
+        spark_df.createOrReplaceTempView(table_name)
+        return self.table(table_name)
+
+    def read_csv(
+        self,
+        source_list: str | list[str] | tuple[str],
+        table_name: str | None = None,
+        **kwargs: Any,
+    ) -> ir.Table:
+        """Register a CSV file as a table in the current database.
+
+        Parameters
+        ----------
+        source_list
+            The data source(s). May be a path to a file or directory of CSV files, or an
+            iterable of CSV files.
+        table_name
+            An optional name to use for the created table. This defaults to
+            a sequentially generated name.
+        kwargs
+            Additional keyword arguments passed to PySpark loading function.
+            https://spark.apache.org/docs/latest/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameReader.csv.html
+
+        Returns
+        -------
+        ir.Table
+            The just-registered table
+        """
+        source_list = normalize_filenames(source_list)
+        spark_df = self._session.read.csv(source_list, **kwargs)
+        table_name = table_name or util.gen_name("read_csv")
+
+        spark_df.createOrReplaceTempView(table_name)
+        return self.table(table_name)
+
+    def register(
+        self,
+        source: str | Path | Any,
+        table_name: str | None = None,
+        **kwargs: Any,
+    ) -> ir.Table:
+        """Register a data source as a table in the current database.
+
+        Parameters
+        ----------
+        source
+            The data source(s). May be a path to a file or directory of
+            parquet/csv files, or an iterable of CSV files.
+        table_name
+            An optional name to use for the created table. This defaults to
+            a sequentially generated name.
+        **kwargs
+            Additional keyword arguments passed to PySpark loading functions for
+            CSV or parquet.
+
+        Returns
+        -------
+        ir.Table
+            The just-registered table
+        """
+
+        if isinstance(source, (str, Path)):
+            first = str(source)
+        elif isinstance(source, (list, tuple)):
+            first = source[0]
+        else:
+            self._register_failure()
+
+        if first.startswith(("parquet://", "parq://")) or first.endswith(
+            ("parq", "parquet")
+        ):
+            return self.read_parquet(source, table_name=table_name, **kwargs)
+        elif first.startswith(
+            ("csv://", "csv.gz://", "txt://", "txt.gz://")
+        ) or first.endswith(("csv", "csv.gz", "tsv", "tsv.gz", "txt", "txt.gz")):
+            return self.read_csv(source, table_name=table_name, **kwargs)
+        else:
+            self._register_failure()  # noqa: RET503
+
+    def _register_failure(self):
+        import inspect
+
+        msg = ", ".join(
+            name for name, _ in inspect.getmembers(self) if name.startswith("read_")
+        )
+        raise ValueError(
+            f"Cannot infer appropriate read function for input, "
+            f"please call one of {msg} directly"
+        )
+
+    def _to_sql(self, expr: ir.Expr, **kwargs) -> str:
+        raise NotImplementedError(f"Backend '{self.name}' backend doesn't support SQL")

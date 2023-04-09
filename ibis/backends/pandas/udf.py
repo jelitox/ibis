@@ -1,8 +1,8 @@
-"""APIs for creating user-defined element-wise, reduction and analytic
-functions."""
+"""APIs for creating user-defined functions."""
+
+from __future__ import annotations
 
 import itertools
-from typing import Tuple
 
 import pandas as pd
 from pandas.core.groupby import SeriesGroupBy
@@ -15,21 +15,22 @@ from ibis.backends.pandas.dispatch import execute_node, pre_execute
 from ibis.backends.pandas.execution.util import get_grouping
 
 
-def create_gens_from_args_groupby(args: Tuple[SeriesGroupBy]):
-    """Create generators for each args for groupby udaf.
+def create_gens_from_args_groupby(*args: tuple[SeriesGroupBy, ...]):
+    """Create generators for each of `args` for groupby UDAF.
 
     Returns a generator that outputs each group.
 
     Parameters
     ----------
-    args : Tuple[SeriesGroupBy...]
+    *args
+        A tuple of group by objects
 
     Returns
     -------
     Tuple[Generator]
+        Generators of group by data
     """
-    iters = ((data for _, data in arg) for arg in args)
-    return iters
+    return ((data for _, data in arg) for arg in args)
 
 
 class udf:
@@ -144,7 +145,7 @@ def pre_execute_analytic_and_reduction_udf(op, *clients, scope=None, **kwargs):
             # for every argument excluding the first (pandas performs
             # the iteration for the first argument) for each argument
             # that is a SeriesGroupBy.
-            iters = create_gens_from_args_groupby(args[1:])
+            iters = create_gens_from_args_groupby(*args[1:])
 
             # TODO: Unify calling convension here to be more like
             # window

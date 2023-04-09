@@ -294,7 +294,6 @@ def test_window_no_group_by():
     t = ibis.table(dict(a="int64", b="string"), name="t")
     expr = t.a.mean().over(ibis.window(preceding=0))
     result = repr(expr)
-    assert "preceding=0" in result
     assert "group_by=[]" not in result
 
 
@@ -303,7 +302,7 @@ def test_window_group_by():
     expr = t.a.mean().over(ibis.window(group_by=t.b))
 
     result = repr(expr)
-    assert "preceding=0" not in result
+    assert "start=0" not in result
     assert "group_by=[r0.b]" in result
 
 
@@ -313,10 +312,10 @@ def test_fillna():
     expr = t.fillna({"a": 3})
     repr(expr)
 
-    expr = t.fillna(3)
+    expr = t[["a"]].fillna(3)
     repr(expr)
 
-    expr = t.fillna("foo")
+    expr = t[["b"]].fillna("foo")
     repr(expr)
 
 
@@ -346,12 +345,7 @@ def test_destruct_selection():
 
     @udf.reduction(
         input_type=['int64'],
-        output_type=dt.Struct.from_dict(
-            {
-                'sum': 'int64',
-                'mean': 'float64',
-            }
-        ),
+        output_type=dt.Struct({'sum': 'int64', 'mean': 'float64'}),
     )
     def multi_output_udf(v):
         return v.sum(), v.mean()
@@ -361,3 +355,11 @@ def test_destruct_selection():
 
     assert "sum:  StructField(ReductionVectorizedUDF" in result
     assert "mean: StructField(ReductionVectorizedUDF" in result
+
+
+@pytest.mark.parametrize(
+    "literal, typ, output",
+    [(42, None, '42'), ('42', None, "'42'"), (42, "double", '42.0')],
+)
+def test_format_literal(literal, typ, output):
+    assert repr(ibis.literal(literal, type=typ)) == output

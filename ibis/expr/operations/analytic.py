@@ -5,29 +5,7 @@ from public import public
 import ibis.expr.datatypes as dt
 import ibis.expr.rules as rlz
 from ibis.common.annotations import attribute
-from ibis.expr.operations.core import Node, Value
-from ibis.expr.window import propagate_down_window
-
-
-@public
-class Window(Value):
-    expr = rlz.analytic
-    window = rlz.window_from(rlz.base_table_of(rlz.ref("expr"), strict=False))
-
-    output_dtype = rlz.dtype_like("expr")
-    output_shape = rlz.Shape.COLUMNAR
-
-    def __init__(self, expr, window):
-        expr = propagate_down_window(expr, window)
-        super().__init__(expr=expr, window=window)
-
-    def over(self, window):
-        new_window = self.window.combine(window)
-        return Window(self.expr, new_window)
-
-    @property
-    def name(self):
-        return self.expr.name
+from ibis.expr.operations.core import Value
 
 
 @public
@@ -62,56 +40,19 @@ class RankBase(Analytic):
 
 @public
 class MinRank(RankBase):
-    """Compute position of first element within each equal-value group in
-    sorted order. Equivalent to SQL RANK().
-
-    Examples
-    --------
-    values   ranks
-    1        0
-    1        0
-    2        2
-    2        2
-    2        2
-    3        5
-
-    Returns
-    -------
-    Int64Column
-        The min rank
-    """
-
     arg = rlz.column(rlz.any)
 
 
 @public
 class DenseRank(RankBase):
-    """Compute position of first element within each equal-value group in
-    sorted order, ignoring duplicate values. Equivalent to SQL DENSE_RANK().
-
-    Examples
-    --------
-    values   ranks
-    1        0
-    1        0
-    2        1
-    2        1
-    2        1
-    3        2
-
-    Returns
-    -------
-    IntegerColumn
-        The rank
-    """
-
     arg = rlz.column(rlz.any)
 
 
 @public
 class RowNumber(RankBase):
-    """Compute row number starting from 0 after sorting by column expression.
-    Equivalent to SQL ROW_NUMBER().
+    """Compute the row number over a window, starting from 0.
+
+    Equivalent to SQL's `ROW_NUMBER()`.
 
     Examples
     --------
@@ -163,11 +104,6 @@ class CumulativeMean(CumulativeOp):
 
 @public
 class CumulativeMax(CumulativeOp):
-    """Cumulative max.
-
-    Requires an order window.
-    """
-
     arg = rlz.column(rlz.any)
     output_dtype = rlz.dtype_like("arg")
 
@@ -239,17 +175,4 @@ class NthValue(Analytic):
     output_dtype = rlz.dtype_like("arg")
 
 
-# TODO(kszucs): should inherit from analytic base
-@public
-class TopK(Node):
-    arg = rlz.column(rlz.any)
-    k = rlz.non_negative_integer
-    by = rlz.one_of((rlz.function_of(rlz.base_table_of(rlz.ref("arg"))), rlz.any))
-
-    def to_expr(self):
-        import ibis.expr.types as ir
-
-        return ir.TopK(self)
-
-
-public(WindowOp=Window, AnalyticOp=Analytic)
+public(AnalyticOp=Analytic)

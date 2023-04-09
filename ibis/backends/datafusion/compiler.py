@@ -1,11 +1,16 @@
+from __future__ import annotations
+
 import functools
+import math
 import operator
 
 import datafusion as df
 import datafusion.functions
 import pyarrow as pa
+import pyarrow.compute as pc
 
 import ibis.common.exceptions as com
+import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 from ibis.backends.datafusion.datatypes import to_pyarrow_type
 
@@ -255,15 +260,11 @@ def capitalize(op):
 def substring(op):
     arg = translate(op.arg)
     start = translate(ops.Add(left=op.start, right=1))
-    length = translate(op.length)
-    return df.functions.substr(arg, start, length)
-
-
-@translate.register(ops.RegexExtract)
-def regex_extract(op):
-    arg = translate(op.arg)
-    pattern = translate(op.pattern)
-    return df.functions.regexp_match(arg, pattern)
+    if op_length := op.length:
+        length = translate(op_length)
+        return df.functions.substr(arg, start, length)
+    else:
+        return df.functions.substr(arg, start)
 
 
 @translate.register(ops.Repeat)
@@ -362,6 +363,8 @@ def count_star(_):
 @translate.register(ops.Sum)
 def sum(op):
     arg = translate(op.arg)
+    if op.arg.output_dtype.is_boolean():
+        arg = arg.cast(pa.int64())
     return df.functions.sum(arg)
 
 
@@ -383,22 +386,17 @@ def mean(op):
     return df.functions.avg(arg)
 
 
-@translate.register(ops.NodeList)
-def value_list(op):
-    return list(map(translate, op.values))
-
-
 @translate.register(ops.Contains)
 def contains(op):
     value = translate(op.value)
-    options = translate(op.options)
+    options = list(map(translate, op.options))
     return df.functions.in_list(value, options, negated=False)
 
 
 @translate.register(ops.NotContains)
 def not_contains(op):
     value = translate(op.value)
-    options = translate(op.options)
+    options = list(map(translate, op.options))
     return df.functions.in_list(value, options, negated=True)
 
 
@@ -413,6 +411,7 @@ def negate(op):
 @translate.register(ops.Cos)
 @translate.register(ops.Sin)
 @translate.register(ops.Tan)
+@translate.register(ops.Exp)
 def trig(op):
     func_name = op.__class__.__name__.lower()
     func = getattr(df.functions, func_name)
@@ -428,7 +427,32 @@ def atan2(op):
 @translate.register(ops.Cot)
 def cot(op):
     x = translate(op.arg)
-    return df.functions.cos(x) / df.functions.sin(x)
+    return df.lit(1.0) / df.functions.tan(x)
+
+
+@translate.register(ops.Radians)
+def radians(op):
+    return translate(op.arg) * df.lit(math.pi) / df.lit(180)
+
+
+@translate.register(ops.Degrees)
+def degrees(op):
+    return translate(op.arg) * df.lit(180) / df.lit(math.pi)
+
+
+@translate.register(ops.RandomScalar)
+def random_scalar(_):
+    return df.functions.random()
+
+
+@translate.register(ops.Pi)
+def pi(_):
+    return df.lit(math.pi)
+
+
+@translate.register(ops.E)
+def e(_):
+    return df.lit(math.e)
 
 
 @translate.register(ops.ElementWiseVectorizedUDF)
@@ -442,3 +466,48 @@ def elementwise_udf(op):
     args = map(translate, op.func_args)
 
     return udf(*args)
+
+
+@translate.register(ops.StringConcat)
+def string_concat(op):
+    return df.functions.concat(*map(translate, op.arg))
+
+
+@translate.register(ops.Translate)
+def string_translate(op):
+    return df.functions.translate(*map(translate, op.args))
+
+
+@translate.register(ops.StringAscii)
+def string_ascii(op):
+    return df.functions.ascii(translate(op.arg))
+
+
+@translate.register(ops.StartsWith)
+def string_starts_with(op):
+    return df.functions.starts_with(translate(op.arg), translate(op.start))
+
+
+@translate.register(ops.StrRight)
+def string_right(op):
+    return df.functions.right(translate(op.arg), translate(op.nchars))
+
+
+@translate.register(ops.RegexExtract)
+def regex_extract(op):
+    arg = translate(op.arg)
+    concat = ops.StringConcat(("(", op.pattern, ")"))
+    pattern = translate(concat)
+    if (index := getattr(op.index, "value", None)) is None:
+        raise ValueError(
+            "re_extract `index` expressions must be literals. "
+            "Arbitrary expressions are not supported in the DataFusion backend"
+        )
+    string_array_get = df.udf(
+        lambda arr, index=index: pc.list_element(arr, index),
+        input_types=[to_pyarrow_type(dt.Array(dt.string))],
+        return_type=to_pyarrow_type(dt.string),
+        volatility="immutable",
+        name="string_array_get",
+    )
+    return string_array_get(df.functions.regexp_match(arg, pattern))

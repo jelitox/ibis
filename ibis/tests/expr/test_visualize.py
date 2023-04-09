@@ -2,15 +2,15 @@ import os
 
 import pytest
 
-import ibis  # noqa: E402
-import ibis.expr.operations as ops  # noqa: E402
-import ibis.expr.rules as rlz  # noqa: E402
-import ibis.expr.types as ir  # noqa: E402
+import ibis
+import ibis.expr.operations as ops
+import ibis.expr.rules as rlz
+import ibis.expr.types as ir
 
 pytest.importorskip('graphviz')
 
-import ibis.expr.visualize as viz  # noqa: E402, isort:skip
-import ibis.expr.api as api  # noqa; E402
+import ibis.expr.visualize as viz  # noqa: E402
+from ibis.expr import api  # noqa: E402
 
 pytestmark = pytest.mark.skipif(
     int(os.environ.get('CONDA_BUILD', 0)) == 1, reason='CONDA_BUILD defined'
@@ -153,12 +153,18 @@ def test_filter():
     t = ibis.table([('a', 'int64'), ('b', 'string'), ('c', 'int32')])
     expr = t.filter((t.a == 1) & (t.b == "x"))
     graph = viz.to_graph(expr, label_edges=True)
-    assert "values[0]" in graph.source
-    assert "values[1]" in graph.source
+    assert "predicates[0]" in graph.source
+    assert "predicates[1]" in graph.source
 
 
 def test_html_escape(with_graphviz):
     # Check that we correctly escape HTML <> characters in the graphviz
     # representation. If an error is thrown, _repr_png_ returns None.
     expr = ibis.table([('<a & b>', ibis.expr.datatypes.Array('string'))])
+    assert expr._repr_png_() is not None
+
+    expr = ibis.array([1, 2, 3])
+    assert expr._repr_png_() is not None
+
+    expr = ibis.array([1, 2, 3]).name("COL")
     assert expr._repr_png_() is not None

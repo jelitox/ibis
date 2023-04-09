@@ -67,15 +67,13 @@ def test_list_tables(con):
     assert len(con.list_tables(like='functional')) == 1
 
 
-def test_compile_toplevel():
+def test_compile_toplevel(snapshot):
     t = ibis.table([('foo', 'double')], name='t0')
 
     # it works!
     expr = t.foo.sum()
     result = ibis.postgres.compile(expr)
-    expected = "SELECT sum(t0.foo) AS sum \nFROM t0 AS t0"
-
-    assert str(result) == expected
+    snapshot.assert_match(str(result), "out.sql")
 
 
 def test_list_databases(con):
@@ -83,27 +81,11 @@ def test_list_databases(con):
     assert POSTGRES_TEST_DB in con.list_databases()
 
 
-def test_metadata_is_per_table():
-    con = ibis.postgres.connect(
-        host=IBIS_POSTGRES_HOST,
-        database=POSTGRES_TEST_DB,
-        user=IBIS_POSTGRES_USER,
-        password=IBIS_POSTGRES_PASS,
-        port=IBIS_POSTGRES_PORT,
-    )
-    assert len(con.meta.tables) == 0
-
-    # assert that we reflect only when a table is requested
-    con.table('functional_alltypes')
-    assert 'functional_alltypes' in con.meta.tables
-    assert len(con.meta.tables) == 1
-
-
 def test_schema_type_conversion():
     typespec = [
         # name, type, nullable
         ('json', postgresql.JSON, True, dt.JSON),
-        ('jsonb', postgresql.JSONB, True, dt.JSONB),
+        ('jsonb', postgresql.JSONB, True, dt.JSON),
         ('uuid', postgresql.UUID, True, dt.UUID),
         ('macaddr', postgresql.MACADDR, True, dt.MACADDR),
         ('inet', postgresql.INET, True, dt.INET),
@@ -112,17 +94,15 @@ def test_schema_type_conversion():
     sqla_types = []
     ibis_types = []
     for name, t, nullable, ibis_type in typespec:
-        sqla_type = sa.Column(name, t, nullable=nullable)
-        sqla_types.append(sqla_type)
+        sqla_types.append(sa.Column(name, t, nullable=nullable))
         ibis_types.append((name, ibis_type(nullable=nullable)))
 
     # Create a table with placeholder stubs for JSON, JSONB, and UUID.
-    engine = sa.create_engine('postgresql://')
-    table = sa.Table('tname', sa.MetaData(bind=engine), *sqla_types)
+    table = sa.Table('tname', sa.MetaData(), *sqla_types)
 
     # Check that we can correctly create a schema with dt.any for the
     # missing types.
-    schema = schema_from_table(table)
+    schema = schema_from_table(table, dialect=postgresql.dialect())
     expected = ibis.schema(ibis_types)
 
     assert_equal(schema, expected)
@@ -131,49 +111,25 @@ def test_schema_type_conversion():
 def test_interval_films_schema(con):
     t = con.table("films")
     assert t.len.type() == dt.Interval(unit="m")
-    assert t.len.execute().dtype == np.dtype("timedelta64[ns]")
+    assert issubclass(t.len.execute().dtype.type, np.timedelta64)
 
 
 @pytest.mark.parametrize(
     ("column", "expected_dtype"),
     [
         # a, b and g are variable length intervals, like YEAR TO MONTH
-        ("c", dt.Interval("D")),
-        ("d", dt.Interval("h")),
-        ("e", dt.Interval("m")),
-        ("f", dt.Interval("s")),
-        ("h", dt.Interval("h")),
-        ("i", dt.Interval("m")),
-        ("j", dt.Interval("s")),
-        ("k", dt.Interval("m")),
-        ("l", dt.Interval("s")),
-        ("m", dt.Interval("s")),
-    ],
-)
-def test_all_interval_types_schema(intervals, column, expected_dtype):
-    assert intervals[column].type() == expected_dtype
-
-
-@pytest.mark.parametrize(
-    ("column", "expected_dtype"),
-    [
-        # a, b and g are variable length intervals, like YEAR TO MONTH
-        ("c", dt.Interval("D")),
-        ("d", dt.Interval("h")),
-        ("e", dt.Interval("m")),
-        ("f", dt.Interval("s")),
-        ("h", dt.Interval("h")),
-        ("i", dt.Interval("m")),
-        ("j", dt.Interval("s")),
-        ("k", dt.Interval("m")),
-        ("l", dt.Interval("s")),
-        ("m", dt.Interval("s")),
+        param("c", dt.Interval("D"), id="day"),
+        param("d", dt.Interval("h"), id="hour"),
+        param("e", dt.Interval("m"), id="minute"),
+        param("f", dt.Interval("s"), id="second"),
     ],
 )
 def test_all_interval_types_execute(intervals, column, expected_dtype):
     expr = intervals[column]
+    assert expr.type() == expected_dtype
+
     series = expr.execute()
-    assert series.dtype == np.dtype("timedelta64[ns]")
+    assert issubclass(series.dtype.type, np.timedelta64)
 
 
 @pytest.mark.xfail(
@@ -238,16 +194,22 @@ def test_create_and_drop_table(con, temp_table, params):
             ("numeric", dt.decimal),
             ("numeric(3, 2)", dt.Decimal(3, 2)),
             ("uuid", dt.uuid),
-            ("jsonb", dt.jsonb),
+            ("jsonb", dt.json),
             ("geometry", dt.geometry),
             ("geography", dt.geography),
         ]
     ],
 )
 def test_get_schema_from_query(con, pg_type, expected_type):
-    raw_name = ibis.util.guid()
-    name = con.con.dialect.identifier_preparer.quote_identifier(raw_name)
-    con.raw_sql(f"CREATE TEMPORARY TABLE {name} (x {pg_type}, y {pg_type}[])")
+    name = con._quote(ibis.util.guid())
+    with con.begin() as c:
+        c.exec_driver_sql(f"CREATE TEMP TABLE {name} (x {pg_type}, y {pg_type}[])")
     expected_schema = ibis.schema(dict(x=expected_type, y=dt.Array(expected_type)))
     result_schema = con._get_schema_using_query(f"SELECT x, y FROM {name}")
     assert result_schema == expected_schema
+
+
+@pytest.mark.parametrize("col", ["search", "simvec"])
+def test_unknown_column_type(con, col):
+    awards_players = con.table("awards_players")
+    assert awards_players[col].type().is_unknown()

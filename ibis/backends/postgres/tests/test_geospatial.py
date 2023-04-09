@@ -434,7 +434,7 @@ def test_geo_dataframe(geotable):
             ),
             (
                 "(((40.0 40.0, 20.0 45.0, 45.0 30.0, 40.0 40.0)), "
-                "((20.0 35.0, 10.0 30.0, 10.0 10.0, 30.0 5.0, 45.0 20.0, 20.0 35.0), "  # noqa: E501
+                "((20.0 35.0, 10.0 30.0, 10.0 10.0, 30.0 5.0, 45.0 20.0, 20.0 35.0), "
                 "(30.0 20.0, 20.0 15.0, 20.0 25.0, 30.0 20.0)))"
             ),
             id="multipolygon",
@@ -518,7 +518,7 @@ def test_geo_literals_smoke(con, shape, value, modifier, expected):
 )
 def test_geo_ops_smoke(geotable, fn_expr):
     """Smoke tests for geo spatial operations."""
-    assert fn_expr(geotable).compile() != ''
+    assert str(fn_expr(geotable).compile())
 
 
 def test_geo_equals(geotable):

@@ -15,6 +15,7 @@ on:
       - pyproject.toml
       - requirements.txt
       - .github/workflows/check-requirements-txt.yml
+  merge_group:
 
 concurrency:
   group: ${{ github.repository }}-${{ github.head_ref || github.sha }}-${{ github.workflow }}
@@ -31,7 +32,7 @@ jobs:
         uses: actions/setup-python@v4
         id: install_python
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
       - name: update apt-get
         run: sudo apt-get update -y -q
@@ -40,13 +41,28 @@ jobs:
         run: sudo apt-get install -y -q build-essential graphviz libgeos-dev
 
       - name: install poetry
-        run: pip install 'poetry>=1.2' 'poetry-core>=1.1'
+        run: pip install 'poetry<1.4'
 
       - name: check consistency with pyproject.toml
         run: poetry lock --check
 
+      - name: check that the `all` extra matches the current lock file
+        run: |
+          set -euo pipefail
+
+          js="$(mktemp --suffix=.pyproject.json)"
+          docker run --rm -i sclevine/yj -tj < pyproject.toml > "$js"
+
+          old="$(mktemp --suffix=.old)"
+          jq -rM '.tool.poetry.extras.all | unique | sort' < "$js" > "$old"
+
+          new="$(mktemp --suffix=.new)"
+          jq -rM '.tool.poetry.extras | with_entries(select(.key != "all")) | [.[]] | add | unique | sort' < "$js" > "$new"
+
+          diff --unified "$old" "$new"
+
       - name: generate requirements.txt
-        run: poetry export --with dev --with test --with docs --without-hashes --no-ansi > requirements.txt
+        run: poetry export --extras all --with dev --with test --with docs --without-hashes --no-ansi > requirements.txt
 
       - name: check requirements.txt
         run: git diff --exit-code requirements.txt
@@ -54,7 +70,7 @@ jobs:
       - uses: syphar/restore-virtualenv@v1
         with:
           requirement_files: requirements.txt
-          custom_cache_key_element: check-setuptools-install-${{ steps.install_python.outputs.python-version }}
+          custom_cache_key_element: check-setuptools-install
 
       - uses: syphar/restore-pip-download-cache@v1
         with:

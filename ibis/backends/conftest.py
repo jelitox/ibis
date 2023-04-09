@@ -1,26 +1,35 @@
 from __future__ import annotations
 
+import contextlib
 import importlib
 import importlib.metadata
+import itertools
 import os
 import platform
+import sys
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, TextIO
+from typing import Any, TextIO
 
 import _pytest
+import numpy as np
 import pandas as pd
+import pytest
 import sqlalchemy as sa
+from packaging.requirements import Requirement
 from packaging.version import parse as vparse
 
-if TYPE_CHECKING:
-    import pyarrow as pa
-
-import pytest
-
 import ibis
-import ibis.util as util
+from ibis import util
 from ibis.backends.base import _get_backend_names
+
+SANDBOXED = (
+    any(key.startswith("NIX_") for key in os.environ)
+    and os.environ.get("IN_NIX_SHELL") != "impure"
+)
+LINUX = platform.system() == "Linux"
+MACOS = platform.system() == "Darwin"
+WINDOWS = platform.system() == "Windows"
 
 TEST_TABLES = {
     "functional_alltypes": ibis.schema(
@@ -94,6 +103,26 @@ TEST_TABLES = {
     ),
 }
 
+# We want to check for exceptions in xfail tests for two reasons:
+# * xfail tests without exception checking may hide problems.
+#   For example, the implementation may work, but we may have an error in the test that needs to be fixed.
+# * facilitates code reviews
+# For now, many of our tests don't do this, and we're working to change this situation
+# by improving all tests file by file. All files that have already been improved are
+# added to this list to prevent regression.
+FIlES_WITH_STRICT_EXCEPTION_CHECK = [
+    'ibis/backends/tests/test_api.py',
+    'ibis/backends/tests/test_array.py',
+    'ibis/backends/tests/test_aggregation.py',
+    'ibis/backends/tests/test_binary.py',
+    'ibis/backends/tests/test_numeric.py',
+    'ibis/backends/tests/test_column.py',
+    'ibis/backends/tests/test_string.py',
+    'ibis/backends/tests/test_temporal.py',
+    'ibis/backends/tests/test_uuid.py',
+    'ibis/backends/tests/test_window.py',
+]
+
 
 @pytest.fixture(scope='session')
 def script_directory() -> Path:
@@ -118,12 +147,7 @@ def data_directory() -> Path:
     """
     root = Path(__file__).absolute().parents[2]
 
-    return Path(
-        os.environ.get(
-            "IBIS_TEST_DATA_DIRECTORY",
-            root / "ci" / "ibis-testing-data",
-        )
-    )
+    return root / "ci" / "ibis-testing-data"
 
 
 def recreate_database(
@@ -131,7 +155,7 @@ def recreate_database(
     database: str,
     **kwargs: Any,
 ) -> None:
-    """Drop the {database} at {url}, if it exists.
+    """Drop the `database` at `url`, if it exists.
 
     Create a new, blank database with the same name.
 
@@ -142,12 +166,12 @@ def recreate_database(
     database : str
         Name of the database to be dropped.
     """
-    engine = sa.create_engine(url, **kwargs)
+    engine = sa.create_engine(url.set(database=""), **kwargs)
 
     if url.database is not None:
-        with engine.connect() as conn:
-            conn.execute(f'DROP DATABASE IF EXISTS {database}')
-            conn.execute(f'CREATE DATABASE {database}')
+        with engine.begin() as con:
+            con.exec_driver_sql(f"DROP DATABASE IF EXISTS {database}")
+            con.exec_driver_sql(f"CREATE DATABASE {database}")
 
 
 def init_database(
@@ -155,11 +179,12 @@ def init_database(
     database: str,
     schema: TextIO | None = None,
     recreate: bool = True,
+    isolation_level: str | None = "AUTOCOMMIT",
     **kwargs: Any,
 ) -> sa.engine.Engine:
-    """Initialise {database} at {url} with {schema}.
+    """Initialise `database` at `url` with `schema`.
 
-    If {recreate}, drop the {database} at {url}, if it exists.
+    If `recreate`, drop the `database` at `url`, if it exists.
 
     Parameters
     ----------
@@ -171,11 +196,17 @@ def init_database(
         File object containing schema to use
     recreate : bool
         If true, drop the database if it exists
+    isolation_level : str
+        Transaction isolation_level
 
     Returns
     -------
-    sa.engine.Engine for the database created
+    sa.engine.Engine
+        SQLAlchemy engine object
     """
+    if isolation_level is not None:
+        kwargs["isolation_level"] = isolation_level
+
     if recreate:
         recreate_database(url, database, **kwargs)
 
@@ -187,34 +218,11 @@ def init_database(
     engine = sa.create_engine(url, **kwargs)
 
     if schema:
-        with engine.connect() as conn:
+        with engine.begin() as conn:
             for stmt in filter(None, map(str.strip, schema.read().split(';'))):
-                conn.execute(stmt)
+                conn.exec_driver_sql(stmt)
 
     return engine
-
-
-def read_tables(
-    names: Iterable[str],
-    data_dir: Path,
-) -> Iterator[tuple[str, pa.Table]]:
-    """For each csv {names} in {data_dir} return a pyarrow.Table."""
-
-    import pyarrow.csv as pac
-
-    import ibis.backends.pyarrow.datatypes as pa_dt
-
-    for name in names:
-        schema = TEST_TABLES[name]
-        convert_options = pac.ConvertOptions(
-            column_types={
-                name: pa_dt.to_pyarrow_type(type) for name, type in schema.items()
-            }
-        )
-        yield name, pac.read_csv(
-            data_dir / f'{name}.csv',
-            convert_options=convert_options,
-        )
 
 
 def _random_identifier(suffix: str) -> str:
@@ -276,7 +284,12 @@ def pytest_ignore_collect(path, config):
 def pytest_collection_modifyitems(session, config, items):
     # add the backend marker to any tests are inside "ibis/backends"
     all_backends = _get_backend_names()
-    xdist_group_markers = []
+    additional_markers = []
+
+    try:
+        import pyspark
+    except ImportError:
+        pyspark = None
 
     for item in items:
         parts = item.path.parts
@@ -284,19 +297,44 @@ def pytest_collection_modifyitems(session, config, items):
         if backend is not None and backend in all_backends:
             item.add_marker(getattr(pytest.mark, backend))
             item.add_marker(pytest.mark.backend)
-        elif "backends" not in parts:
+        elif "backends" not in parts and not tuple(
+            itertools.chain(
+                *(item.iter_markers(name=name) for name in all_backends),
+                item.iter_markers(name="backend"),
+                item.iter_markers(name="backend_nodata"),
+            )
+        ):
             # anything else is a "core" test and is run by default
             if not any(item.iter_markers(name="benchmark")):
                 item.add_marker(pytest.mark.core)
 
-        for name in ("duckdb", "sqlite"):
-            # build a list of markers so we're don't invalidate the item's
-            # marker iterator
-            for _ in item.iter_markers(name=name):
-                xdist_group_markers.append((item, pytest.mark.xdist_group(name=name)))
+        for _ in item.iter_markers(name="pyspark"):
+            if not isinstance(item, pytest.DoctestItem):
+                additional_markers.append(
+                    (
+                        item,
+                        [
+                            pytest.mark.xfail(
+                                sys.version_info >= (3, 11),
+                                reason="PySpark doesn't support Python 3.11",
+                            ),
+                            pytest.mark.xfail(
+                                vparse(pd.__version__) >= vparse("2"),
+                                reason="PySpark doesn't support pandas>=2",
+                            ),
+                            pytest.mark.skipif(
+                                pyspark is not None
+                                and vparse(pyspark.__version__) < vparse("3.3.3")
+                                and vparse(np.__version__) >= vparse("1.24"),
+                                reason="PySpark doesn't support numpy >= 1.24",
+                            ),
+                        ],
+                    )
+                )
 
-    for item, marker in xdist_group_markers:
-        item.add_marker(marker)
+    for item, markers in additional_markers:
+        for marker in markers:
+            item.add_marker(marker)
 
 
 @lru_cache(maxsize=None)
@@ -313,9 +351,6 @@ def _get_backends_to_test(
     if keep:
         backends = backends.intersection(keep)
 
-    # spark is an alias for pyspark
-    backends = backends.difference(("spark",))
-
     return [
         pytest.param(
             backend,
@@ -331,7 +366,7 @@ def pytest_runtest_call(item):
     backend = [
         backend.name()
         for key, backend in item.funcargs.items()
-        if key.endswith("backend")
+        if key.endswith(("backend", "backend_nodata"))
     ]
     if len(backend) > 1:
         raise ValueError(
@@ -356,7 +391,11 @@ def pytest_runtest_call(item):
         funcargs = item.funcargs
         con = funcargs.get(
             "con",
-            getattr(funcargs.get("backend"), "connection", None),
+            getattr(
+                funcargs.get("backend", funcargs.get("backend_nodata")),
+                "connection",
+                None,
+            ),
         )
 
         if con is None:
@@ -369,7 +408,7 @@ def pytest_runtest_call(item):
             pytest.mark.xfail(
                 condition,
                 reason=(
-                    "unsupported functionality for server version " f"{server_version}"
+                    f"unsupported functionality for server version {server_version}"
                 ),
                 **kwargs,
             )
@@ -389,9 +428,7 @@ def pytest_runtest_call(item):
         else:
             condition = vparse(version) < vparse(min_version)
             if reason is None:
-                reason = (
-                    f"test requires {backend}>={version}; " f"got version {version}"
-                )
+                reason = f"test requires {backend}>={version}; got version {version}"
             else:
                 reason = f"{backend}@{version} (<{min_version}): {reason}"
         item.add_marker(pytest.mark.xfail(condition, reason=reason, **kwargs))
@@ -400,6 +437,11 @@ def pytest_runtest_call(item):
     # This xfails so that you know when it starts to pass
     for marker in item.iter_markers(name="notimpl"):
         if backend in marker.args[0]:
+            if (
+                item.location[0] in FIlES_WITH_STRICT_EXCEPTION_CHECK
+                and "raises" not in marker.kwargs.keys()
+            ):
+                raise ValueError("notimpl requires a raises")
             reason = marker.kwargs.get("reason")
             item.add_marker(
                 pytest.mark.xfail(
@@ -412,6 +454,11 @@ def pytest_runtest_call(item):
     # This xfails so that you know when it starts to pass
     for marker in item.iter_markers(name="notyet"):
         if backend in marker.args[0]:
+            if (
+                item.location[0] in FIlES_WITH_STRICT_EXCEPTION_CHECK
+                and "raises" not in marker.kwargs.keys()
+            ):
+                raise ValueError("notyet requires a raises")
             reason = marker.kwargs.get("reason")
             item.add_marker(
                 pytest.mark.xfail(
@@ -435,6 +482,11 @@ def pytest_runtest_call(item):
     # bring it to attention  -- USE SPARINGLY
     for marker in item.iter_markers(name="broken"):
         if backend in marker.args[0]:
+            if (
+                item.location[0] in FIlES_WITH_STRICT_EXCEPTION_CHECK
+                and "raises" not in marker.kwargs.keys()
+            ):
+                raise ValueError("broken requires a raises")
             reason = marker.kwargs.get("reason")
             item.add_marker(
                 pytest.mark.xfail(
@@ -442,6 +494,24 @@ def pytest_runtest_call(item):
                     **{k: v for k, v in marker.kwargs.items() if k != "reason"},
                 )
             )
+
+    for marker in item.iter_markers(name="xfail_version"):
+        kwargs = marker.kwargs
+        if backend not in kwargs:
+            continue
+
+        provided_reason = kwargs.pop("reason", None)
+        specs = kwargs.pop(backend)
+        failing_specs = []
+        for spec in specs:
+            req = Requirement(spec)
+            if req.specifier.contains(importlib.import_module(req.name).__version__):
+                failing_specs.append(spec)
+        reason = f"{backend} backend test fails with {backend}{specs}"
+        if provided_reason is not None:
+            reason += f"; {provided_reason}"
+        if failing_specs:
+            item.add_marker(pytest.mark.xfail(reason=reason, **kwargs))
 
 
 @pytest.fixture(params=_get_backends_to_test(), scope='session')
@@ -458,6 +528,20 @@ def con(backend):
     return backend.connection
 
 
+@pytest.fixture(params=_get_backends_to_test(), scope='session')
+def backend_nodata(request, data_directory):
+    """Return an instance of BackendTest, loaded with data."""
+
+    cls = _get_backend_conf(request.param)
+    return cls(data_directory)
+
+
+@pytest.fixture(scope="session")
+def con_nodata(backend_nodata):
+    """Instance of a backend client."""
+    return backend_nodata.connection
+
+
 def _setup_backend(
     request, data_directory, script_directory, tmp_path_factory, worker_id
 ):
@@ -466,6 +550,7 @@ def _setup_backend(
             "windows prevents two connections to the same duckdb file "
             "even in the same process"
         )
+        return None
     else:
         cls = _get_backend_conf(backend)
         return cls.load_data(
@@ -478,11 +563,7 @@ def _setup_backend(
     scope='session',
 )
 def ddl_backend(request, data_directory, script_directory, tmp_path_factory, worker_id):
-    """Set up the backends that are SQL-based.
-
-    (sqlite, postgres, mysql, duckdb, datafusion, clickhouse, pyspark,
-    impala)
-    """
+    """Set up the backends that are SQL-based."""
     return _setup_backend(
         request, data_directory, script_directory, tmp_path_factory, worker_id
     )
@@ -496,17 +577,14 @@ def ddl_con(ddl_backend):
 
 @pytest.fixture(
     params=_get_backends_to_test(
-        keep=("sqlite", "postgres", "mysql", "duckdb", "snowflake")
+        keep=("duckdb", "mssql", "mysql", "postgres", "snowflake", "sqlite", "trino")
     ),
     scope='session',
 )
 def alchemy_backend(
     request, data_directory, script_directory, tmp_path_factory, worker_id
 ):
-    """Set up the SQLAlchemy-based backends.
-
-    (sqlite, mysql, postgres, duckdb)
-    """
+    """Set up the SQLAlchemy-based backends."""
     return _setup_backend(
         request, data_directory, script_directory, tmp_path_factory, worker_id
     )
@@ -625,13 +703,9 @@ def alchemy_temp_table(alchemy_con) -> str:
         Random table name for a temporary usage.
     """
     name = _random_identifier('table')
-    try:
-        yield name
-    finally:
-        try:
-            alchemy_con.drop_table(name, force=True)
-        except NotImplementedError:
-            pass
+    yield name
+    with contextlib.suppress(NotImplementedError):
+        alchemy_con.drop_table(name, force=True)
 
 
 @pytest.fixture
@@ -648,13 +722,9 @@ def temp_table(con) -> str:
         Random table name for a temporary usage.
     """
     name = _random_identifier('table')
-    try:
-        yield name
-    finally:
-        try:
-            con.drop_table(name, force=True)
-        except NotImplementedError:
-            pass
+    yield name
+    with contextlib.suppress(NotImplementedError):
+        con.drop_table(name, force=True)
 
 
 @pytest.fixture
@@ -671,13 +741,9 @@ def temp_view(ddl_con) -> str:
         Random view name for a temporary usage.
     """
     name = _random_identifier('view')
-    try:
-        yield name
-    finally:
-        try:
-            ddl_con.drop_view(name, force=True)
-        except NotImplementedError:
-            pass
+    yield name
+    with contextlib.suppress(NotImplementedError):
+        ddl_con.drop_view(name, force=True)
 
 
 @pytest.fixture(scope='session')
@@ -687,7 +753,7 @@ def current_data_db(ddl_con) -> str:
 
 
 @pytest.fixture
-def alternate_current_database(ddl_con, ddl_backend, current_data_db: str) -> str:
+def alternate_current_database(ddl_con, ddl_backend) -> str:
     """Create a temporary database and yield its name. Drops the created
     database upon completion.
 
@@ -704,11 +770,8 @@ def alternate_current_database(ddl_con, ddl_backend, current_data_db: str) -> st
         ddl_con.create_database(name)
     except NotImplementedError:
         pytest.skip(f"{ddl_backend.name()} doesn't have create_database method.")
-    try:
-        yield name
-    finally:
-        ddl_con.set_database(current_data_db)
-        ddl_con.drop_database(name, force=True)
+    yield name
+    ddl_con.drop_database(name, force=True)
 
 
 @pytest.fixture

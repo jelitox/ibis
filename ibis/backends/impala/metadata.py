@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Copyright 2014 Cloudera Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,10 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from io import StringIO
-
-import pandas as pd
 
 
 def parse_metadata(descr_table):
@@ -44,6 +43,8 @@ _get_comment = _item_converter(2)
 
 
 def _try_timestamp(x):
+    import pandas as pd
+
     try:
         ts = pd.Timestamp(x, tz='UTC')
         return ts.to_pydatetime().replace(tzinfo=None)
@@ -57,6 +58,8 @@ def _try_unix_timestamp(x):
     except (ValueError, TypeError):
         return x
     else:
+        import pandas as pd
+
         return (
             pd.Timestamp.fromtimestamp(value, tz="UTC")
             .tz_localize(None)
@@ -84,9 +87,7 @@ def _try_int(x):
 
 
 class MetadataParser:
-
-    """A simple state-ish machine to parse the results of DESCRIBE
-    FORMATTED."""
+    """A simple state machine to parse the results of `DESCRIBE FORMATTED`."""
 
     def __init__(self, table):
         self.table = table
@@ -146,7 +147,7 @@ class MetadataParser:
         schema = []
         while True:
             tup = self._next_tuple()
-            if tup[0].strip() == '':
+            if not tup[0].strip():
                 break
             schema.append((tup[0], tup[1]))
 
@@ -159,7 +160,7 @@ class MetadataParser:
             orig_key = tup[0].strip(':')
             key = _clean_param_name(tup[0])
 
-            if key == '' or key.startswith('#'):
+            if not key or key.startswith('#'):
                 # section is done
                 break
 
@@ -213,7 +214,7 @@ class MetadataParser:
             orig_key = tup[0].strip(':')
             key = _clean_param_name(tup[0])
 
-            if key == '' or key.startswith('#'):
+            if not key or key.startswith('#'):
                 # section is done
                 break
 
@@ -237,6 +238,8 @@ class MetadataParser:
     _storage_param_cleaners = {}
 
     def _parse_nested_params(self, cleaners):
+        import pandas as pd
+
         params = {}
         while True:
             try:
@@ -278,9 +281,7 @@ def _get_meta(attr, key):
 
 
 class TableMetadata:
-
-    """Container for the parsed and wrangled results of DESCRIBE FORMATTED for
-    easier Ibis use (and testing)."""
+    """Container for the parsed and wrangled results of `DESCRIBE FORMATTED`."""
 
     def __init__(self, schema, info, storage, partitions=None):
         self.schema = schema
@@ -304,7 +305,7 @@ class TableMetadata:
         if self.partitions is not None:
             data['partition schema'] = self.partitions
 
-        pprint.pprint(data, stream=buf)
+        pprint.pprint(data, stream=buf)  # noqa: T203
 
         return buf.getvalue()
 

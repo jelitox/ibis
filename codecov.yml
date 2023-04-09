@@ -4,29 +4,18 @@ codecov:
     # runs have finished. Should match with comment.after_n_builds below.
     after_n_builds: 32
 
-comment:
-  after_n_builds: 32
-  layout: "reach, diff, files"
-  behavior: default
-  require_changes: true # if true: only post the comment if coverage changes
-  require_base: false # [yes :: must have a base report to post]
-  require_head: true # [yes :: must have a head report to post]
-  branches: null
+comment: false
 
 ignore:
   - "docs/**"
 
 coverage:
   status:
-    project:
-      default:
-        # Allow for slight decreases in code coverage, makes
-        # the coverage status checks a little less finicky
-        target: auto
-        threshold: 1%
-        only_pulls: true
     patch:
       default:
         target: auto
         threshold: 1%
         only_pulls: true
+    project:
+      default:
+        enabled: false

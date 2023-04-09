@@ -1,12 +1,22 @@
 import pandas as pd
 import pandas.testing as tm
 import pytest
+from clickhouse_driver.dbapi import OperationalError
+from pytest import param
 
 import ibis
-import ibis.config as config
 import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
-from ibis import util
+from ibis import config
+from ibis.backends.clickhouse.tests.conftest import (
+    CLICKHOUSE_HOST,
+    CLICKHOUSE_PASS,
+    CLICKHOUSE_PORT,
+    CLICKHOUSE_USER,
+    IBIS_TEST_CLICKHOUSE_DB,
+)
+from ibis.common.exceptions import IbisError
+from ibis.util import gen_name
 
 pytest.importorskip("clickhouse_driver")
 
@@ -67,7 +77,7 @@ def test_verbose_log_queries(con):
         with config.option_context('verbose_log', logger):
             con.table('functional_alltypes')
 
-    expected = 'DESCRIBE ibis_testing.`functional_alltypes`'
+    expected = 'DESCRIBE ibis_testing.functional_alltypes'
 
     assert len(queries) == 1
     assert queries[0] == expected
@@ -112,14 +122,26 @@ def test_embedded_identifier_quoting(alltypes):
     expr.execute()
 
 
+@pytest.fixture(scope="session")
+def tmpcon():
+    return ibis.clickhouse.connect(
+        host=CLICKHOUSE_HOST,
+        port=CLICKHOUSE_PORT,
+        password=CLICKHOUSE_PASS,
+        database="tmptables",
+        user=CLICKHOUSE_USER,
+    )
+
+
 @pytest.fixture
-def temporary_alltypes(con):
-    id = util.guid()
-    con.raw_sql(f"CREATE TABLE temporary_alltypes_{id} AS functional_alltypes")
-    try:
-        yield con.table(f"temporary_alltypes_{id}")
-    finally:
-        con.raw_sql(f"DROP TABLE temporary_alltypes_{id}")
+def temporary_alltypes(tmpcon):
+    id = ibis.util.guid()
+    table = f"temporary_alltypes_{id}"
+    tmpcon.raw_sql(
+        f"CREATE TABLE {table} AS {IBIS_TEST_CLICKHOUSE_DB}.functional_alltypes"
+    )
+    yield tmpcon.table(table)
+    tmpcon.raw_sql(f"DROP TABLE {table}")
 
 
 def test_insert(temporary_alltypes, df):
@@ -158,7 +180,7 @@ def test_insert_with_more_columns(temporary_alltypes, df):
             ibis.schema(dict(a=dt.UInt8(nullable=False), b=dt.UInt16(nullable=False))),
         ),
         (
-            "SELECT string_col, sum(double_col) as b FROM functional_alltypes GROUP BY string_col",  # noqa: E501
+            "SELECT string_col, sum(double_col) as b FROM functional_alltypes GROUP BY string_col",
             ibis.schema(
                 dict(
                     string_col=dt.String(nullable=True),
@@ -173,13 +195,95 @@ def test_get_schema_using_query(con, query, expected_schema):
     assert result == expected_schema
 
 
-def test_list_tables_empty(con, worker_id):
+def test_list_tables_database(con):
+    tables = con.list_tables()
+    tables2 = con.list_tables(database=con.current_database)
+    assert tables == tables2
+
+
+def test_list_tables_empty_database(con, worker_id):
     dbname = f"tmpdb_{worker_id}"
-    db = con.current_database
     con.raw_sql(f"CREATE DATABASE IF NOT EXISTS {dbname}")
     try:
-        con.raw_sql(f"USE {dbname}")
-        assert not con.list_tables()
+        assert not con.list_tables(database=dbname)
     finally:
-        con.raw_sql(f"USE {db}")
         con.raw_sql(f"DROP DATABASE IF EXISTS {dbname}")
+
+
+@pytest.mark.parametrize(
+    "temp",
+    [
+        param(
+            True,
+            marks=pytest.mark.xfail(
+                reason="Ibis is likely making incorrect assumptions about object lifetime and cursors",
+                raises=IbisError,
+            ),
+        ),
+        False,
+    ],
+    ids=["temp", "no_temp"],
+)
+def test_create_table_no_data(con, temp):
+    name = gen_name("clickhouse_create_table_no_data")
+    schema = ibis.schema(dict(a="!int", b="string"))
+    t = con.create_table(
+        name, schema=schema, temp=temp, engine="Memory", database="tmptables"
+    )
+    try:
+        assert t.execute().empty
+    finally:
+        con.drop_table(name, force=True, database="tmptables")
+    assert name not in con.list_tables(database="tmptables")
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"a": [1, 2, 3], "b": [None, "b", "c"]},
+        pd.DataFrame({"a": [1, 2, 3], "b": [None, "b", "c"]}),
+    ],
+    ids=["dict", "dataframe"],
+)
+@pytest.mark.parametrize(
+    "engine",
+    ["File(Native)", "File(Parquet)", "Memory"],
+    ids=["native", "mem", "parquet"],
+)
+def test_create_table_data(con, data, engine):
+    name = gen_name("clickhouse_create_table_data")
+    schema = ibis.schema(dict(a="!int", b="string"))
+    t = con.create_table(
+        name, obj=data, schema=schema, engine=engine, database="tmptables"
+    )
+    try:
+        assert len(t.execute()) == 3
+    finally:
+        con.drop_table(name, force=True, database="tmptables")
+    assert name not in con.list_tables(database="tmptables")
+
+
+@pytest.mark.parametrize(
+    "engine",
+    [
+        "File(Native)",
+        param(
+            "File(Parquet)",
+            marks=pytest.mark.xfail(
+                reason="Parquet file size is 0 bytes", raises=OperationalError
+            ),
+        ),
+        "Memory",
+    ],
+    ids=["native", "mem", "parquet"],
+)
+def test_truncate_table(con, engine):
+    name = gen_name("clickhouse_create_table_data")
+    t = con.create_table(name, obj={"a": [1]}, engine=engine, database="tmptables")
+    try:
+        assert len(t.execute()) == 1
+        con.truncate_table(name, database="tmptables")
+        assert len(t.execute()) == 0
+    finally:
+        con.drop_table(name, force=True, database="tmptables")
+    assert name not in con.list_tables(database="tmptables")

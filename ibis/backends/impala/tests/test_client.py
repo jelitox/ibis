@@ -7,9 +7,9 @@ import pytz
 
 import ibis
 import ibis.common.exceptions as com
-import ibis.config as config
 import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
+from ibis import config
 from ibis.tests.util import assert_equal
 
 pytest.importorskip("impala")
@@ -21,22 +21,8 @@ def db(con, test_data_db):
     return con.database(test_data_db)
 
 
-@pytest.mark.xfail(
-    raises=AssertionError,
-    reason='Temporary not setting default backends. #2676',
-)
-def test_execute_exprs_default_backend(con_no_hdfs):
-    expr = ibis.literal(2)
-    expected = 2
-
-    assert ibis.options.default_backend is not None
-
-    result = expr.execute()
-    assert result == expected
-
-
 def test_cursor_garbage_collection(con):
-    for i in range(5):
+    for _ in range(5):
         con.raw_sql('select 1').fetchall()
         con.raw_sql('select 1').fetchone()
 
@@ -44,7 +30,7 @@ def test_cursor_garbage_collection(con):
 def test_raise_ibis_error_no_hdfs(con_no_hdfs):
     # GH299
     with pytest.raises(com.IbisError):
-        con_no_hdfs.hdfs
+        con_no_hdfs.hdfs  # noqa: B018
 
 
 def test_get_table_ref(db):
@@ -316,23 +302,3 @@ def test_list_databases(con):
 def test_list_tables(con, test_data_db):
     assert con.list_tables(database=test_data_db)
     assert con.list_tables(like='*nat*', database=test_data_db)
-
-
-def test_set_database(con_no_db, test_data_db):
-    # create new connection with no default db set
-    # TODO: set test_data_db to None
-    with pytest.raises(Exception):
-        con_no_db.table('functional_alltypes')
-    con_no_db.set_database(test_data_db)
-    assert con_no_db.table('functional_alltypes') is not None
-
-
-def test_tables_robust_to_set_database(con, test_data_db, temp_database):
-    table = con.table('functional_alltypes', database=test_data_db)
-    con.set_database(temp_database)
-    assert con.current_database == temp_database
-
-    # it still works!
-    n = 10
-    df = table.limit(n).execute()
-    assert len(df) == n

@@ -195,7 +195,7 @@ Pandas
     ...     'time': pd.date_range(periods=4, start='now')
     ... })
     >>> sorter = lambda df: df.sort_values('time')
-    >>> gb = df.groupby('key').apply(sorter).reset_index(
+    >>> gb = df.groupby('key', group_keys=False).apply(sorter).reset_index(
     ...    drop=True
     ... ).groupby('key')
     >>> rolling = gb.value.rolling(2)
@@ -214,11 +214,13 @@ Ibis
     >>> t.value.sum().over(window)  # doctest: +SKIP
 """
 
+from __future__ import annotations
+
 import abc
 import functools
 import itertools
 import operator
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple, Union
+from typing import Any, Callable, Iterator
 
 import numpy as np
 import pandas as pd
@@ -227,8 +229,12 @@ from pandas.core.groupby import SeriesGroupBy
 import ibis
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
+import ibis.expr.operations as ops
 import ibis.util
-from ibis.expr.timecontext import construct_time_context_aware_series, get_time_col
+from ibis.backends.base.df.timecontext import (
+    construct_time_context_aware_series,
+    get_time_col,
+)
 
 
 class AggregationContext(abc.ABC):
@@ -263,8 +269,8 @@ class AggregationContext(abc.ABC):
 
 def wrap_for_apply(
     function: Callable,
-    args: Optional[Tuple[Any, ...]] = None,
-    kwargs: Optional[Dict[str, Any]] = None,
+    args: tuple[Any, ...] | None = None,
+    kwargs: dict[str, Any] | None = None,
 ) -> Callable:
     """Wrap a function for use with Pandas `apply`.
 
@@ -279,11 +285,11 @@ def wrap_for_apply(
     """
     assert callable(function), f'function {function} is not callable'
 
-    new_args: Tuple[Any, ...] = ()
+    new_args: tuple[Any, ...] = ()
     if args is not None:
         new_args = args
 
-    new_kwargs: Dict[str, Any] = {}
+    new_kwargs: dict[str, Any] = {}
     if kwargs is not None:
         new_kwargs = kwargs
 
@@ -291,8 +297,8 @@ def wrap_for_apply(
     def wrapped_func(
         data: Any,
         function: Callable = function,
-        args: Tuple[Any, ...] = new_args,
-        kwargs: Dict[str, Any] = new_kwargs,
+        args: tuple[Any, ...] = new_args,
+        kwargs: dict[str, Any] = new_kwargs,
     ) -> Callable:
         return function(data, *args, **kwargs)
 
@@ -301,8 +307,8 @@ def wrap_for_apply(
 
 def wrap_for_agg(
     function: Callable,
-    args: Tuple[Any, ...],
-    kwargs: Dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
 ) -> Callable:
     """Wrap a function for use with Pandas `agg`.
 
@@ -337,8 +343,8 @@ def wrap_for_agg(
     def wrapped_func(
         data: Any,
         function: Callable = function,
-        args: Tuple[Any, ...] = args,
-        kwargs: Dict[str, Any] = kwargs,
+        args: tuple[Any, ...] = args,
+        kwargs: dict[str, Any] = kwargs,
     ) -> Callable:
         # `data` will be a scalar here if Pandas `agg` is trying to behave like
         # like Pandas `apply`.
@@ -392,7 +398,7 @@ class Transform(AggregationContext):
         # "transform" here (Data must be 1-dimensional)
         # Instead, we need to use "apply", which can return a non
         # numeric type, e.g, tuple of two double.
-        if isinstance(self.output_type, dt.Struct):
+        if self.output_type.is_struct():
             res = grouped_data.apply(function, *args, **kwargs)
         else:
             res = grouped_data.transform(function, *args, **kwargs)
@@ -411,21 +417,26 @@ def compute_window_spec(dtype, obj):
     )
 
 
-@compute_window_spec.register(type(None))
+@compute_window_spec.register(dt.Integer)
 def compute_window_spec_none(_, obj):
-    """Helper method only used for row-based windows:
+    """Helper method only used for row-based windows.
 
     Window spec in ibis is an inclusive window bound. A bound of 0
     indicates the current row. Window spec in Pandas indicates window
     size. Therefore, we must add 1 to the ibis window bound to get the
     expected behavior.
     """
-    return obj + 1
+    from ibis.backends.pandas.core import execute
+
+    value = execute(obj)
+    return value + 1
 
 
 @compute_window_spec.register(dt.Interval)
-def compute_window_spec_interval(_, expr):
-    value = ibis.pandas.execute(expr)
+def compute_window_spec_interval(_, obj):
+    from ibis.backends.pandas.core import execute
+
+    value = execute(obj)
     return pd.tseries.frequencies.to_offset(value)
 
 
@@ -433,9 +444,9 @@ def window_agg_built_in(
     frame: pd.DataFrame,
     windowed: pd.core.window.Window,
     function: str,
-    max_lookback: int,
-    *args: Tuple[Any],
-    **kwargs: Dict[str, Any],
+    max_lookback: ops.Literal,
+    *args: tuple[Any, ...],
+    **kwargs: dict[str, Any],
 ) -> pd.Series:
     """Apply window aggregation with built-in aggregators."""
     assert isinstance(function, str)
@@ -445,7 +456,7 @@ def window_agg_built_in(
         agg_method = method
 
         def sliced_agg(s):
-            return agg_method(s.iloc[-max_lookback:])
+            return agg_method(s.iloc[-max_lookback.value :])
 
         method = operator.methodcaller('apply', sliced_agg, raw=False)
 
@@ -459,7 +470,7 @@ def window_agg_built_in(
 
 
 def create_window_input_iter(
-    grouped_data: Union[SeriesGroupBy, pd.Series],
+    grouped_data: SeriesGroupBy | pd.Series,
     masked_window_lower_indices: pd.Series,
     masked_window_upper_indices: pd.Series,
 ) -> Iterator[np.ndarray]:
@@ -484,12 +495,13 @@ def window_agg_udf(
     result_index: pd.Index,
     dtype: np.dtype,
     max_lookback: int,
-    *args: Tuple[Any],
-    **kwargs: Dict[str, Any],
+    *args: tuple[Any, ...],
+    **kwargs: dict[str, Any],
 ) -> pd.Series:
     """Apply window aggregation with UDFs.
 
-    Notes:
+    Notes
+    -----
     Use custom logic to computing rolling window UDF instead of
     using pandas's rolling function.
     This is because pandas's rolling function doesn't support
@@ -556,8 +568,8 @@ class Window(AggregationContext):
 
     def agg(
         self,
-        grouped_data: Union[pd.Series, SeriesGroupBy],
-        function: Union[str, Callable],
+        grouped_data: pd.Series | SeriesGroupBy,
+        function: str | Callable,
         *args: Any,
         **kwargs: Any,
     ) -> pd.Series:
@@ -662,19 +674,18 @@ class Cumulative(Window):
 class Moving(Window):
     __slots__ = ()
 
-    def __init__(self, preceding, max_lookback, *args, **kwargs):
+    def __init__(self, start, max_lookback, *args, **kwargs):
         from ibis.backends.pandas.core import timedelta_types
 
-        ibis_dtype = getattr(preceding, 'type', lambda: None)()
-        preceding = compute_window_spec(ibis_dtype, preceding)
-        closed = (
-            None
-            if not isinstance(preceding, timedelta_types + (pd.offsets.DateOffset,))
-            else 'both'
-        )
+        start = compute_window_spec(start.output_dtype, start.value)
+        if isinstance(start, timedelta_types + (pd.offsets.DateOffset,)):
+            closed = 'both'
+        else:
+            closed = None
+
         super().__init__(
             'rolling',
-            preceding,
+            start,
             *args,
             max_lookback=max_lookback,
             closed=closed,

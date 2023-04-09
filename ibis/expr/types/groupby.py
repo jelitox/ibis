@@ -16,16 +16,17 @@
 
 from __future__ import annotations
 
+import itertools
 import types
 from typing import Iterable, Sequence
 
-import toolz
-
-import ibis.expr.analysis as L
+import ibis
+import ibis.expr.analysis as an
+import ibis.expr.operations as ops
 import ibis.expr.types as ir
-import ibis.expr.window as _window
-import ibis.util as util
+from ibis import util
 from ibis.expr.deferred import Deferred
+from ibis.selectors import Selector
 
 _function_types = tuple(
     filter(
@@ -36,7 +37,7 @@ _function_types = tuple(
             types.FunctionType,
             types.LambdaType,
             types.MethodType,
-            getattr(types, 'UnboundMethodType', None),
+            getattr(types, "UnboundMethodType", None),
         ),
     )
 )
@@ -44,15 +45,20 @@ _function_types = tuple(
 
 def _get_group_by_key(table, value):
     if isinstance(value, str):
-        return table[value]
+        yield table[value]
     elif isinstance(value, _function_types):
-        return value(table)
+        yield value(table)
     elif isinstance(value, Deferred):
-        return value.resolve(table)
+        yield value.resolve(table)
+    elif isinstance(value, Selector):
+        yield from value.expand(table)
+    elif isinstance(value, ir.Expr):
+        yield an.sub_immediate_parents(value.op(), table.op()).to_expr()
     else:
-        return value
+        yield value
 
 
+# TODO(kszucs): make a builder class for this
 class GroupedTable:
     """An intermediate table expression to hold grouping information."""
 
@@ -60,17 +66,25 @@ class GroupedTable:
         self, table, by, having=None, order_by=None, window=None, **expressions
     ):
         self.table = table
-        self.by = [_get_group_by_key(table, v) for v in util.promote_list(by)] + [
-            _get_group_by_key(table, v).name(k)
-            for k, v in sorted(expressions.items(), key=toolz.first)
-        ]
+        self.by = list(
+            itertools.chain(
+                itertools.chain.from_iterable(
+                    _get_group_by_key(table, v) for v in util.promote_list(by)
+                ),
+                (
+                    expr.name(k)
+                    for k, v in expressions.items()
+                    for expr in _get_group_by_key(table, v)
+                ),
+            )
+        )
         self._order_by = order_by or []
         self._having = having or []
         self._window = window
 
     def __getitem__(self, args):
         # Shortcut for projection with window functions
-        return self.projection(list(args))
+        return self.select(*args)
 
     def __getattr__(self, attr):
         if hasattr(self.table, attr):
@@ -86,10 +100,15 @@ class GroupedTable:
             return GroupedArray(col, self)
 
     def aggregate(self, metrics=None, **kwds):
+        """Compute aggregates over a group by."""
         return self.table.aggregate(metrics, by=self.by, having=self._having, **kwds)
+
+    agg = aggregate
 
     def having(self, expr: ir.BooleanScalar) -> GroupedTable:
         """Add a post-aggregation result filter `expr`.
+
+        !!! warning "Expressions like `x is None` return `bool` and **will not** generate a SQL comparison to `NULL`"
 
         Parameters
         ----------
@@ -134,11 +153,7 @@ class GroupedTable:
             window=self._window,
         )
 
-    def mutate(
-        self,
-        exprs: ir.Value | Sequence[ir.Value] | None = None,
-        **kwds: ir.Value,
-    ):
+    def mutate(self, *exprs: ir.Value | Sequence[ir.Value], **kwexprs: ir.Value):
         """Return a table projection with window functions applied.
 
         Any arguments can be functions.
@@ -147,7 +162,7 @@ class GroupedTable:
         ----------
         exprs
             List of expressions
-        kwds
+        kwexprs
             Expressions
 
         Examples
@@ -159,88 +174,115 @@ class GroupedTable:
         ...     ('baz', 'double'),
         ... ], name='t')
         >>> t
-        UnboundTable[t]
+        UnboundTable: t
           foo string
           bar string
           baz float64
         >>> expr = (t.group_by('foo')
         ...          .order_by(ibis.desc('bar'))
-        ...          .mutate(qux=lambda x: x.baz.lag(),
-        ...                  qux2=t.baz.lead()))
+        ...          .mutate(qux=lambda x: x.baz.lag(), qux2=t.baz.lead()))
         >>> print(expr)
-        r0 := UnboundTable[t]
+        r0 := UnboundTable: t
           foo string
           bar string
           baz float64
         Selection[r0]
           selections:
             r0
-            qux:  Window(Lag(r0.baz), window=Window(group_by=[r0.foo], order_by=[desc|r0.bar], how='rows'))
-            qux2: Window(Lead(r0.baz), window=Window(group_by=[r0.foo], order_by=[desc|r0.bar], how='rows'))
+            qux:  WindowFunction(...)
+            qux2: WindowFunction(...)
 
         Returns
         -------
         Table
             A table expression with window functions applied
-        """  # noqa: E501
-        if exprs is None:
-            exprs = []
-        else:
-            exprs = util.promote_list(exprs)
+        """
 
-        for name, expr in kwds.items():
-            expr = self.table._ensure_expr(expr)
-            exprs.append(expr.name(name))
+        exprs = self._selectables(*exprs, **kwexprs)
+        return self.table.mutate(exprs)
 
-        return self.projection([self.table, *exprs])
-
-    def projection(self, exprs):
+    def select(self, *exprs, **kwexprs):
         """Project new columns out of the grouped table.
 
         See Also
         --------
-        ibis.expr.groupby.GroupedTable.mutate
+        [`GroupedTable.mutate`][ibis.expr.types.groupby.GroupedTable.mutate]
         """
-        w = self._get_window()
-        windowed_exprs = []
-        for expr in util.promote_list(exprs):
-            expr = self.table._ensure_expr(expr)
-            expr = L.windowize_function(expr, w=w)
-            windowed_exprs.append(expr)
-        return self.table.projection(windowed_exprs)
+        exprs = self._selectables(*exprs, **kwexprs)
+        return self.table.select(exprs)
+
+    def _selectables(self, *exprs, **kwexprs):
+        """Project new columns out of the grouped table.
+
+        See Also
+        --------
+        [`GroupedTable.mutate`][ibis.expr.types.groupby.GroupedTable.mutate]
+        """
+        table = self.table
+        default_frame = self._get_window()
+        return [
+            an.windowize_function(e2, frame=default_frame)
+            for expr in exprs
+            for e1 in util.promote_list(expr)
+            for e2 in util.promote_list(table._ensure_expr(e1))
+        ] + [
+            an.windowize_function(e, frame=default_frame).name(k)
+            for k, expr in kwexprs.items()
+            for e in util.promote_list(table._ensure_expr(expr))
+        ]
+
+    projection = select
 
     def _get_window(self):
         if self._window is None:
-            groups = self.by
-            sorts = self._order_by
-            preceding, following = None, None
+            return ops.RowsWindowFrame(
+                table=self.table,
+                group_by=self.by,
+                order_by=self._order_by,
+            )
         else:
-            w = self._window
-            groups = w.group_by + self.by
-            sorts = w.order_by + self._order_by
-            preceding, following = w.preceding, w.following
+            return self._window.copy(
+                groupy_by=self._window.group_by + self.by,
+                order_by=self._window.order_by + self._order_by,
+            )
 
-        return _window.window(
-            preceding=preceding,
-            following=following,
-            group_by=list(map(self.table._ensure_expr, util.promote_list(groups))),
-            order_by=list(map(self.table._ensure_expr, util.promote_list(sorts))),
-        )
-
-    def over(self, window: _window.Window) -> GroupedTable:
-        """Add a window frame clause to be applied to child analytic
-        expressions.
+    def over(
+        self,
+        window=None,
+        *,
+        rows=None,
+        range=None,
+        group_by=None,
+        order_by=None,
+    ) -> GroupedTable:
+        """Apply a window over the input expressions.
 
         Parameters
         ----------
         window
-            Window to add to child analytic expressions
+            Window to add to the input
+        rows
+            Whether to use the `ROWS` window clause
+        range
+            Whether to use the `RANGE` window clause
+        group_by
+            Grouping key
+        order_by
+            Ordering key
 
         Returns
         -------
         GroupedTable
             A new grouped table expression
         """
+        if window is None:
+            window = ibis.window(
+                rows=rows,
+                range=range,
+                group_by=group_by,
+                order_by=order_by,
+            )
+
         return self.__class__(
             self.table,
             self.by,
@@ -292,7 +334,19 @@ class GroupedArray:
     approx_median = _group_agg_dispatch('approx_median')
     group_concat = _group_agg_dispatch('group_concat')
 
+    @util.deprecated(
+        instead="Reach out at https://github.com/ibis-project/ibis if you'd like this API to remain.",
+        as_of="5.0",
+        removed_in="6.0",
+    )
     def summary(self, exact_nunique=False):
+        """Summarize a column.
+
+        Parameters
+        ----------
+        exact_nunique
+            Whether to compute an exact count distinct.
+        """
         metric = self.arr.summary(exact_nunique=exact_nunique)
         return self.parent.aggregate(metric)
 
@@ -300,7 +354,3 @@ class GroupedArray:
 class GroupedNumbers(GroupedArray):
     mean = _group_agg_dispatch('mean')
     sum = _group_agg_dispatch('sum')
-
-    def summary(self, exact_nunique=False):
-        metric = self.arr.summary(exact_nunique=exact_nunique)
-        return self.parent.aggregate(metric)

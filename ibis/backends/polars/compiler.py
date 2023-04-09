@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import calendar
 import functools
 import math
 import operator
@@ -6,6 +9,7 @@ from typing import Mapping
 import numpy as np
 import pandas as pd
 import polars as pl
+from packaging.version import parse as vparse
 
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
@@ -68,37 +72,72 @@ def _make_duration(value, dtype):
 
 @translate.register(ops.Literal)
 def literal(op):
-    if isinstance(op.dtype, dt.Array):
-        value = pl.Series("", op.value)
-        typ = to_polars_type(op.dtype)
+    value = op.value
+    dtype = op.dtype
+
+    if dtype.is_array():
+        value = pl.Series("", value)
+        typ = to_polars_type(dtype)
         return pl.lit(value, dtype=typ).list()
-    elif isinstance(op.dtype, dt.Struct):
+    elif dtype.is_struct():
         values = [
-            pl.lit(v, dtype=to_polars_type(op.dtype[k])).alias(k)
-            for k, v in op.value.items()
+            pl.lit(v, dtype=to_polars_type(dtype[k])).alias(k) for k, v in value.items()
         ]
         return pl.struct(values)
-    elif isinstance(op.dtype, dt.Interval):
-        return _make_duration(op.value, op.dtype)
+    elif dtype.is_interval():
+        return _make_duration(value, dtype)
+    elif dtype.is_null():
+        return pl.lit(value)
+    elif dtype.is_binary():
+        raise NotImplementedError(f"Unsupported type: {dtype!r}")
     else:
-        typ = to_polars_type(op.dtype)
+        typ = to_polars_type(dtype)
         return pl.lit(op.value, dtype=typ)
+
+
+_TIMESTAMP_SCALE_TO_UNITS = {
+    0: "s",
+    1: "ms",
+    2: "ms",
+    3: "ms",
+    4: "us",
+    5: "us",
+    6: "us",
+    7: "ns",
+    8: "ns",
+    9: "ns",
+}
 
 
 @translate.register(ops.Cast)
 def cast(op):
     arg = translate(op.arg)
+    dtype = op.arg.output_dtype
+    to = op.to
 
-    if isinstance(op.to, dt.Interval):
-        return _make_duration(arg, op.to)
-    elif isinstance(op.to, dt.Date):
-        if isinstance(op.arg.output_dtype, dt.String):
+    if to.is_interval():
+        return _make_duration(arg, to)
+    elif to.is_date():
+        if dtype.is_string():
             return arg.str.strptime(pl.Date, "%Y-%m-%d")
-    elif isinstance(op.to, dt.Timestamp):
-        if isinstance(op.arg.output_dtype, dt.Integer):
-            return (arg * 1_000_000).cast(pl.Datetime).alias(op.name)
+    elif to.is_timestamp():
+        time_zone = to.timezone
+        time_unit = _TIMESTAMP_SCALE_TO_UNITS.get(to.scale, "us")
 
-    typ = to_polars_type(op.to)
+        if dtype.is_integer():
+            typ = pl.Datetime(time_unit="us", time_zone=time_zone)
+            arg = (arg * 1_000_000).cast(typ)
+            if time_unit != "us":
+                arg = arg.dt.truncate(f"1{time_unit}")
+            return arg.alias(op.name)
+        elif dtype.is_string():
+            typ = pl.Datetime(time_unit=time_unit, time_zone=time_zone)
+            arg = arg.str.strptime(typ)
+            if time_unit == "s":
+                return arg.dt.truncate("1s")
+            return arg
+
+    typ = to_polars_type(to)
     return arg.cast(typ)
 
 
@@ -110,7 +149,11 @@ def column(op):
 @translate.register(ops.SortKey)
 def sort_key(op):
     arg = translate(op.expr)
-    return arg.sort(reverse=op.descending)
+    descending = op.descending
+    try:
+        return arg.sort(descending=descending)
+    except TypeError:  # pragma: no cover
+        return arg.sort(reverse=descending)  # pragma: no cover
 
 
 @translate.register(ops.Selection)
@@ -141,8 +184,11 @@ def selection(op):
 
     if op.sort_keys:
         by = [key.name for key in op.sort_keys]
-        reverse = [key.descending for key in op.sort_keys]
-        lf = lf.sort(by, reverse)
+        descending = [key.descending for key in op.sort_keys]
+        try:
+            lf = lf.sort(by, descending=descending)
+        except TypeError:  # pragma: no cover
+            lf = lf.sort(by, reverse=descending)  # pragma: no cover
 
     return lf
 
@@ -173,7 +219,7 @@ def aggregation(op):
         lf = lf.select
 
     if op.metrics:
-        metrics = [translate(arg) for arg in op.metrics]
+        metrics = [translate(arg).alias(arg.name) for arg in op.metrics]
         lf = lf(metrics)
 
     return lf
@@ -244,12 +290,12 @@ def fillna(op):
             value = op.replacements.value
 
         if value is not None:
-            if isinstance(dtype, dt.Floating):
+            if dtype.is_floating():
                 column = column.fill_nan(value)
             column = column.fill_null(value)
 
         # requires special treatment if the fill value has different datatype
-        if isinstance(dtype, dt.Timestamp):
+        if dtype.is_timestamp():
             column = column.cast(pl.Datetime)
 
         columns.append(column)
@@ -314,39 +360,43 @@ def searched_case(op):
 
 @translate.register(ops.Coalesce)
 def coalesce(op):
-    arg = translate(ops.NodeList(*op.args))
+    arg = list(map(translate, op.arg))
     return pl.coalesce(arg)
 
 
 @translate.register(ops.Least)
 def least(op):
-    arg = [translate(arg) for arg in op.args]
+    arg = [translate(arg) for arg in op.arg]
     return pl.min(arg)
 
 
 @translate.register(ops.Greatest)
 def greatest(op):
-    arg = [translate(arg) for arg in op.args]
+    arg = [translate(arg) for arg in op.arg]
     return pl.max(arg)
 
 
 @translate.register(ops.Contains)
 def contains(op):
     value = translate(op.value)
-    options = translate(op.options)
-    if isinstance(options, list):
+
+    if isinstance(op.options, tuple):
+        options = list(map(translate, op.options))
         return pl.any([value == option for option in options])
     else:
+        options = translate(op.options)
         return value.is_in(options)
 
 
 @translate.register(ops.NotContains)
 def not_contains(op):
     value = translate(op.value)
-    options = translate(op.options)
-    if isinstance(options, list):
+
+    if isinstance(op.options, tuple):
+        options = list(map(translate, op.options))
         return ~pl.any([value == option for option in options])
     else:
+        options = translate(op.options)
         return ~value.is_in(options)
 
 
@@ -369,7 +419,10 @@ def string_length(op):
 @translate.register(ops.StringUnary)
 def string_unary(op):
     arg = translate(op.arg)
-    func = _string_unary[type(op)]
+    func = _string_unary.get(type(op))
+    if func is None:
+        raise com.OperationNotDefinedError(f'{type(op).__name__} not supported')
+
     method = getattr(arg.str, func)
     return method()
 
@@ -405,7 +458,7 @@ def string_replace(op):
 def string_startswith(op):
     arg = translate(op.arg)
     _assert_literal(op.start)
-    return arg.str.ends_with(op.start.value)
+    return arg.str.starts_with(op.start.value)
 
 
 @translate.register(ops.EndsWith)
@@ -425,7 +478,11 @@ def string_concat(op):
 def string_join(op):
     args = [translate(arg) for arg in op.arg]
     _assert_literal(op.sep)
-    return pl.concat_str(args, sep=op.sep.value)
+    sep = op.sep.value
+    try:
+        return pl.concat_str(args, separator=sep)
+    except TypeError:  # pragma: no cover
+        return pl.concat_str(args, sep=sep)  # pragma: no cover
 
 
 @translate.register(ops.Substring)
@@ -580,17 +637,19 @@ _reductions = {
     ops.StandardDev: 'std',
     ops.Sum: 'sum',
     ops.Variance: 'var',
+    ops.CountDistinct: 'n_unique',
 }
 
+for reduction in _reductions.keys():
 
-@translate.register(ops.Reduction)
-def reduction(op):
-    arg = translate(op.arg)
-    agg = _reductions[type(op)]
-    if (where := op.where) is not None:
-        arg = arg.filter(translate(where))
-    method = getattr(arg, agg)
-    return method()
+    @translate.register(reduction)
+    def reduction(op):
+        arg = translate(op.arg)
+        agg = _reductions[type(op)]
+        if (where := op.where) is not None:
+            arg = arg.filter(translate(where))
+        method = getattr(arg, agg)
+        return method()
 
 
 @translate.register(ops.Mode)
@@ -613,11 +672,6 @@ def count_star(op):
         condition = translate(where)
         return condition.filter(condition).count()
     return pl.count()
-
-
-@translate.register(ops.NodeList)
-def node_list(op):
-    return list(map(translate, op.values))
 
 
 @translate.register(ops.TimestampNow)
@@ -645,7 +699,7 @@ def temporal_truncate(op):
     arg = translate(op.arg)
     unit = "mo" if op.unit == "M" else op.unit
     unit = f"1{unit.lower()}"
-    return arg.dt.truncate(unit)
+    return arg.dt.truncate(unit, "-1w")
 
 
 @translate.register(ops.DateFromYMD)
@@ -703,7 +757,6 @@ def interval_from_integer(op):
 def string_to_timestamp(op):
     arg = translate(op.arg)
     _assert_literal(op.format_str)
-    # TODO(kszucs): raise if op.timezone is not None
     return arg.str.strptime(pl.Datetime, op.format_str.value)
 
 
@@ -715,13 +768,21 @@ def timestamp_add(op):
 
 
 @translate.register(ops.TimestampSub)
-@translate.register(ops.TimestampDiff)
 @translate.register(ops.DateDiff)
 @translate.register(ops.IntervalSubtract)
 def timestamp_sub(op):
     left = translate(op.left)
     right = translate(op.right)
     return left - right
+
+
+@translate.register(ops.TimestampDiff)
+def timestamp_diff(op):
+    left = translate(op.left)
+    right = translate(op.right)
+    # TODO: truncating both to seconds is necessary to conform to the output
+    # type of the operation
+    return left.dt.truncate("1s") - right.dt.truncate("1s")
 
 
 @translate.register(ops.ArrayLength)
@@ -739,20 +800,25 @@ def array_concat(op):
 
 @translate.register(ops.ArrayColumn)
 def array_column(op):
-    cols = translate(op.cols)
+    cols = list(map(translate, op.cols))
     return pl.concat_list(cols)
 
 
 @translate.register(ops.ArrayCollect)
 def array_collect(op):
     arg = translate(op.arg)
+    if (where := op.where) is not None:
+        arg = arg.filter(translate(where))
     return arg.list()
 
 
 @translate.register(ops.Unnest)
 def unnest(op):
     arg = translate(op.arg)
-    return arg.explode()
+    try:
+        return arg.arr.explode()
+    except AttributeError:
+        return arg.explode()
 
 
 _date_methods = {
@@ -782,6 +848,9 @@ def extract_epoch_seconds(op):
     return arg.dt.epoch('s').cast(pl.Int32)
 
 
+_day_of_week_offset = vparse(pl.__version__) >= vparse("0.15.1")
+
+
 _unary = {
     # TODO(kszucs): factor out the lambdas
     ops.Abs: operator.methodcaller('abs'),
@@ -790,8 +859,10 @@ _unary = {
     ops.Atan: operator.methodcaller('arctan'),
     ops.Ceil: lambda arg: arg.ceil().cast(pl.Int64),
     ops.Cos: operator.methodcaller('cos'),
-    ops.Cot: lambda arg: arg.cos() / arg.sin(),
-    ops.DayOfWeekIndex: lambda arg: arg.dt.weekday().cast(pl.Int16),
+    ops.Cot: lambda arg: 1.0 / arg.tan(),
+    ops.DayOfWeekIndex: (
+        lambda arg: arg.dt.weekday().cast(pl.Int16) - _day_of_week_offset
+    ),
     ops.Exp: operator.methodcaller('exp'),
     ops.Floor: lambda arg: arg.floor().cast(pl.Int64),
     ops.IsInf: operator.methodcaller('is_infinite'),
@@ -808,24 +879,12 @@ _unary = {
     ops.Tan: operator.methodcaller('tan'),
 }
 
-# ops.DayOfWeekName: lambda arg: arg.dt.weekday().apply(lambda x: _WEEKDAY.get(x)),
-
-_WEEKDAY = {
-    0: "Monday",
-    1: "Tuesday",
-    2: "Wednesday",
-    3: "Thursday",
-    4: "Friday",
-    5: "Saturday",
-    6: "Sunday",
-}
-
 
 @translate.register(ops.DayOfWeekName)
 def day_of_week_name(op):
-    index = translate(op.arg).dt.weekday()
+    index = translate(op.arg).dt.weekday() - _day_of_week_offset
     arg = None
-    for i, name in reversed(_WEEKDAY.items()):
+    for i, name in enumerate(calendar.day_name):
         arg = pl.when(index == i).then(name).otherwise(arg)
     return arg
 
@@ -833,7 +892,9 @@ def day_of_week_name(op):
 @translate.register(ops.Unary)
 def unary(op):
     arg = translate(op.arg)
-    func = _unary[type(op)]
+    func = _unary.get(type(op))
+    if func is None:
+        raise com.OperationNotDefinedError(f'{type(op).__name__} not supported')
     return func(arg)
 
 
@@ -851,16 +912,20 @@ _comparisons = {
 def comparison(op):
     left = translate(op.left)
     right = translate(op.right)
-    func = _comparisons[type(op)]
+    func = _comparisons.get(type(op))
+    if func is None:
+        raise com.OperationNotDefinedError(f'{type(op).__name__} not supported')
     return func(left, right)
 
 
 @translate.register(ops.Between)
 def between(op):
-    arg = translate(op.arg)
-    lower = translate(op.lower_bound)
-    upper = translate(op.upper_bound)
-    return arg.is_between(lower, upper)
+    op_arg = op.arg
+    arg = translate(op_arg)
+    dtype = op_arg.output_dtype
+    lower = translate(ops.Cast(op.lower_bound, dtype))
+    upper = translate(ops.Cast(op.upper_bound, dtype))
+    return arg.is_between(lower, upper, closed="both")
 
 
 _bitwise_binops = {
@@ -874,7 +939,9 @@ _bitwise_binops = {
 
 @translate.register(ops.BitwiseBinary)
 def bitwise_binops(op):
-    ufunc = _bitwise_binops[type(op)]
+    ufunc = _bitwise_binops.get(type(op))
+    if ufunc is None:
+        raise com.OperationNotDefinedError(f'{type(op).__name__} not supported')
     left = translate(op.left)
     right = translate(op.right)
 
@@ -912,13 +979,41 @@ _binops = {
 def binop(op):
     left = translate(op.left)
     right = translate(op.right)
-    func = _binops[type(op)]
+    func = _binops.get(type(op))
+    if func is None:
+        raise com.OperationNotDefinedError(f'{type(op).__name__} not supported')
     return func(left, right)
 
 
 @translate.register(ops.ElementWiseVectorizedUDF)
 def elementwise_udf(op):
-    func_args = translate(op.func_args)
+    func_args = list(map(translate, op.func_args))
     return_type = to_polars_type(op.return_type)
 
     return pl.map(func_args, lambda args: op.func(*args), return_dtype=return_type)
+
+
+@translate.register(ops.E)
+def execute_e(op, **kwargs):
+    return pl.lit(np.e)
+
+
+@translate.register(ops.Pi)
+def execute_pi(op, **kwargs):
+    return pl.lit(np.pi)
+
+
+@translate.register(ops.Time)
+def execute_time(op, **kwargs):
+    arg = translate(op.arg, **kwargs)
+    if op.arg.output_dtype.is_timestamp():
+        return arg.dt.truncate("1us").cast(pl.Time)
+    return arg
+
+
+@translate.register(ops.Union)
+def execute_union(op, **kwargs):
+    result = pl.concat([translate(op.left, **kwargs), translate(op.right, **kwargs)])
+    if op.distinct:
+        return result.unique()
+    return result

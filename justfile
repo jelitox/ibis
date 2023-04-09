@@ -6,9 +6,10 @@ default:
 clean:
     git clean -fdx -e 'ci/ibis-testing-data'
 
+# lock dependencies without updating existing versions
 lock:
     poetry lock --no-update
-    poetry export --with dev --with test --with docs --without-hashes --no-ansi > requirements.txt
+    poetry export --extras all --with dev --with test --with docs --without-hashes --no-ansi > requirements.txt
 
 # show all backends
 @list-backends:
@@ -17,10 +18,8 @@ lock:
 
 # format code
 fmt:
-    absolufy-imports ibis/**/*.py
     black .
-    isort .
-    pyupgrade --py38-plus --keep-runtime-typing ibis/**/*.py
+    ruff --fix .
 
 # run all non-backend tests; additional arguments are forwarded to pytest
 check *args:
@@ -33,12 +32,7 @@ ci-check *args:
 # lint code
 lint:
     black -q . --check
-    isort -q . --check
-    flake8 .
-
-# type check code using mypy
-typecheck:
-    mypy .
+    ruff .
 
 # run the test suite for one or more backends
 test +backends:
@@ -52,6 +46,22 @@ test +backends:
     fi
 
     pytest "${pytest_args[@]}"
+
+# run doctests
+doctest *args:
+    #!/usr/bin/env bash
+
+    # TODO(cpcloud): why doesn't pytest --ignore-glob=test_*.py work?
+    mapfile -t doctest_modules < <(
+      find \
+        ibis \
+        -wholename '*.py' \
+        -and -not -wholename '*test*.py' \
+        -and -not -wholename '*__init__*' \
+        -and -not -wholename '*gen_*.py' \
+        -and -not -wholename '*ibis/expr/selectors.py'
+    )
+    pytest --doctest-modules {{ args }} "${doctest_modules[@]}"
 
 # download testing data
 download-data owner="ibis-project" repo="testing-data" rev="master":
@@ -71,19 +81,34 @@ download-data owner="ibis-project" repo="testing-data" rev="master":
 up *backends:
     docker compose up --wait {{ backends }}
 
+# stop and remove containers -> clean up dangling volumes -> start backends
+reup *backends:
+    just down {{ backends }}
+    docker system prune --force --volumes
+    just up {{ backends }}
+
 # stop and remove containers; clean up networks and volumes
-down:
-    docker compose down --volumes --remove-orphans
+down *backends:
+    #!/usr/bin/env bash
+    if [ -z "{{ backends }}" ]; then
+        docker compose down --volumes --remove-orphans
+    else
+        docker compose rm {{ backends }} --force --stop --volumes
+    fi
 
 # run the benchmark suite
 bench +args='ibis/tests/benchmarks':
-    pytest --benchmark-only --benchmark-autosave {{ args }}
+    pytest --benchmark-only --benchmark-enable --benchmark-autosave {{ args }}
+
+# run benchmarks and compare with a previous run
+benchcmp *args:
+    just bench {{ args }} --benchmark-compare
 
 # check for invalid links in a locally built version of the docs
 checklinks *args:
     #!/usr/bin/env bash
     mapfile -t files < <(find site -name '*.html')
-    lychee "${files[@]}" {{ args }}
+    lychee --base site "${files[@]}" {{ args }}
 
 # view the changelog for upcoming release (use --pretty to format with glow)
 view-changelog flags="":

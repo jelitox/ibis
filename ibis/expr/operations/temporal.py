@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import operator
 
 import toolz
@@ -79,7 +81,7 @@ _timestamp_units = toolz.merge(_date_units, _time_units)
 @public
 class TimestampTruncate(Value):
     arg = rlz.timestamp
-    unit = rlz.isin(_timestamp_units)
+    unit = rlz.map_to(_timestamp_units)
 
     output_shape = rlz.shape_like("arg")
     output_dtype = dt.timestamp
@@ -88,7 +90,7 @@ class TimestampTruncate(Value):
 @public
 class DateTruncate(Value):
     arg = rlz.date
-    unit = rlz.isin(_date_units)
+    unit = rlz.map_to(_date_units)
 
     output_shape = rlz.shape_like("arg")
     output_dtype = dt.date
@@ -97,7 +99,7 @@ class DateTruncate(Value):
 @public
 class TimeTruncate(Value):
     arg = rlz.time
-    unit = rlz.isin(_time_units)
+    unit = rlz.map_to(_time_units)
 
     output_shape = rlz.shape_like("arg")
     output_dtype = dt.time
@@ -116,7 +118,6 @@ class Strftime(Value):
 class StringToTimestamp(Value):
     arg = rlz.string
     format_str = rlz.string
-    timezone = rlz.optional(rlz.string)
 
     output_shape = rlz.shape_like("arg")
     output_dtype = dt.Timestamp(timezone='UTC')
@@ -125,9 +126,6 @@ class StringToTimestamp(Value):
 @public
 class ExtractTemporalField(TemporalUnary):
     output_dtype = dt.int32
-
-
-ExtractTimestampField = ExtractTemporalField
 
 
 @public
@@ -253,7 +251,6 @@ class TimestampFromYMDHMS(Value):
 @public
 class TimestampFromUNIX(Value):
     arg = rlz.any
-    # Only pandas-based backends support 'ns'
     unit = rlz.isin({'s', 'ms', 'us', 'ns'})
 
     output_dtype = dt.timestamp
@@ -354,7 +351,7 @@ class IntervalBinary(Binary):
     def output_dtype(self):
         integer_args = [
             Cast(arg, to=arg.output_dtype.value_type)
-            if isinstance(arg.output_dtype, dt.Interval)
+            if arg.output_dtype.is_interval()
             else arg
             for arg in (self.left, self.right)
         ]
@@ -412,3 +409,6 @@ class BetweenTime(Between):
     arg = rlz.one_of([rlz.timestamp, rlz.time])
     lower_bound = rlz.one_of([rlz.time, rlz.string])
     upper_bound = rlz.one_of([rlz.time, rlz.string])
+
+
+public(ExtractTimestampField=ExtractTemporalField)

@@ -4,16 +4,12 @@ from __future__ import annotations
 
 import datetime
 import functools
-import itertools
 import operator
-from typing import Iterable, Literal, Mapping, Sequence
-from typing import Tuple as _Tuple
-from typing import TypeVar
-from typing import Union as _Union
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Iterable, NamedTuple, Sequence, TypeVar
 
 import dateutil.parser
 import numpy as np
-import pandas as pd
 
 import ibis.expr.builders as bl
 import ibis.expr.datatypes as dt
@@ -21,95 +17,34 @@ import ibis.expr.operations as ops
 import ibis.expr.rules as rlz
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
-from ibis.backends.base import connect
-from ibis.common.pretty import show_sql, to_sql
+from ibis import selectors, util
+from ibis.backends.base import BaseBackend, connect
+from ibis.common.dispatch import lazy_singledispatch
+from ibis.common.exceptions import IbisInputError
+from ibis.expr.decompile import decompile
 from ibis.expr.deferred import Deferred
 from ibis.expr.schema import Schema
-from ibis.expr.types import (  # noqa: F401
-    ArrayColumn,
-    ArrayScalar,
-    ArrayValue,
-    BooleanColumn,
-    BooleanScalar,
-    BooleanValue,
-    CategoryScalar,
-    CategoryValue,
-    Column,
-    DateColumn,
-    DateScalar,
+from ibis.expr.sql import parse_sql, show_sql, to_sql
+from ibis.expr.types import (
     DateValue,
-    DecimalColumn,
-    DecimalScalar,
-    DecimalValue,
     Expr,
-    FloatingColumn,
-    FloatingScalar,
-    FloatingValue,
-    GeoSpatialColumn,
-    GeoSpatialScalar,
-    GeoSpatialValue,
     IntegerColumn,
-    IntegerScalar,
-    IntegerValue,
-    IntervalColumn,
-    IntervalScalar,
-    IntervalValue,
-    LineStringColumn,
-    LineStringScalar,
-    LineStringValue,
-    MapColumn,
-    MapScalar,
-    MapValue,
-    MultiLineStringColumn,
-    MultiLineStringScalar,
-    MultiLineStringValue,
-    MultiPointColumn,
-    MultiPointScalar,
-    MultiPointValue,
-    MultiPolygonColumn,
-    MultiPolygonScalar,
-    MultiPolygonValue,
-    NullColumn,
-    NullScalar,
-    NullValue,
-    NumericColumn,
-    NumericScalar,
-    NumericValue,
-    PointColumn,
-    PointScalar,
-    PointValue,
-    PolygonColumn,
-    PolygonScalar,
-    PolygonValue,
-    Scalar,
-    StringColumn,
-    StringScalar,
     StringValue,
-    StructColumn,
-    StructScalar,
-    StructValue,
     Table,
-    TimeColumn,
-    TimeScalar,
-    TimestampColumn,
-    TimestampScalar,
-    TimestampValue,
     TimeValue,
-    Value,
     array,
     literal,
     map,
     null,
     struct,
 )
-from ibis.expr.window import (
-    cumulative_window,
-    range_window,
-    rows_with_max_lookback,
-    trailing_range_window,
-    trailing_window,
-    window,
-)
+from ibis.util import deprecated, experimental
+
+if TYPE_CHECKING:
+    import pandas as pd
+    import pyarrow as pa
+
+    from ibis.common.typing import SupportsSchema
 
 __all__ = (
     'aggregate',
@@ -123,6 +58,8 @@ __all__ = (
     'cumulative_window',
     'date',
     'desc',
+    'decompile',
+    'deferred',
     'difference',
     'e',
     'Expr',
@@ -178,6 +115,7 @@ __all__ = (
     'geo_y',
     'geo_y_max',
     'geo_y_min',
+    'get_backend',
     'greatest',
     'ifelse',
     'infer_dtype',
@@ -195,17 +133,24 @@ __all__ = (
     'null',
     'or_',
     'param',
+    'parse_sql',
     'pi',
     'random',
     'range_window',
+    'read_csv',
+    'read_json',
+    'read_parquet',
     'row_number',
+    'rows_window',
     'rows_with_max_lookback',
     'schema',
     'Schema',
+    'selectors',
     'sequence',
+    'set_backend',
     'show_sql',
-    'to_sql',
     'struct',
+    'to_sql',
     'table',
     'time',
     'timestamp',
@@ -214,6 +159,8 @@ __all__ = (
     'union',
     'where',
     'window',
+    'preceding',
+    'following',
     '_',
 )
 
@@ -227,13 +174,6 @@ NA = null()
 T = TypeVar("T")
 
 negate = ir.NumericValue.negate
-
-SupportsSchema = TypeVar(
-    "SupportsSchema",
-    Iterable[_Tuple[str, _Union[str, dt.DataType]]],
-    Mapping[str, dt.DataType],
-    sch.Schema,
-)
 
 
 def _deferred(fn):
@@ -276,11 +216,12 @@ def param(type: dt.DataType) -> ir.Scalar:
       predicates:
         r0.timestamp_col >= $(date)
         r0.timestamp_col <= $(date)
-    sum: Sum(r1.value)
+    Sum(value): Sum(r1.value)
     """
-    return ops.ScalarParameter(dt.dtype(type)).to_expr()
+    return ops.ScalarParameter(type).to_expr()
 
 
+@deprecated(as_of='5.0', removed_in='6.0', instead='use tuple or list instead')
 def sequence(values: Sequence[T | None]) -> ir.List:
     """Wrap a list of Python values as an Ibis sequence type.
 
@@ -288,13 +229,12 @@ def sequence(values: Sequence[T | None]) -> ir.List:
     ----------
     values
         Should all be None or the same type
-
     Returns
     -------
     List
-        A list expression
+        A list expression.
     """
-    return rlz.nodes_of(rlz.any, values).to_expr()
+    return [op.to_expr() for op in rlz.tuple_of(rlz.any, values)]
 
 
 def schema(
@@ -323,13 +263,13 @@ def schema(
     >>> sc = schema(names=['foo', 'bar', 'baz'],
     ...             types=['string', 'int64', 'boolean'])
     >>> sc = schema(dict(foo="string"))
-    >>> sc = schema(Schema(['foo'], ['string']))  # no-op
+    >>> sc = schema(Schema(dict(foo="string")))  # no-op
 
     Returns
     -------
     Schema
         An ibis schema
-    """  # noqa: E501
+    """
     if pairs is not None:
         return sch.schema(pairs)
     else:
@@ -358,18 +298,31 @@ def table(
     --------
     Create a table with no data backing it
 
-    >>> t = ibis.table(schema=dict(a="int", b="string"))
+    >>> import ibis
+    >>> ibis.options.interactive
+    False
+    >>> t = ibis.table(schema=dict(a="int", b="string"), name="t")
     >>> t
-    UnboundTable: unbound_table_0
+    UnboundTable: t
       a int64
       b string
     """
-    if schema is not None:
-        schema = sch.schema(schema)
+    if isinstance(schema, type) and name is None:
+        name = schema.__name__
     return ops.UnboundTable(schema=schema, name=name).to_expr()
 
 
-@functools.singledispatch
+@lazy_singledispatch
+def _memtable(
+    data,
+    *,
+    columns: Iterable[str] | None = None,
+    schema: SupportsSchema | None = None,
+    name: str | None = None,
+):
+    raise NotImplementedError(type(data))
+
+
 def memtable(
     data,
     *,
@@ -382,10 +335,10 @@ def memtable(
     Parameters
     ----------
     data
-        Any data accepted by the `pandas.DataFrame` constructor.
+        Any data accepted by the `pandas.DataFrame` constructor or a `pyarrow.Table`.
 
-        The use of `DataFrame` underneath should **not** be relied upon and is
-        free to change across non-major releases.
+        Do not depend on the underlying storage type (e.g., pyarrow.Table), it's subject
+        to change across non-major releases.
     columns
         Optional [`Iterable`][typing.Iterable] of [`str`][str] column names.
     schema
@@ -404,7 +357,7 @@ def memtable(
     >>> import ibis
     >>> t = ibis.memtable([{"a": 1}, {"a": 2}])
     >>> t
-    PandasInMemoryTable
+    InMemoryTable
       data:
         DataFrameProxy:
              a
@@ -413,7 +366,7 @@ def memtable(
 
     >>> t = ibis.memtable([{"a": 1, "b": "foo"}, {"a": 2, "b": "baz"}])
     >>> t
-    PandasInMemoryTable
+    InMemoryTable
       data:
         DataFrameProxy:
              a    b
@@ -425,7 +378,7 @@ def memtable(
 
     >>> t = ibis.memtable([(1, "foo"), (2, "baz")], columns=["a", "b"])
     >>> t
-    PandasInMemoryTable
+    InMemoryTable
       data:
         DataFrameProxy:
              a    b
@@ -437,7 +390,7 @@ def memtable(
 
     >>> t = ibis.memtable([(1, "foo"), (2, "baz")])
     >>> t
-    PandasInMemoryTable
+    InMemoryTable
       data:
         DataFrameProxy:
              col0 col1
@@ -449,6 +402,41 @@ def memtable(
             "passing `columns` and schema` is ambiguous; "
             "pass one or the other but not both"
         )
+    return _memtable(data, name=name, schema=schema, columns=columns)
+
+
+@_memtable.register("pyarrow.Table")
+def _memtable_from_pyarrow_table(
+    data: pa.Table,
+    *,
+    name: str | None = None,
+    schema: SupportsSchema | None = None,
+    columns: Iterable[str] | None = None,
+):
+    from ibis.backends.pyarrow import PyArrowTableProxy
+
+    if columns is not None:
+        assert schema is None, "if `columns` is not `None` then `schema` must be `None`"
+        schema = sch.Schema(dict(zip(columns, sch.infer(data).values())))
+    return ops.InMemoryTable(
+        name=name if name is not None else util.gen_name("pyarrow_memtable"),
+        schema=sch.infer(data) if schema is None else schema,
+        data=PyArrowTableProxy(data),
+    ).to_expr()
+
+
+@_memtable.register(object)
+def _memtable_from_dataframe(
+    data: pd.DataFrame | Any,
+    *,
+    name: str | None = None,
+    schema: SupportsSchema | None = None,
+    columns: Iterable[str] | None = None,
+) -> Table:
+    import pandas as pd
+
+    from ibis.backends.pandas.client import DataFrameProxy
+
     df = pd.DataFrame(data, columns=columns)
     if df.columns.inferred_type != "string":
         cols = df.columns
@@ -458,31 +446,16 @@ def memtable(
             (f"col{i:d}" for i in range(len(cols))),
         )
         df = df.rename(columns=dict(zip(cols, newcols)))
-    return memtable(df, name=name, schema=schema)
-
-
-_gen_memtable_name = (f"_ibis_memtable{i:d}" for i in itertools.count())
-
-
-@memtable.register(pd.DataFrame)
-def _memtable_from_dataframe(
-    df: pd.DataFrame,
-    *,
-    name: str | None = None,
-    schema: SupportsSchema | None = None,
-) -> Table:
-    from ibis.backends.pandas.client import DataFrameProxy, PandasInMemoryTable
-
-    op = PandasInMemoryTable(
-        name=name if name is not None else next(_gen_memtable_name),
+    op = ops.InMemoryTable(
+        name=name if name is not None else util.gen_name("pandas_memtable"),
         schema=sch.infer(df) if schema is None else schema,
         data=DataFrameProxy(df),
     )
     return op.to_expr()
 
 
-def _sort_order(expr, order: Literal["desc"] | Literal["asc"]):
-    method = operator.methodcaller(order)
+def _deferred_method_call(expr, method_name):
+    method = operator.methodcaller(method_name)
     if isinstance(expr, str):
         value = _[expr]
     elif isinstance(expr, Deferred):
@@ -505,25 +478,27 @@ def desc(expr: ir.Column | str) -> ir.Value:
     Examples
     --------
     >>> import ibis
-    >>> t = ibis.table(dict(g='string'), name='t')
-    >>> t.group_by('g').size('count').order_by(ibis.desc('count'))
-    r0 := UnboundTable: t
-      g string
-    r1 := Aggregation[r0]
-      metrics:
-        count: Count(t)
-      by:
-        g: r0.g
-    Selection[r1]
-      sort_keys:
-        desc|r1.count
+    >>> ibis.options.interactive = True
+    >>> t = ibis.examples.penguins.fetch()
+    >>> t[["species", "year"]].order_by(ibis.desc("year")).head()
+    ┏━━━━━━━━━┳━━━━━━━┓
+    ┃ species ┃ year  ┃
+    ┡━━━━━━━━━╇━━━━━━━┩
+    │ string  │ int64 │
+    ├─────────┼───────┤
+    │ Adelie  │  2009 │
+    │ Adelie  │  2009 │
+    │ Adelie  │  2009 │
+    │ Adelie  │  2009 │
+    │ Adelie  │  2009 │
+    └─────────┴───────┘
 
     Returns
     -------
     ir.ValueExpr
         An expression
     """
-    return _sort_order(expr, "desc")
+    return _deferred_method_call(expr, "desc")
 
 
 def asc(expr: ir.Column | str) -> ir.Value:
@@ -537,25 +512,35 @@ def asc(expr: ir.Column | str) -> ir.Value:
     Examples
     --------
     >>> import ibis
-    >>> t = ibis.table(dict(g='string'), name='t')
-    >>> t.group_by('g').size('count').order_by(ibis.asc('count'))
-    r0 := UnboundTable: t
-      g string
-    r1 := Aggregation[r0]
-      metrics:
-        count: Count(t)
-      by:
-        g: r0.g
-    Selection[r1]
-      sort_keys:
-        asc|r1.count
+    >>> ibis.options.interactive = True
+    >>> t = ibis.examples.penguins.fetch()
+    >>> t[["species", "year"]].order_by(ibis.asc("year")).head()
+    ┏━━━━━━━━━┳━━━━━━━┓
+    ┃ species ┃ year  ┃
+    ┡━━━━━━━━━╇━━━━━━━┩
+    │ string  │ int64 │
+    ├─────────┼───────┤
+    │ Adelie  │  2007 │
+    │ Adelie  │  2007 │
+    │ Adelie  │  2007 │
+    │ Adelie  │  2007 │
+    │ Adelie  │  2007 │
+    └─────────┴───────┘
 
     Returns
     -------
     ir.ValueExpr
         An expression
     """
-    return _sort_order(expr, "asc")
+    return _deferred_method_call(expr, "asc")
+
+
+def preceding(value) -> ir.Value:
+    return ops.WindowBoundary(value, preceding=True).to_expr()
+
+
+def following(value) -> ir.Value:
+    return ops.WindowBoundary(value, preceding=False).to_expr()
 
 
 def and_(*predicates: ir.BooleanValue) -> ir.BooleanValue:
@@ -606,8 +591,7 @@ def random() -> ir.FloatingScalar:
     FloatingScalar
         Random float value expression
     """
-    op = ops.RandomScalar()
-    return op.to_expr()
+    return ops.RandomScalar().to_expr()
 
 
 @functools.singledispatch
@@ -622,6 +606,8 @@ def timestamp(
     ----------
     value
         The value to use for constructing the timestamp
+    args
+        Additional arguments used when constructing a timestamp
     timezone
         The timezone of the timestamp
 
@@ -637,6 +623,7 @@ def timestamp(
 @timestamp.register(np.floating)
 @timestamp.register(int)
 @timestamp.register(float)
+@timestamp.register(ir.IntegerValue)
 def _timestamp_from_ymdhms(
     value, *args, timezone: str | None = None
 ) -> ir.TimestampScalar:
@@ -650,11 +637,6 @@ def _timestamp_from_ymdhms(
     return ops.TimestampFromYMDHMS(value, *args).to_expr()
 
 
-@timestamp.register(pd.Timestamp)
-def _timestamp_from_timestamp(value, timezone: str | None = None) -> ir.TimestampScalar:
-    return literal(value, type=dt.Timestamp(timezone=timezone))
-
-
 @timestamp.register(datetime.datetime)
 def _timestamp_from_datetime(value, timezone: str | None = None) -> ir.TimestampScalar:
     return literal(value, type=dt.Timestamp(timezone=timezone))
@@ -662,6 +644,8 @@ def _timestamp_from_datetime(value, timezone: str | None = None) -> ir.Timestamp
 
 @timestamp.register(str)
 def _timestamp_from_str(value: str, timezone: str | None = None) -> ir.TimestampScalar:
+    import pandas as pd
+
     try:
         value = pd.Timestamp(value, tz=timezone)
     except pd.errors.OutOfBoundsDatetime:
@@ -689,10 +673,12 @@ def date(value) -> DateValue:
 
 @date.register(str)
 def _date_from_str(value: str) -> ir.DateScalar:
+    import pandas as pd
+
     return literal(pd.to_datetime(value).date(), type=dt.date)
 
 
-@date.register(pd.Timestamp)
+@date.register(datetime.datetime)
 def _date_from_timestamp(value) -> ir.DateScalar:
     return literal(value, type=dt.date)
 
@@ -720,6 +706,8 @@ def time(value) -> TimeValue:
 
 @time.register(str)
 def _time_from_str(value: str) -> ir.TimeScalar:
+    import pandas as pd
+
     return literal(pd.to_datetime(value).time(), type=dt.time)
 
 
@@ -826,9 +814,7 @@ def interval(
 def case() -> bl.SearchedCaseBuilder:
     """Begin constructing a case expression.
 
-    Notes
-    -----
-    Use the `.when` method on the resulting object followed by .end to create a
+    Use the `.when` method on the resulting object followed by `.end` to create a
     complete case.
 
     Examples
@@ -836,16 +822,15 @@ def case() -> bl.SearchedCaseBuilder:
     >>> import ibis
     >>> cond1 = ibis.literal(1) == 1
     >>> cond2 = ibis.literal(2) == 1
-    >>> (ibis.case()
-    ...  .when(cond1, 3)
-    ...  .when(cond2, 4).end())
-    >>> SearchedCase(cases=[ValueList(values=[1 == 1, 2 == 1])], results=[ValueList(values=[3, 4])], default=Cast(None, to=int8))
+    >>> expr = ibis.case().when(cond1, 3).when(cond2, 4).end()
+    >>> expr
+    SearchedCase(...)
 
     Returns
     -------
     SearchedCaseBuilder
         A builder object to use for constructing a case expression.
-    """  # noqa: E501
+    """
     return bl.SearchedCaseBuilder()
 
 
@@ -855,7 +840,7 @@ def now() -> ir.TimestampScalar:
     Returns
     -------
     TimestampScalar
-        A "now" expression
+        An expression representing the current timestamp.
     """
     return ops.TimestampNow().to_expr()
 
@@ -871,10 +856,470 @@ def row_number() -> ir.IntegerColumn:
     return ops.RowNumber().to_expr()
 
 
+def read_csv(sources: str | Path | Sequence[str | Path], **kwargs: Any) -> ir.Table:
+    """Lazily load a CSV or set of CSVs.
+
+    This function delegates to the `read_csv` method on the current default
+    backend (DuckDB or `ibis.config.default_backend`).
+
+    Parameters
+    ----------
+    sources
+        A filesystem path or URL or list of same.  Supports CSV and TSV files.
+    kwargs
+        Backend-specific keyword arguments for the file type. For the DuckDB
+        backend used by default, please refer to:
+
+        * CSV/TSV: https://duckdb.org/docs/data/csv#parameters.
+
+    Returns
+    -------
+    ir.Table
+        Table expression representing a file
+
+    Examples
+    --------
+    >>> import ibis
+    >>> ibis.options.interactive = True
+    >>> t = ibis.examples.Batting_raw.fetch()
+    >>> t
+    ┏━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━┓
+    ┃ playerID  ┃ yearID ┃ stint ┃ teamID ┃ lgID   ┃ G     ┃ AB    ┃ R     ┃ … ┃
+    ┡━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━┩
+    │ string    │ int64  │ int64 │ string │ string │ int64 │ int64 │ int64 │ … │
+    ├───────────┼────────┼───────┼────────┼────────┼───────┼───────┼───────┼───┤
+    │ abercda01 │   1871 │     1 │ TRO    │ NA     │     1 │     4 │     0 │ … │
+    │ addybo01  │   1871 │     1 │ RC1    │ NA     │    25 │   118 │    30 │ … │
+    │ allisar01 │   1871 │     1 │ CL1    │ NA     │    29 │   137 │    28 │ … │
+    │ allisdo01 │   1871 │     1 │ WS3    │ NA     │    27 │   133 │    28 │ … │
+    │ ansonca01 │   1871 │     1 │ RC1    │ NA     │    25 │   120 │    29 │ … │
+    │ armstbo01 │   1871 │     1 │ FW1    │ NA     │    12 │    49 │     9 │ … │
+    │ barkeal01 │   1871 │     1 │ RC1    │ NA     │     1 │     4 │     0 │ … │
+    │ barnero01 │   1871 │     1 │ BS1    │ NA     │    31 │   157 │    66 │ … │
+    │ barrebi01 │   1871 │     1 │ FW1    │ NA     │     1 │     5 │     1 │ … │
+    │ barrofr01 │   1871 │     1 │ BS1    │ NA     │    18 │    86 │    13 │ … │
+    │ …         │      … │     … │ …      │ …      │     … │     … │     … │ … │
+    └───────────┴────────┴───────┴────────┴────────┴───────┴───────┴───────┴───┘
+    """
+    from ibis.config import _default_backend
+
+    con = _default_backend()
+    return con.read_csv(sources, **kwargs)
+
+
+@experimental
+def read_json(sources: str | Path | Sequence[str | Path], **kwargs: Any) -> ir.Table:
+    """Lazily load newline-delimited JSON data.
+
+    This function delegates to the `read_json` method on the current default
+    backend (DuckDB or `ibis.config.default_backend`).
+
+    Parameters
+    ----------
+    sources
+        A filesystem path or URL or list of same.
+    kwargs
+        Backend-specific keyword arguments for the file type. See
+        https://duckdb.org/docs/extensions/json.html for details.
+
+    Returns
+    -------
+    ir.Table
+        Table expression representing a file
+
+    Examples
+    --------
+    >>> import ibis
+    >>> ibis.options.interactive = True
+    >>> lines = '''
+    ... {"a": 1, "b": "d"}
+    ... {"a": 2, "b": null}
+    ... {"a": null, "b": "f"}
+    ... '''
+    >>> with open("/tmp/lines.json", mode="w") as f:
+    ...     _ = f.write(lines)
+    >>> t = ibis.read_json("/tmp/lines.json")
+    >>> t
+    ┏━━━━━━━━┳━━━━━━━━┓
+    ┃ a      ┃ b      ┃
+    ┡━━━━━━━━╇━━━━━━━━┩
+    │ uint64 │ string │
+    ├────────┼────────┤
+    │      1 │ d      │
+    │      2 │ NULL   │
+    │   NULL │ f      │
+    └────────┴────────┘
+    """
+    from ibis.config import _default_backend
+
+    con = _default_backend()
+    return con.read_json(sources, **kwargs)
+
+
+def read_parquet(sources: str | Path | Sequence[str | Path], **kwargs: Any) -> ir.Table:
+    """Lazily load a parquet file or set of parquet files.
+
+    This function delegates to the `read_parquet` method on the current default
+    backend (DuckDB or `ibis.config.default_backend`).
+
+    Parameters
+    ----------
+    sources
+        A filesystem path or URL or list of same.
+    kwargs
+        Backend-specific keyword arguments for the file type. For the DuckDB
+        backend used by default, please refer to:
+
+        * Parquet: https://duckdb.org/docs/data/parquet
+
+    Returns
+    -------
+    ir.Table
+        Table expression representing a file
+
+    Examples
+    --------
+    >>> import ibis
+    >>> ibis.options.interactive = True
+    >>> t = ibis.examples.Batting_raw.fetch()
+    >>> t
+    ┏━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━┓
+    ┃ playerID  ┃ yearID ┃ stint ┃ teamID ┃ lgID   ┃ G     ┃ AB    ┃ R     ┃ … ┃
+    ┡━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━┩
+    │ string    │ int64  │ int64 │ string │ string │ int64 │ int64 │ int64 │ … │
+    ├───────────┼────────┼───────┼────────┼────────┼───────┼───────┼───────┼───┤
+    │ abercda01 │   1871 │     1 │ TRO    │ NA     │     1 │     4 │     0 │ … │
+    │ addybo01  │   1871 │     1 │ RC1    │ NA     │    25 │   118 │    30 │ … │
+    │ allisar01 │   1871 │     1 │ CL1    │ NA     │    29 │   137 │    28 │ … │
+    │ allisdo01 │   1871 │     1 │ WS3    │ NA     │    27 │   133 │    28 │ … │
+    │ ansonca01 │   1871 │     1 │ RC1    │ NA     │    25 │   120 │    29 │ … │
+    │ armstbo01 │   1871 │     1 │ FW1    │ NA     │    12 │    49 │     9 │ … │
+    │ barkeal01 │   1871 │     1 │ RC1    │ NA     │     1 │     4 │     0 │ … │
+    │ barnero01 │   1871 │     1 │ BS1    │ NA     │    31 │   157 │    66 │ … │
+    │ barrebi01 │   1871 │     1 │ FW1    │ NA     │     1 │     5 │     1 │ … │
+    │ barrofr01 │   1871 │     1 │ BS1    │ NA     │    18 │    86 │    13 │ … │
+    │ …         │      … │     … │ …      │ …      │     … │     … │     … │ … │
+    └───────────┴────────┴───────┴────────┴────────┴───────┴───────┴───────┴───┘
+    """
+    from ibis.config import _default_backend
+
+    con = _default_backend()
+    return con.read_parquet(sources, **kwargs)
+
+
+def set_backend(backend: str | BaseBackend) -> None:
+    """Set the default Ibis backend.
+
+    Parameters
+    ----------
+    backend
+        May be a backend name or URL, or an existing backend instance.
+
+    Examples
+    --------
+    You can pass the backend as a name:
+
+    >>> import ibis
+    >>> ibis.set_backend("polars")
+
+    Or as a URI
+
+    >>> ibis.set_backend("postgres://user:password@hostname:5432")  # doctest: +SKIP
+
+    Or as an existing backend instance
+
+    >>> ibis.set_backend(ibis.duckdb.connect())
+    """
+    import ibis
+
+    if isinstance(backend, str) and backend.isidentifier():
+        try:
+            backend_type = getattr(ibis, backend)
+        except AttributeError:
+            pass
+        else:
+            backend = backend_type.connect()
+    if isinstance(backend, str):
+        backend = ibis.connect(backend)
+
+    ibis.options.default_backend = backend
+
+
+def get_backend(expr: Expr | None = None) -> BaseBackend:
+    """Get the current Ibis backend to use for a given expression.
+
+    expr
+        An expression to get the backend from. If not passed, the default
+        backend is returned.
+
+    Returns
+    -------
+    BaseBackend
+        The Ibis backend.
+    """
+    if expr is None:
+        from ibis.config import _default_backend
+
+        return _default_backend()
+    return expr._find_backend(use_default=True)
+
+
+class RowsWithMaxLookback(NamedTuple):
+    rows: int
+    max_lookback: ir.IntervalValue
+
+
+def rows_with_max_lookback(
+    rows: int | np.integer, max_lookback: ir.IntervalValue
+) -> RowsWithMaxLookback:
+    """Create a bound preceding value for use with trailing window functions.
+
+    Parameters
+    ----------
+    rows
+        Number of rows
+    max_lookback
+        Maximum lookback in time
+    Returns
+    -------
+    RowsWithMaxLookback
+        A named tuple of rows and maximum look-back in time.
+    """
+    return RowsWithMaxLookback(rows, max_lookback)
+
+
+def window(
+    preceding=None,
+    following=None,
+    order_by=None,
+    group_by=None,
+    *,
+    rows=None,
+    range=None,
+    between=None,
+):
+    """Create a window clause for use with window functions.
+
+    The `ROWS` window clause includes peer rows based on differences in row
+    **number** whereas `RANGE` includes rows based on the differences in row
+    **value** of a single `order_by` expression.
+
+    All window frame bounds are inclusive.
+
+    Parameters
+    ----------
+    preceding
+        Number of preceding rows in the window
+    following
+        Number of following rows in the window
+    group_by
+        Grouping key
+    order_by
+        Ordering key
+    rows
+        Whether to use the `ROWS` window clause
+    range
+        Whether to use the `RANGE` window clause
+    between
+        Automatically infer the window kind based on the boundaries
+
+    Returns
+    -------
+    Window
+        A window frame
+    """
+    if isinstance(preceding, RowsWithMaxLookback):
+        max_lookback = preceding.max_lookback
+        preceding = preceding.rows
+    else:
+        max_lookback = None
+
+    has_rows = rows is not None
+    has_range = range is not None
+    has_between = between is not None
+    has_preceding_following = preceding is not None or following is not None
+    if has_rows + has_range + has_between + has_preceding_following > 1:
+        raise IbisInputError(
+            "Must only specify either `rows`, `range`, `between` or `preceding`/`following`"
+        )
+
+    builder = (
+        bl.LegacyWindowBuilder()
+        .group_by(group_by)
+        .order_by(order_by)
+        .lookback(max_lookback)
+    )
+    if has_rows:
+        return builder.rows(*rows)
+    elif has_range:
+        return builder.range(*range)
+    elif has_between:
+        return builder.between(*between)
+    elif has_preceding_following:
+        return builder.preceding_following(preceding, following)
+    else:
+        return builder
+
+
+def rows_window(preceding=None, following=None, group_by=None, order_by=None):
+    """Create a rows-based window clause for use with window functions.
+
+    This ROWS window clause aggregates rows based upon differences in row
+    number.
+
+    All window frames / ranges are inclusive.
+
+    Parameters
+    ----------
+    preceding
+        Number of preceding rows in the window
+    following
+        Number of following rows in the window
+    group_by
+        Grouping key
+    order_by
+        Ordering key
+
+    Returns
+    -------
+    Window
+        A window frame
+    """
+    if isinstance(preceding, RowsWithMaxLookback):
+        max_lookback = preceding.max_lookback
+        preceding = preceding.rows
+    else:
+        max_lookback = None
+
+    return (
+        bl.LegacyWindowBuilder()
+        .group_by(group_by)
+        .order_by(order_by)
+        .lookback(max_lookback)
+        .preceding_following(preceding, following, how="rows")
+    )
+
+
+def range_window(preceding=None, following=None, group_by=None, order_by=None):
+    """Create a range-based window clause for use with window functions.
+
+    This RANGE window clause aggregates rows based upon differences in the
+    value of the order-by expression.
+
+    All window frames / ranges are inclusive.
+
+    Parameters
+    ----------
+    preceding
+        Number of preceding rows in the window
+    following
+        Number of following rows in the window
+    group_by
+        Grouping key
+    order_by
+        Ordering key
+
+    Returns
+    -------
+    Window
+        A window frame
+    """
+    return (
+        bl.LegacyWindowBuilder()
+        .group_by(group_by)
+        .order_by(order_by)
+        .preceding_following(preceding, following, how="range")
+    )
+
+
+def cumulative_window(group_by=None, order_by=None):
+    """Create a cumulative window for use with window functions.
+
+    All window frames / ranges are inclusive.
+
+    Parameters
+    ----------
+    group_by
+        Grouping key
+    order_by
+        Ordering key
+
+    Returns
+    -------
+    Window
+        A window frame
+    """
+    return window(rows=(None, 0), group_by=group_by, order_by=order_by)
+
+
+def trailing_window(preceding, group_by=None, order_by=None):
+    """Create a trailing window for use with window functions.
+
+    Parameters
+    ----------
+    preceding
+        The number of preceding rows
+    group_by
+        Grouping key
+    order_by
+        Ordering key
+
+    Returns
+    -------
+    Window
+        A window frame
+    """
+    return window(
+        preceding=preceding, following=0, group_by=group_by, order_by=order_by
+    )
+
+
+def trailing_rows_window(preceding, group_by=None, order_by=None):
+    """Create a trailing window for use with aggregate window functions.
+
+    Parameters
+    ----------
+    preceding
+        The number of preceding rows
+    group_by
+        Grouping key
+    order_by
+        Ordering key
+
+    Returns
+    -------
+    Window
+        A window frame
+    """
+    return rows_window(
+        preceding=preceding, following=0, group_by=group_by, order_by=order_by
+    )
+
+
+def trailing_range_window(preceding, order_by, group_by=None):
+    """Create a trailing range window for use with window functions.
+
+    Parameters
+    ----------
+    preceding
+        A value expression
+    order_by
+        Ordering key
+    group_by
+        Grouping key
+
+    Returns
+    -------
+    Window
+        A window frame
+    """
+    return range_window(
+        preceding=preceding, following=0, group_by=group_by, order_by=order_by
+    )
+
+
 e = ops.E().to_expr()
-
 pi = ops.Pi().to_expr()
-
 
 geo_area = _deferred(ir.GeoSpatialValue.area)
 geo_as_binary = _deferred(ir.GeoSpatialValue.as_binary)
@@ -934,7 +1379,7 @@ where = ifelse = _deferred(ir.BooleanValue.ifelse)
 coalesce = _deferred(ir.Value.coalesce)
 greatest = _deferred(ir.Value.greatest)
 least = _deferred(ir.Value.least)
-category_label = _deferred(ir.CategoryValue.label)
+category_label = _deferred(ir.IntegerColumn.label)
 
 aggregate = ir.Table.aggregate
 cross_join = ir.Table.cross_join
@@ -945,4 +1390,27 @@ union = ir.Table.union
 intersect = ir.Table.intersect
 difference = ir.Table.difference
 
-_ = Deferred()
+_ = deferred = Deferred()
+"""Deferred expression object.
+
+Use this object to refer to a previous table expression in a chain of
+expressions.
+
+!!! note "`_` may conflict with other idioms in Python"
+
+    See https://github.com/ibis-project/ibis/issues/4704 for details.
+
+    Use `from ibis import deferred as <NAME>` to assign a different name to
+    the deferred object builder.
+
+Examples
+--------
+>>> from ibis import _
+>>> t = ibis.table(dict(key="int", value="float"), name="t")
+>>> expr = t.group_by(key=_.key - 1).agg(total=_.value.sum())
+>>> expr.schema()
+ibis.Schema {
+  key    int64
+  total  float64
+}
+"""

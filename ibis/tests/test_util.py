@@ -37,22 +37,17 @@ def test_flatten_invalid_input(case):
         list(flat)
 
 
-def test_dotdict():
-    d = util.DotDict({"a": 1, "b": 2, "c": 3})
-    assert d["a"] == d.a == 1
-    assert d["b"] == d.b == 2
+def test_import_object():
+    import collections
 
-    d.b = 3
-    assert d.b == 3
-    assert d["b"] == 3
+    assert util.import_object("collections.defaultdict") is collections.defaultdict
+    assert util.import_object("collections.abc.Mapping") is collections.abc.Mapping
 
-    del d.c
-    assert not hasattr(d, "c")
-    assert "c" not in d
+    with pytest.raises(ImportError):
+        util.import_object("this_module_probably.doesnt_exist")
 
-    assert repr(d) == "DotDict({'a': 1, 'b': 3})"
+    with pytest.raises(ImportError):
+        util.import_object("collections.this_attribute_doesnt_exist")
 
-    with pytest.raises(KeyError):
-        assert d['x']
-    with pytest.raises(AttributeError):
-        assert d.x
+
+# TODO(kszucs): add tests for promote_list and promote_tuple

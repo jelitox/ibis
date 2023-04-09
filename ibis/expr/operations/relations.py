@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import abc
 import collections
 import itertools
 from abc import abstractmethod
+from typing import TYPE_CHECKING
 
 from public import public
 
@@ -11,12 +13,18 @@ import ibis.expr.operations as ops
 import ibis.expr.rules as rlz
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
-import ibis.util as util
+from ibis import util
 from ibis.common.annotations import attribute
+from ibis.common.collections import frozendict
+from ibis.common.grounds import Immutable
 from ibis.expr.deferred import Deferred
 from ibis.expr.operations.core import Named, Node, Value
 from ibis.expr.operations.generic import TableColumn
 from ibis.expr.operations.logical import Equals, ExistsSubquery, NotExistsSubquery
+
+if TYPE_CHECKING:
+    import pandas as pd
+    import pyarrow as pa
 
 _table_names = (f'unbound_table_{i:d}' for i in itertools.count())
 
@@ -34,7 +42,7 @@ class TableNode(Node):
     @property
     @abstractmethod
     def schema(self) -> sch.Schema:
-        """Return a schema."""
+        ...
 
     def to_expr(self):
         import ibis.expr.types as ir
@@ -49,7 +57,7 @@ class PhysicalTable(TableNode, Named):
 
 @public
 class UnboundTable(PhysicalTable):
-    schema = rlz.instance_of(sch.Schema)
+    schema = rlz.coerced_to(sch.Schema)
     name = rlz.optional(rlz.instance_of(str), default=genname)
 
 
@@ -58,9 +66,6 @@ class DatabaseTable(PhysicalTable):
     name = rlz.instance_of(str)
     schema = rlz.instance_of(sch.Schema)
     source = rlz.client
-
-    def change_name(self, new_name):
-        return type(self)(new_name, self.args[1], self.source)
 
 
 @public
@@ -72,27 +77,40 @@ class SQLQueryResult(TableNode):
     source = rlz.client
 
 
+class TableProxy(Immutable):
+    __slots__ = ('_data', '_hash')
+
+    def __init__(self, data) -> None:
+        object.__setattr__(self, "_data", data)
+        object.__setattr__(self, "_hash", hash((type(data), id(data))))
+
+    def __hash__(self) -> int:
+        return self._hash
+
+    def __repr__(self) -> str:
+        data_repr = util.indent(repr(self._data), spaces=2)
+        return f"{self.__class__.__name__}:\n{data_repr}"
+
+    @abc.abstractmethod
+    def to_frame(self) -> pd.DataFrame:  # pragma: no cover
+        """Convert this input to a pandas DataFrame."""
+
+    @abc.abstractmethod
+    def to_pyarrow(self, schema: sch.Schema) -> pa.Table:  # pragma: no cover
+        """Convert this input to a PyArrow Table."""
+
+
 @public
 class InMemoryTable(PhysicalTable):
     name = rlz.instance_of(str)
     schema = rlz.instance_of(sch.Schema)
-
-    @property
-    @abstractmethod
-    def data(self) -> util.ToFrame:
-        """Return the data of an in-memory table."""
-
-    def has_resolved_name(self):
-        return True
-
-    def resolve_name(self):
-        return self.name
+    data = rlz.instance_of(TableProxy)
 
 
 # TODO(kszucs): desperately need to clean this up, the majority of this
 # functionality should be handled by input rules for the Join class
 def _clean_join_predicates(left, right, predicates):
-    import ibis.expr.analysis as L
+    import ibis.expr.analysis as an
     import ibis.expr.types as ir
     from ibis.expr.analysis import shares_all_roots
 
@@ -101,7 +119,7 @@ def _clean_join_predicates(left, right, predicates):
     for pred in predicates:
         if isinstance(pred, tuple):
             if len(pred) != 2:
-                raise com.ExpressionError('Join key tuple must be ' 'length 2')
+                raise com.ExpressionError('Join key tuple must be length 2')
             lk, rk = pred
             lk = left.to_expr()._ensure_expr(lk)
             rk = right.to_expr()._ensure_expr(rk)
@@ -119,7 +137,7 @@ def _clean_join_predicates(left, right, predicates):
         if not isinstance(pred, ir.BooleanColumn):
             raise com.ExpressionError('Join predicate must be comparison')
 
-        preds = L.flatten_predicate(pred.op())
+        preds = an.flatten_predicate(pred.op())
         result.extend(preds)
 
     # Validate join predicates. Each predicate must be valid jointly when
@@ -147,7 +165,7 @@ class Join(TableNode):
         # TODO(kszucs): predicates should be already a list of operations, need
         # to update the validation rule for the Join classes which is a noop
         # currently
-        import ibis.expr.analysis as L
+        import ibis.expr.analysis as an
         import ibis.expr.operations as ops
 
         # TODO(kszucs): need to factor this out to appropiate join predicate
@@ -169,7 +187,7 @@ class Join(TableNode):
             old = right
             new = right = ops.SelfReference(right)
             predicates = [
-                L.sub_for(pred, {old: new}) if isinstance(pred, ops.Node) else pred
+                an.sub_for(pred, {old: new}) if isinstance(pred, ops.Node) else pred
                 for pred in predicates
             ]
 
@@ -179,8 +197,13 @@ class Join(TableNode):
 
     @property
     def schema(self):
-        # For joins retaining both table schemas, merge them together here
-        return self.left.schema.append(self.right.schema)
+        # TODO(kszucs): use `return self.lefts.chema | self.right.schema` instead which
+        # eliminates unnecessary projection over the join, but currently breaks the
+        # pandas backend
+        left, right = self.left.schema, self.right.schema
+        if duplicates := left.keys() & right.keys():
+            raise com.IntegrityError(f'Duplicate column name(s): {duplicates}')
+        return sch.Schema({**left, **right})
 
 
 @public
@@ -250,8 +273,12 @@ class SetOp(TableNode):
     distinct = rlz.optional(rlz.instance_of(bool), default=False)
 
     def __init__(self, left, right, **kwargs):
-        if not left.schema == right.schema:
+        if left.schema != right.schema:
             raise com.RelationError('Table schemas must be equal for set operations')
+        elif left.schema.names != right.schema.names:
+            # rewrite so that both sides have the columns in the same order making it
+            # easier for the backends to implement set operations
+            right = ops.Selection(right, left.schema.names)
         super().__init__(left=left, right=right, **kwargs)
 
     @property
@@ -296,7 +323,7 @@ class SelfReference(TableNode):
 
 class Projection(TableNode):
     table = rlz.table
-    selections = rlz.nodes_of(
+    selections = rlz.tuple_of(
         rlz.one_of(
             (
                 rlz.table,
@@ -310,13 +337,10 @@ class Projection(TableNode):
     @attribute.default
     def schema(self):
         # Resolve schema and initialize
-
         if not self.selections:
             return self.table.schema
 
-        types = []
-        names = []
-
+        types, names = [], []
         for projection in self.selections:
             if isinstance(projection, Value):
                 names.append(projection.name)
@@ -326,14 +350,14 @@ class Projection(TableNode):
                 names.extend(schema.names)
                 types.extend(schema.types)
 
-        return sch.Schema(names, types)
+        return sch.schema(names, types)
 
 
 @public
 class Selection(Projection):
-    predicates = rlz.optional(rlz.nodes_of(rlz.boolean), default=())
+    predicates = rlz.optional(rlz.tuple_of(rlz.boolean), default=())
     sort_keys = rlz.optional(
-        rlz.nodes_of(rlz.sort_key_from(rlz.ref("table"))), default=()
+        rlz.tuple_of(rlz.sort_key_from(rlz.ref("table"))), default=()
     )
 
     def __init__(self, table, selections, predicates, sort_keys, **kwargs):
@@ -346,7 +370,10 @@ class Selection(Projection):
             )
 
         for predicate in predicates:
-            if not shares_some_roots(predicate, table):
+            if isinstance(predicate, ops.Literal):
+                if not (dtype := predicate.output_dtype).is_boolean():
+                    raise com.IbisTypeError(f"Invalid predicate dtype: {dtype}")
+            elif not shares_some_roots(predicate, table):
                 raise com.RelationError("Predicate doesn't share any roots with table")
 
         super().__init__(
@@ -358,17 +385,20 @@ class Selection(Projection):
         )
 
     def order_by(self, sort_exprs):
-        from ibis.expr.analysis import shares_all_roots
+        from ibis.expr.analysis import shares_all_roots, sub_immediate_parents
 
         keys = rlz.tuple_of(rlz.sort_key_from(rlz.just(self)), sort_exprs)
 
         if not self.selections:
-            if shares_all_roots(keys, self.table):
+            if shares_all_roots(keys, table := self.table):
+                sort_keys = tuple(self.sort_keys) + tuple(
+                    sub_immediate_parents(key, table) for key in keys
+                )
                 return Selection(
-                    self.table,
+                    table,
                     self.selections,
                     predicates=self.predicates,
-                    sort_keys=self.sort_keys + keys,
+                    sort_keys=sort_keys,
                 )
 
         return Selection(self, [], sort_keys=keys)
@@ -379,20 +409,19 @@ class Selection(Projection):
 
 
 @public
+class DummyTable(TableNode):
+    values = rlz.tuple_of(rlz.scalar(rlz.any), min_length=1)
+
+    @property
+    def schema(self):
+        return sch.Schema({op.name: op.output_dtype for op in self.values})
+
+
+@public
 class Aggregation(TableNode):
-
-    """
-    metrics : per-group scalar aggregates
-    by : group expressions
-    having : post-aggregation predicate
-
-    TODO: not putting this in the aggregate operation yet
-    where : pre-aggregation predicate
-    """
-
     table = rlz.table
     metrics = rlz.optional(
-        rlz.nodes_of(
+        rlz.tuple_of(
             rlz.one_of(
                 (
                     rlz.function_of(
@@ -401,7 +430,7 @@ class Aggregation(TableNode):
                     ),
                     rlz.reduction,
                     rlz.scalar(rlz.any),
-                    rlz.nodes_of(rlz.scalar(rlz.any)),  # TODO(kszucs): ???
+                    rlz.tuple_of(rlz.scalar(rlz.any)),
                 )
             ),
             flatten=True,
@@ -409,7 +438,7 @@ class Aggregation(TableNode):
         default=(),
     )
     by = rlz.optional(
-        rlz.nodes_of(
+        rlz.tuple_of(
             rlz.one_of(
                 (
                     rlz.function_of(rlz.ref("table")),
@@ -421,7 +450,7 @@ class Aggregation(TableNode):
         default=(),
     )
     having = rlz.optional(
-        rlz.nodes_of(
+        rlz.tuple_of(
             rlz.one_of(
                 (
                     rlz.function_of(
@@ -433,8 +462,10 @@ class Aggregation(TableNode):
         ),
         default=(),
     )
-    predicates = rlz.optional(rlz.nodes_of(rlz.boolean), default=())
-    sort_keys = rlz.optional(rlz.nodes_of(rlz.sort_key_from("table")), default=())
+    predicates = rlz.optional(rlz.tuple_of(rlz.boolean), default=())
+    sort_keys = rlz.optional(
+        rlz.tuple_of(rlz.sort_key_from(rlz.ref("table"))), default=()
+    )
 
     def __init__(self, table, metrics, by, having, predicates, sort_keys):
         from ibis.expr.analysis import shares_all_roots, shares_some_roots
@@ -464,28 +495,28 @@ class Aggregation(TableNode):
 
     @attribute.default
     def schema(self):
-        names = []
-        types = []
-
-        for e in self.by + self.metrics:
-            names.append(e.name)
-            types.append(e.output_dtype)
-
-        return sch.Schema(names, types)
+        names, types = [], []
+        for value in self.by + self.metrics:
+            names.append(value.name)
+            types.append(value.output_dtype)
+        return sch.schema(names, types)
 
     def order_by(self, sort_exprs):
-        from ibis.expr.analysis import shares_all_roots
+        from ibis.expr.analysis import shares_all_roots, sub_immediate_parents
 
         keys = rlz.tuple_of(rlz.sort_key_from(rlz.just(self)), sort_exprs)
 
-        if shares_all_roots(keys, self.table):
+        if shares_all_roots(keys, table := self.table):
+            sort_keys = tuple(self.sort_keys) + tuple(
+                sub_immediate_parents(key, table) for key in keys
+            )
             return Aggregation(
-                self.table,
-                self.metrics,
+                table,
+                metrics=self.metrics,
                 by=self.by,
                 having=self.having,
                 predicates=self.predicates,
-                sort_keys=self.sort_keys + keys,
+                sort_keys=sort_keys,
             )
 
         return Selection(self, [], sort_keys=keys)
@@ -530,7 +561,7 @@ class FillNa(TableNode):
             replacements=(
                 replacements
                 if not isinstance(replacements, collections.abc.Mapping)
-                else util.frozendict(replacements)
+                else frozendict(replacements)
             ),
             **kwargs,
         )
@@ -546,7 +577,7 @@ class DropNa(TableNode):
 
     table = rlz.table
     how = rlz.isin({'any', 'all'})
-    subset = rlz.optional(rlz.nodes_of(rlz.column_from(rlz.ref("table"))))
+    subset = rlz.optional(rlz.tuple_of(rlz.column_from(rlz.ref("table"))))
 
     @property
     def schema(self):
@@ -628,7 +659,7 @@ def _dedup_join_columns(expr, suffixes: tuple[str, str]):
         for column in right.columns
         if column not in equal
     ]
-    return expr.projection(left_projections + right_projections)
+    return expr.select(left_projections + right_projections)
 
 
 public(ExistsSubquery=ExistsSubquery, NotExistsSubquery=NotExistsSubquery)

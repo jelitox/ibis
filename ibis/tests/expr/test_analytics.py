@@ -44,7 +44,7 @@ def test_category_project(alltypes):
     tier = t.double_col.bucket([0, 50, 100]).name('tier')
     expr = t[tier, t]
 
-    assert isinstance(expr.tier, ir.CategoryColumn)
+    assert isinstance(expr.tier, ir.IntegerColumn)
 
 
 def test_bucket(alltypes):
@@ -52,7 +52,7 @@ def test_bucket(alltypes):
     bins = [0, 10, 50, 100]
 
     expr = d.bucket(bins)
-    assert isinstance(expr, ir.CategoryColumn)
+    assert isinstance(expr, ir.IntegerColumn)
     assert expr.op().nbuckets == 3
 
     expr = d.bucket(bins, include_over=True)
@@ -93,19 +93,13 @@ def test_histogram(alltypes):
     with pytest.raises(ValueError):
         d.histogram()
 
-    with pytest.raises(ValueError):
-        d.histogram(10, closed="foo")
-
 
 def test_topk_analysis_bug(airlines):
     # GH #398
     dests = ['ORD', 'JFK', 'SFO']
     t = airlines[airlines.dest.isin(dests)]
-    delay_filter = t.origin.topk(10, by=t.arrdelay.mean())
-
-    filtered = t.filter([delay_filter])
-
-    assert delay_filter._to_semi_join(t)[t].equals(filtered)
+    filtered = t.semi_join(t.origin.topk(10, by=t.arrdelay.mean()), "origin")
+    assert filtered is not None
 
 
 def test_topk_function_late_bind(airlines):
@@ -113,4 +107,4 @@ def test_topk_function_late_bind(airlines):
     expr1 = airlines.dest.topk(5, by=lambda x: x.arrdelay.mean())
     expr2 = airlines.dest.topk(5, by=airlines.arrdelay.mean())
 
-    assert_equal(expr1.to_aggregation(), expr2.to_aggregation())
+    assert_equal(expr1, expr2)

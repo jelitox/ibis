@@ -1,16 +1,14 @@
 import re
 
+import dask.dataframe as dd
 import numpy as np
 import pandas as pd
 import pytest
+from dask.dataframe.utils import tm
 from pytest import param
 
 import ibis
-
-dd = pytest.importorskip("dask.dataframe")
-from dask.dataframe.utils import tm  # noqa: E402
-
-from ibis.backends.dask.client import DaskTable  # noqa: E402
+from ibis.backends.dask.client import DaskTable
 
 
 def make_dask_data_frame(npartitions):
@@ -39,6 +37,11 @@ def table(client):
     return client.table('df')
 
 
+def test_connect_no_args():
+    con = ibis.dask.connect()
+    assert dict(con.tables) == {}
+
+
 def test_client_table(table):
     assert isinstance(table.op(), ibis.expr.operations.DatabaseTable)
     assert isinstance(table.op(), DaskTable)
@@ -49,7 +52,8 @@ def test_client_table_repr(table):
 
 
 def test_load_data(client, npartitions):
-    client.load_data('testing', make_dask_data_frame(npartitions))
+    with pytest.warns(FutureWarning):
+        client.load_data('testing', make_dask_data_frame(npartitions))
     assert 'testing' in client.list_tables()
     assert client.get_schema('testing')
 
@@ -74,11 +78,6 @@ def test_list_tables(client):
     assert client.list_tables()
 
 
-def test_read_with_undiscoverable_type(client):
-    with pytest.raises(TypeError):
-        client.table('df_unknown')
-
-
 def test_drop(table):
     table = table.mutate(c=table.a)
     expr = table.drop('a')
@@ -90,25 +89,25 @@ def test_drop(table):
 @pytest.mark.parametrize(
     'unit',
     [
-        param('Y', marks=pytest.mark.xfail(raises=TypeError)),
-        param('M', marks=pytest.mark.xfail(raises=TypeError)),
-        param('D', marks=pytest.mark.xfail(raises=TypeError)),
-        param('h', marks=pytest.mark.xfail(raises=TypeError)),
-        param('m', marks=pytest.mark.xfail(raises=TypeError)),
-        param('s', marks=pytest.mark.xfail(raises=TypeError)),
-        param('ms', marks=pytest.mark.xfail(raises=TypeError)),
-        param('us', marks=pytest.mark.xfail(raises=TypeError)),
+        'Y',
+        'M',
+        'D',
+        'h',
+        'm',
+        's',
+        'ms',
+        'us',
         'ns',
-        param('ps', marks=pytest.mark.xfail(raises=TypeError)),
-        param('fs', marks=pytest.mark.xfail(raises=TypeError)),
-        param('as', marks=pytest.mark.xfail(raises=TypeError)),
+        param('ps', marks=pytest.mark.xfail),
+        param('fs', marks=pytest.mark.xfail),
+        param('as', marks=pytest.mark.xfail),
     ],
 )
 def test_datetime64_infer(client, unit):
     value = np.datetime64('2018-01-02', unit)
     expr = ibis.literal(value, type='timestamp')
     result = client.execute(expr)
-    assert result == value
+    assert result == pd.Timestamp(value).to_pydatetime()
 
 
 def test_invalid_connection_parameter_types(npartitions):
@@ -134,5 +133,6 @@ def test_invalid_connection_parameter_types(npartitions):
         "Expected an instance of 'dask.dataframe.DataFrame' for 'df', "
         "got an instance of 'str' instead."
     )
+    con = ibis.dask.connect()
     with pytest.raises(TypeError, match=expeced_msg):
-        ibis.dask.from_dataframe("file.csv")
+        con.from_dataframe("file.csv")

@@ -26,7 +26,7 @@ class TestConf(BackendTest, RoundHalfToEven):
     returned_timestamp_unit = 's'
     supports_arrays = False
     supports_arrays_outside_of_select = supports_arrays
-    bool_is_int = True
+    native_bool = False
     supports_structs = False
 
     def __init__(self, data_directory: Path) -> None:
@@ -75,11 +75,12 @@ class TestConf(BackendTest, RoundHalfToEven):
         with open(script_dir / 'schema' / 'mysql.sql') as schema:
             engine = init_database(
                 url=sa.engine.make_url(
-                    f"mysql+pymysql://{user}:{password}@{host}:{port:d}?local_infile=1",  # noqa: E501
+                    f"mysql+pymysql://{user}:{password}@{host}:{port:d}?local_infile=1",
                 ),
                 database=database,
                 schema=schema,
                 isolation_level="AUTOCOMMIT",
+                recreate=False,
             )
             with engine.begin() as con:
                 for table in TEST_TABLES:
@@ -92,7 +93,7 @@ class TestConf(BackendTest, RoundHalfToEven):
                         "LINES TERMINATED BY '\\n'",
                         "IGNORE 1 LINES",
                     ]
-                    con.execute("\n".join(lines))
+                    con.exec_driver_sql("\n".join(lines))
 
     @staticmethod
     def connect(_: Path):
@@ -103,10 +104,6 @@ class TestConf(BackendTest, RoundHalfToEven):
             database=IBIS_TEST_MYSQL_DB,
             port=MYSQL_PORT,
         )
-
-
-def _random_identifier(suffix):
-    return f'__ibis_test_{suffix}_{ibis.util.guid()}'
 
 
 @pytest.fixture(scope='session')

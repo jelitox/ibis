@@ -1,12 +1,25 @@
 import numpy as np
 import pandas as pd
 import pytest
+import sqlalchemy as sa
+import sqlglot
 from pytest import mark, param
 
+import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 from ibis import _
 from ibis import literal as L
 from ibis.udf.vectorized import reduction
+
+try:
+    from pyspark.sql.utils import AnalysisException as PysparkAnalysisException
+except ImportError:
+    PysparkAnalysisException = None
+
+try:
+    from google.api_core.exceptions import BadRequest as GoogleBadRequest
+except ImportError:
+    GoogleBadRequest = None
 
 
 @reduction(input_type=[dt.double], output_type=dt.double)
@@ -19,6 +32,11 @@ aggregate_test_params = [
         lambda t: t.double_col.mean(),
         lambda t: t.double_col.mean(),
         id='mean',
+        marks=mark.broken(
+            ["druid"],
+            reason="sqlalchemy dialect returns incorrect type",
+            raises=AssertionError,
+        ),
     ),
     param(
         lambda t: mean_udf(t.double_col),
@@ -27,6 +45,7 @@ aggregate_test_params = [
         marks=[
             pytest.mark.notimpl(
                 [
+                    "bigquery",
                     "datafusion",
                     "postgres",
                     "clickhouse",
@@ -34,20 +53,38 @@ aggregate_test_params = [
                     "duckdb",
                     "polars",
                     "snowflake",
-                ]
+                    "mssql",
+                    "trino",
+                    "druid",
+                ],
+                raises=com.OperationNotDefinedError,
             ),
-            pytest.mark.never(["sqlite", "mysql"], reason="no udf support"),
+            pytest.mark.never(
+                ["sqlite", "mysql"],
+                reason="no udf support",
+                raises=com.OperationNotDefinedError,
+            ),
         ],
     ),
     param(
         lambda t: t.double_col.min(),
         lambda t: t.double_col.min(),
         id='min',
+        marks=mark.broken(
+            ["druid"],
+            reason="sqlalchemy dialect returns incorrect type",
+            raises=AssertionError,
+        ),
     ),
     param(
         lambda t: t.double_col.max(),
         lambda t: t.double_col.max(),
         id='max',
+        marks=mark.broken(
+            ["druid"],
+            reason="sqlalchemy dialect returns incorrect type",
+            raises=AssertionError,
+        ),
     ),
     param(
         # int_col % 3 so there are no ties for most common value
@@ -56,24 +93,41 @@ aggregate_test_params = [
         id='mode',
         marks=pytest.mark.notyet(
             [
+                "bigquery",
                 "clickhouse",
                 "datafusion",
                 "impala",
                 "mysql",
                 "pyspark",
                 "sqlite",
-            ]
+                "mssql",
+                "trino",
+                "druid",
+            ],
+            raises=com.OperationNotDefinedError,
         ),
     ),
     param(
         lambda t: (t.double_col + 5).sum(),
         lambda t: (t.double_col + 5).sum(),
         id='complex_sum',
+        marks=mark.broken(
+            ["druid"],
+            reason="sqlalchemy dialect returns incorrect type",
+            raises=AssertionError,
+        ),
     ),
     param(
         lambda t: t.timestamp_col.max(),
         lambda t: t.timestamp_col.max(),
         id='timestamp_max',
+        marks=pytest.mark.broken(
+            ["druid"],
+            raises=sa.exc.ProgrammingError,
+            reason=(
+                "Query not supported. Possible error: Max aggregation is not supported for 'STRING' type SQL"
+            ),
+        ),
     ),
 ]
 
@@ -81,27 +135,26 @@ argidx_not_grouped_marks = [
     "datafusion",
     "impala",
     "mysql",
-    "postgres",
-    "pyspark",
     "sqlite",
-    "snowflake",
     "polars",
+    "mssql",
+    "druid",
 ]
 argidx_grouped_marks = ["dask"] + argidx_not_grouped_marks
 
 
 def make_argidx_params(marks):
-    marks = pytest.mark.notyet(marks)
+    marks = pytest.mark.notyet(marks, raises=com.OperationNotDefinedError)
     return [
         param(
-            lambda t: t.timestamp_col.argmin(t.int_col),
-            lambda s: s.timestamp_col.iloc[s.int_col.argmin()],
+            lambda t: t.timestamp_col.argmin(t.id),
+            lambda s: s.timestamp_col.iloc[s.id.argmin()],
             id='argmin',
             marks=marks,
         ),
         param(
-            lambda t: t.double_col.argmax(t.int_col),
-            lambda s: s.double_col.iloc[s.int_col.argmax()],
+            lambda t: t.double_col.argmax(t.id),
+            lambda s: s.double_col.iloc[s.id.argmax()],
             id='argmax',
             marks=marks,
         ),
@@ -155,25 +208,38 @@ def test_aggregate_grouped(backend, alltypes, df, result_fn, expected_fn):
 
 @mark.notimpl(
     [
+        "bigquery",
         "clickhouse",
         "datafusion",
         "duckdb",
         "impala",
         "mysql",
         "postgres",
-        "pyspark",
         "sqlite",
         "snowflake",
         "polars",
-    ]
+        "mssql",
+        "trino",
+        "druid",
+    ],
+    raises=com.OperationNotDefinedError,
 )
-def test_aggregate_multikey_group_reduction(backend, alltypes, df):
+@mark.notimpl(
+    ["pyspark"],
+    raises=NotImplementedError,
+    reason=(
+        "Invalid  return type with grouped aggregate Pandas UDFs: "
+        "StructType([StructField('mean', DoubleType(), True), "
+        "StructField('std', DoubleType(), True)]) is not supported"
+    ),
+)
+def test_aggregate_multikey_group_reduction_udf(backend, alltypes, df):
     """Tests .aggregate() on a multi-key group_by with a reduction
     operation."""
 
     @reduction(
         input_type=[dt.double],
-        output_type=dt.Struct(['mean', 'std'], [dt.double, dt.double]),
+        output_type=dt.Struct({'mean': dt.double, 'std': dt.double}),
     )
     def mean_and_std(v):
         return v.mean(), v.std()
@@ -194,7 +260,11 @@ def test_aggregate_multikey_group_reduction(backend, alltypes, df):
     # Row ordering may differ depending on backend, so sort on the
     # grouping key
     result1 = result1.sort_values(by=grouping_key_cols).reset_index(drop=True)
-    expected = expected.sort_values(by=grouping_key_cols).reset_index(drop=True)
+    expected = (
+        expected.sort_values(by=grouping_key_cols)
+        .reset_index(drop=True)
+        .assign(int_col=lambda df: df.int_col.astype("int32"))
+    )
 
     backend.assert_frame_equal(result1, expected)
 
@@ -208,45 +278,147 @@ def test_aggregate_multikey_group_reduction(backend, alltypes, df):
             id='count',
         ),
         param(
+            lambda t, where: t.bool_col.nunique(where=where),
+            lambda t, where: t.bool_col[where].dropna().nunique(),
+            id='nunique',
+            marks=pytest.mark.notimpl(
+                ["datafusion"], raises=com.OperationNotDefinedError
+            ),
+        ),
+        param(
             lambda t, _: t.bool_col.any(),
             lambda t, _: t.bool_col.any(),
             id='any',
-            marks=pytest.mark.notimpl(["polars"]),
+            marks=[
+                pytest.mark.notimpl(
+                    ["polars", "datafusion"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.broken(
+                    ["druid"],
+                    raises=AttributeError,
+                    reason="'IntegerColumn' object has no attribute 'any'",
+                ),
+            ],
         ),
         param(
             lambda t, _: t.bool_col.notany(),
             lambda t, _: ~t.bool_col.any(),
             id='notany',
-            marks=pytest.mark.notimpl(["polars"]),
+            marks=[
+                pytest.mark.notimpl(
+                    ["polars", "datafusion"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.notimpl(
+                    ['mssql'],
+                    raises=sa.exc.ProgrammingError,
+                ),
+                pytest.mark.broken(
+                    ["druid"],
+                    raises=AttributeError,
+                    reason="'IntegerColumn' object has no attribute 'notany'",
+                ),
+            ],
         ),
         param(
             lambda t, _: -t.bool_col.any(),
             lambda t, _: ~t.bool_col.any(),
             id='any_negate',
-            marks=pytest.mark.notimpl(["polars"]),
+            marks=[
+                pytest.mark.notimpl(
+                    ["polars", "datafusion"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.broken(
+                    ['mssql'],
+                    raises=sa.exc.ProgrammingError,
+                    reason="Incorrect syntax near '='",
+                ),
+                pytest.mark.broken(
+                    ["druid"],
+                    raises=AttributeError,
+                    reason="'IntegerColumn' object has no attribute 'any'",
+                ),
+            ],
         ),
         param(
             lambda t, _: t.bool_col.all(),
             lambda t, _: t.bool_col.all(),
             id='all',
-            marks=pytest.mark.notimpl(["polars"]),
+            marks=[
+                pytest.mark.notimpl(
+                    ["polars", "datafusion"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.broken(
+                    ["druid"],
+                    raises=AttributeError,
+                    reason="'IntegerColumn' object has no attribute 'all'",
+                ),
+            ],
         ),
         param(
             lambda t, _: t.bool_col.notall(),
             lambda t, _: ~t.bool_col.all(),
             id='notall',
-            marks=pytest.mark.notimpl(["polars"]),
+            marks=[
+                pytest.mark.notimpl(
+                    ["polars", "datafusion"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.broken(
+                    ["druid"],
+                    raises=AttributeError,
+                    reason="'IntegerColumn' object has no attribute 'notall'",
+                ),
+                pytest.mark.broken(
+                    ['mssql'],
+                    raises=sa.exc.ProgrammingError,
+                    reason="Incorrect syntax near '='",
+                ),
+            ],
         ),
         param(
             lambda t, _: -t.bool_col.all(),
             lambda t, _: ~t.bool_col.all(),
             id='all_negate',
-            marks=pytest.mark.notimpl(["polars"]),
+            marks=[
+                pytest.mark.notimpl(
+                    ["polars", "datafusion"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.broken(
+                    ['mssql'],
+                    raises=sa.exc.ProgrammingError,
+                    reason="Incorrect syntax near '='",
+                ),
+                pytest.mark.broken(
+                    ["druid"],
+                    raises=AttributeError,
+                    reason="'IntegerColumn' object has no attribute 'all'",
+                ),
+            ],
         ),
         param(
             lambda t, where: t.double_col.sum(where=where),
             lambda t, where: t.double_col[where].sum(),
             id='sum',
+        ),
+        param(
+            lambda t, where: (t.int_col > 0).sum(where=where),
+            lambda t, where: (t.int_col > 0)[where].sum(),
+            id="bool_sum",
+            marks=[
+                pytest.mark.notimpl(
+                    ["pyspark"],
+                    raises=PysparkAnalysisException,
+                    reason=(
+                        "pyspark.sql.utils.AnalysisException: "
+                        "function sum requires numeric or interval types, not boolean;"
+                    ),
+                ),
+            ],
         ),
         param(
             lambda t, where: t.double_col.mean(where=where),
@@ -270,13 +442,18 @@ def test_aggregate_multikey_group_reduction(backend, alltypes, df):
             id='mode',
             marks=pytest.mark.notyet(
                 [
+                    "bigquery",
                     "clickhouse",
                     "datafusion",
                     "impala",
                     "mysql",
                     "pyspark",
                     "sqlite",
-                ]
+                    "mssql",
+                    "trino",
+                    "druid",
+                ],
+                raises=com.OperationNotDefinedError,
             ),
         ),
         param(
@@ -284,15 +461,8 @@ def test_aggregate_multikey_group_reduction(backend, alltypes, df):
             lambda t, where: t.double_col[where].iloc[t.int_col[where].argmin()],
             id='argmin',
             marks=pytest.mark.notyet(
-                [
-                    "impala",
-                    "mysql",
-                    "postgres",
-                    "pyspark",
-                    "sqlite",
-                    "snowflake",
-                    "polars",
-                ]
+                ["impala", "mysql", "sqlite", "polars", "datafusion", "mssql", "druid"],
+                raises=com.OperationNotDefinedError,
             ),
         ),
         param(
@@ -300,101 +470,166 @@ def test_aggregate_multikey_group_reduction(backend, alltypes, df):
             lambda t, where: t.double_col[where].iloc[t.int_col[where].argmax()],
             id='argmax',
             marks=pytest.mark.notyet(
-                [
-                    "impala",
-                    "mysql",
-                    "postgres",
-                    "pyspark",
-                    "sqlite",
-                    "snowflake",
-                    "polars",
-                ]
+                ["impala", "mysql", "sqlite", "polars", "datafusion", "mssql", "druid"],
+                raises=com.OperationNotDefinedError,
             ),
         ),
         param(
             lambda t, where: t.double_col.std(how='sample', where=where),
             lambda t, where: t.double_col[where].std(ddof=1),
             id='std',
+            marks=[
+                mark.notimpl(
+                    ["datafusion"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                mark.notimpl(
+                    ["druid"],
+                    raises=sa.exc.ProgrammingError,
+                    reason="No match found for function signature stddev_samp(<NUMERIC>)",
+                ),
+            ],
         ),
         param(
             lambda t, where: t.double_col.var(how='sample', where=where),
             lambda t, where: t.double_col[where].var(ddof=1),
             id='var',
+            marks=[
+                mark.notimpl(
+                    ["datafusion"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                mark.notimpl(
+                    ["druid"],
+                    raises=sa.exc.ProgrammingError,
+                    reason="No match found for function signature var_samp(<NUMERIC>)",
+                ),
+            ],
         ),
         param(
             lambda t, where: t.double_col.std(how='pop', where=where),
             lambda t, where: t.double_col[where].std(ddof=0),
             id='std_pop',
+            marks=[
+                mark.notimpl(
+                    ["datafusion"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                mark.notimpl(
+                    ["druid"],
+                    raises=sa.exc.ProgrammingError,
+                    reason="No match found for function signature stddev_pop(<NUMERIC>)",
+                ),
+            ],
         ),
         param(
             lambda t, where: t.double_col.var(how='pop', where=where),
             lambda t, where: t.double_col[where].var(ddof=0),
             id='var_pop',
+            marks=[
+                mark.notimpl(
+                    ["datafusion"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                mark.notimpl(
+                    ["druid"],
+                    raises=sa.exc.ProgrammingError,
+                    reason="No match found for function signature var_pop(<NUMERIC>)",
+                ),
+            ],
         ),
         param(
             lambda t, where: t.string_col.approx_nunique(where=where),
             lambda t, where: t.string_col[where].nunique(),
             id='approx_nunique',
-            marks=pytest.mark.notimpl(['polars']),
+            marks=pytest.mark.notimpl(
+                ['polars', "datafusion"], raises=com.OperationNotDefinedError
+            ),
+        ),
+        param(
+            lambda t, where: t.double_col.arbitrary(where=where),
+            lambda t, where: t.double_col[where].iloc[0],
+            id='arbitrary_default',
+            marks=pytest.mark.notimpl(
+                ['impala', 'mysql', 'polars', 'datafusion', "mssql", "druid"],
+                raises=com.OperationNotDefinedError,
+            ),
         ),
         param(
             lambda t, where: t.double_col.arbitrary(how='first', where=where),
             lambda t, where: t.double_col[where].iloc[0],
             id='arbitrary_first',
             marks=pytest.mark.notimpl(
-                [
-                    'impala',
-                    'postgres',
-                    'mysql',
-                    'sqlite',
-                    'snowflake',
-                    'polars',
-                ]
+                ['impala', 'mysql', 'polars', 'datafusion', "mssql", "druid"],
+                raises=com.OperationNotDefinedError,
             ),
         ),
         param(
             lambda t, where: t.double_col.arbitrary(how='last', where=where),
             lambda t, where: t.double_col[where].iloc[-1],
             id='arbitrary_last',
-            marks=pytest.mark.notimpl(
-                [
-                    'impala',
-                    'postgres',
-                    'mysql',
-                    'sqlite',
-                    'snowflake',
-                    'polars',
-                ]
-            ),
+            marks=[
+                pytest.mark.notimpl(
+                    ['impala', 'mysql', 'polars', 'datafusion', "mssql", "druid"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.notimpl(
+                    ["bigquery", "snowflake", "trino"],
+                    raises=com.UnsupportedOperationError,
+                    reason="backend only supports the `first` option for `.arbitrary()",
+                ),
+            ],
         ),
         param(
             lambda t, where: t.double_col.arbitrary(how='heavy', where=where),
             lambda t, where: t.double_col[where].iloc[8],
             id='arbitrary_heavy',
             # only clickhouse implements this option
-            marks=pytest.mark.notimpl(
-                [
-                    "dask",
-                    "datafusion",
-                    "duckdb",
-                    "impala",
-                    "mysql",
-                    "pandas",
-                    "postgres",
-                    "pyspark",
-                    "sqlite",
-                    "snowflake",
-                    "polars",
-                ],
-            ),
+            marks=[
+                pytest.mark.notimpl(
+                    [
+                        "dask",
+                        "datafusion",
+                        "druid",
+                        "impala",
+                        "mssql",
+                        "mysql",
+                        "pandas",
+                        "polars",
+                        "sqlite",
+                    ],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.notimpl(
+                    ["bigquery", "duckdb", "postgres", "pyspark", "trino"],
+                    raises=com.UnsupportedOperationError,
+                    reason="how='heavy' not supported in the backend",
+                ),
+                pytest.mark.notimpl(
+                    ["snowflake"],
+                    raises=com.UnsupportedOperationError,
+                    reason="Snowflake only supports the `first` option for `.arbitrary()",
+                ),
+            ],
         ),
         param(
             lambda t, where: t.bigint_col.bit_and(where=where),
             lambda t, where: np.bitwise_and.reduce(t.bigint_col[where].values),
             id='bit_and',
             marks=[
-                pytest.mark.notimpl(["dask", "snowflake", "polars"]),
-                pytest.mark.notyet(["impala", "pyspark"]),
+                pytest.mark.notimpl(
+                    ["polars", "datafusion", "mssql"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.notimpl(["druid"], strict=False, raises=AssertionError),
+                pytest.mark.notyet(
+                    ["impala", "pyspark"], raises=com.OperationNotDefinedError
+                ),
+                pytest.mark.broken(
+                    ["dask"],
+                    raises=AttributeError,
+                    reason="'Series' object has no attribute 'bitand'",
+                ),
             ],
         ),
         param(
@@ -402,8 +637,18 @@ def test_aggregate_multikey_group_reduction(backend, alltypes, df):
             lambda t, where: np.bitwise_or.reduce(t.bigint_col[where].values),
             id='bit_or',
             marks=[
-                pytest.mark.notimpl(["dask", "snowflake", "polars"]),
-                pytest.mark.notyet(["impala", "pyspark"]),
+                pytest.mark.notimpl(
+                    ["polars", "datafusion", "mssql"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.notyet(
+                    ["impala", "pyspark"], raises=com.OperationNotDefinedError
+                ),
+                pytest.mark.broken(
+                    ["dask"],
+                    raises=AttributeError,
+                    reason="'Series' object has no attribute 'bitor'",
+                ),
             ],
         ),
         param(
@@ -411,14 +656,45 @@ def test_aggregate_multikey_group_reduction(backend, alltypes, df):
             lambda t, where: np.bitwise_xor.reduce(t.bigint_col[where].values),
             id='bit_xor',
             marks=[
-                pytest.mark.notimpl(["dask", "snowflake", "polars"]),
-                pytest.mark.notyet(["impala", "pyspark"]),
+                pytest.mark.notimpl(
+                    ["polars", "datafusion", "mssql"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.notyet(
+                    ["impala", "pyspark"], raises=com.OperationNotDefinedError
+                ),
+                pytest.mark.broken(
+                    ["dask"],
+                    raises=AttributeError,
+                    reason="'Series' object has no attribute 'bitxor'",
+                ),
             ],
         ),
         param(
             lambda t, where: t.count(where=where),
             lambda t, where: len(t[where]),
             id='count_star',
+        ),
+        param(
+            lambda t, where: t.string_col.collect(where=where),
+            lambda t, where: t.string_col[where].tolist(),
+            id="collect",
+            marks=[
+                mark.notimpl(
+                    ["impala", "mysql", "sqlite", "datafusion", "mssql", "druid"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.broken(
+                    ["dask"],
+                    raises=(AttributeError, TypeError),
+                    reason=(
+                        "For 'is_in' case: 'Series' object has no attribute 'arraycollect'"
+                        "For 'no_cond' case: TypeError: Object "
+                        "<dask.dataframe.groupby.Aggregation object at 0x124569840> is not "
+                        "callable or a string"
+                    ),
+                ),
+            ],
         ),
     ],
 )
@@ -430,10 +706,10 @@ def test_aggregate_multikey_group_reduction(backend, alltypes, df):
             lambda t: t.string_col.isin(['1', '7']),
             lambda t: t.string_col.isin(['1', '7']),
             id='is_in',
+            marks=[mark.broken(["datafusion"], raises=AssertionError)],
         ),
     ],
 )
-@mark.notimpl(["datafusion"])
 def test_reduction_ops(
     backend,
     alltypes,
@@ -443,10 +719,123 @@ def test_reduction_ops(
     ibis_cond,
     pandas_cond,
 ):
-    expr = result_fn(alltypes, ibis_cond(alltypes))
-    result = expr.execute()
+    expr = alltypes.agg(tmp=result_fn(alltypes, ibis_cond(alltypes))).tmp
+    result = expr.execute().squeeze()
     expected = expected_fn(df, pandas_cond(df))
-    np.testing.assert_allclose(result, expected, rtol=backend.reduction_tolerance)
+    try:
+        np.testing.assert_allclose(result, expected, rtol=backend.reduction_tolerance)
+    except TypeError:  # assert_allclose only handles numerics
+        # if we're not testing numerics, then the arrays should be exactly equal
+        np.testing.assert_array_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    ('result_fn', 'expected_fn'),
+    [
+        param(
+            lambda t, where: t.double_col.quantile(0.5, where=where),
+            lambda t, where: t.double_col[where].quantile(0.5),
+            id="quantile",
+            marks=[
+                mark.notimpl(
+                    [
+                        "bigquery",
+                        "datafusion",
+                        "impala",
+                        "mssql",
+                        "mysql",
+                        "polars",
+                        "sqlite",
+                        "druid",
+                    ],
+                    raises=com.OperationNotDefinedError,
+                ),
+                mark.broken(
+                    ["dask"],
+                    raises=AssertionError,
+                    reason="assert 50.5 ± 5.1e-05 == 45.45",
+                ),
+                mark.never(
+                    ["trino"],
+                    reason="backend implements approximate quantiles",
+                    raises=com.OperationNotDefinedError,
+                ),
+                mark.never(
+                    ["pyspark"],
+                    reason="backend implements approximate quantiles",
+                    raises=AssertionError,
+                ),
+            ],
+        ),
+        param(
+            lambda t, where: t.double_col.quantile([0.5], where=where),
+            lambda t, where: t.double_col[where].quantile([0.5]),
+            id="multi-quantile",
+            marks=[
+                mark.notimpl(
+                    [
+                        "bigquery",
+                        "dask",
+                        "datafusion",
+                        "impala",
+                        "mssql",
+                        "mysql",
+                        "polars",
+                        "sqlite",
+                        "druid",
+                    ],
+                    raises=com.OperationNotDefinedError,
+                ),
+                mark.notyet(
+                    ["snowflake"],
+                    reason="backend doesn't implement array of quantiles as input",
+                    raises=com.OperationNotDefinedError,
+                ),
+                # strict=False untile quantilesIf works
+                mark.notyet(
+                    ["clickhouse"],
+                    reason="sqlglot throws a parse error",
+                    strict=False,
+                    raises=sqlglot.errors.ParseError,
+                ),
+                mark.never(
+                    ["trino"],
+                    reason="backend implements approximate quantiles",
+                    raises=com.OperationNotDefinedError,
+                ),
+                mark.broken(
+                    ["pyspark"],
+                    reason="backend implements approximate quantiles",
+                    raises=AssertionError,
+                ),
+            ],
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ('ibis_cond', 'pandas_cond'),
+    [
+        param(lambda _: None, lambda _: slice(None), id='no_cond'),
+        param(
+            lambda t: t.string_col.isin(['1', '7']),
+            lambda t: t.string_col.isin(['1', '7']),
+            id='is_in',
+            marks=[mark.notimpl(["datafusion"], raises=com.OperationNotDefinedError)],
+        ),
+    ],
+)
+def test_quantile(
+    alltypes,
+    df,
+    result_fn,
+    expected_fn,
+    ibis_cond,
+    pandas_cond,
+):
+    expr = alltypes.agg(tmp=result_fn(alltypes, ibis_cond(alltypes))).tmp
+    result = expr.execute().squeeze()
+    expected = expected_fn(df, pandas_cond(df))
+    assert pytest.approx(result) == expected
 
 
 @pytest.mark.parametrize(
@@ -457,8 +846,13 @@ def test_reduction_ops(
             lambda t, where: t.G[where].cov(t.RBI[where], ddof=0),
             id='covar_pop',
             marks=[
-                pytest.mark.notimpl(["dask", "datafusion", "pandas", "polars"]),
-                pytest.mark.notyet(["mysql", "impala", "sqlite"]),
+                pytest.mark.notimpl(
+                    ["dask", "datafusion", "pandas", "polars", "druid"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.notyet(
+                    ["mysql", "impala", "sqlite"], raises=com.OperationNotDefinedError
+                ),
             ],
         ),
         param(
@@ -466,8 +860,13 @@ def test_reduction_ops(
             lambda t, where: t.G[where].cov(t.RBI[where], ddof=1),
             id='covar_samp',
             marks=[
-                pytest.mark.notimpl(["dask", "datafusion", "pandas", "polars"]),
-                pytest.mark.notyet(["mysql", "impala", "sqlite"]),
+                pytest.mark.notimpl(
+                    ["dask", "datafusion", "pandas", "polars", "druid"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.notyet(
+                    ["mysql", "impala", "sqlite"], raises=com.OperationNotDefinedError
+                ),
             ],
         ),
         param(
@@ -475,9 +874,23 @@ def test_reduction_ops(
             lambda t, where: t.G[where].corr(t.RBI[where]),
             id='corr_pop',
             marks=[
-                pytest.mark.notimpl(["dask", "datafusion", "pandas", "polars"]),
+                pytest.mark.notimpl(
+                    ["dask", "datafusion", "pandas", "polars", "druid"],
+                    raises=com.OperationNotDefinedError,
+                ),
                 pytest.mark.notyet(
-                    ["clickhouse", "impala", "mysql", "pyspark", "sqlite"]
+                    ["impala", "mysql", "sqlite"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.notyet(
+                    ["clickhouse"],
+                    raises=ValueError,
+                    reason="ClickHouse only implements `sample` correlation coefficient",
+                ),
+                pytest.mark.notyet(
+                    ["pyspark"],
+                    raises=ValueError,
+                    reason="PySpark only implements sample correlation",
                 ),
             ],
         ),
@@ -486,17 +899,23 @@ def test_reduction_ops(
             lambda t, where: t.G[where].corr(t.RBI[where]),
             id='corr_samp',
             marks=[
-                pytest.mark.notimpl(["dask", "datafusion", "pandas", "polars"]),
+                pytest.mark.notimpl(
+                    ["dask", "datafusion", "pandas", "polars", "druid"],
+                    raises=com.OperationNotDefinedError,
+                ),
                 pytest.mark.notyet(
-                    [
-                        "duckdb",
-                        "impala",
-                        "mysql",
-                        "postgres",
-                        "sqlite",
-                        "snowflake",
-                        "polars",
-                    ]
+                    ["impala", "mysql", "sqlite", "polars"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.notyet(
+                    ["bigquery"],
+                    raises=ValueError,
+                    reason="Correlation with how='sample' is not supported.",
+                ),
+                pytest.mark.notyet(
+                    ["trino", "postgres", "duckdb", "snowflake"],
+                    raises=ValueError,
+                    reason="XXXXSQLExprTranslator only implements population correlation coefficient",
                 ),
             ],
         ),
@@ -509,8 +928,13 @@ def test_reduction_ops(
             lambda t, where: (t.G[where] > 34.0).cov(t.G[where] <= 34.0, ddof=0),
             id='covar_pop_bool',
             marks=[
-                pytest.mark.notimpl(["dask", "datafusion", "pandas", "polars"]),
-                pytest.mark.notyet(["mysql", "impala", "sqlite"]),
+                pytest.mark.notimpl(
+                    ["dask", "datafusion", "pandas", "polars", "druid"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.notyet(
+                    ["mysql", "impala", "sqlite"], raises=com.OperationNotDefinedError
+                ),
             ],
         ),
         param(
@@ -522,9 +946,23 @@ def test_reduction_ops(
             lambda t, where: (t.G[where] > 34.0).corr(t.G[where] <= 34.0),
             id='corr_pop_bool',
             marks=[
-                pytest.mark.notimpl(["dask", "datafusion", "pandas", "polars"]),
+                pytest.mark.notimpl(
+                    ["dask", "datafusion", "pandas", "polars", "druid"],
+                    raises=com.OperationNotDefinedError,
+                ),
                 pytest.mark.notyet(
-                    ["clickhouse", "impala", "mysql", "pyspark", "sqlite"]
+                    ["impala", "mysql", "sqlite"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.notyet(
+                    ["clickhouse"],
+                    raises=ValueError,
+                    reason="ClickHouse only implements `sample` correlation coefficient",
+                ),
+                pytest.mark.notyet(
+                    ["pyspark"],
+                    raises=ValueError,
+                    reason="PySpark only implements sample correlation",
                 ),
             ],
         ),
@@ -538,14 +976,12 @@ def test_reduction_ops(
             lambda t: t.yearID.isin([2009, 2015]),
             lambda t: t.yearID.isin([2009, 2015]),
             id='cond',
-            marks=[
-                pytest.mark.broken(
-                    ["snowflake"],
-                    reason=("snowflake doesn't allow quoted columns in group_by"),
-                ),
-            ],
         ),
     ],
+)
+@pytest.mark.notimpl(
+    ["mssql"],
+    raises=com.OperationNotDefinedError,
 )
 def test_corr_cov(
     batting,
@@ -555,7 +991,7 @@ def test_corr_cov(
     ibis_cond,
     pandas_cond,
 ):
-    expr = result_fn(batting, ibis_cond(batting))
+    expr = result_fn(batting, ibis_cond(batting)).name("tmp")
     result = expr.execute()
 
     expected = expected_fn(batting_df, pandas_cond(batting_df))
@@ -569,15 +1005,13 @@ def test_corr_cov(
 
 
 @pytest.mark.notimpl(
-    [
-        "dask",
-        "datafusion",
-        "mysql",
-        "pandas",
-        "postgres",
-        "sqlite",
-        "snowflake",
-    ]
+    ["datafusion", "mysql", "postgres", "sqlite", "snowflake", "mssql", "druid"],
+    raises=com.OperationNotDefinedError,
+)
+@pytest.mark.broken(
+    ["dask", "pandas"],
+    raises=AttributeError,
+    reason="'Series' object has no attribute 'approxmedian'",
 )
 def test_approx_median(alltypes):
     expr = alltypes.double_col.approx_median()
@@ -620,7 +1054,24 @@ def test_approx_median(alltypes):
             L(":") + ":",
             "::",
             id="expr",
-            marks=mark.notyet(["duckdb", "mysql", "pyspark"]),
+            marks=[
+                mark.notyet(
+                    ["duckdb", "trino"],
+                    raises=com.UnsupportedOperationError,
+                ),
+                mark.notyet(
+                    ["bigquery"],
+                    raises=GoogleBadRequest,
+                    reason='Argument 2 to STRING_AGG must be a literal or query parameter',
+                ),
+                mark.broken(
+                    ["pyspark"], raises=TypeError, reason='Column is not iterable'
+                ),
+                mark.broken(
+                    ["mysql"],
+                    raises=sa.exc.ProgrammingError,
+                ),
+            ],
         ),
     ],
 )
@@ -631,18 +1082,26 @@ def test_approx_median(alltypes):
         param(
             lambda t: t.string_col.isin(['1', '7']),
             lambda t: t.string_col.isin(['1', '7']),
-            marks=mark.notimpl(["dask"]),
+            marks=mark.notimpl(["dask"], raises=com.OperationNotDefinedError),
             id='is_in',
         ),
         param(
             lambda t: t.string_col.notin(['1', '7']),
             lambda t: ~t.string_col.isin(['1', '7']),
-            marks=mark.notimpl(["dask"]),
+            marks=mark.notimpl(["dask"], raises=com.OperationNotDefinedError),
             id='not_in',
         ),
     ],
 )
-@mark.notimpl(["datafusion", "snowflake", "polars"])
+@mark.notimpl(
+    ["datafusion", "polars", "mssql"],
+    raises=com.OperationNotDefinedError,
+)
+@mark.notimpl(
+    ["druid"],
+    raises=sa.exc.ProgrammingError,
+    reason="No match found for function signature group_concat(<CHARACTER>, <CHARACTER>)",
+)
 def test_group_concat(
     backend,
     alltypes,
@@ -671,8 +1130,11 @@ def test_group_concat(
         )
     ],
 )
-@mark.notimpl(["pandas", "dask"])
-@pytest.mark.notyet(["pyspark", "datafusion", "polars"])
+@mark.notimpl(
+    ["pandas", "dask"],
+    raises=NotImplementedError,
+    reason="sorting on aggregations not yet implemented",
+)
 def test_topk_op(alltypes, df, result_fn, expected_fn):
     # TopK expression will order rows by "count" but each backend
     # can have different result for that.
@@ -689,7 +1151,7 @@ def test_topk_op(alltypes, df, result_fn, expected_fn):
     ('result_fn', 'expected_fn'),
     [
         param(
-            lambda t: t[t.string_col.topk(3)],
+            lambda t: t.semi_join(t.string_col.topk(3), "string_col"),
             lambda t: t[
                 t.string_col.isin(
                     t.groupby('string_col')['string_col'].count().head(3).index
@@ -699,7 +1161,25 @@ def test_topk_op(alltypes, df, result_fn, expected_fn):
         )
     ],
 )
-@mark.notimpl(["datafusion", "pandas", "dask"])
+@mark.notimpl(["datafusion", "pandas"], raises=com.OperationNotDefinedError)
+@mark.broken(
+    ["bigquery"],
+    raises=GoogleBadRequest,
+    reason='400 Syntax error: Expected keyword JOIN but got identifier "SEMI"',
+)
+@mark.broken(
+    ["druid"],
+    raises=sa.exc.ProgrammingError,
+    reason=(
+        "(pydruid.db.exceptions.ProgrammingError) Plan validation failed "
+        "(org.apache.calcite.tools.ValidationException): java.lang.NullPointerException"
+    ),
+)
+@mark.notimpl(
+    ["pandas", "dask"],
+    raises=NotImplementedError,
+    reason="sorting on aggregations not yet implemented",
+)
 def test_topk_filter_op(alltypes, df, result_fn, expected_fn):
     # TopK expression will order rows by "count" but each backend
     # can have different result for that.
@@ -714,14 +1194,11 @@ def test_topk_filter_op(alltypes, df, result_fn, expected_fn):
 
 
 @pytest.mark.parametrize(
-    'agg_fn',
-    [
-        param(lambda s: list(s), id='agg_to_list'),
-        param(lambda s: np.array(s), id='agg_to_ndarray'),
-    ],
+    'agg_fn', [lambda s: list(s), lambda s: np.array(s)], ids=lambda obj: obj.__name__
 )
 @mark.notimpl(
     [
+        "bigquery",
         "clickhouse",
         "datafusion",
         "duckdb",
@@ -731,7 +1208,11 @@ def test_topk_filter_op(alltypes, df, result_fn, expected_fn):
         "sqlite",
         "snowflake",
         "polars",
-    ]
+        "mssql",
+        "trino",
+        "druid",
+    ],
+    raises=com.OperationNotDefinedError,
 )
 def test_aggregate_list_like(backend, alltypes, df, agg_fn):
     """Tests .aggregate() where the result of an aggregation is a list-like.
@@ -754,6 +1235,7 @@ def test_aggregate_list_like(backend, alltypes, df, agg_fn):
 
 @mark.notimpl(
     [
+        "bigquery",
         "clickhouse",
         "datafusion",
         "duckdb",
@@ -763,9 +1245,13 @@ def test_aggregate_list_like(backend, alltypes, df, agg_fn):
         "sqlite",
         "snowflake",
         "polars",
-    ]
+        "mssql",
+        "trino",
+        "druid",
+    ],
+    raises=com.OperationNotDefinedError,
 )
-def test_aggregate_mixed(backend, alltypes, df):
+def test_aggregate_mixed_udf(backend, alltypes, df):
     """Tests .aggregate() with multiple aggregations with mixed result types.
 
     (In particular, one aggregation that results in an array, and other
@@ -796,7 +1282,7 @@ def test_aggregate_mixed(backend, alltypes, df):
     backend.assert_frame_equal(result, expected, check_like=True)
 
 
-@pytest.mark.notimpl(["datafusion", "pyspark"])
+@pytest.mark.notimpl(["datafusion", "pyspark"], raises=com.OperationNotDefinedError)
 def test_binds_are_cast(alltypes):
     expr = alltypes.aggregate(
         high_line_count=(
@@ -813,12 +1299,15 @@ def test_agg_sort(alltypes):
     query.execute()
 
 
+@pytest.mark.xfail_version(
+    polars=["polars==0.14.31"], reason="projection of scalars is broken"
+)
 def test_filter(backend, alltypes, df):
     expr = (
         alltypes[_.string_col == "1"]
         .mutate(x=L(1, "int64"))
         .group_by(_.x)
-        .aggregate(_.double_col.sum())
+        .aggregate(sum=_.double_col.sum())
     )
 
     # TODO: The pyspark backend doesn't apply schemas to outputs
@@ -832,3 +1321,27 @@ def test_filter(backend, alltypes, df):
         .reset_index()
     )
     backend.assert_frame_equal(result, expected, check_like=True)
+
+
+@pytest.mark.notimpl(["polars", "datafusion"], raises=com.OperationNotDefinedError)
+@pytest.mark.notimpl(
+    ["pyspark"],
+    raises=PysparkAnalysisException,
+    reason=(
+        "cannot resolve 'sum((functional_alltypes.bool_col IS NULL))' due to data type mismatch: "
+        "function sum requires numeric or interval types, not boolean;"
+    ),
+)
+def test_column_summary(alltypes):
+    with pytest.warns(FutureWarning, match="is deprecated"):
+        bool_col_summary = alltypes.bool_col.summary()
+    expr = alltypes.aggregate(bool_col_summary)
+    result = expr.execute()
+    assert result.shape == (1, 7)
+
+
+def test_agg_name_in_output_column(alltypes):
+    query = alltypes.aggregate([alltypes.int_col.min(), alltypes.int_col.max()])
+    df = query.execute()
+    assert "min" in df.columns[0].lower()
+    assert "max" in df.columns[1].lower()

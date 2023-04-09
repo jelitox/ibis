@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import itertools
 
 import dask.dataframe as dd
@@ -5,6 +7,7 @@ import dask.dataframe.groupby as ddgb
 import numpy as np
 
 import ibis.expr.operations as ops
+from ibis.backends.dask.core import execute
 from ibis.backends.dask.dispatch import execute_node
 from ibis.backends.dask.execution.util import (
     TypeRegistrationDict,
@@ -30,8 +33,9 @@ collect_list = dd.Aggregation(
 )
 
 
-@execute_node.register(ops.ArrayColumn, list)
+@execute_node.register(ops.ArrayColumn, tuple)
 def execute_array_column(op, cols, **kwargs):
+    cols = [execute(arg, **kwargs) for arg in cols]
     df = dd.concat(cols, axis=1)
     return df.apply(
         lambda row: np.array(row, dtype=object), axis=1, meta=(None, 'object')
@@ -39,11 +43,11 @@ def execute_array_column(op, cols, **kwargs):
 
 
 # TODO - aggregations - #2553
-@execute_node.register(ops.ArrayCollect, dd.Series)
-def execute_array_collect(op, data, aggcontext=None, **kwargs):
+@execute_node.register(ops.ArrayCollect, dd.Series, type(None))
+def execute_array_collect(op, data, where, aggcontext=None, **kwargs):
     return aggcontext.agg(data, collect_list)
 
 
-@execute_node.register(ops.ArrayCollect, ddgb.SeriesGroupBy)
-def execute_array_collect_grouped_series(op, data, aggcontext=None, **kwargs):
+@execute_node.register(ops.ArrayCollect, ddgb.SeriesGroupBy, type(None))
+def execute_array_collect_grouped_series(op, data, where, **kwargs):
     return data.agg(collect_list)

@@ -1,13 +1,14 @@
+from __future__ import annotations
+
+import contextlib
 import itertools
-from typing import List, Tuple
 
 import dask.dataframe as dd
 import dask.dataframe.groupby as ddgb
 import dask.delayed
 import numpy as np
-import pandas
+import pandas as pd
 
-import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
 from ibis.backends.base import BaseBackend
@@ -19,7 +20,7 @@ from ibis.backends.dask.execution.util import (
 )
 
 
-def make_struct_op_meta(op: ir.Expr) -> List[Tuple[str, np.dtype]]:
+def make_struct_op_meta(op: ir.Expr) -> list[tuple[str, np.dtype]]:
     """Unpacks a dt.Struct into a DataFrame meta."""
     return list(
         zip(
@@ -69,18 +70,15 @@ def pre_execute_elementwise_udf(op, *clients, scope=None, **kwargs):
         # kwargs here. This is true for all udf execution in this
         # file.
         # See ibis.udf.vectorized.UserDefinedFunction
-        try:
+        with contextlib.suppress(KeyError):
             return cache[(op, timecontext)]
-        except KeyError:
-            pass
 
-        if isinstance(op.return_type, dt.Struct):
+        if op.return_type.is_struct():
             meta = make_struct_op_meta(op)
-
             df = dd.map_partitions(op.func, *args, meta=meta)
         else:
             name = args[0].name if len(args) == 1 else None
-            meta = pandas.Series([], name=name, dtype=op.return_type.to_dask())
+            meta = pd.Series([], name=name, dtype=op.return_type.to_dask())
             df = dd.map_partitions(op.func, *args, meta=meta)
 
         cache[(op, timecontext)] = df
@@ -106,12 +104,11 @@ def pre_execute_analytic_and_reduction_udf(op, *clients, scope=None, **kwargs):
     # This is generally not recommened.
     @execute_node.register(type(op), *(itertools.repeat(dd.Series, nargs)))
     def execute_udaf_node_no_groupby(op, *args, aggcontext, **kwargs):
-
         # This function is in essence fully materializing the dd.Series and
         # passing that (now) pd.Series to aggctx. This materialization
         # happens at `.compute()` time, making this "lazy"
         @dask.delayed
-        def lazy_agg(*series: pandas.Series):
+        def lazy_agg(*series: pd.Series):
             return aggcontext.agg(series[0], op.func, *series[1:])
 
         lazy_result = lazy_agg(*args)
@@ -119,7 +116,7 @@ def pre_execute_analytic_and_reduction_udf(op, *clients, scope=None, **kwargs):
         # Depending on the type of operation, lazy_result is a Delayed that
         # could become a dd.Series or a dd.core.Scalar
         if isinstance(op, ops.AnalyticVectorizedUDF):
-            if isinstance(op.return_type, dt.Struct):
+            if op.return_type.is_struct():
                 meta = make_struct_op_meta(op)
             else:
                 meta = make_meta_series(
@@ -144,7 +141,8 @@ def pre_execute_analytic_and_reduction_udf(op, *clients, scope=None, **kwargs):
                 result = result.repartition(divisions=original_divisions)
         else:
             # lazy_result is a dd.core.Scalar from an ungrouped reduction
-            if isinstance(op.return_type, (dt.Array, dt.Struct)):
+            return_type = op.return_type
+            if return_type.is_array() or return_type.is_struct():
                 # we're outputing a dt.Struct that will need to be destructured
                 # or an array of an unknown size.
                 # we compute so we can work with items inside downstream.
@@ -177,6 +175,14 @@ def pre_execute_analytic_and_reduction_udf(op, *clients, scope=None, **kwargs):
         func = op.func
         groupings = args[0].index
         parent_df = args[0].obj
+
+        columns = [parent_df[idx] for idx in args[0].index]
+        for arg in args:
+            df = arg.obj
+            column = df[arg._meta.obj.name]
+            columns.append(column)
+        parent_df = dd.concat(columns, axis=1)
+
         out_type = op.return_type.to_dask()
 
         grouped_df = parent_df.groupby(groupings)
@@ -187,19 +193,19 @@ def pre_execute_analytic_and_reduction_udf(op, *clients, scope=None, **kwargs):
             return apply_func(*cols)
 
         if len(groupings) > 1:
-            meta_index = pandas.MultiIndex.from_arrays(
+            meta_index = pd.MultiIndex.from_arrays(
                 [[0]] * len(groupings), names=groupings
             )
             meta_value = [dd.utils.make_meta(out_type)]
         else:
-            meta_index = pandas.Index([], name=groupings[0])
+            meta_index = pd.Index([], name=groupings[0])
             meta_value = []
 
         return grouped_df.apply(
             apply_wrapper,
             func,
             col_names,
-            meta=pandas.Series(meta_value, index=meta_index, dtype=out_type),
+            meta=pd.Series(meta_value, index=meta_index, dtype=out_type),
         )
 
     @execute_node.register(
@@ -219,6 +225,11 @@ def pre_execute_analytic_and_reduction_udf(op, *clients, scope=None, **kwargs):
         func = op.func
         groupings = args[0].index
         parent_df = args[0].obj
+
+        columns = [parent_df[idx] for idx in groupings]
+        columns.extend(arg.obj[arg._meta.obj.name] for arg in args)
+        parent_df = dd.concat(columns, axis=1)
+
         out_type = op.return_type.to_dask()
 
         grouped_df = parent_df.groupby(groupings)
@@ -228,7 +239,7 @@ def pre_execute_analytic_and_reduction_udf(op, *clients, scope=None, **kwargs):
             cols = (df[col] for col in col_names)
             return apply_func(*cols)
 
-        if isinstance(op.return_type, dt.Struct):
+        if op.return_type.is_struct():
             # with struct output we destruct to a dataframe directly
             meta = dd.utils.make_meta(make_struct_op_meta(op))
             meta.index.name = parent_df.index.name
@@ -243,7 +254,7 @@ def pre_execute_analytic_and_reduction_udf(op, *clients, scope=None, **kwargs):
         else:
             # after application we will get a series with a multi-index of
             # groupings + index
-            meta_index = pandas.MultiIndex.from_arrays(
+            meta_index = pd.MultiIndex.from_arrays(
                 [[0]] * (len(groupings) + 1),
                 names=groupings + [parent_df.index.name],
             )
@@ -253,19 +264,8 @@ def pre_execute_analytic_and_reduction_udf(op, *clients, scope=None, **kwargs):
                 apply_wrapper,
                 func,
                 col_names,
-                meta=pandas.Series(meta_value, index=meta_index, dtype=out_type),
+                meta=pd.Series(meta_value, index=meta_index, dtype=out_type),
             )
-            # If you use the UDF directly (as in `test_udaf_analytic_groupby`)
-            # we need to do some renaming/cleanup to get the result to
-            # conform to what the pandas output would look like. Nomrally this
-            # is handled in `util.coerce_to_output`.
-            parent_idx_name = parent_df.index.name
-            # These defaults are chosen by pandas
-            result_idx_name = parent_idx_name if parent_idx_name else "level_1"
-            result_value_name = result.name if result.name else 0
-            # align the results back to the parent frame
-            result = result.reset_index().set_index(result_idx_name)
-            result = result[result_value_name]
 
         return result
 

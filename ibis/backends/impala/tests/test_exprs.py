@@ -5,11 +5,10 @@ import pandas.testing as tm
 import pytest
 
 import ibis
-import ibis.expr.api as api
 import ibis.expr.types as ir
 from ibis import literal as L
 from ibis.backends.impala.compiler import ImpalaCompiler
-from ibis.expr.datatypes import Category
+from ibis.expr import api
 
 
 def test_embedded_identifier_quoting(alltypes):
@@ -22,23 +21,24 @@ def test_embedded_identifier_quoting(alltypes):
 def test_summary_execute(alltypes):
     table = alltypes
 
-    # also test set_column while we're at it
-    table = table.set_column('double_col', table.double_col * 2)
+    table = table.mutate(double_col=table.double_col * 2)
 
-    metrics = table.double_col.summary()
+    with pytest.warns(FutureWarning, match="is deprecated"):
+        metrics = table.double_col.summary()
     expr = table.aggregate(metrics)
     repr(expr)
 
     result = expr.execute()
     assert isinstance(result, pd.DataFrame)
 
-    expr = table.group_by('string_col').aggregate(
-        [
-            table.double_col.summary(prefix='double_'),
-            table.float_col.summary(prefix='float_'),
-            table.string_col.summary(suffix='_string'),
-        ]
-    )
+    with pytest.warns(FutureWarning, match="is deprecated"):
+        expr = table.group_by('string_col').aggregate(
+            [
+                table.double_col.summary(prefix='double_'),
+                table.float_col.summary(prefix='float_'),
+                table.string_col.summary(suffix='_string'),
+            ]
+        )
     result = expr.execute()
     assert isinstance(result, pd.DataFrame)
 
@@ -168,21 +168,13 @@ def _check_impala_output_types_match(con, table):
     query = ImpalaCompiler.to_sql(table)
     t = con.sql(query)
 
-    def _clean_type(x):
-        if isinstance(x, Category):
-            x = x.to_integer_type()
-        return x
-
-    left, right = t.schema(), table.schema()
-    for n, left, right in zip(left.names, left.types, right.types):
-        left = _clean_type(left)
-        right = _clean_type(right)
-
-        if left != right:
-            pytest.fail(
-                'Value for {} had left type {}'
-                ' and right type {}\nquery:\n{}'.format(n, left, right, query)
-            )
+    left_schema, right_schema = t.schema(), table.schema()
+    for n, left_ty, right_ty in zip(
+        left_schema.names, left_schema.types, right_schema.types
+    ):
+        assert (
+            left_ty == right_ty
+        ), f'Value for {n} had left type {left_ty} and right type {right_ty}\nquery:\n{query}'
 
 
 @pytest.mark.parametrize(
@@ -343,11 +335,9 @@ def test_string_functions(con, expr, expected):
 @pytest.mark.parametrize(
     ('expr', 'expected'),
     [
-        (L("https://www.cloudera.com").parse_url('HOST'), "www.cloudera.com"),
+        (L("https://www.cloudera.com").host(), "www.cloudera.com"),
         (
-            L('https://www.youtube.com/watch?v=kEuEcWfewf8&t=10').parse_url(
-                'QUERY', 'v'
-            ),
+            L('https://www.youtube.com/watch?v=kEuEcWfewf8&t=10').query('v'),
             'kEuEcWfewf8',
         ),
     ],
@@ -382,7 +372,7 @@ def test_filter_predicates(con):
 
     expr = t
     for pred in predicates:
-        expr = expr[pred(expr)].projection([expr])
+        expr = expr[pred(expr)].select(expr)
 
     expr.execute()
 
@@ -681,27 +671,22 @@ def test_identical_to(con, left, right, expected):
 
 def test_not(alltypes):
     t = alltypes.limit(10)
-    expr = t.projection([(~t.double_col.isnull()).name('double_col')])
+    expr = t.select(double_col=~t.double_col.isnull())
     result = expr.execute().double_col
     expected = ~t.execute().double_col.isnull()
     tm.assert_series_equal(result, expected)
 
 
-def test_where_with_timestamp():
+def test_where_with_timestamp(snapshot):
     t = ibis.table(
         [('uuid', 'string'), ('ts', 'timestamp'), ('search_level', 'int64')],
         name='t',
     )
     expr = t.group_by(t.uuid).aggregate(min_date=t.ts.min(where=t.search_level == 1))
-    result = ibis.impala.compile(expr)
-    expected = """\
-SELECT `uuid`, min(if(`search_level` = 1, `ts`, NULL)) AS `min_date`
-FROM t
-GROUP BY 1"""
-    assert result == expected
+    snapshot.assert_match(ibis.impala.compile(expr), "out.sql")
 
 
-def test_filter_with_analytic():
+def test_filter_with_analytic(snapshot):
     x = ibis.table(ibis.schema([('col', 'int32')]), 'x')
     with_filter_col = x[x.columns + [ibis.null().name('filter')]]
     filtered = with_filter_col[with_filter_col['filter'].isnull()]
@@ -710,53 +695,21 @@ def test_filter_with_analytic():
     with_analytic = subquery[['col', subquery.count().name('analytic')]]
     expr = with_analytic[with_analytic.columns]
 
-    result = ibis.impala.compile(expr)
-    expected = """\
-SELECT `col`, `analytic`
-FROM (
-  SELECT `col`, count(1) OVER () AS `analytic`
-  FROM (
-    SELECT `col`, `filter`
-    FROM (
-      SELECT *
-      FROM (
-        SELECT `col`, NULL AS `filter`
-        FROM x
-      ) t3
-      WHERE `filter` IS NULL
-    ) t2
-  ) t1
-) t0"""
-
-    assert result == expected
+    snapshot.assert_match(ibis.impala.compile(expr), "out.sql")
 
 
-def test_named_from_filter_group_by():
+def test_named_from_filter_group_by(snapshot):
     t = ibis.table([('key', 'string'), ('value', 'double')], name='t0')
     gb = t.filter(t.value == 42).group_by(t.key)
-    sum_expr = lambda t: (t.value + 1 + 2 + 3).sum()  # noqa: E731
+    sum_expr = lambda t: (t.value + 1 + 2 + 3).sum()
     expr = gb.aggregate(abc=sum_expr)
-    expected = """\
-SELECT `key`, sum(((`value` + 1) + 2) + 3) AS `abc`
-FROM t0
-WHERE `value` = 42
-GROUP BY 1"""
-    assert ibis.impala.compile(expr) == expected
+    snapshot.assert_match(ibis.impala.compile(expr), "abc.sql")
 
     expr = gb.aggregate(foo=sum_expr)
-    expected = """\
-SELECT `key`, sum(((`value` + 1) + 2) + 3) AS `foo`
-FROM t0
-WHERE `value` = 42
-GROUP BY 1"""
-    assert ibis.impala.compile(expr) == expected
+    snapshot.assert_match(ibis.impala.compile(expr), "foo.sql")
 
 
-def test_nunique_where():
+def test_nunique_where(snapshot):
     t = ibis.table([('key', 'string'), ('value', 'double')], name='t0')
     expr = t.key.nunique(where=t.value >= 1.0)
-    expected = """\
-SELECT count(DISTINCT if(`value` >= 1.0, `key`, NULL)) AS `nunique`
-FROM t0"""  # noqa: E501
-    result = ibis.impala.compile(expr)
-    assert result == expected
+    snapshot.assert_match(ibis.impala.compile(expr), "out.sql")

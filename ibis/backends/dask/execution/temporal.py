@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import datetime
 
 import dask.array as da
@@ -26,6 +28,8 @@ from ibis.backends.pandas.execution.temporal import (
     execute_cast_integer_to_interval_series,
     execute_date_add,
     execute_date_sub_diff,
+    execute_date_sub_diff_date_series,
+    execute_date_sub_diff_series_date,
     execute_day_of_week_index_series,
     execute_day_of_week_name_series,
     execute_epoch_seconds,
@@ -44,6 +48,7 @@ from ibis.backends.pandas.execution.temporal import (
     execute_timestamp_interval_add_series_delta,
     execute_timestamp_interval_add_series_series,
     execute_timestamp_sub_series_timedelta,
+    execute_timestamp_truncate,
 )
 
 DASK_DISPATCH_TYPES: TypeRegistrationDict = {
@@ -130,10 +135,12 @@ DASK_DISPATCH_TYPES: TypeRegistrationDict = {
         ((dd.Series, timedelta_types), execute_date_sub_diff),
     ],
     ops.DateDiff: [
-        ((date_types, dd.Series), execute_date_sub_diff),
+        ((date_types, dd.Series), execute_date_sub_diff_date_series),
         ((dd.Series, dd.Series), execute_date_sub_diff),
-        ((dd.Series, date_types), execute_date_sub_diff),
+        ((dd.Series, date_types), execute_date_sub_diff_series_date),
     ],
+    ops.TimestampTruncate: [((dd.Series,), execute_timestamp_truncate)],
+    ops.DateTruncate: [((dd.Series,), execute_timestamp_truncate)],
 }
 register_types_to_dispatcher(execute_node, DASK_DISPATCH_TYPES)
 
@@ -145,20 +152,17 @@ register_types_to_dispatcher(execute_node, DASK_DISPATCH_TYPES)
     (dd.Series, str, datetime.time),
 )
 def execute_between_time(op, data, lower, upper, **kwargs):
-    # TODO - Can this be done better?
-    indexer = (
-        (data.dt.time.astype(str) >= lower) & (data.dt.time.astype(str) <= upper)
-    ).to_dask_array(True)
+    if getattr(data.dtype, "tz", None) is not None:
+        localized = data.dt.tz_convert("UTC").dt.tz_localize(None)
+    else:
+        localized = data
+
+    time = localized.dt.time.astype(str)
+    indexer = ((time >= lower) & (time <= upper)).to_dask_array(True)
 
     result = da.zeros(len(data), dtype=np.bool_)
     result[indexer] = True
     return dd.from_array(result)
-
-
-@execute_node.register((ops.TimestampTruncate, ops.DateTruncate), dd.Series)
-def execute_timestamp_truncate(op, data, **kwargs):
-    dtype = f'datetime64[{op.unit}]'
-    return data.astype(dtype)
 
 
 @execute_node.register(ops.DayOfWeekIndex, ddgb.SeriesGroupBy)

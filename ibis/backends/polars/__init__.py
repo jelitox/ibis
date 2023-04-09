@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Mapping, MutableMapping
+from typing import TYPE_CHECKING, Any, Mapping, MutableMapping
 
 import polars as pl
 
+import ibis
 import ibis.common.exceptions as com
 import ibis.expr.analysis as an
 import ibis.expr.operations as ops
@@ -14,62 +14,33 @@ import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis.backends.base import BaseBackend
 from ibis.backends.polars.compiler import translate
-from ibis.common.dispatch import RegexDispatcher
+from ibis.util import deprecated, gen_name, normalize_filename
 
-_register_file = RegexDispatcher("_register_file")
-
-
-def _name_from_path(path: Path) -> str:
-    base, *_ = path.name.partition(os.extsep)
-    return base.replace("-", "_")
-
-
-@_register_file.register(r"parquet://(?P<path>.+)", priority=10)
-def _parquet(_, path, table_name=None, **kwargs):
-    path = Path(path).absolute()
-    table_name = table_name or _name_from_path(path)
-    return ("scan_parquet", path, table_name)
-
-
-@_register_file.register(r"csv://(?P<path>.+)", priority=10)
-def _csv(_, path, table_name=None, **kwargs):
-    path = Path(path).absolute()
-    table_name = table_name or _name_from_path(path)
-    return ("scan_csv", path, table_name)
-
-
-@_register_file.register(r"(?:file://)?(?P<path>.+)", priority=9)
-def _file(_, path, table_name=None, **kwargs):
-    num_sep_chars = len(os.extsep)
-    extension = "".join(Path(path).suffixes)[num_sep_chars:]
-    return _register_file(f"{extension}://{path}", table_name=table_name, **kwargs)
+if TYPE_CHECKING:
+    import pandas as pd
 
 
 class Backend(BaseBackend):
-    name = 'polars'
+    name = "polars"
     builder = None
 
     def __init__(self, *args, **kwargs):
-        super().__init__(args, kwargs)
-        self._tables = None
+        super().__init__(*args, **kwargs)
+        self._tables = dict()
 
     def do_connect(
-        self,
-        _tables: MutableMapping[str, pl.LazyFrame],
-        *args,
-        **kwargs,
+        self, tables: MutableMapping[str, pl.LazyFrame] | None = None
     ) -> None:
-        """Construct a client from a dictionary of polars LazyFrames.
+        """Construct a client from a dictionary of `polars.LazyFrame`s.
 
         Parameters
         ----------
-        _tables
-            Mutable mapping of string table names to polars LazyFrames.
+        tables
+            An optional mapping of string table names to polars LazyFrames.
         """
-        if isinstance(_tables, dict):
-            self._tables = _tables
-        else:
-            self._tables = dict()
+        if not tables:
+            tables = {}
+        self._tables.update(tables)
 
     @property
     def version(self) -> str:
@@ -94,26 +65,198 @@ class Backend(BaseBackend):
         table_name: str | None = None,
         **kwargs: Any,
     ) -> ir.Table:
+        """Register a data source as a table in the current database.
+
+        Parameters
+        ----------
+        source
+            The data source(s). May be a path to a file, a parquet directory, or a pandas
+            dataframe.
+        table_name
+            An optional name to use for the created table. This defaults to
+            a sequentially generated name.
+        **kwargs
+            Additional keyword arguments passed to Polars loading functions for
+            CSV or parquet.
+            See https://pola-rs.github.io/polars/py-polars/html/reference/api/polars.scan_csv.html
+            and https://pola-rs.github.io/polars/py-polars/html/reference/api/polars.scan_parquet.html
+            for more information
+
+        Returns
+        -------
+        ir.Table
+            The just-registered table
+        """
+
         if isinstance(source, (str, Path)):
-            method, path, name = _register_file(
-                str(source), table_name=table_name, **kwargs
+            first = str(source)
+        elif isinstance(source, (list, tuple)):
+            raise TypeError(
+                """Polars backend cannot register iterables of files.
+           For partitioned-parquet ingestion, use read_parquet"""
             )
-            self._tables[name] = getattr(pl, method)(path, **kwargs)
         else:
-            if table_name is None:
-                raise ValueError(
-                    "Must specify table_name for pandas DataFrame registration"
-                )
-            name = table_name
-            self._tables[name] = pl.from_pandas(source, **kwargs).lazy()
-        return self.table(name)
+            try:
+                return self.read_pandas(source, table_name=table_name, **kwargs)
+            except ValueError:
+                self._register_failure()
+
+        if first.startswith(("parquet://", "parq://")) or first.endswith(
+            ("parq", "parquet")
+        ):
+            return self.read_parquet(source, table_name=table_name, **kwargs)
+        elif first.startswith(
+            ("csv://", "csv.gz://", "txt://", "txt.gz://")
+        ) or first.endswith(("csv", "csv.gz", "tsv", "tsv.gz", "txt", "txt.gz")):
+            return self.read_csv(source, table_name=table_name, **kwargs)
+        else:
+            self._register_failure()
+        return None
+
+    def _register_failure(self):
+        import inspect
+
+        msg = ", ".join(
+            m[0] for m in inspect.getmembers(self) if m[0].startswith("read_")
+        )
+        raise ValueError(
+            f"Cannot infer appropriate read function for input, "
+            f"please call one of {msg} directly"
+        )
+
+    def read_csv(
+        self, path: str | Path, table_name: str | None = None, **kwargs: Any
+    ) -> ir.Table:
+        """Register a CSV file as a table in the current database.
+
+        Parameters
+        ----------
+        path
+            The data source. A string or Path to the CSV file.
+        table_name
+            An optional name to use for the created table. This defaults to
+            a sequentially generated name.
+        **kwargs
+            Additional keyword arguments passed to Polars loading function.
+            See https://pola-rs.github.io/polars/py-polars/html/reference/api/polars.scan_csv.html
+            for more information.
+
+        Returns
+        -------
+        ir.Table
+            The just-registered table
+        """
+        path = normalize_filename(path)
+        table_name = table_name or gen_name("read_csv")
+        try:
+            self._tables[table_name] = pl.scan_csv(path, **kwargs)
+        except pl.exceptions.ComputeError:
+            # handles compressed csvs
+            self._tables[table_name] = pl.read_csv(path, **kwargs).lazy()
+        return self.table(table_name)
+
+    def read_pandas(
+        self, source: pd.DataFrame, table_name: str | None = None, **kwargs: Any
+    ) -> ir.Table:
+        """Register a Pandas DataFrame or pyarrow Table a table in the current database.
+
+        Parameters
+        ----------
+        source
+            The data source.
+        table_name
+            An optional name to use for the created table. This defaults to
+            a sequentially generated name.
+        **kwargs
+            Additional keyword arguments passed to Polars loading function.
+            See https://pola-rs.github.io/polars/py-polars/html/reference/api/polars.from_pandas.html
+            for more information.
+
+        Returns
+        -------
+        ir.Table
+            The just-registered table
+        """
+        table_name = table_name or gen_name("read_in_memory")
+        self._tables[table_name] = pl.from_pandas(source, **kwargs).lazy()
+        return self.table(table_name)
+
+    def read_parquet(
+        self, path: str | Path, table_name: str | None = None, **kwargs: Any
+    ) -> ir.Table:
+        """Register a parquet file as a table in the current database.
+
+        Parameters
+        ----------
+        path
+            The data source(s). May be a path to a file or directory of parquet files.
+        table_name
+            An optional name to use for the created table. This defaults to
+            a sequentially generated name.
+        **kwargs
+            Additional keyword arguments passed to Polars loading function.
+            See https://pola-rs.github.io/polars/py-polars/html/reference/api/polars.scan_parquet.html
+            for more information.
+
+        Returns
+        -------
+        ir.Table
+            The just-registered table
+        """
+        path = normalize_filename(path)
+        table_name = table_name or gen_name("read_parquet")
+        self._tables[table_name] = pl.scan_parquet(path, **kwargs)
+        return self.table(table_name)
 
     def database(self, name=None):
         return self.database_class(name, self)
 
+    @deprecated(
+        as_of="5.0", removed_in="6.0", instead="Use create_table(overwrite=True)"
+    )
     def load_data(self, table_name, obj, **kwargs):
         # kwargs is a catch all for any options required by other backends.
         self._tables[table_name] = obj
+
+    def create_table(
+        self,
+        name: str,
+        obj: pd.DataFrame | ir.Table | None = None,
+        *,
+        schema: ibis.Schema | None = None,
+        database: str | None = None,
+        temp: bool | None = None,
+        overwrite: bool = False,
+    ) -> ir.Table:
+        if schema is not None and obj is None:
+            raise NotImplementedError(
+                "Empty table creation is not yet supported in the Polars backend"
+            )
+
+        if database is not None:
+            raise com.IbisError(
+                "Passing `database` to the Polars backend create_table method has no "
+                "effect: Polars cannot set a database."
+            )
+
+        if temp is not None:
+            raise com.IbisError(
+                "Passing `temp=True` to the Polars backend create_table method has no "
+                "effect: all tables are in memory and temporary. "
+            )
+
+        if not overwrite and name in self._tables:
+            raise com.IntegrityError(
+                f"Table {name} already exists. Use overwrite=True to clobber existing tables"
+            )
+
+        if isinstance(obj, ir.Table):
+            obj = obj.to_pyarrow()
+
+        if not isinstance(obj, (pl.DataFrame, pl.LazyFrame)):
+            obj = pl.LazyFrame(obj)
+
+        self._tables[name] = obj
 
     def get_schema(self, table_name, database=None):
         return self._tables[table_name].schema
@@ -125,27 +268,31 @@ class Backend(BaseBackend):
 
     @classmethod
     def has_operation(cls, operation: type[ops.Value]) -> bool:
+        # Polars doesn't support geospatial ops, but the dispatcher implements
+        # a common base class that makes it appear that it does. Explicitly
+        # exclude these operations.
+        if issubclass(operation, (ops.GeoSpatialUnOp, ops.GeoSpatialBinOp)):
+            return False
         op_classes = cls._get_operations()
         return operation in op_classes or any(
             issubclass(operation, op_impl) for op_impl in op_classes
         )
 
-    def compile(
-        self,
-        expr: ir.Expr,
-        params: Mapping[ir.Expr, object] = None,
-        **kwargs: Any,
-    ):
+    def compile(self, expr: ir.Expr, params: Mapping[ir.Expr, object] = None, **_: Any):
         node = expr.op()
         if params:
-            node = node.replace({p.op(): v for p, v in params.items()})
+            replacements = {}
+            for p, v in params.items():
+                op = p.op() if isinstance(p, ir.Expr) else p
+                replacements[op] = ibis.literal(v, type=op.output_dtype).op()
+            node = node.replace(replacements)
             expr = node.to_expr()
 
         if isinstance(expr, ir.Table):
             return translate(node)
         elif isinstance(expr, ir.Column):
             # expression must be named for the projection
-            node = expr.to_projection().op()
+            node = expr.as_table().op()
             return translate(node)
         elif isinstance(expr, ir.Scalar):
             if an.is_scalar_reduction(node):
@@ -162,10 +309,17 @@ class Backend(BaseBackend):
         self,
         expr: ir.Expr,
         params: Mapping[ir.Expr, object] = None,
-        limit: str = 'default',
+        limit: int | None = None,
         **kwargs: Any,
     ):
-        df = self.compile(expr, params=params).collect()
+        lf = self.compile(expr, params=params, **kwargs)
+        if limit == "default":
+            limit = ibis.options.sql.default_limit
+        if limit is not None:
+            df = lf.fetch(limit)
+        else:
+            df = lf.collect()
+
         if isinstance(expr, ir.Table):
             return df.to_pandas()
         elif isinstance(expr, ir.Column):
@@ -232,3 +386,18 @@ class Backend(BaseBackend):
         self._import_pyarrow()
         table = self._to_pyarrow_table(expr, params=params, limit=limit, **kwargs)
         return table.to_reader(chunk_size)
+
+    def _load_into_cache(self, name, expr):
+        self.create_table(name, self.compile(expr).cache())
+
+    def _clean_up_cached_table(self, op):
+        del self._tables[op.name]
+
+    def create_view(self, *_, **__) -> ir.Table:
+        raise NotImplementedError(self.name)
+
+    def drop_table(self, *_, **__) -> ir.Table:
+        raise NotImplementedError(self.name)
+
+    def drop_view(self, *_, **__) -> ir.Table:
+        raise NotImplementedError(self.name)

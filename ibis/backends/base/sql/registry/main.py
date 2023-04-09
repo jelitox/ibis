@@ -1,8 +1,10 @@
+from __future__ import annotations
+
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
-import ibis.util as util
+from ibis import util
 from ibis.backends.base.sql.registry import (
     aggregate,
     binary_infix,
@@ -55,7 +57,7 @@ def not_(translator, op):
 def negate(translator, op):
     arg = op.args[0]
     formatted_arg = translator.translate(arg)
-    if isinstance(op.output_dtype, dt.Boolean):
+    if op.output_dtype.is_boolean():
         return not_(translator, op)
     else:
         if helpers.needs_parens(arg):
@@ -77,7 +79,7 @@ def sign(translator, op):
     translated_arg = translator.translate(op.arg)
     dtype = op.output_dtype
     translated_type = helpers.type_to_sql_string(dtype)
-    if not isinstance(dtype, dt.Float32):
+    if not dtype.is_float32():
         return f'CAST(sign({translated_arg}) AS {translated_type})'
     return f'sign({translated_arg})'
 
@@ -109,20 +111,10 @@ def log(translator, op):
     return f'log({base_formatted}, {arg_formatted})'
 
 
-def value_list(translator, op):
-    formatted = [translator.translate(x) for x in op.values]
-    return helpers.parenthesize(', '.join(formatted))
-
-
 def cast(translator, op):
     arg_formatted = translator.translate(op.arg)
 
-    if isinstance(op.arg.output_dtype, dt.Category) and op.to == dt.int32:
-        return arg_formatted
-    if (
-        isinstance(op.arg.output_dtype, (dt.Timestamp, dt.Date, dt.Time))
-        and op.to == dt.int64
-    ):
+    if op.arg.output_dtype.is_temporal() and op.to.is_int64():
         return f'1000000 * unix_timestamp({arg_formatted})'
     else:
         sql_type = helpers.type_to_sql_string(op.to)
@@ -131,7 +123,7 @@ def cast(translator, op):
 
 def varargs(func_name):
     def varargs_formatter(translator, op):
-        return helpers.format_call(translator, func_name, *op.args)
+        return helpers.format_call(translator, func_name, *op.arg)
 
     return varargs_formatter
 
@@ -158,13 +150,12 @@ def table_column(translator, op):
     # context, we should format as a subquery
     if translator.permit_subquery and ctx.is_foreign_expr(op.table):
         # TODO(kszucs): avoid the expression roundtrip
-        proj_expr = op.table.to_expr().projection([op.name]).to_array().op()
+        proj_expr = op.table.to_expr().select([op.name]).to_array().op()
         return table_array_view(translator, proj_expr)
 
-    if ctx.need_aliases():
-        alias = ctx.get_ref(op.table)
-        if alias is not None:
-            quoted_name = f'{alias}.{quoted_name}'
+    alias = ctx.get_ref(op.table, search_parents=True)
+    if alias is not None:
+        quoted_name = f"{alias}.{quoted_name}"
 
     return quoted_name
 
@@ -172,23 +163,17 @@ def table_column(translator, op):
 def exists_subquery(translator, op):
     ctx = translator.context
 
-    dummy = ir.literal(1).name(ir.core.unnamed)
+    dummy = ir.literal(1).name("")
 
     filtered = op.foreign_table.to_expr().filter(
         [pred.to_expr() for pred in op.predicates]
     )
-    node = filtered.projection([dummy]).op()
+    node = filtered.select(dummy).op()
 
     subquery = ctx.get_compiled_expr(node)
 
-    if isinstance(op, ops.ExistsSubquery):
-        key = 'EXISTS'
-    elif isinstance(op, ops.NotExistsSubquery):
-        key = 'NOT EXISTS'
-    else:
-        raise NotImplementedError
-
-    return f'{key} (\n{util.indent(subquery, ctx.indent)}\n)'
+    prefix = "NOT " * isinstance(op, ops.NotExistsSubquery)
+    return f'{prefix}EXISTS (\n{util.indent(subquery, ctx.indent)}\n)'
 
 
 # XXX this is not added to operation_registry, but looks like impala is
@@ -218,7 +203,7 @@ def hash(translator, op):
 
 
 def concat(translator, op):
-    joined_args = ', '.join(map(translator.translate, op.args))
+    joined_args = ', '.join(map(translator.translate, op.arg))
     return f"concat({joined_args})"
 
 
@@ -289,6 +274,7 @@ operation_registry = {
     ops.Sqrt: unary('sqrt'),
     ops.Hash: hash,
     ops.HashBytes: hashbytes,
+    ops.RandomScalar: lambda *_: 'rand(utc_to_unix_micros(utc_timestamp()))',
     ops.Log: log,
     ops.Ln: unary('ln'),
     ops.Log2: unary('log2'),
@@ -302,12 +288,10 @@ operation_registry = {
     ops.Sin: unary("sin"),
     ops.Tan: unary("tan"),
     ops.Pi: fixed_arity("pi", 0),
-    ops.E: fixed_arity("exp(1)", 0),
-    ops.DecimalPrecision: unary('precision'),
-    ops.DecimalScale: unary('scale'),
+    ops.E: fixed_arity("e", 0),
+    ops.Degrees: lambda t, op: f"(180 * {t.translate(op.arg)} / {t.translate(ops.Pi())})",
+    ops.Radians: lambda t, op: f"({t.translate(ops.Pi())} * {t.translate(op.arg)} / 180)",
     # Unary aggregates
-    ops.CMSMedian: aggregate.reduction('appx_median'),
-    ops.HLLCardinality: aggregate.reduction('ndv'),
     ops.ApproxMedian: aggregate.reduction('appx_median'),
     ops.ApproxCountDistinct: aggregate.reduction('ndv'),
     ops.Mean: aggregate.reduction('avg'),
@@ -341,10 +325,18 @@ operation_registry = {
     ops.RPad: fixed_arity('rpad', 3),
     ops.StringJoin: string.string_join,
     ops.StringSQLLike: string.string_like,
+    ops.StringSQLILike: string.string_ilike,
     ops.RegexSearch: fixed_arity('regexp_like', 2),
     ops.RegexExtract: fixed_arity('regexp_extract', 3),
     ops.RegexReplace: fixed_arity('regexp_replace', 3),
-    ops.ParseURL: string.parse_url,
+    ops.ExtractProtocol: string.extract_url_field('PROTOCOL'),
+    ops.ExtractAuthority: string.extract_url_field('AUTHORITY'),
+    ops.ExtractUserInfo: string.extract_url_field('USERINFO'),
+    ops.ExtractHost: string.extract_url_field('HOST'),
+    ops.ExtractFile: string.extract_url_field('FILE'),
+    ops.ExtractPath: string.extract_url_field('PATH'),
+    ops.ExtractQuery: string.extract_url_field('QUERY'),
+    ops.ExtractFragment: string.extract_url_field('REF'),
     ops.StartsWith: string.startswith,
     ops.EndsWith: string.endswith,
     ops.StringReplace: fixed_arity('replace', 3),
@@ -365,10 +357,8 @@ operation_registry = {
     ops.DateTruncate: timestamp.truncate,
     ops.IntervalFromInteger: timestamp.interval_from_integer,
     # Other operations
-    ops.E: lambda *args: 'e()',
     ops.Literal: literal,
     ops.NullLiteral: null_literal,
-    ops.NodeList: value_list,
     ops.Cast: cast,
     ops.Coalesce: varargs('coalesce'),
     ops.Greatest: varargs('greatest'),
@@ -406,5 +396,6 @@ operation_registry = {
     ops.DayOfWeekName: timestamp.day_of_week_name,
     ops.Strftime: timestamp.strftime,
     ops.SortKey: sort_key,
+    ops.TypeOf: unary('typeof'),
     **binary_infix_ops,
 }

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # Copyright 2015 Cloudera Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,8 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-
 import os
 from pathlib import Path
 from typing import Any, Generator
@@ -21,7 +21,7 @@ import pytest
 import sqlalchemy as sa
 
 import ibis
-from ibis.backends.conftest import TEST_TABLES, init_database
+from ibis.backends.conftest import TEST_TABLES, _random_identifier, init_database
 from ibis.backends.tests.base import BackendTest, RoundHalfToEven
 
 PG_USER = os.environ.get(
@@ -69,11 +69,12 @@ class TestConf(BackendTest, RoundHalfToEven):
         with open(script_dir / 'schema' / 'postgresql.sql') as schema:
             engine = init_database(
                 url=sa.engine.make_url(
-                    f"postgresql://{user}:{password}@{host}:{port:d}"
+                    f"postgresql://{user}:{password}@{host}:{port:d}/{database}"
                 ),
                 database=database,
                 schema=schema,
                 isolation_level='AUTOCOMMIT',
+                recreate=False,
             )
 
         tables = list(TEST_TABLES) + ['geo']
@@ -86,11 +87,9 @@ class TestConf(BackendTest, RoundHalfToEven):
                 # incurs an unnecessary round trip and requires more code: the
                 # `data_iter` argument would have to be turned back into a CSV
                 # before being passed to `copy_expert`.
-                sql = f"COPY {table} FROM STDIN WITH (FORMAT CSV, HEADER TRUE, DELIMITER ',')"  # noqa: E501
+                sql = f"COPY {table} FROM STDIN WITH (FORMAT CSV, HEADER TRUE, DELIMITER ',')"
                 with data_dir.joinpath(f'{table}.csv').open('r') as file:
                     cur.copy_expert(sql=sql, file=file)
-
-        engine.execute('VACUUM FULL ANALYZE')
 
     @staticmethod
     def connect(data_directory: Path):
@@ -101,10 +100,6 @@ class TestConf(BackendTest, RoundHalfToEven):
             password=PG_PASS,
             database=IBIS_TEST_POSTGRES_DB,
         )
-
-
-def _random_identifier(suffix):
-    return f'__ibis_test_{suffix}_{ibis.util.guid()}'
 
 
 @pytest.fixture(scope='session')

@@ -3,24 +3,24 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Iterable, Literal, Sequence
 
 from public import public
-from rich.jupyter import JupyterMixin
 
 import ibis
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-from ibis.expr.types.core import Expr, _binop
+from ibis import util
+from ibis.common.grounds import Singleton
+from ibis.expr.types.core import Expr, _binop, _FixedTextJupyterMixin
 
 if TYPE_CHECKING:
+    import pandas as pd
+
     import ibis.expr.types as ir
-    import ibis.expr.window as win
 
 
 @public
 class Value(Expr):
-
-    """Base class for a data generating expression having a fixed and known
-    type, either a single value (scalar)"""
+    """Base class for a data generating expression having a known type."""
 
     def name(self, name):
         """Rename an expression to `name`.
@@ -38,9 +38,9 @@ class Value(Expr):
         Examples
         --------
         >>> import ibis
-        >>> t = ibis.table(dict(a="int64"))
+        >>> t = ibis.table(dict(a="int64"), name="t")
         >>> t.a.name("b")
-        r0 := UnboundTable[unbound_table_...]
+        r0 := UnboundTable: t
           a int64
         b: r0.a
         """
@@ -59,7 +59,8 @@ class Value(Expr):
         return op.to_expr()
 
     # TODO(kszucs): should rename to dtype
-    def type(self):
+    def type(self) -> dt.DataType:
+        """Return the [DataType] of this expression."""
         return self.op().output_dtype
 
     def hash(self, how: str = "fnv") -> ir.IntegerValue:
@@ -96,7 +97,7 @@ class Value(Expr):
             # noop case if passed type is the same
             return self
 
-        if isinstance(op.to, (dt.Geography, dt.Geometry)):
+        if op.to.is_geospatial():
             from_geotype = self.type().geotype or 'geometry'
             to_geotype = op.to.geotype
             if from_geotype == to_geotype:
@@ -120,10 +121,10 @@ class Value(Expr):
         Examples
         --------
         >>> import ibis
-        >>> ibis.coalesce(None, 4, 5)
-        Coalesce([ValueList(values=[None, 4, 5])])
+        >>> ibis.coalesce(None, 4, 5).name("x")
+        x: Coalesce(...)
         """
-        return ops.Coalesce(self, *args).to_expr()
+        return ops.Coalesce((self, *args)).to_expr()
 
     def greatest(self, *args: ir.Value) -> ir.Value:
         """Compute the largest value among the supplied arguments.
@@ -138,7 +139,7 @@ class Value(Expr):
         Value
             Maximum of the passed arguments
         """
-        return ops.Greatest(self, *args).to_expr()
+        return ops.Greatest((self, *args)).to_expr()
 
     def least(self, *args: ir.Value) -> ir.Value:
         """Compute the smallest value among the supplied arguments.
@@ -153,7 +154,7 @@ class Value(Expr):
         Value
             Minimum of the passed arguments
         """
-        return ops.Least(self, *args).to_expr()
+        return ops.Least((self, *args)).to_expr()
 
     def typeof(self) -> ir.StringValue:
         """Return the data type of the expression.
@@ -178,17 +179,44 @@ class Value(Expr):
         Examples
         --------
         >>> import ibis
-        >>> table = ibis.table(dict(col='int64', other_col='int64'))
-        >>> result = table.col.fillna(5)
-        r0 := UnboundTable: unbound_table_0
-          col       int64
-          other_col int64
-        IfNull(r0.col, ifnull_expr=5)
-        >>> table.col.fillna(table.other_col * 3)
-        r0 := UnboundTable: unbound_table_0
-          col       int64
-          other_col int64
-        IfNull(r0.col, ifnull_expr=r0.other_col * 3)
+        >>> ibis.options.interactive = True
+        >>> t = ibis.examples.penguins.fetch()
+        >>> t.sex
+        ┏━━━━━━━━┓
+        ┃ sex    ┃
+        ┡━━━━━━━━┩
+        │ string │
+        ├────────┤
+        │ male   │
+        │ female │
+        │ female │
+        │ NULL   │
+        │ female │
+        │ male   │
+        │ female │
+        │ male   │
+        │ NULL   │
+        │ NULL   │
+        │ …      │
+        └────────┘
+        >>> t.sex.fillna("unrecorded").name("sex")
+        ┏━━━━━━━━━━━━┓
+        ┃ sex        ┃
+        ┡━━━━━━━━━━━━┩
+        │ string     │
+        ├────────────┤
+        │ male       │
+        │ female     │
+        │ female     │
+        │ unrecorded │
+        │ female     │
+        │ male       │
+        │ female     │
+        │ male       │
+        │ unrecorded │
+        │ unrecorded │
+        │ …          │
+        └────────────┘
 
         Returns
         -------
@@ -254,22 +282,22 @@ class Value(Expr):
         Check whether a column's values are contained in a sequence
 
         >>> import ibis
-        >>> table = ibis.table(dict(string_col='string'))
+        >>> table = ibis.table(dict(string_col='string'), name="t")
         >>> table.string_col.isin(['foo', 'bar', 'baz'])
-        r0 := UnboundTable: unbound_table_1
+        r0 := UnboundTable: t
           string_col string
-        Contains(value=r0.string_col, options=[ValueList(values=['foo', 'bar', 'baz'])])
+        Contains(string_col): Contains(...)
 
         Check whether a column's values are contained in another table's column
 
-        >>> table2 = ibis.table(dict(other_string_col='string'))
+        >>> table2 = ibis.table(dict(other_string_col='string'), name="t2")
         >>> table.string_col.isin(table2.other_string_col)
-        r0 := UnboundTable: unbound_table_3
-          other_string_col string
-        r1 := UnboundTable: unbound_table_1
+        r0 := UnboundTable: t
           string_col string
-        Contains(value=r1.string_col, options=r0.other_string_col)
-        """  # noqa: E501
+        r1 := UnboundTable: t2
+          other_string_col string
+        Contains(string_col, other_string_col): Contains(...)
+        """
         return ops.Contains(self, values).to_expr()
 
     def notin(self, values: Value | Sequence[Value]) -> ir.BooleanValue:
@@ -289,21 +317,24 @@ class Value(Expr):
 
     def substitute(
         self,
-        value: Value,
+        value: Value | dict,
         replacement: Value | None = None,
         else_: Value | None = None,
     ):
-        """Replace one or more values in a value expression.
+        """Replace values given in `values` with `replacement`.
+
+        This is similar to the pandas `replace` method.
 
         Parameters
         ----------
         value
-            Expression or mapping
+            Expression or dict.
         replacement
-            Expression. If an expression is passed to value, this must be
+            If an expression is passed to value, this must be
             passed.
         else_
-            Expression
+            If an original value does not match `value`, then `else_` is used.
+            The default of `None` means leave the original value unchanged.
 
         Returns
         -------
@@ -319,31 +350,63 @@ class Value(Expr):
 
         return expr.else_(else_ if else_ is not None else self).end()
 
-    def over(self, window: win.Window) -> Value:
+    def over(
+        self,
+        window=None,
+        *,
+        rows=None,
+        range=None,
+        group_by=None,
+        order_by=None,
+    ) -> Value:
         """Construct a window expression.
 
         Parameters
         ----------
         window
             Window specification
+        rows
+            Whether to use the `ROWS` window clause
+        range
+            Whether to use the `RANGE` window clause
+        group_by
+            Grouping key
+        order_by
+            Ordering key
 
         Returns
         -------
         Value
             A window function expression
         """
-        prior_op = self.op()
+        import ibis.expr.analysis as an
+        import ibis.expr.builders as bl
+        import ibis.expr.deferred as de
 
-        # TODO(kszucs): fix this ugly hack
-        if isinstance(prior_op, ops.Alias):
-            return prior_op.arg.to_expr().over(window).name(prior_op.name)
+        if window is None:
+            window = ibis.window(
+                rows=rows,
+                range=range,
+                group_by=group_by,
+                order_by=order_by,
+            )
 
-        if isinstance(prior_op, ops.Window):
-            op = prior_op.over(window)
+        def bind(table):
+            frame = window.bind(table)
+            return ops.WindowFunction(self, frame).to_expr()
+
+        op = self.op()
+        if isinstance(op, ops.Alias):
+            return op.arg.to_expr().over(window).name(op.name)
+        elif isinstance(op, ops.WindowFunction):
+            return op.func.to_expr().over(window)
+        elif isinstance(window, bl.WindowBuilder):
+            if table := an.find_first_base_table(self.op()):
+                return bind(table)
+            else:
+                return de.Deferred(bind)
         else:
-            op = ops.Window(self, window)
-
-        return op.to_expr()
+            return ops.WindowFunction(self, window).to_expr()
 
     def isnull(self) -> ir.BooleanValue:
         """Return whether this expression is NULL."""
@@ -375,10 +438,10 @@ class Value(Expr):
         ...              .else_('null or (not a and not b)')
         ...              .end())
         >>> case_expr
-        r0 := UnboundTable[t]
+        r0 := UnboundTable: t
           string_col string
-        SimpleCase(base=r0.string_col, cases=[List(values=['a', 'b'])], results=[List(values=['an a', 'a b'])], default='null or (not a and not b)')
-        """  # noqa: E501
+        SimpleCase(...)
+        """
         import ibis.expr.builders as bl
 
         return bl.SimpleCaseBuilder(self.op())
@@ -407,9 +470,70 @@ class Value(Expr):
             builder = builder.when(case, result)
         return builder.else_(default).end()
 
-    def collect(self) -> ir.ArrayValue:
-        """Return an array of the elements of this expression."""
-        return ops.ArrayCollect(self).to_expr()
+    def collect(self, where: ir.BooleanValue | None = None) -> ir.ArrayScalar:
+        """Aggregate this expression's elements into an array.
+
+        This function is called `array_agg`, `list_agg`, or `list` in other systems.
+
+        Parameters
+        ----------
+        where
+            Filter to apply before aggregation
+
+        Returns
+        -------
+        ArrayScalar
+            Collected array
+
+        Examples
+        --------
+        Basic collect usage
+
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable({"key": list("aaabb"), "value": [1, 2, 3, 4, 5]})
+        >>> t
+        ┏━━━━━━━━┳━━━━━━━┓
+        ┃ key    ┃ value ┃
+        ┡━━━━━━━━╇━━━━━━━┩
+        │ string │ int64 │
+        ├────────┼───────┤
+        │ a      │     1 │
+        │ a      │     2 │
+        │ a      │     3 │
+        │ b      │     4 │
+        │ b      │     5 │
+        └────────┴───────┘
+        >>> t.value.collect()
+        [1, 2, 3, 4, 5]
+        >>> type(t.value.collect())
+        <class 'ibis.expr.types.arrays.ArrayScalar'>
+
+        Collect elements per group
+
+        >>> t.group_by("key").agg(v=lambda t: t.value.collect())
+        ┏━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ key    ┃ v                    ┃
+        ┡━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string │ array<int64>         │
+        ├────────┼──────────────────────┤
+        │ a      │ [1, 2, ... +1]       │
+        │ b      │ [4, 5]               │
+        └────────┴──────────────────────┘
+
+        Collect elements per group using a filter
+
+        >>> t.group_by("key").agg(v=lambda t: t.value.collect(where=t.value > 1))
+        ┏━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ key    ┃ v                    ┃
+        ┡━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string │ array<int64>         │
+        ├────────┼──────────────────────┤
+        │ a      │ [2, 3]               │
+        │ b      │ [4, 5]               │
+        └────────┴──────────────────────┘
+        """
+        return ops.ArrayCollect(self, where=where).to_expr()
 
     def identical_to(self, other: Value) -> ir.BooleanValue:
         """Return whether this expression is identical to other.
@@ -436,8 +560,7 @@ class Value(Expr):
         sep: str = ",",
         where: ir.BooleanValue | None = None,
     ) -> ir.StringScalar:
-        """Concatenate values using the indicated separator to produce a
-        string.
+        """Concatenate values using the indicated separator to produce a string.
 
         Parameters
         ----------
@@ -482,8 +605,22 @@ class Value(Expr):
         """Sort an expression descending."""
         return ops.SortKey(self, ascending=False).to_expr()
 
-    def to_projection(self) -> ir.Table:
-        """Promote this value expression to a projection."""
+    def as_table(self) -> ir.Table:
+        """Promote the expression to a table.
+
+        Returns
+        -------
+        Table
+            A table expression
+
+        Examples
+        --------
+        >>> t = ibis.table(dict(a="str"), name="t")
+        >>> expr = t.a.length().name("len").as_table()
+        >>> expected = t.select(len=t.a.length())
+        >>> expr.equals(expected)
+        True
+        """
         from ibis.expr.analysis import find_immediate_parent_tables
 
         roots = find_immediate_parent_tables(self.op())
@@ -493,8 +630,18 @@ class Value(Expr):
                 'involving multiple base table references '
                 'to a projection'
             )
+        table = roots[0].to_expr()
+        return table.select(self)
 
-        return roots[0].to_expr().projection([self])
+    def to_pandas(self, **kwargs) -> pd.Series:
+        """Convert a column expression to a pandas Series or scalar object.
+
+        Parameters
+        ----------
+        kwargs
+            Same as keyword arguments to [`execute`][ibis.expr.types.core.Expr.execute]
+        """
+        return self.execute(**kwargs)
 
 
 @public
@@ -506,24 +653,67 @@ class Scalar(Value):
             return console.render(Text(self._repr()), options=options)
         return console.render(repr(self.execute()), options=options)
 
+    def as_table(self) -> ir.Table:
+        """Promote the scalar expression to a table.
+
+        Returns
+        -------
+        Table
+            A table expression
+
+        Examples
+        --------
+        Promote an aggregation to a table
+
+        >>> import ibis
+        >>> import ibis.expr.types as ir
+        >>> t = ibis.table(dict(a="str"), name="t")
+        >>> expr = t.a.length().sum().name("len").as_table()
+        >>> isinstance(expr, ir.Table)
+        True
+
+        Promote a literal value to a table
+
+        >>> import ibis.expr.types as ir
+        >>> lit = ibis.literal(1).name("a").as_table()
+        >>> isinstance(lit, ir.Table)
+        True
+        """
+        from ibis.expr.analysis import (
+            find_first_base_table,
+            is_scalar_reduction,
+            reduction_to_aggregation,
+        )
+
+        op = self.op()
+        if is_scalar_reduction(op):
+            return reduction_to_aggregation(op)
+
+        table = find_first_base_table(op)
+        if table is not None:
+            agg = ops.Aggregation(table=table, metrics=(op,))
+        else:
+            agg = ops.DummyTable(values=(op,))
+        return agg.to_expr()
+
+    def _repr_html_(self) -> str | None:
+        return None
+
 
 @public
-class Column(Value, JupyterMixin):
+class Column(Value, _FixedTextJupyterMixin):
     # Higher than numpy & dask objects
     __array_priority__ = 20
 
     __array_ufunc__ = None
 
-    def __array__(self):
-        return self.execute().__array__()
+    def __array__(self, dtype=None):
+        return self.execute().__array__(dtype)
 
     def __rich_console__(self, console, options):
         named = self.name(self.op().name)
-        projection = named.to_projection()
+        projection = named.as_table()
         return console.render(projection, options=options)
-
-    def bottomk(self, k: int, by: Value | None = None) -> ir.TopK:
-        raise NotImplementedError("bottomk is not implemented")
 
     def approx_nunique(
         self,
@@ -547,7 +737,7 @@ class Column(Value, JupyterMixin):
         Scalar
             An approximate count of the distinct elements of `self`
         """
-        return ops.ApproxCountDistinct(self, where).to_expr().name("approx_nunique")
+        return ops.ApproxCountDistinct(self, where).to_expr()
 
     def approx_median(
         self,
@@ -571,19 +761,19 @@ class Column(Value, JupyterMixin):
         Scalar
             An approximation of the median of `self`
         """
-        return ops.ApproxMedian(self, where).to_expr().name("approx_median")
+        return ops.ApproxMedian(self, where).to_expr()
 
     def mode(self, where: ir.BooleanValue | None = None) -> Scalar:
         """Return the mode of a column."""
-        return ops.Mode(self, where).to_expr().name("mode")
+        return ops.Mode(self, where).to_expr()
 
     def max(self, where: ir.BooleanValue | None = None) -> Scalar:
         """Return the maximum of a column."""
-        return ops.Max(self, where).to_expr().name("max")
+        return ops.Max(self, where).to_expr()
 
     def min(self, where: ir.BooleanValue | None = None) -> Scalar:
         """Return the minimum of a column."""
-        return ops.Min(self, where).to_expr().name("min")
+        return ops.Min(self, where).to_expr()
 
     def argmax(self, key: ir.Value, where: ir.BooleanValue | None = None) -> Scalar:
         """Return the value of `self` that maximizes `key`."""
@@ -594,7 +784,19 @@ class Column(Value, JupyterMixin):
         return ops.ArgMin(self, key=key, where=where).to_expr()
 
     def nunique(self, where: ir.BooleanValue | None = None) -> ir.IntegerScalar:
-        return ops.CountDistinct(self, where).to_expr().name("nunique")
+        """Compute the number of distinct rows in an expression.
+
+        Parameters
+        ----------
+        where
+            Filter expression
+
+        Returns
+        -------
+        IntegerScalar
+            Number of distinct elements in an expression
+        """
+        return ops.CountDistinct(self, where).to_expr()
 
     def topk(
         self,
@@ -608,16 +810,45 @@ class Column(Value, JupyterMixin):
         k
             Return this number of rows
         by
-            An expression. Defaults to the count
+            An expression. Defaults to `count`.
 
         Returns
         -------
-        TopK
+        TableExpr
             A top-k expression
         """
-        op = ops.TopK(self, k, by=by if by is not None else self.count())
-        return op.to_expr()
 
+        from ibis.expr.analysis import find_first_base_table
+
+        arg_table = find_first_base_table(self.op()).to_expr()
+
+        if by is None:
+            by = self.count().name("count")
+
+        if callable(by):
+            by = by(arg_table)
+            by_table = arg_table
+        elif isinstance(by, Value):
+            by_table = find_first_base_table(by.op()).to_expr()
+        else:
+            raise com.IbisTypeError(f"Invalid `by` argument with type {type(by)}")
+
+        assert by.op().name != self.op().name
+
+        if not arg_table.equals(by_table):
+            raise com.IbisError('Cross-table TopK; must provide a parent joined table')
+
+        return (
+            arg_table.aggregate(by, by=[self])
+            .order_by(ibis.desc(by.get_name()))
+            .limit(k)
+        )
+
+    @util.deprecated(
+        instead="Reach out at https://github.com/ibis-project/ibis if you'd like this API to remain.",
+        as_of="5.0",
+        removed_in="6.0",
+    )
     def summary(
         self,
         exact_nunique: bool = False,
@@ -642,12 +873,13 @@ class Column(Value, JupyterMixin):
             Metrics list
         """
         if exact_nunique:
-            unique_metric = self.nunique().name('uniques')
+            unique_metric = self.nunique()
         else:
-            unique_metric = self.approx_nunique().name('uniques')
+            unique_metric = self.approx_nunique()
+        unique_metric = unique_metric.name("uniques")
 
         metrics = [
-            self.count(),
+            self.count().name("count"),
             self.isnull().sum().name('nulls'),
             unique_metric,
         ]
@@ -658,7 +890,7 @@ class Column(Value, JupyterMixin):
     def arbitrary(
         self,
         where: ir.BooleanValue | None = None,
-        how: Literal["first", "last", "heavy"] | None = None,
+        how: Literal["first", "last", "heavy"] = "first",
     ) -> Scalar:
         """Select an arbitrary value in a column.
 
@@ -695,47 +927,132 @@ class Column(Value, JupyterMixin):
         IntegerScalar
             Number of elements in an expression
         """
-        return ops.Count(self, where).to_expr().name("count")
+        return ops.Count(self, where).to_expr()
 
-    def value_counts(self, metric_name: str = "count") -> ir.Table:
+    def value_counts(self) -> ir.Table:
         """Compute a frequency table.
 
         Returns
         -------
         Table
             Frequency table expression
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable({"chars": char} for char in "aabcddd")
+        >>> t
+        ┏━━━━━━━━┓
+        ┃ chars  ┃
+        ┡━━━━━━━━┩
+        │ string │
+        ├────────┤
+        │ a      │
+        │ a      │
+        │ b      │
+        │ c      │
+        │ d      │
+        │ d      │
+        │ d      │
+        └────────┘
+        >>> t.chars.value_counts()
+        ┏━━━━━━━━┳━━━━━━━━━━━━━┓
+        ┃ chars  ┃ chars_count ┃
+        ┡━━━━━━━━╇━━━━━━━━━━━━━┩
+        │ string │ int64       │
+        ├────────┼─────────────┤
+        │ a      │           2 │
+        │ b      │           1 │
+        │ c      │           1 │
+        │ d      │           3 │
+        └────────┴─────────────┘
         """
         from ibis.expr.analysis import find_first_base_table
 
-        base = find_first_base_table(self.op()).to_expr()
-        metric = base.count().name(metric_name)
-
-        return base.group_by(self).aggregate(metric)
+        name = self.get_name()
+        return (
+            find_first_base_table(self.op())
+            .to_expr()
+            .select(self)
+            .group_by(name)
+            .agg(**{f"{name}_count": lambda t: t.count()})
+        )
 
     def first(self) -> Column:
+        """Return the first value of a column.
+
+        Equivalent to SQL's `FIRST_VALUE` window function.
+        """
         return ops.FirstValue(self).to_expr()
 
     def last(self) -> Column:
+        """Return the last value of a column.
+
+        Equivalent to SQL's `LAST_VALUE` window function.
+        """
         return ops.LastValue(self).to_expr()
 
-    def rank(self) -> Column:
+    def rank(self) -> ir.IntegerColumn:
+        """Compute position of first element within each equal-value group in sorted order.
+
+        Equivalent to SQL's `RANK()` window function.
+
+        Examples
+        --------
+        values   ranks
+        1        0
+        1        0
+        2        2
+        2        2
+        2        2
+        3        5
+
+        Returns
+        -------
+        Int64Column
+            The min rank
+        """
         return ops.MinRank(self).to_expr()
 
-    def dense_rank(self) -> Column:
+    def dense_rank(self) -> ir.IntegerColumn:
+        """Position of first element within each group of equal values.
+
+        Values are returned in sorted order and duplicate values are ignored.
+
+        Equivalent to SQL's `DENSE_RANK()`.
+
+        Examples
+        --------
+        values   ranks
+        1        0
+        1        0
+        2        1
+        2        1
+        2        1
+        3        2
+
+        Returns
+        -------
+        IntegerColumn
+            The rank
+        """
         return ops.DenseRank(self).to_expr()
 
     def percent_rank(self) -> Column:
+        """Return the relative rank of the values in the column."""
         return ops.PercentRank(self).to_expr()
 
     def cume_dist(self) -> Column:
-        import ibis.expr.operations as ops
-
+        """Return the cumulative distribution over a window."""
         return ops.CumeDist(self).to_expr()
 
     def cummin(self) -> Column:
+        """Return the cumulative min over a window."""
         return ops.CumulativeMin(self).to_expr()
 
     def cummax(self) -> Column:
+        """Return the cumulative max over a window."""
         return ops.CumulativeMax(self).to_expr()
 
     def lag(
@@ -743,6 +1060,15 @@ class Column(Value, JupyterMixin):
         offset: int | ir.IntegerValue | None = None,
         default: Value | None = None,
     ) -> Column:
+        """Return the row located at `offset` rows **before** the current row.
+
+        Parameters
+        ----------
+        offset
+            Index of row to select
+        default
+            Value used if no row exists at `offset`
+        """
         return ops.Lag(self, offset, default).to_expr()
 
     def lead(
@@ -750,13 +1076,33 @@ class Column(Value, JupyterMixin):
         offset: int | ir.IntegerValue | None = None,
         default: Value | None = None,
     ) -> Column:
+        """Return the row located at `offset` rows **after** the current row.
+
+        Parameters
+        ----------
+        offset
+            Index of row to select
+        default
+            Value used if no row exists at `offset`
+        """
         return ops.Lead(self, offset, default).to_expr()
 
     def ntile(self, buckets: int | ir.IntegerValue) -> ir.IntegerColumn:
+        """Return the integer number of a partitioning of the column values.
+
+        Parameters
+        ----------
+        buckets
+            Number of buckets to partition into
+        """
         return ops.NTile(self, buckets).to_expr()
 
     def nth(self, n: int | ir.IntegerValue) -> Column:
-        """Return the `n`th value over a window.
+        """Return the `n`th value (0-indexed) over a window.
+
+        `.nth(0)` is equivalent to `.first()`. Negative will result in `NULL`.
+        If the value of `n` is greater than the number of rows in the window,
+        `NULL` will be returned.
 
         Parameters
         ----------
@@ -772,52 +1118,39 @@ class Column(Value, JupyterMixin):
 
 
 @public
-class NullValue(Value):
-    pass  # noqa: E701,E302
+class UnknownValue(Value):
+    pass
 
 
 @public
-class NullScalar(Scalar, NullValue):
-    pass  # noqa: E701,E302
+class UnknownScalar(Scalar):
+    pass
+
+
+@public
+class UnknownColumn(Column):
+    pass
+
+
+@public
+class NullValue(Value):
+    pass
+
+
+@public
+class NullScalar(Scalar, NullValue, Singleton):
+    pass
 
 
 @public
 class NullColumn(Column, NullValue):
-    pass  # noqa: E701,E302
-
-
-@public
-class List(Expr, Sequence[Expr]):
-    @property
-    def values(self):
-        return self.op().values
-
-    def __getitem__(self, key):
-        return self.values[key]
-
-    def __bool__(self):
-        return bool(self.values)
-
-    __nonzero__ = __bool__
-
-    def __len__(self):
-        return len(self.values)
-
-
-_NULL = None
+    pass
 
 
 @public
 def null():
     """Create a NULL/NA scalar."""
-
-    # TODO(kszucs): NullLiteral is a singleton, so we should be able to remove
-    # the global _NULL variable
-    global _NULL
-    if _NULL is None:
-        _NULL = ops.NullLiteral().to_expr()
-
-    return _NULL
+    return ops.NullLiteral().to_expr()
 
 
 @public
@@ -873,46 +1206,12 @@ def literal(value: Any, type: dt.DataType | str | None = None) -> Scalar:
       ...
     TypeError: Value 'foobar' cannot be safely coerced to int64
     """
-    import ibis.expr.datatypes as dt
+    import ibis.expr.rules as rlz
 
-    if hasattr(value, 'op') and isinstance(value.op(), ops.Literal):
-        return value
+    if isinstance(value, Expr):
+        value = value.op()
 
-    try:
-        inferred_dtype = dt.infer(value)
-    except com.InputTypeError:
-        has_inferred = False
-    else:
-        has_inferred = True
-
-    if type is None:
-        has_explicit = False
-    else:
-        has_explicit = True
-        explicit_dtype = dt.dtype(type)
-
-    if has_explicit and has_inferred:
-        try:
-            # ensure type correctness: check that the inferred dtype is
-            # implicitly castable to the explicitly given dtype and value
-            dtype = dt.cast(inferred_dtype, explicit_dtype, value=value)
-        except com.IbisTypeError:
-            raise TypeError(f'Value {value!r} cannot be safely coerced to {type}')
-    elif has_explicit:
-        dtype = explicit_dtype
-    elif has_inferred:
-        dtype = inferred_dtype
-    else:
-        raise TypeError(
-            'The datatype of value {!r} cannot be inferred, try '
-            'passing it explicitly with the `type` keyword.'.format(value)
-        )
-
-    if isinstance(dtype, dt.Null):
-        return null().cast(dtype)
-    else:
-        value = dt.normalize(dtype, value)
-        return ops.Literal(value, dtype=dtype).to_expr()
+    return rlz.literal(type, value).to_expr()
 
 
 public(
@@ -922,6 +1221,4 @@ public(
     AnyValue=Value,
     AnyScalar=Scalar,
     AnyColumn=Column,
-    ListExpr=List,
-    ValueList=List,
 )

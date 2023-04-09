@@ -2,40 +2,38 @@ from __future__ import annotations
 
 import functools
 import operator
-from collections import Counter
+from collections import defaultdict
+from typing import Iterable, Iterator, Mapping
 
 import toolz
 
 import ibis.common.graph as g
-import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
+import ibis.expr.operations.relations as rels
 import ibis.expr.types as ir
 from ibis import util
 from ibis.common.exceptions import IbisTypeError, IntegrityError
-from ibis.expr.rules import Shape
-from ibis.expr.window import window
 
 # ---------------------------------------------------------------------
 # Some expression metaprogramming / graph transformations to support
 # compilation later
 
 
-def sub_for(node, substitutions):
-    """Substitute subexpressions in `expr` with expression to expression
-    mapping `substitutions`.
+def sub_for(node: ops.Node, substitutions: Mapping[ops.node, ops.Node]) -> ops.Node:
+    """Substitute operations in `node` with nodes in `substitutions`.
 
     Parameters
     ----------
-    expr : ibis.expr.types.Expr
-        An Ibis expression
-    substitutions : List[Tuple[ibis.expr.types.Expr, ibis.expr.types.Expr]]
-        A mapping from expression to expression. If any subexpression of `expr`
-        is equal to any of the keys in `substitutions`, the value for that key
-        will replace the corresponding expression in `expr`.
+    node
+        An Ibis operation
+    substitutions
+        A mapping from node to node. If any subnode of `node` is equal to any
+        of the keys in `substitutions`, the value for that key will replace the
+        corresponding node in `node`.
 
     Returns
     -------
-    ibis.expr.types.Expr
+    Node
         An Ibis expression
     """
     assert isinstance(node, ops.Node), type(node)
@@ -49,6 +47,11 @@ def sub_for(node, substitutions):
             return g.proceed
 
     return substitute(fn, node)
+
+
+def sub_immediate_parents(op: ops.Node, table: ops.TableNode) -> ops.Node:
+    """Replace immediate parent tables in `op` with `table`."""
+    return sub_for(op, {base: table for base in find_immediate_parent_tables(op)})
 
 
 class ScalarAggregate:
@@ -65,7 +68,7 @@ class ScalarAggregate:
         for other in self.tables[1:]:
             table = table.cross_join(other)
 
-        return table.projection([subbed_expr])
+        return table.select(subbed_expr)
 
     def _visit(self, expr):
         assert isinstance(expr, ir.Expr), type(expr)
@@ -104,57 +107,65 @@ def reduction_to_aggregation(node):
     tables = find_immediate_parent_tables(node)
 
     # TODO(kszucs): avoid the expression roundtrip
+    node = ops.Alias(node, node.name)
+    expr = node.to_expr()
     if len(tables) == 1:
         (table,) = tables
-        agg = table.to_expr().aggregate([node.to_expr()])
+        agg = table.to_expr().aggregate([expr])
     else:
-        agg = ScalarAggregate(node.to_expr()).get_result()
+        agg = ScalarAggregate(expr).get_result()
 
     return agg
 
 
-def find_immediate_parent_tables(node):
-    """Find every first occurrence of a :class:`ibis.expr.types.Table` object
-    in `expr`.
+def find_immediate_parent_tables(input_node, keep_input=True):
+    """Find every first occurrence of a `ir.Table` object in `input_node`.
+
+    This function does not traverse into `Table` objects. For example, the
+    underlying `PhysicalTable` of a `Selection` will not be yielded.
 
     Parameters
     ----------
-    expr : ir.Expr
+    input_node
+        Input node
+    keep_input
+        Whether to keep the input when traversing
 
     Yields
     ------
-    e : ir.Expr
-
-    Notes
-    -----
-    This function does not traverse into Table objects. This means that the
-    underlying PhysicalTable of a Selection will not be yielded, for example.
+    ir.Expr
+        Parent table expression
 
     Examples
     --------
     >>> import ibis, toolz
     >>> t = ibis.table([('a', 'int64')], name='t')
     >>> expr = t.mutate(foo=t.a + 1)
-    >>> result = find_immediate_parent_tables(expr)
-    >>> len(result)
-    1
-    >>> result[0]
-    r0 := UnboundTable[t]
-      a int64
-    Selection[r0]
-      selections:
-        r0
-        foo: r0.a + 1
+    >>> result, = find_immediate_parent_tables(expr.op())
+    >>> result.equals(expr.op())
+    True
+    >>> result, = find_immediate_parent_tables(expr.op(), keep_input=False)
+    >>> result.equals(t.op())
+    True
     """
-    assert all(isinstance(arg, ops.Node) for arg in util.promote_list(node))
+    assert all(isinstance(arg, ops.Node) for arg in util.promote_list(input_node))
 
     def finder(node):
         if isinstance(node, ops.TableNode):
-            return g.halt, node
+            if keep_input or node != input_node:
+                return g.halt, node
+            else:
+                return g.proceed, None
+
+        # HACK: special case ops.Contains to only consider the needle's base
+        # table, since that's the only expression that matters for determining
+        # cardinality
+        elif isinstance(node, ops.Contains):
+            return [node.value], None
         else:
             return g.proceed, None
 
-    return list(toolz.unique(g.traverse(finder, node)))
+    return list(toolz.unique(g.traverse(finder, input_node)))
 
 
 def substitute(fn, node):
@@ -186,10 +197,7 @@ def substitute(fn, node):
 
 
 def substitute_parents(node):
-    """Rewrite the input expression by replacing any table expressions part of
-    a "commutative table operation unit" (for lack of scientific term, a set of
-    operations that can be written down in any order and still yield the same
-    semantic result)"""
+    """Rewrite `node` by replacing table nodes that commute."""
     assert isinstance(node, ops.Node), type(node)
 
     def fn(node):
@@ -215,9 +223,21 @@ def substitute_parents(node):
     return substitute(fn, node)
 
 
+def substitute_unbound(node):
+    """Rewrite `node` by replacing table expressions with an equivalent unbound table."""
+    assert isinstance(node, ops.Node), type(node)
+
+    def fn(node, _, *args, **kwargs):
+        if isinstance(node, ops.DatabaseTable):
+            return ops.UnboundTable(name=node.name, schema=node.schema)
+        else:
+            return node.__class__(*args, **kwargs)
+
+    return node.substitute(fn)
+
+
 def get_mutation_exprs(exprs: list[ir.Expr], table: ir.Table) -> list[ir.Expr | None]:
-    """Given the list of exprs and the underlying table of a mutation op,
-    return the exprs to use to instantiate the mutation."""
+    """Return the exprs to use to instantiate the mutation."""
     # The below logic computes the mutation node exprs by splitting the
     # assignment exprs into two disjoint sets:
     # 1) overwriting_cols_to_expr, which maps a column name to its expr
@@ -257,41 +277,31 @@ def apply_filter(op, predicates):
     # This will attempt predicate pushdown in the cases where we can do it
     # easily and safely, to make both cleaner SQL and fewer referential errors
     # for users
-    assert isinstance(op, ops.Node)
-
-    if isinstance(op, ops.Selection):
-        return _filter_selection(op, predicates)
-    elif isinstance(op, ops.Aggregation):
-        # Potential fusion opportunity
-        # GH1344: We can't sub in things with correlated subqueries
-        simplified_predicates = tuple(
-            # Originally this line tried substituting op.table in for expr, but
-            # that is too aggressive in the presence of filters that occur
-            # after aggregations.
-            #
-            # See https://github.com/ibis-project/ibis/pull/3341 for details
-            sub_for(predicate, {op.table: op})
-            if not is_reduction(predicate)
-            else predicate
-            for predicate in predicates
-        )
-
-        if shares_all_roots(simplified_predicates, op.table):
-            return ops.Aggregation(
-                op.table,
-                op.metrics,
-                by=op.by,
-                having=op.having,
-                predicates=op.predicates + simplified_predicates,
-                sort_keys=op.sort_keys,
-            )
-
     if not predicates:
         return op
-    return ops.Selection(op, [], predicates)
+
+    if isinstance(op, ops.Selection):
+        return pushdown_selection_filters(op, predicates)
+    elif isinstance(op, ops.Aggregation):
+        return pushdown_aggregation_filters(op, predicates)
+    else:
+        return ops.Selection(op, [], predicates)
 
 
-def _filter_selection(op, predicates):
+def pushdown_selection_filters(op, predicates):
+    default = ops.Selection(op, selections=[], predicates=predicates)
+
+    # We can't push down filters on Unnest or Window because they
+    # change the shape and potential values of the data.
+    if any(
+        isinstance(
+            sel.arg if isinstance(sel, ops.Alias) else sel,
+            (ops.Unnest, ops.Window),
+        )
+        for sel in op.selections
+    ):
+        return default
+
     # if any of the filter predicates have the parent expression among
     # their roots, then pushdown (at least of that predicate) is not
     # possible
@@ -316,137 +326,116 @@ def _filter_selection(op, predicates):
             for predicate in predicates
         )
     except IntegrityError:
-        pass
-    else:
-        if shares_all_roots(simplified_predicates, op.table) and not any(
-            # we can't push down filters on unnest because unnest changes the
-            # shape and potential values of the data: unnest can potentially
-            # produce NULLs
-            #
-            # the getattr shenanigans is to handle Alias
-            isinstance(
-                sel.arg if isinstance(sel, ops.Alias) else sel,
-                ops.Unnest,
-            )
-            for sel in op.selections
-        ):
-            return ops.Selection(
-                op.table,
-                selections=op.selections,
-                predicates=op.predicates + simplified_predicates,
-                sort_keys=op.sort_keys,
-            )
+        return default
 
-    can_pushdown = _can_pushdown(op, predicates)
+    if not shares_all_roots(simplified_predicates, op.table):
+        return default
 
-    if can_pushdown:
-        simplified_predicates = tuple(substitute_parents(x) for x in predicates)
-        fused_predicates = op.predicates + simplified_predicates
-        return ops.Selection(
+    # find spuriously simplified predicates
+    for predicate in simplified_predicates:
+        # find columns in the predicate
+        depends_on = predicate.find((ops.TableColumn, ops.Literal))
+        for projection in op.selections:
+            if not isinstance(projection, (ops.TableColumn, ops.Literal)):
+                # if the projection's table columns overlap with columns
+                # used in the predicate then we return immediately
+                #
+                # this means that we were too aggressive during simplification
+                # example: t.mutate(a=_.a + 1).filter(_.a > 1)
+                if projection.find((ops.TableColumn, ops.Literal)) & depends_on:
+                    return default
+
+    return ops.Selection(
+        op.table,
+        selections=op.selections,
+        predicates=op.predicates + simplified_predicates,
+        sort_keys=op.sort_keys,
+    )
+
+
+def pushdown_aggregation_filters(op, predicates):
+    # Potential fusion opportunity
+    # GH1344: We can't sub in things with correlated subqueries
+    simplified_predicates = tuple(
+        # Originally this line tried substituting op.table in for expr, but
+        # that is too aggressive in the presence of filters that occur
+        # after aggregations.
+        #
+        # See https://github.com/ibis-project/ibis/pull/3341 for details
+        sub_for(predicate, {op.table: op}) if not is_reduction(predicate) else predicate
+        for predicate in predicates
+    )
+
+    if shares_all_roots(simplified_predicates, op.table):
+        return ops.Aggregation(
             op.table,
-            selections=op.selections,
-            predicates=fused_predicates,
+            op.metrics,
+            by=op.by,
+            having=op.having,
+            predicates=op.predicates + simplified_predicates,
             sort_keys=op.sort_keys,
         )
     else:
-        return ops.Selection(op, selections=[], predicates=predicates)
+        return ops.Selection(op, [], predicates)
 
 
-def _can_pushdown(op, predicates):
-    # Per issues discussed in #173
-    #
-    # The only case in which pushdown is possible is that all table columns
-    # referenced must meet all of the following (not that onerous in practice)
-    # criteria
-    #
-    # 1) Is a table column, not any other kind of expression
-    # 2) Is unaliased. So, if you project t3.foo AS bar, then filter on bar,
-    #    this cannot be pushed down (until we implement alias rewriting if
-    #    necessary)
-    # 3) Appears in the selections in the projection (either is part of one of
-    #    the entire tables or a single column selection)
+# TODO(kszucs): use ibis.expr.analysis.substitute instead
+def propagate_down_window(func: ops.Value, frame: ops.WindowFrame):
+    import ibis.expr.operations as ops
 
-    for pred in predicates:
-        if isinstance(pred, ir.Expr):
-            pred = pred.op()
-        validator = _PushdownValidate(op, pred)
-        predicate_is_valid = validator.get_result()
-        if not predicate_is_valid:
-            return False
-    return True
+    clean_args = []
+    for arg in func.args:
+        if isinstance(arg, ops.Value) and not isinstance(func, ops.WindowFunction):
+            arg = propagate_down_window(arg, frame)
+            if isinstance(arg, ops.Analytic):
+                arg = ops.WindowFunction(arg, frame)
+        clean_args.append(arg)
 
-
-# TODO(kszucs): rewrite to only work with operation objects
-class _PushdownValidate:
-    def __init__(self, parent, predicate):
-        self.parent = parent
-        self.pred = predicate
-
-    def get_result(self):
-        assert isinstance(self.pred, ops.Node), type(self.pred)
-
-        def validate(node):
-            if isinstance(node, ops.TableColumn):
-                return g.proceed, self._validate_projection(node)
-            return g.proceed, None
-
-        return all(g.traverse(validate, self.pred))
-
-    def _validate_projection(self, node):
-        is_valid = False
-
-        for val in self.parent.selections:
-            if isinstance(val, ops.PhysicalTable) and node.name in val.schema:
-                is_valid = True
-            elif isinstance(val, ops.TableColumn) and node.name == val.name:
-                # Aliased table columns are no good
-                is_valid = val.table == node.table
-
-        return is_valid
+    return type(func)(*clean_args)
 
 
 # TODO(kszucs): rewrite to receive and return an ops.Node
-def windowize_function(expr, w=None):
+def windowize_function(expr, frame):
     assert isinstance(expr, ir.Expr), type(expr)
+    assert isinstance(frame, ops.WindowFrame)
 
-    def _windowize(op, w):
-        if not isinstance(op, ops.Window):
-            walked = _walk(op, w)
+    def _windowize(op, frame):
+        if isinstance(op, ops.WindowFunction):
+            walked_child = _walk(op.func, frame)
+            walked = walked_child.to_expr().over(op.frame).op()
+        elif isinstance(op, ops.Value):
+            walked = _walk(op, frame)
         else:
-            window_arg, window_w = op.args
-            walked_child = _walk(window_arg, w)
-
-            if walked_child is not window_arg:
-                walked = ops.Window(walked_child, window_w)
-            else:
-                walked = op
+            walked = op
 
         if isinstance(walked, (ops.Analytic, ops.Reduction)):
-            if w is None:
-                w = window()
-            return walked.to_expr().over(w).op()
-        elif isinstance(walked, ops.Window):
-            if w is not None:
-                return walked.to_expr().over(w.combine(walked.window)).op()
+            return op.to_expr().over(frame).op()
+        elif isinstance(walked, ops.WindowFunction):
+            if frame is not None:
+                frame = walked.frame.copy(
+                    group_by=frame.group_by + walked.frame.group_by,
+                    order_by=frame.order_by + walked.frame.order_by,
+                )
+                return walked.to_expr().over(frame).op()
             else:
                 return walked
         else:
             return walked
 
-    def _walk(op, w):
+    def _walk(op, frame):
         # TODO(kszucs): rewrite to use the substitute utility
         windowed_args = []
         for arg in op.args:
-            if not isinstance(arg, ops.Value):
-                windowed_args.append(arg)
-                continue
+            if isinstance(arg, ops.Value):
+                arg = _windowize(arg, frame)
+            elif isinstance(arg, tuple):
+                arg = tuple(_windowize(x, frame) for x in arg)
 
-            new_arg = _windowize(arg, w)
-            windowed_args.append(new_arg)
+            windowed_args.append(arg)
 
         return type(op)(*windowed_args)
 
-    return _windowize(expr.op(), w).to_expr()
+    return _windowize(expr.op(), frame).to_expr()
 
 
 def simplify_aggregation(agg):
@@ -469,26 +458,34 @@ def simplify_aggregation(agg):
         having_valid, lowered_having = _pushdown(agg.having)
 
         if metrics_valid and by_valid and having_valid:
+            valid_lowered_sort_keys = frozenset(lowered_metrics).union(lowered_by)
             return ops.Aggregation(
                 agg.table.table,
                 lowered_metrics,
                 by=lowered_by,
                 having=lowered_having,
                 predicates=agg.table.predicates,
-                sort_keys=agg.table.sort_keys,
+                # only the sort keys that exist as grouping keys or metrics can
+                # be included
+                sort_keys=[
+                    key
+                    for key in agg.table.sort_keys
+                    if key.expr in valid_lowered_sort_keys
+                ],
             )
 
     return agg
 
 
 class Projector:
+    """Analysis and validation of projection operation.
 
-    """Analysis and validation of projection operation, taking advantage of
-    "projection fusion" opportunities where they exist, i.e. combining
-    compatible projections together rather than nesting them.
+    This pass tries to take advantage of projection fusion opportunities where
+    they exist, i.e. combining compatible projections together rather than
+    nesting them.
 
-    Translation / evaluation later will not attempt to do any further
-    fusion / simplification.
+    Translation / evaluation later will not attempt to do any further fusion /
+    simplification.
     """
 
     def __init__(self, parent, proj_exprs):
@@ -497,7 +494,12 @@ class Projector:
         self.parent = parent
         self.input_exprs = proj_exprs
         self.resolved_exprs = [parent._ensure_expr(e) for e in proj_exprs]
-        self.clean_exprs = list(map(windowize_function, self.resolved_exprs))
+
+        default_frame = ops.RowsWindowFrame(table=parent)
+        self.clean_exprs = [
+            windowize_function(expr, frame=default_frame)
+            for expr in self.resolved_exprs
+        ]
 
     def get_result(self):
         roots = find_immediate_parent_tables(self.parent.op())
@@ -601,6 +603,8 @@ def _find_projections(node):
         return g.proceed, None
     elif isinstance(node, ops.TableNode):
         return g.halt, node
+    elif isinstance(node, ops.Contains):
+        return [node.value], None
     else:
         return g.proceed, None
 
@@ -616,38 +620,31 @@ def shares_some_roots(exprs, parents):
     # unique table dependencies of exprs and parents
     exprs_deps = set(g.traverse(_find_projections, exprs))
     parents_deps = set(g.traverse(_find_projections, parents))
-    return bool(exprs_deps & parents_deps)
+    # Also return True if exprs has no roots (e.g. literal-only expressions)
+    return bool(exprs_deps & parents_deps) or not exprs_deps
 
 
 def flatten_predicate(node):
     """Yield the expressions corresponding to the `And` nodes of a predicate.
-
-    Parameters
-    ----------
-    expr : ir.BooleanColumn
-
-    Returns
-    -------
-    exprs : List[ir.BooleanColumn]
 
     Examples
     --------
     >>> import ibis
     >>> t = ibis.table([('a', 'int64'), ('b', 'string')], name='t')
     >>> filt = (t.a == 1) & (t.b == 'foo')
-    >>> predicates = flatten_predicate(filt)
+    >>> predicates = flatten_predicate(filt.op())
     >>> len(predicates)
     2
-    >>> predicates[0]
-    r0 := UnboundTable[t]
+    >>> predicates[0].to_expr().name("left")
+    r0 := UnboundTable: t
       a int64
       b string
-    r0.a == 1
-    >>> predicates[1]
-    r0 := UnboundTable[t]
+    left: r0.a == 1
+    >>> predicates[1].to_expr().name("right")
+    r0 := UnboundTable: t
       a int64
       b string
-    r0.b == 'foo'
+    right: r0.b == 'foo'
     """
 
     def predicate(node):
@@ -687,14 +684,6 @@ def is_reduction(node):
     aggregation" in a GROUP BY-type expression and should be treated a
     literal, and must be computed as a separate query and stored in a
     temporary variable (or joined, for bound aggregations with keys)
-
-    Parameters
-    ----------
-    expr : ir.Expr
-
-    Returns
-    -------
-    check output : bool
     """
 
     def predicate(node):
@@ -711,7 +700,7 @@ def is_reduction(node):
 
 def is_scalar_reduction(node):
     assert isinstance(node, ops.Node), type(node)
-    return node.output_shape is Shape.SCALAR and is_reduction(node)
+    return node.output_shape.is_scalar() and is_reduction(node)
 
 
 _ANY_OP_MAPPING = {
@@ -725,7 +714,7 @@ def find_predicates(node, flatten=True):
     # flatten_predicates instead
     def predicate(node):
         assert isinstance(node, ops.Node), type(node)
-        if isinstance(node, ops.Value) and isinstance(node.output_dtype, dt.Boolean):
+        if isinstance(node, ops.Value) and node.output_dtype.is_boolean():
             if flatten and isinstance(node, ops.And):
                 return g.proceed, None
             else:
@@ -735,37 +724,31 @@ def find_predicates(node, flatten=True):
     return list(g.traverse(predicate, node))
 
 
-def find_subqueries(node: ops.Node) -> Counter:
-    counts = Counter()
+def find_subqueries(node: ops.Node, min_dependents=1) -> tuple[ops.Node, ...]:
+    subquery_dependents = defaultdict(set)
+    for n in filter(None, util.promote_list(node)):
+        dependents = g.Graph.from_dfs(n).invert()
+        for u, vs in dependents.toposort().items():
+            # count the number of table-node dependents on the current node
+            # but only if the current node is a selection or aggregation
+            if isinstance(u, (rels.Projection, rels.Aggregation, rels.Limit)):
+                subquery_dependents[u].update(vs)
 
-    def finder(node: ops.Node):
-        if isinstance(node, ops.Join):
-            return [node.left, node.right], None
-        elif isinstance(node, ops.PhysicalTable):
-            return g.halt, None
-        elif isinstance(node, ops.SelfReference):
-            return g.proceed, None
-        elif isinstance(node, (ops.Selection, ops.Aggregation)):
-            counts[node] += 1
-            return [node.table], None
-        elif isinstance(node, ops.TableNode):
-            counts[node] += 1
-            return g.proceed, None
-        elif isinstance(node, ops.TableColumn):
-            return node.table not in counts, None
-        else:
-            return g.proceed, None
-
-    # keep duplicates so we can determine where an expression is used
-    # more than once
-    list(g.traverse(finder, node, dedup=False))
-
-    return counts
+    return tuple(
+        node
+        for node, dependents in reversed(subquery_dependents.items())
+        if len(dependents) >= min_dependents
+    )
 
 
 # TODO(kszucs): move to types/logical.py
-def _make_any(expr, any_op_class: type[ops.Any] | type[ops.NotAny]):
-    assert isinstance(expr, ir.Expr)
+def _make_any(
+    expr,
+    any_op_class: type[ops.Any] | type[ops.NotAny],
+    *,
+    where: ir.BooleanValue | None = None,
+):
+    assert isinstance(expr, ir.Expr), type(expr)
 
     tables = find_immediate_parent_tables(expr.op())
     predicates = find_predicates(expr.op(), flatten=True)
@@ -776,7 +759,7 @@ def _make_any(expr, any_op_class: type[ops.Any] | type[ops.NotAny]):
             predicates=predicates,
         )
     else:
-        op = any_op_class(expr)
+        op = any_op_class(expr, where=where)
     return op.to_expr()
 
 
@@ -804,7 +787,7 @@ def _rewrite_filter_reduction(op, name: str | None = None, **kwargs):
 @_rewrite_filter.register(ops.Literal)
 @_rewrite_filter.register(ops.ExistsSubquery)
 @_rewrite_filter.register(ops.NotExistsSubquery)
-@_rewrite_filter.register(ops.Window)
+@_rewrite_filter.register(ops.WindowFunction)
 def _rewrite_filter_subqueries(op, **kwargs):
     """Don't rewrite any of these operations in filters."""
     return op
@@ -834,7 +817,7 @@ def _rewrite_filter_value(op, **kwargs):
     return op.__class__(*visited)
 
 
-@_rewrite_filter.register(ops.NodeList)
+@_rewrite_filter.register(tuple)
 def _rewrite_filter_value_list(op, **kwargs):
     visited = [
         _rewrite_filter(arg, **kwargs) if isinstance(arg, ops.Node) else arg
@@ -845,3 +828,32 @@ def _rewrite_filter_value_list(op, **kwargs):
         return op
 
     return op.__class__(*visited)
+
+
+def find_memtables(node: ops.Node) -> Iterator[ops.InMemoryTable]:
+    """Find all in-memory tables in `node`."""
+
+    def finder(node):
+        return g.proceed, node if isinstance(node, ops.InMemoryTable) else None
+
+    return g.traverse(finder, node, filter=ops.Node)
+
+
+def find_toplevel_unnest_children(nodes: Iterable[ops.Node]) -> Iterator[ops.Table]:
+    def finder(node):
+        return (
+            isinstance(node, ops.Value),
+            find_first_base_table(node) if isinstance(node, ops.Unnest) else None,
+        )
+
+    return g.traverse(finder, nodes, filter=ops.Node)
+
+
+def find_toplevel_aggs(nodes: Iterable[ops.Node]) -> Iterator[ops.Table]:
+    def finder(node):
+        return (
+            isinstance(node, ops.Value),
+            node if isinstance(node, ops.Reduction) else None,
+        )
+
+    return g.traverse(finder, nodes, filter=ops.Node)

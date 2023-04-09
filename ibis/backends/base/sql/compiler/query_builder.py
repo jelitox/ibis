@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from io import StringIO
+from typing import Iterable
 
 import toolz
 
 import ibis.common.exceptions as com
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
-import ibis.util as util
+from ibis import util
 from ibis.backends.base.sql.compiler.base import DML, QueryAST, SetOp
 from ibis.backends.base.sql.compiler.select_builder import SelectBuilder, _LimitSpec
 from ibis.backends.base.sql.compiler.translator import ExprTranslator, QueryContext
@@ -17,7 +18,6 @@ from ibis.config import options
 
 
 class TableSetFormatter:
-
     _join_names = {
         ops.InnerJoin: 'INNER JOIN',
         ops.LeftJoin: 'LEFT OUTER JOIN',
@@ -45,7 +45,7 @@ class TableSetFormatter:
     # TODO(kszucs): could use lin.traverse here
     def _walk_join_tree(self, op):
         if util.all_of([op.left, op.right], ops.Join):
-            raise NotImplementedError('Do not support joins between ' 'joins yet')
+            raise NotImplementedError('Do not support joins between joins yet')
 
         jname = self._get_join_type(op)
 
@@ -73,15 +73,22 @@ class TableSetFormatter:
 
     def _format_in_memory_table(self, op):
         names = op.schema.names
-        raw_rows = (
-            ", ".join(
-                f"{val!r} AS {self._quote_identifier(name)}"
-                for val, name in zip(row, names)
-            )
-            for row in op.data.to_frame().itertuples(index=False)
-        )
-        rows = ", ".join(f"({raw_row})" for raw_row in raw_rows)
-        return f"(VALUES {rows})"
+        raw_rows = []
+        for row in op.data.to_frame().itertuples(index=False):
+            raw_row = []
+            for val, name in zip(row, names):
+                lit = ops.Literal(val, dtype=op.schema[name])
+                raw_row.append(
+                    f"{self._translate(lit)} AS {self._quote_identifier(name)}"
+                )
+            raw_rows.append(", ".join(raw_row))
+
+        if self.context.compiler.support_values_syntax_in_select:
+            rows = ", ".join(f"({raw_row})" for raw_row in raw_rows)
+            return f"(VALUES {rows})"
+        else:
+            rows = " UNION ALL ".join(f"(SELECT {raw_row})" for raw_row in raw_rows)
+            return f"({rows})"
 
     def _format_table(self, op):
         # TODO: This could probably go in a class and be significantly nicer
@@ -93,7 +100,6 @@ class TableSetFormatter:
 
         if isinstance(ref_op, ops.InMemoryTable):
             result = self._format_in_memory_table(ref_op)
-            is_subquery = True
         elif isinstance(ref_op, ops.PhysicalTable):
             name = ref_op.name
             # TODO(kszucs): add a mandatory `name` field to the base
@@ -102,7 +108,6 @@ class TableSetFormatter:
             if name is None:
                 raise com.RelationError(f'Table did not have a name: {op!r}')
             result = self._quote_identifier(name)
-            is_subquery = False
         else:
             # A subquery
             if ctx.is_extracted(ref_op):
@@ -118,10 +123,8 @@ class TableSetFormatter:
 
             subquery = ctx.get_compiled_expr(op)
             result = f'(\n{util.indent(subquery, self.indent)}\n)'
-            is_subquery = True
 
-        if is_subquery or ctx.need_aliases(op):
-            result += f' {ctx.get_ref(op)}'
+        result += f' {ctx.get_ref(op)}'
 
         return result
 
@@ -164,10 +167,7 @@ class TableSetFormatter:
 
 
 class Select(DML, Comparable):
-
-    """A SELECT statement which, after execution, might yield back to the user
-    a table, array/list, or scalar value, depending on the expression that
-    generated it."""
+    """A SELECT statement."""
 
     def __init__(
         self,
@@ -235,8 +235,11 @@ class Select(DML, Comparable):
         )
 
     def compile(self):
-        """This method isn't yet idempotent; calling multiple times may yield
-        unexpected results."""
+        """Compile a query.
+
+        This method isn't yet idempotent; calling multiple times may yield
+        unexpected results.
+        """
         # Can't tell if this is a hack or not. Revisit later
         self.context.set_query(self)
 
@@ -281,7 +284,7 @@ class Select(DML, Comparable):
 
     def format_subqueries(self):
         if not self.subqueries:
-            return
+            return None
 
         context = self.context
 
@@ -300,14 +303,10 @@ class Select(DML, Comparable):
         formatted = []
         for node in self.select_set:
             if isinstance(node, ops.Value):
-                expr_str = self._translate(node, named=True)
+                expr_str = self._translate(node, named=True, permit_subquery=True)
             elif isinstance(node, ops.TableNode):
-                # A * selection, possibly prefixed
-                if context.need_aliases(node):
-                    alias = context.get_ref(node)
-                    expr_str = f'{alias}.*' if alias else '*'
-                else:
-                    expr_str = '*'
+                alias = context.get_ref(node)
+                expr_str = f'{alias}.*' if alias else '*'
             else:
                 raise TypeError(node)
             formatted.append(expr_str)
@@ -443,14 +442,18 @@ class Difference(SetOp):
     _keyword = "EXCEPT"
 
 
-def flatten_set_op(op):
+def flatten_set_op(op) -> Iterable[ops.Table | bool]:
     """Extract all union queries from `table`.
+
     Parameters
     ----------
-    table : ops.TableNode
+    op
+        Set operation to flatten
+
     Returns
     -------
-    Iterable[Union[Table, bool]]
+    Iterable[Table | bool]
+        Iterable of tables and `bool`s indicating `distinct`.
     """
 
     if isinstance(op, ops.SetOp):
@@ -467,12 +470,16 @@ def flatten_set_op(op):
 
 def flatten(op: ops.TableNode):
     """Extract all intersection or difference queries from `table`.
+
     Parameters
     ----------
-    table : Table
+    op
+        Table operation to flatten
+
     Returns
     -------
-    Iterable[Union[Table]]
+    Iterable[Table | bool]
+        Iterable of tables and `bool`s indicating `distinct`.
     """
     return list(toolz.concatv(flatten_set_op(op.left), flatten_set_op(op.right)))
 
@@ -488,6 +495,7 @@ class Compiler:
     difference_class = Difference
 
     cheap_in_memory_tables = False
+    support_values_syntax_in_select = True
 
     @classmethod
     def make_context(cls, params=None):

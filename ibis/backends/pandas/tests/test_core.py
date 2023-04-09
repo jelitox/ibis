@@ -3,17 +3,16 @@ from typing import Any
 import pandas as pd
 import pandas.testing as tm
 import pytest
-from multipledispatch.conflict import ambiguities
 
 import ibis
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
+from ibis.backends.base.df.scope import Scope
 from ibis.backends.pandas import Backend
 from ibis.backends.pandas.core import is_computable_input
 from ibis.backends.pandas.dispatch import execute_node, post_execute, pre_execute
 from ibis.backends.pandas.execution import execute
-from ibis.expr.scope import Scope
 
 
 @pytest.fixture
@@ -35,11 +34,6 @@ def core_client(dataframe):
 @pytest.fixture
 def ibis_table(core_client):
     return core_client.table('df')
-
-
-@pytest.mark.parametrize('func', [execute_node, pre_execute, post_execute])
-def test_no_execute_ambiguities(func):
-    assert not ambiguities(func.funcs)
 
 
 def test_from_dataframe(dataframe, ibis_table, core_client):
@@ -99,10 +93,8 @@ def test_missing_data_on_custom_client():
     con = MyBackend()
     t = con.table('t')
     with pytest.raises(
-        NotImplementedError,
-        match=(
-            'Could not find signature for execute_node: ' '<DatabaseTable, MyBackend>'
-        ),
+        com.OperationNotDefinedError,
+        match="Operation 'DatabaseTable' is not implemented for this backend",
     ):
         con.execute(t)
 
@@ -169,15 +161,6 @@ def test_is_computable_input():
     four = three + 1
     result = execute(four.op())
     assert result == 4.0
-
-    del execute_node[ops.Add, int, MyObject]
-
-    execute_node.reorder()
-    execute_node._cache.clear()
-
-    del dt.infer.funcs[(MyObject,)]
-    dt.infer.reorder()
-    dt.infer._cache.clear()
 
 
 def test_scope_look_up():

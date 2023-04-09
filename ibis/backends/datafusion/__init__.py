@@ -14,6 +14,7 @@ import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis.backends.base import BaseBackend
 from ibis.backends.datafusion.compiler import translate
+from ibis.util import gen_name, normalize_filename
 
 try:
     from datafusion import ExecutionContext as SessionContext
@@ -21,17 +22,6 @@ except ImportError:
     from datafusion import SessionContext
 
 import datafusion
-
-
-def _to_pyarrow_table(frame):
-    batches = frame.collect()
-    if batches:
-        return pa.Table.from_batches(batches)
-    else:
-        # TODO(kszucs): file a bug to datafusion because the fields'
-        # nullability from frame.schema() is not always consistent
-        # with the first record batch's schema
-        return pa.Table.from_batches(batches, schema=frame.schema())
 
 
 class Backend(BaseBackend):
@@ -46,7 +36,7 @@ class Backend(BaseBackend):
 
     def do_connect(
         self,
-        config: Mapping[str, str | Path] | SessionContext,
+        config: Mapping[str, str | Path] | SessionContext | None = None,
     ) -> None:
         """Create a Datafusion backend for use with Ibis.
 
@@ -66,18 +56,10 @@ class Backend(BaseBackend):
         else:
             self._context = SessionContext()
 
+        config = config or {}
+
         for name, path in config.items():
-            strpath = str(path)
-            if strpath.endswith('.csv'):
-                self.register_csv(name, path)
-            elif strpath.endswith('.parquet'):
-                self.register_parquet(name, path)
-            else:
-                raise ValueError(
-                    "Currently the DataFusion backend only supports CSV "
-                    "files with the extension .csv and Parquet files with "
-                    "the .parquet extension."
-                )
+            self.register(path, table_name=name)
 
     def current_database(self) -> str:
         raise NotImplementedError()
@@ -97,11 +79,7 @@ class Backend(BaseBackend):
             return list(filter(lambda t: pattern.findall(t), tables))
         return tables
 
-    def table(
-        self,
-        name: str,
-        schema: sch.Schema | None = None,
-    ) -> ir.Table:
+    def table(self, name: str, schema: sch.Schema | None = None) -> ir.Table:
         """Get an ibis expression representing a DataFusion table.
 
         Parameters
@@ -122,40 +100,101 @@ class Backend(BaseBackend):
         schema = sch.schema(table.schema)
         return self.table_class(name, schema, self).to_expr()
 
-    def register_csv(
-        self,
-        name: str,
-        path: str | Path,
-        schema: sch.Schema | None = None,
-    ) -> None:
-        """Register a CSV file with with `name` located at `path`.
+    def register(
+        self, source: str | Path, table_name: str | None = None, **kwargs: Any
+    ) -> ir.Table:
+        """Register a CSV or Parquet file with `table_name` located at `source`.
 
         Parameters
         ----------
-        name
+        source
+            The path to the file
+        table_name
             The name of the table
-        path
-            The path to the CSV file
-        schema
-            An optional schema
+        kwargs
+            Datafusion-specific keyword arguments
         """
-        self._context.register_csv(name, str(path), schema=schema)
+        if isinstance(source, (str, Path)):
+            first = str(source)
+        else:
+            raise ValueError("`source` must be either a string or a pathlib.Path")
 
-    def register_parquet(
-        self,
-        name: str,
-        path: str | Path,
-    ) -> None:
-        """Register a parquet file with with `name` located at `path`.
+        if first.startswith(("parquet://", "parq://")) or first.endswith(
+            ("parq", "parquet")
+        ):
+            return self.read_parquet(source, table_name=table_name, **kwargs)
+        elif first.startswith(("csv://", "txt://")) or first.endswith(
+            ("csv", "tsv", "txt")
+        ):
+            return self.read_csv(source, table_name=table_name, **kwargs)
+        else:
+            self._register_failure()
+            return None
+
+    def _register_failure(self):
+        import inspect
+
+        msg = ", ".join(
+            m[0] for m in inspect.getmembers(self) if m[0].startswith("read_")
+        )
+        raise ValueError(
+            f"Cannot infer appropriate read function for input, "
+            f"please call one of {msg} directly"
+        )
+
+    def read_csv(
+        self, path: str | Path, table_name: str | None = None, **kwargs: Any
+    ) -> ir.Table:
+        """Register a CSV file as a table in the current database.
 
         Parameters
         ----------
-        name
-            The name of the table
         path
-            The path to the Parquet file
+            The data source. A string or Path to the CSV file.
+        table_name
+            An optional name to use for the created table. This defaults to
+            a sequentially generated name.
+        **kwargs
+            Additional keyword arguments passed to Datafusion loading function.
+
+        Returns
+        -------
+        ir.Table
+            The just-registered table
         """
-        self._context.register_parquet(name, str(path))
+        path = normalize_filename(path)
+        table_name = table_name or gen_name("read_csv")
+        # Our other backends support overwriting views / tables when reregistering
+        self._context.deregister_table(table_name)
+        self._context.register_csv(table_name, path, **kwargs)
+        return self.table(table_name)
+
+    def read_parquet(
+        self, path: str | Path, table_name: str | None = None, **kwargs: Any
+    ) -> ir.Table:
+        """Register a parquet file as a table in the current database.
+
+        Parameters
+        ----------
+        path
+            The data source.
+        table_name
+            An optional name to use for the created table. This defaults to
+            a sequentially generated name.
+        **kwargs
+            Additional keyword arguments passed to Datafusion loading function.
+
+        Returns
+        -------
+        ir.Table
+            The just-registered table
+        """
+        path = normalize_filename(path)
+        table_name = table_name or gen_name("read_parquet")
+        # Our other backends support overwriting views / tables when reregistering
+        self._context.deregister_table(table_name)
+        self._context.register_parquet(table_name, path, **kwargs)
+        return self.table(table_name)
 
     def _get_frame(
         self,
@@ -168,14 +207,14 @@ class Backend(BaseBackend):
             return self.compile(expr, params, **kwargs)
         elif isinstance(expr, ir.Column):
             # expression must be named for the projection
-            expr = expr.name('tmp').to_projection()
+            expr = expr.name('tmp').as_table()
             return self.compile(expr, params, **kwargs)
         elif isinstance(expr, ir.Scalar):
             if an.find_immediate_parent_tables(expr.op()):
                 # there are associated datafusion tables so convert the expr
                 # to a selection which we can directly convert to a datafusion
                 # plan
-                expr = expr.name('tmp').to_projection()
+                expr = expr.name('tmp').as_table()
                 frame = self.compile(expr, params, **kwargs)
             else:
                 # doesn't have any tables associated so create a plan from a
@@ -194,10 +233,10 @@ class Backend(BaseBackend):
         limit: int | str | None = None,
         chunk_size: int = 1_000_000,
         **kwargs: Any,
-    ) -> pa.RecordBatchReader:
+    ) -> pa.ipc.RecordBatchReader:
         pa = self._import_pyarrow()
         frame = self._get_frame(expr, params, limit, **kwargs)
-        return pa.RecordBatchReader.from_batches(frame.schema(), frame.collect())
+        return pa.ipc.RecordBatchReader.from_batches(frame.schema(), frame.collect())
 
     def execute(
         self,
@@ -239,3 +278,15 @@ class Backend(BaseBackend):
         return operation in op_classes or any(
             issubclass(operation, op_impl) for op_impl in op_classes
         )
+
+    def create_table(self, *_, **__) -> ir.Table:
+        raise NotImplementedError(self.name)
+
+    def create_view(self, *_, **__) -> ir.Table:
+        raise NotImplementedError(self.name)
+
+    def drop_table(self, *_, **__) -> ir.Table:
+        raise NotImplementedError(self.name)
+
+    def drop_view(self, *_, **__) -> ir.Table:
+        raise NotImplementedError(self.name)

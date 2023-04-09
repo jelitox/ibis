@@ -1,13 +1,15 @@
-from typing import Any, Optional, Union
+from __future__ import annotations
+
+from typing import Any
 
 import pandas as pd
 
 import ibis.expr.analysis as an
 import ibis.expr.operations as ops
 import ibis.util
+from ibis.backends.base.df.scope import Scope
 from ibis.backends.pandas.core import execute
 from ibis.backends.pandas.execution import constants
-from ibis.expr.scope import Scope
 
 
 def get_grouping(grouper):
@@ -83,8 +85,8 @@ def compute_sorted_frame(df, order_by, group_by=(), timecontext=None, **kwargs):
 
 
 def coerce_to_output(
-    result: Any, node: ops.Node, index: Optional[pd.Index] = None
-) -> Union[pd.Series, pd.DataFrame]:
+    result: Any, node: ops.Node, index: pd.Index | None = None
+) -> pd.Series | pd.DataFrame:
     """Cast the result to either a Series or DataFrame.
 
     This method casts result of an execution to a Series or DataFrame,
@@ -108,18 +110,18 @@ def coerce_to_output(
     --------
     For dataframe outputs, see ``ibis.util.coerce_to_dataframe``.
 
-    >>> coerce_to_output(pd.Series(1), node)
+    >>> coerce_to_output(pd.Series(1), node)  # doctest: +SKIP
     0    1
     Name: result, dtype: int64
-    >>> coerce_to_output(1, node)
+    >>> coerce_to_output(1, node)  # doctest: +SKIP
     0    1
     Name: result, dtype: int64
-    >>> coerce_to_output(1, node, [1,2,3])
+    >>> coerce_to_output(1, node, [1,2,3])  # doctest: +SKIP
     1    1
     2    1
     3    1
     Name: result, dtype: int64
-    >>> coerce_to_output([1,2,3], node)
+    >>> coerce_to_output([1,2,3], node)  # doctest: +SKIP
     0    [1, 2, 3]
     Name: result, dtype: object
     """

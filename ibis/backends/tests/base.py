@@ -1,7 +1,11 @@
+from __future__ import annotations
+
 import abc
+import concurrent.futures
 import inspect
+import subprocess
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Mapping, NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -70,10 +74,15 @@ class BackendTest(abc.ABC):
     returned_timestamp_unit = 'us'
     supported_to_timestamp_units = {'s', 'ms', 'us'}
     supports_floating_modulus = True
-    bool_is_int = False
+    native_bool = True
     supports_structs = True
     supports_json = True
+    supports_map = False  # basically nothing does except trino and snowflake
     reduction_tolerance = 1e-7
+
+    @staticmethod
+    def format_table(name: str) -> str:
+        return name
 
     def __init__(self, data_directory: Path) -> None:
         self.connection = self.connect(data_directory)
@@ -93,17 +102,17 @@ class BackendTest(abc.ABC):
         """Return a connection with data loaded from `data_directory`."""
 
     @staticmethod
-    def _load_data(data_directory: Path, script_directory: Path, **kwargs: Any) -> None:
-        ...
+    def _load_data(  # noqa: B027
+        data_directory: Path, script_directory: Path, **kwargs: Any
+    ) -> None:
+        """Load test data into a backend.
+
+        Default implementation is a no-op.
+        """
 
     @classmethod
     def load_data(
-        cls,
-        data_dir: Path,
-        script_dir: Path,
-        tmpdir: Path,
-        worker_id: str,
-        **kwargs: Any,
+        cls, data_dir: Path, script_dir: Path, tmpdir: Path, worker_id: str, **kw: Any
     ) -> None:
         """Load testdata from `data_directory` into the backend using scripts
         in `script_directory`."""
@@ -117,9 +126,14 @@ class BackendTest(abc.ABC):
         fn = root_tmp_dir / f"lockfile_{cls.name()}"
         with FileLock(f"{fn}.lock"):
             if not fn.exists():
-                cls._load_data(data_dir, script_dir, **kwargs)
+                cls.preload(data_dir)
+                cls._load_data(data_dir, script_dir, **kw)
                 fn.touch()
         return cls(data_dir)
+
+    @classmethod
+    def preload(cls, data_dir: Path):  # noqa: B027
+        """Code to execute before loading data."""
 
     @classmethod
     def assert_series_equal(
@@ -141,18 +155,10 @@ class BackendTest(abc.ABC):
     def default_series_rename(series: pd.Series, name: str = 'tmp') -> pd.Series:
         return series.rename(name)
 
-    @staticmethod
-    def greatest(f: Callable[..., ir.Value], *args: ir.Value) -> ir.Value:
-        return f(*args)
-
-    @staticmethod
-    def least(f: Callable[..., ir.Value], *args: ir.Value) -> ir.Value:
-        return f(*args)
-
     @property
     def functional_alltypes(self) -> ir.Table:
         t = self.connection.table('functional_alltypes')
-        if self.bool_is_int:
+        if not self.native_bool:
             return t.mutate(bool_col=t.bool_col == 1)
         return t
 
@@ -165,20 +171,31 @@ class BackendTest(abc.ABC):
         return self.connection.table('awards_players')
 
     @property
-    def geo(self) -> Optional[ir.Table]:
+    def diamonds(self) -> ir.Table:
+        return self.connection.table('diamonds')
+
+    @property
+    def geo(self) -> ir.Table | None:
         if 'geo' in self.connection.list_tables():
             return self.connection.table('geo')
         return None
 
     @property
-    def struct(self) -> Optional[ir.Table]:
+    def struct(self) -> ir.Table | None:
         if self.supports_structs:
             return self.connection.table("struct")
         else:
             pytest.xfail(f"{self.name()} backend does not support struct types")
 
     @property
-    def json_t(self) -> Optional[ir.Table]:
+    def array_types(self) -> ir.Table | None:
+        if self.supports_arrays:
+            return self.connection.table("array_types")
+        else:
+            pytest.xfail(f"{self.name()} backend does not support array types")
+
+    @property
+    def json_t(self) -> ir.Table | None:
         from ibis import _
 
         if self.supports_json:
@@ -187,8 +204,53 @@ class BackendTest(abc.ABC):
             pytest.xfail(f"{self.name()} backend does not support json types")
 
     @property
+    def map(self) -> ir.Table | None:
+        if self.supports_map:
+            return self.connection.table("map")
+        else:
+            pytest.xfail(f"{self.name()} backend does not support map types")
+
+    @property
+    def win(self) -> ir.Table | None:
+        return self.connection.table("win")
+
+    @property
     def api(self):
         return self.connection
 
-    def make_context(self, params: Optional[Mapping[ir.Value, Any]] = None):
+    def make_context(self, params: Mapping[ir.Value, Any] | None = None):
         return self.api.compiler.make_context(params=params)
+
+
+class ServiceSpec(NamedTuple):
+    name: str
+    data_volume: str
+    files: list[Path]
+
+
+class ServiceBackendTest(BackendTest):
+    @classmethod
+    @abc.abstractmethod
+    def service_spec(data_dir: Path) -> ServiceSpec:
+        ...
+
+    @classmethod
+    def preload(cls, data_dir: Path):
+        spec = cls.service_spec(data_dir)
+        service = spec.name
+        data_volume = spec.data_volume
+        with concurrent.futures.ThreadPoolExecutor() as e:
+            for fut in concurrent.futures.as_completed(
+                e.submit(
+                    subprocess.check_call,
+                    [
+                        "docker",
+                        "compose",
+                        "cp",
+                        str(path),
+                        f"{service}:{data_volume}/{path.name}",
+                    ],
+                )
+                for path in spec.files
+            ):
+                fut.result()

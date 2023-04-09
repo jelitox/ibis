@@ -3,70 +3,94 @@ ci:
   autofix_prs: false
   autoupdate_commit_msg: "chore(deps): pre-commit.ci autoupdate"
   skip:
-    - prettier
-    - shellcheck
-    - shfmt
+    - actionlint
+    - deadnix
     - just
     - nixpkgs-fmt
-    - nix-linter
-    - poetry-check
+    - prettier
+    - ruff
+    - shellcheck
+    - shfmt
+    - statix
+    - taplo
 default_stages:
   - commit
 repos:
-  - repo: https://github.com/python-poetry/poetry
-    rev: 1.2.2
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.6.23
     hooks:
-      - id: poetry-check
-  - repo: https://github.com/pycqa/isort
-    rev: 5.10.1
-    hooks:
-      - id: isort
+      - id: actionlint
   - repo: https://github.com/psf/black
-    rev: 22.10.0
+    rev: 23.3.0
     hooks:
       - id: black
-        exclude: _py310\.py$
-  - repo: https://github.com/pycqa/flake8
-    rev: 5.0.4
+  - repo: local
     hooks:
-      - id: flake8
-        exclude: _py310\.py$
-  - repo: https://github.com/pycqa/docformatter
-    rev: v1.5.0
-    hooks:
-      - id: docformatter
-  - repo: https://github.com/MarcoGorelli/absolufy-imports
-    rev: v0.3.1
-    hooks:
-      - id: absolufy-imports
-  - repo: https://github.com/asottile/pyupgrade
-    rev: v3.1.0
-    hooks:
-      - id: pyupgrade
-        entry: pyupgrade --py38-plus --keep-runtime-typing
-        types:
+      - id: ruff
+        name: ruff
+        description: "Run 'ruff' for extremely fast Python linting"
+        entry: ruff
+        language: system
+        types_or:
           - python
+          - pyi
+        args: ["check", "--force-exclude", "--show-source", "--fix"]
+        require_serial: true
+        minimum_pre_commit_version: "2.9.2"
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.30.0
+    hooks:
+      - id: yamllint
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.4.0
+    hooks:
+      - id: check-added-large-files
+      - id: check-case-conflict
+      - id: check-executables-have-shebangs
+      - id: check-merge-conflict
+      - id: check-shebang-scripts-are-executable
+      - id: check-vcs-permalinks
+      - id: destroyed-symlinks
+      - id: detect-aws-credentials
+        args: ["--allow-missing-credentials"]
+      - id: detect-private-key
+      - id: end-of-file-fixer
+        exclude: .+/snapshots/.+
+      - id: fix-byte-order-marker
+      - id: mixed-line-ending
+      - id: trailing-whitespace
+        args: ["--markdown-linebreak-ext=md"]
+        exclude: .+/snapshots/.+
+  - repo: meta
+    hooks:
+      - id: check-hooks-apply
+      - id: check-useless-excludes
   - repo: local
     hooks:
       - id: prettier
         name: prettier
         language: system
-        entry: prettier --write
+        entry: prettier
+        args: ["--write"]
         types_or:
+          - javascript
           - json
-          - toml
-          - yaml
           - markdown
+          - yaml
+      - id: taplo
+        name: taplo
+        language: system
+        entry: taplo
+        args: ["fmt"]
+        types:
+          - toml
       - id: shellcheck
         name: shellcheck
         language: system
         entry: shellcheck
-        files: \.sh$
-        types:
-          - shell
         types_or:
-          - file
           - sh
+          - shell
           - ash
           - bash
           - bats
@@ -75,37 +99,41 @@ repos:
       - id: shfmt
         name: shfmt
         language: system
-        entry: shfmt -i 2 -sr -s
-        files: \.sh$
-        types:
-          - file
+        entry: shfmt
+        args: ["-i", "2", "-sr", "-s"]
         types_or:
-          - file
+          - sh
+          - shell
+          - ash
+          - bash
+          - bats
+          - dash
+          - ksh
       - id: just
         name: just
         language: system
-        entry: just --fmt --unstable --check
+        entry: just
+        args: ["--fmt", "--unstable"]
         files: ^justfile$
         pass_filenames: false
-        types:
-          - file
       - id: nixpkgs-fmt
         name: nixpkgs-fmt
         language: system
         entry: nixpkgs-fmt
-        exclude: nix/sources\.nix
-        files: \.nix$
         types:
-          - file
-        types_or:
-          - file
-      - id: nix-linter
-        name: nix-linter
+          - nix
+      - id: statix
+        name: statix
         language: system
-        entry: nix-linter --check="no-FreeLetInFunc"
-        exclude: nix/sources\.nix
-        files: \.nix$
+        entry: statix
+        args: ["fix"]
+        pass_filenames: false
         types:
-          - file
-        types_or:
-          - file
+          - nix
+      - id: deadnix
+        name: deadnix
+        language: system
+        entry: deadnix
+        args: ["--edit", "--fail"]
+        types:
+          - nix

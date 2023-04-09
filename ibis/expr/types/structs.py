@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import collections
-import itertools
+from keyword import iskeyword
 from typing import TYPE_CHECKING, Iterable, Mapping, Sequence
 
 from public import public
 
 import ibis.expr.operations as ops
-from ibis import util
 from ibis.expr.types.generic import Column, Scalar, Value, literal
 from ibis.expr.types.typing import V
 
@@ -48,19 +47,26 @@ def struct(
     """
     import ibis.expr.operations as ops
 
-    items = dict(value)
-    values = items.values()
-    if any(isinstance(value, Value) for value in values):
-        return ops.StructColumn(
-            names=tuple(items.keys()), values=tuple(values)
-        ).to_expr()
-    return literal(collections.OrderedDict(items), type=type)
+    fields = dict(value)
+    if any(isinstance(value, Value) for value in fields.values()):
+        names = tuple(fields.keys())
+        values = tuple(fields.values())
+        return ops.StructColumn(names=names, values=values).to_expr()
+    else:
+        return literal(collections.OrderedDict(fields), type=type)
 
 
 @public
 class StructValue(Value):
     def __dir__(self):
-        return sorted(frozenset(itertools.chain(dir(type(self)), self.type().names)))
+        out = set(dir(type(self)))
+        out.update(
+            c for c in self.type().names if c.isidentifier() and not iskeyword(c)
+        )
+        return sorted(out)
+
+    def _ipython_key_completions_(self) -> list[str]:
+        return sorted(self.type().names)
 
     def __getitem__(self, name: str) -> ir.Value:
         """Extract the `name` field from this struct.
@@ -80,8 +86,8 @@ class StructValue(Value):
         >>> import ibis
         >>> s = ibis.struct(dict(fruit="pear", weight=0))
         >>> s['fruit']
-        fruit: StructField(frozendict({'fruit': 'pear', 'weight': 0}), field='fruit')
-        """  # noqa: E501
+        fruit: StructField(...)
+        """
         return ops.StructField(self, name).to_expr()
 
     def __setstate__(self, instance_dictionary):
@@ -106,7 +112,7 @@ class StructValue(Value):
     @property
     def fields(self) -> Mapping[str, dt.DataType]:
         """Return a mapping from field name to field type of the struct."""
-        return util.frozendict(self.type().pairs)
+        return self.type().fields
 
     def lift(self) -> ir.Table:
         """Project the fields of `self` into a table.
@@ -115,8 +121,6 @@ class StructValue(Value):
         structs or arrays of structs. `lift` can be chained to avoid repeating
         column names and table references.
 
-        See also [`Table.unpack`][ibis.expr.types.relations.Table.unpack].
-
         Returns
         -------
         Table
@@ -124,21 +128,40 @@ class StructValue(Value):
 
         Examples
         --------
-        >>> schema = dict(a="struct<b: float, c: string>", d="string")
-        >>> t = ibis.table(schema, name="t")
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> lines = '''
+        ...     {"pos": {"lat": 10.1, "lon": 30.3}}
+        ...     {"pos": {"lat": 10.2, "lon": 30.2}}
+        ...     {"pos": {"lat": 10.3, "lon": 30.1}}
+        ... '''
+        >>> with open("/tmp/lines.json", "w") as f:
+        ...     _ = f.write(lines)
+        >>> t = ibis.read_json("/tmp/lines.json")
         >>> t
-        UnboundTable: t
-          a struct<b: float64, c: string>
-          d string
-        >>> t.a.lift()
-        r0 := UnboundTable: t
-          a struct<b: float64, c: string>
-          d string
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ pos                                ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ struct<lat: float64, lon: float64> │
+        ├────────────────────────────────────┤
+        │ {'lat': 10.1, 'lon': 30.3}         │
+        │ {'lat': 10.2, 'lon': 30.2}         │
+        │ {'lat': 10.3, 'lon': 30.1}         │
+        └────────────────────────────────────┘
+        >>> t.pos.lift()
+        ┏━━━━━━━━━┳━━━━━━━━━┓
+        ┃ lat     ┃ lon     ┃
+        ┡━━━━━━━━━╇━━━━━━━━━┩
+        │ float64 │ float64 │
+        ├─────────┼─────────┤
+        │    10.1 │    30.3 │
+        │    10.2 │    30.2 │
+        │    10.3 │    30.1 │
+        └─────────┴─────────┘
 
-        Selection[r0]
-          selections:
-            b: StructField(r0.a, field='b')
-            c: StructField(r0.a, field='c')
+        See Also
+        --------
+        [`Table.unpack`][ibis.expr.types.relations.Table.unpack].
         """
         import ibis.expr.analysis as an
 

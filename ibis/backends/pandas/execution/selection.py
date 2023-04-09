@@ -1,9 +1,11 @@
 """Dispatching code for Selection operations."""
 
+from __future__ import annotations
+
 import functools
 import operator
 from collections import defaultdict
-from typing import List, Optional
+from typing import Any, Iterable
 
 import pandas as pd
 from toolz import concatv, first
@@ -11,41 +13,26 @@ from toolz import concatv, first
 import ibis.expr.analysis as an
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
+from ibis.backends.base.df.scope import Scope
+from ibis.backends.base.df.timecontext import TimeContext
 from ibis.backends.pandas.core import execute
 from ibis.backends.pandas.dispatch import execute_node
 from ibis.backends.pandas.execution import constants, util
 from ibis.backends.pandas.execution.util import coerce_to_output
-from ibis.expr.rules import Shape
-from ibis.expr.scope import Scope
-from ibis.expr.typing import TimeContext
 
 
 def compute_projection(
-    node,
-    parent,
-    data,
-    scope: Scope = None,
-    timecontext: Optional[TimeContext] = None,
-    **kwargs,
+    node: ops.Node,
+    parent: ops.Selection,
+    data: pd.DataFrame,
+    scope: Scope | None = None,
+    timecontext: TimeContext | None = None,
+    **kwargs: Any,
 ):
     """Compute a projection.
 
-    Parameters
-    ----------
-    node : Union[ops.Scalar, ops.Column, ops.TableNode]
-    parent : ops.Selection
-    data : pd.DataFrame
-    scope : Scope
-    timecontext:Optional[TimeContext]
-
-    Returns
-    -------
-    value : scalar, pd.Series, pd.DataFrame
-
-    Notes
-    -----
-    :class:`~ibis.expr.types.Scalar` instances occur when a specific column
-    projection is a window operation.
+    `ibis.expr.types.Scalar` instances occur when a specific column projection
+    is a window operation.
     """
     if isinstance(node, ops.TableNode):
         if node == parent.table:
@@ -64,7 +51,7 @@ def compute_projection(
         name = node.name
         assert name is not None, 'Value selection name is None'
 
-        if node.output_shape is Shape.SCALAR:
+        if node.output_shape.is_scalar():
             data_columns = frozenset(data.columns)
 
             if scope is None:
@@ -123,8 +110,7 @@ def compute_projection(
 
 
 def remap_overlapping_column_names(table, root_table, data_columns):
-    """Return a mapping of possibly-suffixed column names to column names
-    without suffixes.
+    """Return a mapping of suffixed column names to column names without suffixes.
 
     Parameters
     ----------
@@ -179,33 +165,17 @@ def map_new_column_names_to_data(mapping, df):
 
 
 def _compute_predicates(
-    table_op,
-    predicates,
-    data,
+    table_op: ops.TableNode,
+    predicates: Iterable[ir.BooleanColumn],
+    data: pd.DataFrame,
     scope: Scope,
-    timecontext: Optional[TimeContext],
-    **kwargs,
-):
+    timecontext: TimeContext | None,
+    **kwargs: Any,
+) -> pd.Series:
     """Compute the predicates for a table operation.
 
-    Parameters
-    ----------
-    table_op : TableNode
-    predicates : List[ir.Column]
-    data : pd.DataFrame
-    scope : Scope
-    timecontext: Optional[TimeContext]
-    kwargs : dict
-
-    Returns
-    -------
-    computed_predicate : pd.Series[bool]
-
-    Notes
-    -----
-    This handles the cases where the predicates are computed columns, in
-    addition to the simple case of named columns coming directly from the input
-    table.
+    This handles the cases where `predicates` are computed columns, in addition
+    to the simple case of named columns coming directly from the input table.
     """
     for predicate in predicates:
         # Map each root table of the predicate to the data so that we compute
@@ -230,7 +200,7 @@ def _compute_predicates(
 
 
 def build_df_from_selection(
-    selections: List[ops.Value],
+    selections: list[ops.Value],
     data: pd.DataFrame,
     table: ops.Node,
 ) -> pd.DataFrame:
@@ -271,7 +241,7 @@ def build_df_from_selection(
 
 
 def build_df_from_projection(
-    selection_exprs: List[ir.Expr],
+    selection_exprs: list[ir.Expr],
     op: ops.Selection,
     data: pd.DataFrame,
     **kwargs,
@@ -289,10 +259,13 @@ def build_df_from_projection(
     # Result series might be trimmed by time context, thus index may
     # have changed. To concat rows properly, we first `sort_index` on
     # each pieces then assign data index manually to series
+    #
+    # If cardinality changes (e.g. unnest/explode), trying to do this
+    # won't work so don't try?
     for i in range(len(new_pieces)):
-        assert len(new_pieces[i].index) == len(data.index)
         new_pieces[i] = new_pieces[i].sort_index()
-        new_pieces[i].index = data.index
+        if len(new_pieces[i].index) == len(data.index):
+            new_pieces[i].index = data.index
 
     return pd.concat(new_pieces, axis=1)
 
@@ -302,7 +275,7 @@ def execute_selection_dataframe(
     op,
     data,
     scope: Scope,
-    timecontext: Optional[TimeContext],
+    timecontext: TimeContext | None,
     **kwargs,
 ):
     result = data

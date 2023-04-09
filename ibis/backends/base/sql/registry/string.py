@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import ibis.expr.operations as ops
 from ibis.backends.base.sql.registry import helpers
 
@@ -36,20 +38,21 @@ def string_find(translator, op):
             return 'locate({}, {}, {}) - 1'.format(
                 substr_formatted, arg_formatted, sval + 1
             )
+        else:
+            raise ValueError(f"invalid `start` value: {sval}")
     else:
         return f'locate({substr_formatted}, {arg_formatted}) - 1'
 
 
 def find_in_set(translator, op):
-    arg, str_list = op.args
-    arg_formatted = translator.translate(arg)
-    str_formatted = ','.join([x.value for x in str_list.values])
+    arg_formatted = translator.translate(op.needle)
+    str_formatted = ','.join([x.value for x in op.values])
     return f"find_in_set({arg_formatted}, '{str_formatted}') - 1"
 
 
 def string_join(translator, op):
     arg, strings = op.args
-    return helpers.format_call(translator, 'concat_ws', arg, *strings.values)
+    return helpers.format_call(translator, 'concat_ws', arg, *strings)
 
 
 def string_like(translator, op):
@@ -58,15 +61,32 @@ def string_like(translator, op):
     return f'{arg} LIKE {pattern}'
 
 
-def parse_url(translator, op):
-    arg, extract, key = op.args
-    arg_formatted = translator.translate(arg)
+def string_ilike(translator, op):
+    arg = translator.translate(op.arg)
+    pattern = translator.translate(op.pattern)
+    return f'upper({arg}) LIKE upper({pattern})'
 
-    if key is None:
-        return f"parse_url({arg_formatted}, '{extract}')"
+
+def extract_url_field(extract):
+    if extract == 'QUERY':
+
+        def _op(translator, op):
+            arg, key = op.args
+            arg_formatted = translator.translate(arg)
+
+            if key is None:
+                return f"parse_url({arg_formatted}, '{extract}')"
+            else:
+                key_fmt = translator.translate(key)
+                return f"parse_url({arg_formatted}, '{extract}', {key_fmt})"
+
     else:
-        key_fmt = translator.translate(key)
-        return f"parse_url({arg_formatted}, '{extract}', {key_fmt})"
+
+        def _op(translator, op):
+            arg_formatted = translator.translate(op.arg)
+            return f"parse_url({arg_formatted}, '{extract}')"
+
+    return _op
 
 
 def startswith(translator, op):

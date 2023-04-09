@@ -1,26 +1,18 @@
 """The dask client implementation."""
 
+from __future__ import annotations
+
 import dask.dataframe as dd
 import numpy as np
 import pandas as pd
+from dateutil.parser import parse as date_parse
 from pandas.api.types import DatetimeTZDtype
 
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 from ibis.backends.base import Database
-from ibis.backends.pandas.client import (
-    PANDAS_DATE_TYPES,
-    PANDAS_STRING_TYPES,
-    _inferable_pandas_dtypes,
-    ibis_dtype_to_pandas,
-    ibis_schema_to_pandas,
-)
-
-infer_dask_dtype = pd.api.types.infer_dtype
-
-
-_inferable_dask_dtypes = _inferable_pandas_dtypes
+from ibis.backends.pandas.client import ibis_dtype_to_pandas, ibis_schema_to_pandas
 
 
 @sch.schema.register(dd.Series)
@@ -40,16 +32,11 @@ def infer_dask_schema(df, schema=None):
         if column_name in schema:
             ibis_dtype = dt.dtype(schema[column_name])
         elif dask_dtype == np.object_:
-            inferred_dtype = infer_dask_dtype(df[column_name].compute(), skipna=True)
-            if inferred_dtype in {'mixed', 'decimal'}:
-                # TODO: in principal we can handle decimal (added in pandas
-                # 0.23)
-                raise TypeError(
-                    'Unable to infer type of column {0!r}. Try instantiating '
-                    'your table from the client with client.table('
-                    "'my_table', schema={{{0!r}: <explicit type>}})".format(column_name)
-                )
-            ibis_dtype = _inferable_dask_dtypes[inferred_dtype]
+            # TODO: don't call compute here. ibis should just assume that
+            # object dtypes are strings, which is what dask does. The user
+            # can always explicitly pass in `schema=...` when creating a
+            # table if they want to use a different dtype.
+            ibis_dtype = dt.infer(df[column_name].compute()).value_type
         else:
             ibis_dtype = dt.dtype(dask_dtype)
 
@@ -64,15 +51,31 @@ ibis_schema_to_dask = ibis_schema_to_pandas
 
 
 @sch.convert.register(DatetimeTZDtype, dt.Timestamp, dd.Series)
-def convert_datetimetz_to_timestamp(in_dtype, out_dtype, column):
+def convert_datetimetz_to_timestamp(_, out_dtype, column):
     output_timezone = out_dtype.timezone
     if output_timezone is not None:
         return column.dt.tz_convert(output_timezone)
-    return column.astype(out_dtype.to_dask())
+    else:
+        return column.dt.tz_localize(None)
 
 
-DASK_STRING_TYPES = PANDAS_STRING_TYPES
-DASK_DATE_TYPES = PANDAS_DATE_TYPES
+@sch.convert.register(np.dtype, dt.Timestamp, dd.Series)
+def convert_any_to_timestamp(_, out_dtype, column):
+    if isinstance(dtype := out_dtype.to_dask(), DatetimeTZDtype):
+        column = dd.to_datetime(column)
+        timezone = out_dtype.timezone
+        if getattr(column.dtype, "tz", None) is not None:
+            return column.dt.tz_convert(timezone)
+        else:
+            return column.dt.tz_localize(timezone)
+    else:
+        try:
+            return column.astype(dtype)
+        except pd.errors.OutOfBoundsDatetime:
+            try:
+                return column.map(date_parse)
+            except TypeError:
+                return column
 
 
 @sch.convert.register(np.dtype, dt.Interval, dd.Series)

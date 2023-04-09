@@ -18,8 +18,9 @@ class MapValue(Value):
         key: ir.Value,
         default: ir.Value | None = None,
     ) -> ir.Value:
-        """Return the value for `key` from `expr` or the default if `key` is
-        not in the map.
+        """Return the value for `key` from `expr`.
+
+        Return `default` if `key` is not in the map.
 
         Parameters
         ----------
@@ -38,12 +39,12 @@ class MapValue(Value):
         >>> import ibis
         >>> m = ibis.map({"a": 1, "b": 2})
         >>> m.get("a")
-        MapGet(frozendict({'a': 1, 'b': 2}), key='a', default=None)
+        MapGet(...)
         >>> m.get("c", 3)
-        MapGet(frozendict({'a': 1, 'b': 2}), key='c', default=3)
+        MapGet(...)
         >>> m.get("d")
-        MapGet(frozendict({'a': 1, 'b': 2}), key='d', default=None)
-        """  # noqa: E501
+        MapGet(...)
+        """
 
         return ops.MapGet(self, key, default).to_expr()
 
@@ -60,7 +61,7 @@ class MapValue(Value):
         >>> import ibis
         >>> m = ibis.map({"a": 1, "b": 2})
         >>> m.length()
-        MapLength(frozendict({'a': 1, 'b': 2}))
+        MapLength(...)
         """
         return ops.MapLength(self).to_expr()
 
@@ -87,10 +88,10 @@ class MapValue(Value):
         >>> import ibis
         >>> m = ibis.map({"a": 1, "b": 2})
         >>> m["a"]
-        MapValueForKey(frozendict({'a': 1, 'b': 2}), key='a')
+        MapGet(...)
         >>> m["c"]  # note that this does not fail on construction
-        MapValueForKey(frozendict({'a': 1, 'b': 2}), key='c')
-        """  # noqa: E501
+        MapGet(...)
+        """
         return ops.MapGet(self, key).to_expr()
 
     def contains(
@@ -123,7 +124,7 @@ class MapValue(Value):
         >>> import ibis
         >>> m = ibis.map({"a": 1, "b": 2})
         >>> m.keys()
-        MapKeys(frozendict({'a': 1, 'b': 2}))
+        MapKeys(...)
         """
         return ops.MapKeys(self).to_expr()
 
@@ -139,8 +140,8 @@ class MapValue(Value):
         --------
         >>> import ibis
         >>> m = ibis.map({"a": 1, "b": 2})
-        >>> m.keys()
-        MapKeys(frozendict({'a': 1, 'b': 2}))
+        >>> m.values()
+        MapValues(...)
         """
         return ops.MapValues(self).to_expr()
 
@@ -163,8 +164,8 @@ class MapValue(Value):
         >>> m1 = ibis.map({"a": 1, "b": 2})
         >>> m2 = ibis.map({"c": 3, "d": 4})
         >>> m1 + m2
-        MapConcat(left=frozendict({'a': 1, 'b': 2}), right=frozendict({'c': 3, 'd': 4}))
-        """  # noqa: E501
+        MapMerge(...)
+        """
         return ops.MapMerge(self, other).to_expr()
 
     def __radd__(self, other: MapValue) -> MapValue:
@@ -186,31 +187,31 @@ class MapValue(Value):
         >>> m1 = ibis.map({"a": 1, "b": 2})
         >>> m2 = ibis.map({"c": 3, "d": 4})
         >>> m1 + m2
-        MapConcat(left=frozendict({'a': 1, 'b': 2}), right=frozendict({'c': 3, 'd': 4}))
-        """  # noqa: E501
+        MapMerge(...)
+        """
         return ops.MapMerge(self, other).to_expr()
 
 
 @public
 class MapScalar(Scalar, MapValue):
-    pass  # noqa: E701,E302
+    pass
 
 
 @public
 class MapColumn(Column, MapValue):
-    pass  # noqa: E701,E302
+    pass
 
 
 @public
-def map(keys, values) -> MapValue:
-    """Create a map literal from a [`dict`][dict] or other mapping.
+def map(keys, values=None) -> MapValue:
+    """Create a map literal from a [`dict`][dict], other mapping or two sequences.
 
     Parameters
     ----------
     keys
-        Keys of the map
+        Keys of the map or `Mapping`. If `keys` is a `Mapping`, `values` must be `None`.
     values
-        Values of the map
+        Values of the map or `None`. If `None`, the `keys` argument must be a `Mapping`.
 
     Returns
     -------
@@ -221,11 +222,10 @@ def map(keys, values) -> MapValue:
     Examples
     --------
     Create a map literal from a dict with the type inferred
+
     >>> import ibis
     >>> t = ibis.map(dict(a=1, b=2))
-
-    Create a map literal from a dict with the specified type
-    >>> import ibis
-    >>> t = ibis.map(dict(a=1, b=2), type='map<string, double>')
     """
+    if values is None:
+        keys, values = list(keys.keys()), list(keys.values())
     return ops.Map(keys, values).to_expr()

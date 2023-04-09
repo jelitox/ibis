@@ -4,7 +4,6 @@ import collections
 import functools
 from typing import Any, Iterator
 
-import pandas as pd
 from multipledispatch import Dispatcher
 from public import public
 
@@ -52,10 +51,11 @@ def can_cast_subtype(source: dt.DataType, target: dt.DataType, **kwargs) -> bool
     return isinstance(target, source.__class__)
 
 
-@castable.register(dt.Integer, dt.Category)
 @castable.register(dt.Integer, (dt.Floating, dt.Decimal))
 @castable.register(dt.Floating, dt.Decimal)
 @castable.register((dt.Date, dt.Timestamp), (dt.Date, dt.Timestamp))
+@castable.register(dt.String, dt.JSON)
+@castable.register(dt.JSON, dt.String)
 def can_cast_any(source: dt.DataType, target: dt.DataType, **kwargs) -> bool:
     return True
 
@@ -91,7 +91,7 @@ def can_cast_to_differently_signed_integer_type(
 @castable.register(dt.SignedInteger, dt.SignedInteger)
 @castable.register(dt.UnsignedInteger, dt.UnsignedInteger)
 def can_cast_integers(source: dt.Integer, target: dt.Integer, **kwargs) -> bool:
-    return target._nbytes >= source._nbytes
+    return target.nbytes >= source.nbytes
 
 
 @castable.register(dt.Floating, dt.Floating)
@@ -99,7 +99,7 @@ def can_cast_floats(
     source: dt.Floating, target: dt.Floating, upcast: bool = False, **kwargs
 ) -> bool:
     if upcast:
-        return target._nbytes >= source._nbytes
+        return target.nbytes >= source.nbytes
 
     # double -> float must be allowed because
     # float literals are inferred as doubles
@@ -113,8 +113,18 @@ def can_cast_decimals(source: dt.Decimal, target: dt.Decimal, **kwargs) -> bool:
     target_sc = target.scale
     source_sc = source.scale
     return (
-        target_prec is None or (source_prec is not None and target_prec >= source_prec)
-    ) and (target_sc is None or (source_sc is not None and target_sc >= source_sc))
+        # If either sides precision and scale are both `None`, return `True`.
+        target_prec is None
+        and target_sc is None
+        or source_prec is None
+        and source_sc is None
+        # Otherwise, return `True` unless we are downcasting precision or scale.
+        or (
+            target_prec is None
+            or (source_prec is not None and target_prec >= source_prec)
+        )
+        and (target_sc is None or (source_sc is not None and target_sc >= source_sc))
+    )
 
 
 @castable.register(dt.Interval, dt.Interval)
@@ -143,6 +153,8 @@ def can_cast_string_to_temporal(
     value: str | None = None,
     **kwargs,
 ) -> bool:
+    import pandas as pd
+
     if value is None:
         return False
     try:
@@ -162,18 +174,12 @@ def can_cast_map(source, target, **kwargs):
 
 @castable.register(dt.Struct, dt.Struct)
 def can_cast_struct(source, target, **kwargs):
-    source_pairs = source.pairs
-    target_pairs = target.pairs
-    for name in {*source.names, *target.names}:
-        if name in target_pairs:
-            if not castable(source_pairs[name], target_pairs[name]):
-                return False
-    return True
+    return all(castable(source[field], target[field]) for field in target.names)
 
 
 @castable.register(dt.Array, dt.Array)
 @castable.register(dt.Set, dt.Set)
-def can_cast_variadic(
+def can_cast_array_or_set(
     source: dt.Array | dt.Set, target: dt.Array | dt.Set, **kwargs
 ) -> bool:
     return castable(source.value_type, target.value_type)
@@ -184,26 +190,7 @@ def can_cast_json(source, target, **kwargs):
     return True
 
 
-@castable.register(dt.JSONB, dt.JSONB)
-def can_cast_jsonb(source, target, **kwargs):
-    return True
-
-
-# geo spatial data type
-# cast between same type, used to cast from/to geometry and geography
-GEO_TYPES = (
-    dt.Point,
-    dt.LineString,
-    dt.Polygon,
-    dt.MultiLineString,
-    dt.MultiPoint,
-    dt.MultiPolygon,
-)
-
-
-@castable.register(dt.Array, GEO_TYPES)
-@castable.register(GEO_TYPES, dt.Geometry)
-@castable.register(GEO_TYPES, dt.Geography)
+@castable.register(dt.Array, dt.GeoSpatial)
 def can_cast_geospatial(source, target, **kwargs):
     return True
 

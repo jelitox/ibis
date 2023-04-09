@@ -1,3 +1,11 @@
+CREATE OR REPLACE TEMP FILE FORMAT ibis_testing
+    type = 'CSV'
+    field_delimiter = ','
+    skip_header = 1
+    field_optionally_enclosed_by = '"';
+
+CREATE OR REPLACE TEMP STAGE ibis_testing file_format = ibis_testing;
+
 CREATE OR REPLACE TABLE diamonds (
     "carat" FLOAT,
     "cut" TEXT,
@@ -80,6 +88,13 @@ INSERT INTO array_types ("x", "y", "z", "grouper", "scalar_column", "multi_dim")
     SELECT [2, NULL, 3], ['b', NULL, 'c'], NULL, 'b', 5.0, NULL UNION
     SELECT [4, NULL, NULL, 5], ['d', NULL, NULL, 'e'], [4.0, NULL, NULL, 5.0], 'c', 6.0, [[1, 2, 3]];
 
+CREATE OR REPLACE TABLE map ("kv" OBJECT);
+
+INSERT INTO map ("kv")
+    SELECT object_construct('a', 1, 'b', 2, 'c', 3) UNION
+    SELECT object_construct('d', 4, 'e', 5, 'c', 6);
+
+
 CREATE OR REPLACE TABLE struct ("abc" OBJECT);
 
 INSERT INTO struct ("abc")
@@ -100,3 +115,11 @@ INSERT INTO json_t ("js")
     SELECT parse_json('null') UNION
     SELECT parse_json('[42,47,55]') UNION
     SELECT parse_json('[]');
+
+CREATE OR REPLACE TABLE win ("g" TEXT, "x" BIGINT, "y" BIGINT);
+INSERT INTO win VALUES
+    ('a', 0, 3),
+    ('a', 1, 2),
+    ('a', 2, 0),
+    ('a', 3, 1),
+    ('a', 4, 1);

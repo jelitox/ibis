@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import ibis.expr.operations as ops
 from ibis.backends.base.sql.compiler import Compiler, ExprTranslator, TableSetFormatter
 from ibis.backends.base.sql.registry import binary_infix_ops, operation_registry
@@ -16,6 +18,13 @@ class ImpalaTableSetFormatter(TableSetFormatter):
 
 class ImpalaExprTranslator(ExprTranslator):
     _registry = {**operation_registry, **binary_infix_ops}
+    _forbids_frame_clause = (
+        *ExprTranslator._forbids_frame_clause,
+        ops.Lag,
+        ops.Lead,
+        ops.FirstValue,
+        ops.LastValue,
+    )
 
 
 rewrites = ImpalaExprTranslator.rewrites

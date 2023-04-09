@@ -1,23 +1,24 @@
 """The pandas client implementation."""
 
+from __future__ import annotations
+
 import json
-from collections.abc import Mapping, Sequence
+import warnings
+from typing import TYPE_CHECKING
+from uuid import UUID
 
 import numpy as np
 import pandas as pd
 import toolz
+from dateutil.parser import parse as date_parse
 from pandas.api.types import CategoricalDtype, DatetimeTZDtype
 
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-import ibis.expr.rules as rlz
 import ibis.expr.schema as sch
 from ibis import util
 from ibis.backends.base import Database
-from ibis.common.grounds import Immutable
-
-infer_pandas_dtype = pd.api.types.infer_dtype
-
+from ibis.expr.operations.relations import TableProxy
 
 _ibis_dtypes = toolz.valmap(
     np.dtype,
@@ -38,6 +39,7 @@ _ibis_dtypes = toolz.valmap(
         dt.UInt16: np.uint16,
         dt.UInt32: np.uint32,
         dt.UInt64: np.uint64,
+        dt.Float16: np.float16,
         dt.Float32: np.float32,
         dt.Float64: np.float64,
         dt.Decimal: np.object_,
@@ -45,63 +47,8 @@ _ibis_dtypes = toolz.valmap(
     },
 )
 
-
-_numpy_dtypes = toolz.keymap(
-    np.dtype,
-    {
-        'bool': dt.boolean,
-        'int8': dt.int8,
-        'int16': dt.int16,
-        'int32': dt.int32,
-        'int64': dt.int64,
-        'uint8': dt.uint8,
-        'uint16': dt.uint16,
-        'uint32': dt.uint32,
-        'uint64': dt.uint64,
-        'float16': dt.float16,
-        'float32': dt.float32,
-        'float64': dt.float64,
-        'double': dt.double,
-        'unicode': dt.string,
-        'str': dt.string,
-        'datetime64': dt.timestamp,
-        'datetime64[ns]': dt.timestamp,
-        'timedelta64': dt.interval,
-        'timedelta64[ns]': dt.Interval('ns'),
-    },
-)
-
-
-_inferable_pandas_dtypes = {
-    'string': dt.string,
-    'bytes': dt.string,
-    'floating': dt.float64,
-    'integer': dt.int64,
-    'mixed-integer': dt.binary,
-    'mixed-integer-float': dt.float64,
-    'decimal': dt.float64,
-    'complex': dt.binary,
-    'categorical': dt.category,
-    'boolean': dt.boolean,
-    'datetime64': dt.timestamp,
-    'datetime': dt.timestamp,
-    'date': dt.date,
-    'timedelta64': dt.interval,
-    'timedelta': dt.interval,
-    'time': dt.time,
-    'period': dt.binary,
-    'mixed': dt.binary,
-    'empty': dt.binary,
-    'unicode': dt.string,
-}
-
-
-@dt.dtype.register(np.dtype)
-def from_numpy_dtype(value):
-    try:
-        return _numpy_dtypes[value]
-    except KeyError:
-        raise TypeError(f'numpy dtype {value!r} is not supported in the pandas backend')
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 
 @dt.dtype.register(DatetimeTZDtype)
@@ -111,91 +58,28 @@ def from_pandas_tzdtype(value):
 
 @dt.dtype.register(CategoricalDtype)
 def from_pandas_categorical(_):
-    return dt.Category()
-
-
-@dt.dtype.register(pd.core.arrays.string_.StringDtype)
-def from_pandas_string(_):
     return dt.String()
 
 
-@dt.infer.register(np.generic)
-def infer_numpy_scalar(value):
-    return dt.dtype(value.dtype)
+@dt.dtype.register(pd.core.dtypes.base.ExtensionDtype)
+def from_pandas_extension_dtype(t):
+    return getattr(dt, t.__class__.__name__.replace("Dtype", "").lower())
 
 
-def _infer_pandas_series_contents(s: pd.Series) -> dt.DataType:
-    """Infer the type of the **contents** of a pd.Series.
+try:
+    _arrow_dtype_class = pd.ArrowDtype
+except AttributeError:
+    warnings.warn(
+        f"The `ArrowDtype` class is not available in pandas {pd.__version__}. "
+        "Install pandas >= 1.5.0 for interop with pandas and arrow dtype support"
+    )
+else:
 
-    No dispatch for this because there is no class representing "the contents
-    of a Series". Instead, this is meant to be used internally, mainly by
-    `infer_pandas_series`.
+    @dt.dtype.register(_arrow_dtype_class)
+    def from_pandas_arrow_extension_dtype(t):
+        import ibis.backends.pyarrow.datatypes as _  # noqa: F401
 
-    Parameters
-    ----------
-    s : pd.Series
-        The Series whose contents we want to know the type of
-
-    Returns
-    -------
-    dtype : dt.DataType
-        The dtype of the contents of the Series
-    """
-    if s.dtype == np.object_:
-        inferred_dtype = infer_pandas_dtype(s, skipna=True)
-        if inferred_dtype == 'mixed':
-            # We need to inspect an element to determine the Ibis dtype
-            value = s.iloc[0]
-            if isinstance(value, (np.ndarray, pd.Series, Sequence, Mapping)):
-                # Defer to individual `infer` functions for these
-                return dt.infer(value)
-            else:
-                return dt.dtype('binary')
-        else:
-            return _inferable_pandas_dtypes[inferred_dtype]
-    else:
-        return dt.dtype(s.dtype)
-
-
-@dt.infer.register(pd.Series)
-def infer_pandas_series(s):
-    """Infer the type of a pd.Series.
-
-    Note that the returned datatype will be an array type, which
-    corresponds to the fact that a Series is a collection of elements.
-    Please use `_infer_pandas_series_contents` if you are interested in
-    the datatype of the **contents** of the Series.
-    """
-    return dt.Array(_infer_pandas_series_contents(s))
-
-
-@dt.infer.register(pd.Timestamp)
-def infer_pandas_timestamp(value):
-    if value.tz is not None:
-        return dt.Timestamp(timezone=str(value.tz))
-    else:
-        return dt.timestamp
-
-
-@dt.infer.register(np.ndarray)
-def infer_array(value):
-    # In this function, by default we'll directly map the dtype of the
-    # np.array to a corresponding Ibis dtype (see bottom)
-    np_dtype = value.dtype
-
-    # However, there are some special cases where we can't use the np.array's
-    # dtype:
-    if np_dtype.type == np.object_:
-        # np.array dtype is `dtype('O')`, which is ambiguous.
-        inferred_dtype = infer_pandas_dtype(value, skipna=True)
-        return dt.Array(_inferable_pandas_dtypes[inferred_dtype])
-    elif np_dtype.type == np.str_:
-        # np.array dtype is `dtype('<U1')` (for np.arrays containing strings),
-        # which is ambiguous.
-        return dt.Array(dt.string)
-
-    # The dtype of the np.array is not ambiguous, and can be used directly.
-    return dt.Array(dt.dtype(np_dtype))
+        return dt.dtype(t.pyarrow_dtype)
 
 
 @sch.schema.register(pd.Series)
@@ -204,7 +88,7 @@ def schema_from_series(s):
 
 
 @sch.infer.register(pd.DataFrame)
-def infer_pandas_schema(df, schema=None):
+def infer_pandas_schema(df: pd.DataFrame, schema=None):
     schema = schema if schema is not None else {}
 
     pairs = []
@@ -215,27 +99,23 @@ def infer_pandas_schema(df, schema=None):
         if column_name in schema:
             ibis_dtype = dt.dtype(schema[column_name])
         else:
-            ibis_dtype = _infer_pandas_series_contents(df[column_name])
+            ibis_dtype = dt.infer(df[column_name]).value_type
 
         pairs.append((column_name, ibis_dtype))
 
     return sch.schema(pairs)
 
 
-def ibis_dtype_to_pandas(ibis_dtype):
+def ibis_dtype_to_pandas(ibis_dtype: dt.DataType):
     """Convert ibis dtype to the pandas / numpy alternative."""
     assert isinstance(ibis_dtype, dt.DataType)
 
-    if isinstance(ibis_dtype, dt.Timestamp) and ibis_dtype.timezone:
+    if ibis_dtype.is_timestamp() and ibis_dtype.timezone:
         return DatetimeTZDtype('ns', ibis_dtype.timezone)
-    elif isinstance(ibis_dtype, dt.Interval):
+    elif ibis_dtype.is_interval():
         return np.dtype(f'timedelta64[{ibis_dtype.unit}]')
-    elif isinstance(ibis_dtype, dt.Category):
-        return CategoricalDtype()
-    elif type(ibis_dtype) in _ibis_dtypes:
-        return _ibis_dtypes[type(ibis_dtype)]
     else:
-        return np.dtype(np.object_)
+        return _ibis_dtypes.get(type(ibis_dtype), np.dtype(np.object_))
 
 
 def ibis_schema_to_pandas(schema):
@@ -243,15 +123,12 @@ def ibis_schema_to_pandas(schema):
 
 
 @sch.convert.register(DatetimeTZDtype, dt.Timestamp, pd.Series)
-def convert_datetimetz_to_timestamp(in_dtype, out_dtype, column):
+def convert_datetimetz_to_timestamp(_, out_dtype, column):
     output_timezone = out_dtype.timezone
     if output_timezone is not None:
         return column.dt.tz_convert(output_timezone)
-    return column.astype(out_dtype.to_pandas(), errors='ignore')
-
-
-PANDAS_STRING_TYPES = {'string', 'unicode', 'bytes'}
-PANDAS_DATE_TYPES = {'datetime', 'datetime64', 'date'}
+    else:
+        return column.dt.tz_localize(None)
 
 
 @sch.convert.register(np.dtype, dt.Interval, pd.Series)
@@ -265,21 +142,54 @@ def convert_any_to_string(_, out_dtype, column):
     return result
 
 
+@sch.convert.register(np.dtype, dt.UUID, pd.Series)
+def convert_any_to_uuid(_, out_dtype, column):
+    return column.map(lambda v: v if isinstance(v, UUID) else UUID(v))
+
+
 @sch.convert.register(np.dtype, dt.Boolean, pd.Series)
 def convert_boolean_to_series(in_dtype, out_dtype, column):
     # XXX: this is a workaround until #1595 can be addressed
     in_dtype_type = in_dtype.type
     out_dtype_type = out_dtype.to_pandas().type
-    if column.empty or (
-        in_dtype_type != np.object_ and in_dtype_type != out_dtype_type
-    ):
+    if column.empty:
         return column.astype(out_dtype_type)
+    elif in_dtype_type != np.object_ and in_dtype_type != out_dtype_type:
+        return column.map(lambda value: pd.NA if pd.isna(value) else bool(value))
     return column
+
+
+@sch.convert.register(DatetimeTZDtype, dt.Date, pd.Series)
+def convert_timestamp_to_date(in_dtype, out_dtype, column):
+    if in_dtype.tz is not None:
+        column = column.dt.tz_convert("UTC").dt.tz_localize(None)
+    return column.astype(out_dtype.to_pandas(), errors='ignore').dt.normalize()
 
 
 @sch.convert.register(object, dt.DataType, pd.Series)
 def convert_any_to_any(_, out_dtype, column):
-    return column.astype(out_dtype.to_pandas(), errors='ignore')
+    try:
+        return column.astype(out_dtype.to_pandas())
+    except Exception:  # noqa: BLE001
+        return column
+
+
+@sch.convert.register(np.dtype, dt.Timestamp, pd.Series)
+def convert_any_to_timestamp(_, out_dtype, column):
+    try:
+        return column.astype(out_dtype.to_pandas())
+    except pd.errors.OutOfBoundsDatetime:
+        try:
+            return column.map(date_parse)
+        except TypeError:
+            return column
+    except TypeError:
+        column = pd.to_datetime(column)
+        timezone = out_dtype.timezone
+        try:
+            return column.dt.tz_convert(timezone)
+        except TypeError:
+            return column.dt.tz_localize(timezone)
 
 
 @sch.convert.register(object, dt.Struct, pd.Series)
@@ -294,7 +204,7 @@ def convert_struct_to_dict(_, out_dtype, column):
 
 @sch.convert.register(np.dtype, dt.Array, pd.Series)
 def convert_array_to_series(in_dtype, out_dtype, column):
-    return column.map(lambda x: x if x is None else list(x))
+    return column.map(lambda x: list(x) if util.is_iterable(x) else x)
 
 
 @sch.convert.register(np.dtype, dt.JSON, pd.Series)
@@ -310,30 +220,18 @@ def convert_json_to_series(in_, out, col: pd.Series):
     return pd.Series(list(map(try_json, col)), dtype="object")
 
 
-dt.DataType.to_pandas = ibis_dtype_to_pandas  # type: ignore
-sch.Schema.to_pandas = ibis_schema_to_pandas  # type: ignore
+class DataFrameProxy(TableProxy):
+    __slots__ = ()
 
+    def to_frame(self) -> pd.DataFrame:
+        return self._data
 
-class DataFrameProxy(Immutable, util.ToFrame):
-    __slots__ = ('_df', '_hash')
+    def to_pyarrow(self, schema: sch.Schema) -> pa.Table:
+        import pyarrow as pa
 
-    def __init__(self, df):
-        object.__setattr__(self, "_df", df)
-        object.__setattr__(self, "_hash", hash((type(df), id(df))))
+        from ibis.backends.pyarrow.datatypes import ibis_to_pyarrow_schema
 
-    def __hash__(self):
-        return self._hash
-
-    def __repr__(self):
-        df_repr = util.indent(repr(self._df), spaces=2)
-        return f"{self.__class__.__name__}:\n{df_repr}"
-
-    def to_frame(self):
-        return self._df
-
-
-class PandasInMemoryTable(ops.InMemoryTable):
-    data = rlz.instance_of(DataFrameProxy)
+        return pa.Table.from_pandas(self._data, schema=ibis_to_pyarrow_schema(schema))
 
 
 class PandasTable(ops.DatabaseTable):

@@ -11,11 +11,10 @@ import pytest
 from pytest import param
 
 import ibis
-import ibis.config as config
 import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
+from ibis import config
 from ibis import literal as L
-from ibis.expr.window import rows_with_max_lookback
 
 pytest.importorskip("psycopg2")
 sa = pytest.importorskip("sqlalchemy")
@@ -125,7 +124,7 @@ def test_timestamp_cast_noop(alltypes, at, translate):
     assert isinstance(result2, ir.TimestampColumn)
 
     expected1 = at.c.timestamp_col
-    expected2 = sa.func.to_timestamp(at.c.int_col)
+    expected2 = sa.cast(sa.func.to_timestamp(at.c.int_col), sa.TIMESTAMP())
 
     assert str(translate(result1.op())) == str(expected1)
     assert str(translate(result2.op())) == str(expected2)
@@ -367,9 +366,10 @@ def test_regexp(con, expr, expected):
     ('expr', 'expected'),
     [
         param(L('abcd').re_extract('([a-z]+)', 0), 'abcd', id='re_extract_whole'),
-        param(L('abcd').re_extract('(ab)(cd)', 1), 'cd', id='re_extract_first'),
+        param(L('abcd').re_extract('(ab)(cd)', 1), 'ab', id='re_extract_first'),
+        param(L('abcd').re_extract('(ab)(cd)', 2), 'cd', id='re_extract_second'),
         # valid group number but no match => empty string
-        param(L('abcd').re_extract(r'(\d)', 0), '', id='re_extract_no_match'),
+        param(L('abcd').re_extract(r'(\d)', 0), None, id='re_extract_no_match'),
         # match but not a valid group number => NULL
         param(L('abcd').re_extract('abcd', 3), None, id='re_extract_match'),
     ],
@@ -466,12 +466,16 @@ def test_ifelse(alltypes, df, op, pandas_op):
         # tier and histogram
         param(
             lambda d: d.bucket([0, 10, 25, 50, 100]),
-            lambda s: pd.cut(s, [0, 10, 25, 50, 100], right=False, labels=False),
+            lambda s: pd.cut(s, [0, 10, 25, 50, 100], right=False, labels=False).astype(
+                "int8"
+            ),
             id='include_over_false',
         ),
         param(
             lambda d: d.bucket([0, 10, 25, 50], include_over=True),
-            lambda s: pd.cut(s, [0, 10, 25, 50, np.inf], right=False, labels=False),
+            lambda s: pd.cut(
+                s, [0, 10, 25, 50, np.inf], right=False, labels=False
+            ).astype("int8"),
             id='include_over_true',
         ),
         param(
@@ -492,7 +496,9 @@ def test_ifelse(alltypes, df, op, pandas_op):
         ),
         param(
             lambda d: d.bucket([10, 25, 50, 100], include_under=True),
-            lambda s: pd.cut(s, [0, 10, 25, 50, 100], right=False, labels=False),
+            lambda s: pd.cut(s, [0, 10, 25, 50, 100], right=False, labels=False).astype(
+                "int8"
+            ),
             id='include_under_true',
         ),
     ],
@@ -500,7 +506,7 @@ def test_ifelse(alltypes, df, op, pandas_op):
 def test_bucket(alltypes, df, func, pandas_func):
     expr = func(alltypes.double_col)
     result = expr.execute()
-    expected = pandas_func(df.double_col).astype('category')
+    expected = pandas_func(df.double_col)
     tm.assert_series_equal(result, expected, check_names=False)
 
 
@@ -525,11 +531,8 @@ def test_category_label(alltypes, df):
     tm.assert_series_equal(result, expected)
 
 
-@pytest.mark.parametrize(
-    ('distinct', 'union'),
-    [(True, 'UNION'), (False, 'UNION ALL')],
-)
-def test_union_cte(alltypes, distinct, union):
+@pytest.mark.parametrize("distinct", [True, False])
+def test_union_cte(alltypes, distinct, snapshot):
     t = alltypes
     expr1 = t.group_by(t.string_col).aggregate(metric=t.double_col.sum())
     expr2 = expr1.view()
@@ -541,22 +544,7 @@ def test_union_cte(alltypes, distinct, union):
             expr.compile().compile(compile_kwargs={'literal_binds': True})
         ).splitlines()
     )
-    expected = (
-        "WITH anon_1 AS "
-        "(SELECT t0.string_col AS string_col, sum(t0.double_col) AS metric "
-        "FROM functional_alltypes AS t0 GROUP BY t0.string_col), "
-        "anon_2 AS "
-        "(SELECT t0.string_col AS string_col, sum(t0.double_col) AS metric "
-        "FROM functional_alltypes AS t0 GROUP BY t0.string_col), "
-        "anon_3 AS "
-        "(SELECT t0.string_col AS string_col, sum(t0.double_col) AS metric "
-        "FROM functional_alltypes AS t0 GROUP BY t0.string_col) "
-        "SELECT anon_1.string_col, anon_1.metric "
-        f"FROM anon_1 {union} SELECT anon_2.string_col, anon_2.metric "
-        f"FROM anon_2 {union} SELECT anon_3.string_col, anon_3.metric "
-        "FROM anon_3"
-    )
-    assert str(result) == expected
+    snapshot.assert_match(result, "out.sql")
 
 
 @pytest.mark.parametrize(
@@ -755,9 +743,7 @@ def test_simple_window(alltypes, func, df):
     t = alltypes
     f = getattr(t.double_col, func)
     df_f = getattr(df.double_col, func)
-    result = (
-        t.projection([(t.double_col - f()).name('double_col')]).execute().double_col
-    )
+    result = t.select((t.double_col - f()).name('double_col')).execute().double_col
     expected = df.double_col - df_f()
     tm.assert_series_equal(result, expected)
 
@@ -773,7 +759,7 @@ def test_rolling_window(alltypes, func, df):
     window = ibis.window(order_by=t.timestamp_col, preceding=6, following=0)
     f = getattr(t.double_col, func)
     df_f = getattr(df.double_col.rolling(7, min_periods=0), func)
-    result = t.projection([f().over(window).name('double_col')]).execute().double_col
+    result = t.select(f().over(window).name('double_col')).execute().double_col
     expected = df_f()
     tm.assert_series_equal(result, expected)
 
@@ -781,7 +767,7 @@ def test_rolling_window(alltypes, func, df):
 def test_rolling_window_with_mlb(alltypes):
     t = alltypes
     window = ibis.trailing_window(
-        preceding=rows_with_max_lookback(3, ibis.interval(days=5)),
+        preceding=ibis.rows_with_max_lookback(3, ibis.interval(days=5)),
         order_by=t.timestamp_col,
     )
     expr = t['double_col'].sum().over(window)
@@ -809,7 +795,7 @@ def test_partitioned_window(alltypes, func, df):
 
     f = getattr(t.double_col, func)
     expr = f().over(window).name('double_col')
-    result = t.projection([expr]).execute().double_col
+    result = t.select(expr).execute().double_col
     expected = df.groupby('string_col').apply(roller(func)).reset_index(drop=True)
     tm.assert_series_equal(result, expected)
 
@@ -819,7 +805,7 @@ def test_cumulative_simple_window(alltypes, func, df):
     t = alltypes
     f = getattr(t.double_col, func)
     col = t.double_col - f().over(ibis.cumulative_window())
-    expr = t.projection([col.name('double_col')])
+    expr = t.select(col.name('double_col'))
     result = expr.execute().double_col
     expected = df.double_col - getattr(df.double_col, 'cum%s' % func)()
     tm.assert_series_equal(result, expected)
@@ -831,7 +817,7 @@ def test_cumulative_partitioned_window(alltypes, func, df):
     df = df.sort_values('string_col').reset_index(drop=True)
     window = ibis.cumulative_window(group_by=t.string_col)
     f = getattr(t.double_col, func)
-    expr = t.projection([(t.double_col - f().over(window)).name('double_col')])
+    expr = t.select((t.double_col - f().over(window)).name('double_col'))
     result = expr.execute().double_col
     expected = df.groupby(df.string_col).double_col.transform(
         lambda c: c - getattr(c, 'cum%s' % func)()
@@ -845,7 +831,7 @@ def test_cumulative_ordered_window(alltypes, func, df):
     df = df.sort_values('timestamp_col').reset_index(drop=True)
     window = ibis.cumulative_window(order_by=t.timestamp_col)
     f = getattr(t.double_col, func)
-    expr = t.projection([(t.double_col - f().over(window)).name('double_col')])
+    expr = t.select((t.double_col - f().over(window)).name('double_col'))
     result = expr.execute().double_col
     expected = df.double_col - getattr(df.double_col, 'cum%s' % func)()
     tm.assert_series_equal(result, expected)
@@ -857,7 +843,7 @@ def test_cumulative_partitioned_ordered_window(alltypes, func, df):
     df = df.sort_values(['string_col', 'timestamp_col']).reset_index(drop=True)
     window = ibis.cumulative_window(order_by=t.timestamp_col, group_by=t.string_col)
     f = getattr(t.double_col, func)
-    expr = t.projection([(t.double_col - f().over(window)).name('double_col')])
+    expr = t.select((t.double_col - f().over(window)).name('double_col'))
     result = expr.execute().double_col
     method = operator.methodcaller(f'cum{func}')
     expected = df.groupby(df.string_col).double_col.transform(lambda c: c - method(c))
@@ -943,12 +929,10 @@ def array_types(con):
 
 
 def test_array_length(array_types):
-    expr = array_types.projection(
-        [
-            array_types.x.length().name('x_length'),
-            array_types.y.length().name('y_length'),
-            array_types.z.length().name('z_length'),
-        ]
+    expr = array_types.select(
+        array_types.x.length().name('x_length'),
+        array_types.y.length().name('y_length'),
+        array_types.z.length().name('z_length'),
     )
     result = expr.execute()
     expected = pd.DataFrame(
@@ -984,30 +968,6 @@ def test_array_collect(array_types):
     tm.assert_frame_equal(result, expected, check_column_type=False)
 
 
-@pytest.mark.parametrize(
-    ['start', 'stop'],
-    [
-        (1, 3),
-        (1, 1),
-        (2, 3),
-        (2, 5),
-        (None, 3),
-        (None, None),
-        (3, None),
-        (-3, None),
-        (None, -3),
-        (-3, -1),
-    ],
-)
-def test_array_slice(array_types, start, stop):
-    expr = array_types[array_types.y[start:stop].name('sliced')]
-    result = expr.execute()
-    expected = pd.DataFrame(
-        {'sliced': array_types.y.execute().map(lambda x: x[start:stop])}
-    )
-    tm.assert_frame_equal(result, expected)
-
-
 @pytest.mark.parametrize('index', [0, 1, 3, 4, 11, -1, -3, -4, -11])
 def test_array_index(array_types, index):
     expr = array_types[array_types.y[index].name('indexed')]
@@ -1031,7 +991,7 @@ def test_array_index(array_types, index):
     ],
 )
 def test_array_repeat(array_types, n, mul):
-    expr = array_types.projection([mul(array_types.x, n).name('repeated')])
+    expr = array_types.select(mul(array_types.x, n).name('repeated'))
     result = expr.execute()
     expected = pd.DataFrame(
         {'repeated': array_types.x.execute().map(lambda x, n=n: mul(x, n))}
@@ -1049,9 +1009,9 @@ def test_array_repeat(array_types, n, mul):
 def test_array_concat(array_types, catop):
     t = array_types
     x, y = t.x.cast('array<string>').name('x'), t.y
-    expr = t.projection([catop(x, y).name('catted')])
+    expr = t.select(catop(x, y).name('catted'))
     result = expr.execute()
-    tuples = t.projection([x, y]).execute().itertuples(index=False)
+    tuples = t.select(x, y).execute().itertuples(index=False)
     expected = pd.DataFrame({'catted': [catop(i, j) for i, j in tuples]})
     tm.assert_frame_equal(result, expected)
 
@@ -1063,16 +1023,10 @@ def test_array_concat_mixed_types(array_types):
 
 @pytest.fixture
 def t(con, guid):
-    con.raw_sql(
-        """
-        CREATE TABLE "{}" (
-          id SERIAL PRIMARY KEY,
-          name TEXT
+    with con.begin() as c:
+        c.exec_driver_sql(
+            f"CREATE TABLE {con._quote(guid)} (id SERIAL PRIMARY KEY, name TEXT)"
         )
-        """.format(
-            guid
-        )
-    )
     return con.table(guid)
 
 
@@ -1081,33 +1035,25 @@ def s(con, t, guid, guid2):
     assert t.op().name == guid
     assert t.op().name != guid2
 
-    con.raw_sql(
-        """
-        CREATE TABLE "{}" (
-          id SERIAL PRIMARY KEY,
-          left_t_id INTEGER REFERENCES "{}",
-          cost DOUBLE PRECISION
+    with con.begin() as c:
+        c.exec_driver_sql(
+            f"""
+            CREATE TABLE {con._quote(guid2)} (
+              id SERIAL PRIMARY KEY,
+              left_t_id INTEGER REFERENCES {con._quote(guid)},
+              cost DOUBLE PRECISION
+            )
+            """
         )
-        """.format(
-            guid2, guid
-        )
-    )
     return con.table(guid2)
 
 
 @pytest.fixture
 def trunc(con, guid):
-    con.raw_sql(
-        """
-        CREATE TABLE "{}" (
-          id SERIAL PRIMARY KEY,
-          name TEXT
-        )
-        """.format(
-            guid
-        )
-    )
-    con.raw_sql(f"""INSERT INTO "{guid}" (name) VALUES ('a'), ('b'), ('c')""")
+    quoted = con._quote(guid)
+    with con.begin() as c:
+        c.exec_driver_sql(f"CREATE TABLE {quoted} (id SERIAL PRIMARY KEY, name TEXT)")
+        c.exec_driver_sql(f"INSERT INTO {quoted} (name) VALUES ('a'), ('b'), ('c')")
     return con.table(guid)
 
 
@@ -1116,11 +1062,11 @@ def test_semi_join(t, s):
     expr = t.semi_join(s, t.id == s.id)
     result = expr.compile().compile(compile_kwargs={'literal_binds': True})
     base = (
-        sa.select([t_a.c.id, t_a.c.name])
-        .where(sa.exists(sa.select([1]).where(t_a.c.id == s_a.c.id)))
+        sa.select(t_a.c.id, t_a.c.name)
+        .where(sa.exists(sa.select(1).where(t_a.c.id == s_a.c.id)))
         .subquery()
     )
-    expected = sa.select([base.c.id, base.c.name])
+    expected = sa.select(base.c.id, base.c.name)
     assert str(result) == str(expected)
 
 
@@ -1129,16 +1075,16 @@ def test_anti_join(t, s):
     expr = t.anti_join(s, t.id == s.id)
     result = expr.compile().compile(compile_kwargs={'literal_binds': True})
     base = (
-        sa.select([t_a.c.id, t_a.c.name])
-        .where(~sa.exists(sa.select([1]).where(t_a.c.id == s_a.c.id)))
+        sa.select(t_a.c.id, t_a.c.name)
+        .where(~sa.exists(sa.select(1).where(t_a.c.id == s_a.c.id)))
         .subquery()
     )
-    expected = sa.select([base.c.id, base.c.name])
+    expected = sa.select(base.c.id, base.c.name)
     assert str(result) == str(expected)
 
 
 def test_create_table_from_expr(con, trunc, guid2):
-    con.create_table(guid2, expr=trunc)
+    con.create_table(guid2, obj=trunc)
     t = con.table(guid2)
     assert list(t['name'].execute()) == list('abc')
 
@@ -1209,7 +1155,7 @@ def test_ntile(con):
 def test_not_and_negate_bool(con, opname, df):
     op = getattr(operator, opname)
     t = con.table('functional_alltypes').limit(10)
-    expr = t.projection([op(t.bool_col).name('bool_col')])
+    expr = t.select(op(t.bool_col).name('bool_col'))
     result = expr.execute().bool_col
     expected = op(df.head(10).bool_col)
     tm.assert_series_equal(result, expected)
@@ -1230,7 +1176,7 @@ def test_not_and_negate_bool(con, opname, df):
 )
 def test_negate_non_boolean(con, field, df):
     t = con.table('functional_alltypes').limit(10)
-    expr = t.projection([(-t[field]).name(field)])
+    expr = t.select((-t[field]).name(field))
     result = expr.execute()[field]
     expected = -df.head(10)[field]
     tm.assert_series_equal(result, expected)
@@ -1238,7 +1184,7 @@ def test_negate_non_boolean(con, field, df):
 
 def test_negate_boolean(con, df):
     t = con.table('functional_alltypes').limit(10)
-    expr = t.projection([(-t.bool_col).name('bool_col')])
+    expr = t.select((-t.bool_col).name('bool_col'))
     result = expr.execute().bool_col
     expected = -df.head(10).bool_col
     tm.assert_series_equal(result, expected)
@@ -1253,7 +1199,8 @@ def test_boolean_reduction(alltypes, opname, df):
 
 
 def test_boolean_summary(alltypes):
-    bool_col_summary = alltypes.bool_col.summary()
+    with pytest.warns(FutureWarning, match="is deprecated"):
+        bool_col_summary = alltypes.bool_col.summary()
     expr = alltypes.aggregate(bool_col_summary)
 
     result = expr.execute()
@@ -1348,10 +1295,9 @@ def test_timestamp_with_timezone_select(tzone_compute, tz):
 
 
 def test_timestamp_type_accepts_all_timezones(con):
-    assert all(
-        dt.Timestamp(row.name).timezone == row.name
-        for row in con.con.execute('SELECT name FROM pg_timezone_names')
-    )
+    with con.begin() as c:
+        cur = c.exec_driver_sql("SELECT name FROM pg_timezone_names").fetchall()
+    assert all(dt.Timestamp(row.name).timezone == row.name for row in cur)
 
 
 @pytest.mark.parametrize(
@@ -1449,7 +1395,9 @@ def test_string_to_binary_cast(con):
         f"SELECT decode(string_col, 'escape') AS \"{name}\" "
         "FROM functional_alltypes LIMIT 10"
     )
-    raw_data = [row[0][0] for row in con.raw_sql(sql_string).fetchall()]
+    with con.begin() as c:
+        cur = c.exec_driver_sql(sql_string)
+        raw_data = [row[0][0] for row in cur]
     expected = pd.Series(raw_data, name=name)
     tm.assert_series_equal(result, expected)
 
@@ -1464,8 +1412,7 @@ def test_string_to_binary_round_trip(con):
         f"\"{name}\""
         "FROM functional_alltypes LIMIT 10"
     )
-    expected = pd.Series(
-        [row[0][0] for row in con.raw_sql(sql_string).fetchall()],
-        name=name,
-    )
+    with con.begin() as c:
+        cur = c.exec_driver_sql(sql_string)
+        expected = pd.Series([row[0][0] for row in cur], name=name)
     tm.assert_series_equal(result, expected)

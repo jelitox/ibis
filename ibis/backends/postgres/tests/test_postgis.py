@@ -41,9 +41,7 @@ def test_select_linestring_geodata(geotable):
     expr = geotable['geo_linestring']
     sqla_expr = expr.compile()
     compiled = str(sqla_expr.compile(compile_kwargs={'literal_binds': True}))
-    expected = (
-        "SELECT ST_AsEWKB(t0.geo_linestring) AS geo_linestring \n" "FROM geo AS t0"
-    )
+    expected = "SELECT ST_AsEWKB(t0.geo_linestring) AS geo_linestring \nFROM geo AS t0"
     assert compiled == expected
     data = expr.execute()
     assert data.geom_type.iloc[0] == 'LineString'
@@ -53,7 +51,7 @@ def test_select_polygon_geodata(geotable):
     expr = geotable['geo_polygon']
     sqla_expr = expr.compile()
     compiled = str(sqla_expr.compile(compile_kwargs={'literal_binds': True}))
-    expected = "SELECT ST_AsEWKB(t0.geo_polygon) AS geo_polygon \n" "FROM geo AS t0"
+    expected = "SELECT ST_AsEWKB(t0.geo_polygon) AS geo_polygon \nFROM geo AS t0"
     assert compiled == expected
     data = expr.execute()
     assert data.geom_type.iloc[0] == 'Polygon'
@@ -64,7 +62,7 @@ def test_select_multipolygon_geodata(geotable):
     sqla_expr = expr.compile()
     compiled = str(sqla_expr.compile(compile_kwargs={'literal_binds': True}))
     expected = (
-        "SELECT ST_AsEWKB(t0.geo_multipolygon) AS geo_multipolygon \n" "FROM geo AS t0"
+        "SELECT ST_AsEWKB(t0.geo_multipolygon) AS geo_multipolygon \nFROM geo AS t0"
     )
     assert compiled == expected
     data = expr.execute()
@@ -84,9 +82,7 @@ def test_geo_buffer(geotable, gdf):
     expected = pd.Series(
         [linestring.buffer(1.0).area for linestring in gdf.geo_linestring]
     )
-    tm.assert_series_equal(
-        result.area, expected, check_names=False, check_less_precise=2
-    )
+    assert pytest.approx(result.area, abs=1e-1) == expected
 
 
 def test_geo_contains(geotable):
@@ -275,7 +271,7 @@ def test_geo_difference(geotable, gdf):
             for linestring, point in zip(gdf.geo_linestring, gdf.geo_point)
         ]
     )
-    tm.assert_series_equal(result, expected, check_names=False, check_less_precise=2)
+    assert pytest.approx(result, abs=1e-1) == expected
 
 
 def test_geo_intersection(geotable, gdf):
@@ -291,7 +287,7 @@ def test_geo_intersection(geotable, gdf):
             for linestring, point in zip(gdf.geo_linestring, gdf.geo_point)
         ]
     )
-    tm.assert_series_equal(result, expected, check_names=False, check_less_precise=2)
+    assert pytest.approx(result, abs=1e-1) == expected
 
 
 def test_geo_unary_union(geotable, gdf):

@@ -11,7 +11,7 @@ from public import public
 import ibis.expr.datatypes as dt
 import ibis.expr.rules as rlz
 from ibis.common.annotations import attribute
-from ibis.expr.operations.core import Binary, NodeList, Unary, Value
+from ibis.expr.operations.core import Binary, Unary, Value
 from ibis.expr.operations.generic import _Negatable
 
 
@@ -53,13 +53,13 @@ class Comparison(Binary):
     output_dtype = dt.boolean
 
     def __init__(self, left, right):
-        """
+        """Construct a comparison operation between `left` and `right`.
+
         Casting rules for type promotions (for resolving the output type) may
-        depend in some cases on the target backend.
-        TODO: how will overflows be handled? Can we provide anything useful in
+        depend on the target backend.
+
+        TODO: how are overflows handled? Can we provide anything useful in
         Ibis to help the user avoid them?
-        :param left:
-        :param right:
         """
         if not rlz.comparable(left, right):
             raise TypeError(
@@ -133,7 +133,7 @@ class Contains(Value):
     value = rlz.any
     options = rlz.one_of(
         [
-            rlz.nodes_of(rlz.any),
+            rlz.tuple_of(rlz.any),
             rlz.column(rlz.any),
             rlz.array,
             rlz.set_,
@@ -144,7 +144,7 @@ class Contains(Value):
 
     @attribute.default
     def output_shape(self):
-        if isinstance(self.options, NodeList):
+        if isinstance(self.options, tuple):
             args = [self.value, *self.options]
         else:
             args = self.args
@@ -158,33 +158,28 @@ class NotContains(Contains):
 
 @public
 class Where(Value):
-
     """Ternary case expression, equivalent to.
 
-    bool_expr.case()          .when(True, true_expr)
-    .else_(false_or_null_expr)
+    bool_expr.case().when(True, true_expr).else_(false_or_null_expr)
+
+    Many backends implement this as a built-in function.
     """
 
     bool_expr = rlz.boolean
     true_expr = rlz.any
     false_null_expr = rlz.any
 
+    output_shape = rlz.shape_like("args")
+
     @attribute.default
     def output_dtype(self):
-        return rlz.highest_precedence_dtype(
-            [
-                self.true_expr,
-                self.false_null_expr,
-            ]
-        )
-
-    output_shape = rlz.shape_like("bool_expr")
+        return rlz.highest_precedence_dtype([self.true_expr, self.false_null_expr])
 
 
 @public
 class ExistsSubquery(Value, _Negatable):
     foreign_table = rlz.table
-    predicates = rlz.nodes_of(rlz.boolean)
+    predicates = rlz.tuple_of(rlz.boolean)
 
     output_dtype = dt.boolean
     output_shape = rlz.Shape.COLUMNAR
@@ -196,7 +191,7 @@ class ExistsSubquery(Value, _Negatable):
 @public
 class NotExistsSubquery(Value, _Negatable):
     foreign_table = rlz.table
-    predicates = rlz.nodes_of(rlz.boolean)
+    predicates = rlz.tuple_of(rlz.boolean)
 
     output_dtype = dt.boolean
     output_shape = rlz.Shape.COLUMNAR
@@ -212,9 +207,9 @@ class _UnresolvedSubquery(Value, _Negatable):
     -----
     Consider the following ibis expressions
 
-    >>> t = ibis.table(dict(a="string"))
-    >>> s = ibis.table(dict(a="string"))
-    >>> cond = (t.a == s.a).any()
+    >>> t = ibis.table(dict(a="string"))  # doctest: +SKIP
+    >>> s = ibis.table(dict(a="string"))  # doctest: +SKIP
+    >>> cond = (t.a == s.a).any()  # doctest: +SKIP
 
     Without knowing the table to use as the outer query there are two ways to
     turn this expression into a SQL `EXISTS` predicate depending on which of
@@ -243,8 +238,8 @@ class _UnresolvedSubquery(Value, _Negatable):
     resolved against the outer leaf table when `Selection`s are constructed.
     """
 
-    tables = rlz.nodes_of(rlz.table)
-    predicates = rlz.nodes_of(rlz.boolean)
+    tables = rlz.tuple_of(rlz.table)
+    predicates = rlz.tuple_of(rlz.boolean)
 
     output_dtype = dt.boolean
     output_shape = rlz.Shape.COLUMNAR
@@ -266,7 +261,7 @@ class UnresolvedExistsSubquery(_UnresolvedSubquery):
 
         assert isinstance(table, TableNode)
 
-        (foreign_table,) = (t for t in self.tables if not t == table)
+        (foreign_table,) = (t for t in self.tables if t != table)
         return ExistsSubquery(foreign_table, self.predicates).to_expr()
 
 
@@ -280,5 +275,5 @@ class UnresolvedNotExistsSubquery(_UnresolvedSubquery):
 
         assert isinstance(table, TableNode)
 
-        (foreign_table,) = (t for t in self.tables if not t == table)
+        (foreign_table,) = (t for t in self.tables if t != table)
         return NotExistsSubquery(foreign_table, self.predicates).to_expr()

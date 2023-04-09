@@ -1,6 +1,7 @@
 """Execution rules for generic ibis operations."""
 
-import collections
+from __future__ import annotations
+
 import datetime
 import decimal
 import numbers
@@ -37,6 +38,8 @@ from ibis.backends.pandas.core import (
 from ibis.backends.pandas.execution import constants
 from ibis.backends.pandas.execution.generic import (
     _execute_binary_op_impl,
+    coalesce,
+    compute_row_reduction,
     execute_between,
     execute_cast_series_array,
     execute_cast_series_generic,
@@ -49,14 +52,16 @@ from ibis.backends.pandas.execution.generic import (
     execute_intersection_dataframe_dataframe,
     execute_isinf,
     execute_isnan,
+    execute_node_contains_series_nodes,
     execute_node_contains_series_sequence,
     execute_node_dropna_dataframe,
     execute_node_fillna_dataframe_dict,
     execute_node_fillna_dataframe_scalar,
     execute_node_ifnull_series,
+    execute_node_not_contains_series_nodes,
     execute_node_not_contains_series_sequence,
+    execute_node_nullif_scalar_series,
     execute_node_nullif_series,
-    execute_node_nullif_series_scalar,
     execute_node_self_reference_dataframe,
     execute_null_if_zero_series,
     execute_searched_case,
@@ -134,30 +139,20 @@ DASK_DISPATCH_TYPES: TypeRegistrationDict = {
     ops.IsInf: [((dd.Series,), execute_isinf)],
     ops.SelfReference: [((dd.DataFrame,), execute_node_self_reference_dataframe)],
     ops.Contains: [
-        (
-            (
-                dd.Series,
-                (collections.abc.Sequence, collections.abc.Set, dd.Series),
-            ),
-            execute_node_contains_series_sequence,
-        )
+        ((dd.Series, tuple), execute_node_contains_series_nodes),
+        ((dd.Series, dd.Series), execute_node_contains_series_sequence),
     ],
     ops.NotContains: [
-        (
-            (
-                dd.Series,
-                (collections.abc.Sequence, collections.abc.Set, dd.Series),
-            ),
-            execute_node_not_contains_series_sequence,
-        )
+        ((dd.Series, tuple), execute_node_not_contains_series_nodes),
+        ((dd.Series, dd.Series), execute_node_not_contains_series_sequence),
     ],
     ops.IfNull: [
         ((dd.Series, simple_types), execute_node_ifnull_series),
         ((dd.Series, dd.Series), execute_node_ifnull_series),
     ],
     ops.NullIf: [
-        ((dd.Series, dd.Series), execute_node_nullif_series),
-        ((dd.Series, simple_types), execute_node_nullif_series_scalar),
+        ((dd.Series, (dd.Series, *simple_types)), execute_node_nullif_series),
+        ((simple_types, dd.Series), execute_node_nullif_scalar_series),
     ],
     ops.Distinct: [((dd.DataFrame,), execute_distinct_dataframe)],
     ops.ZeroIfNull: [
@@ -174,11 +169,6 @@ register_types_to_dispatcher(execute_node, DASK_DISPATCH_TYPES)
 execute_node.register(DaskTable, DaskBackend)(execute_database_table_client)
 
 
-@execute_node.register(ops.NodeList, collections.abc.Sequence)
-def execute_node_value_list(op, _, **kwargs):
-    return [execute(arg, **kwargs) for arg in op.values]
-
-
 @execute_node.register(ops.Alias, object)
 def execute_alias_series(op, _, **kwargs):
     # just compile the underlying argument because the naming is handled
@@ -188,10 +178,11 @@ def execute_alias_series(op, _, **kwargs):
 
 @execute_node.register(ops.Arbitrary, dd.Series, (dd.Series, type(None)))
 def execute_arbitrary_series_mask(op, data, mask, aggcontext=None, **kwargs):
-    """
-    Note: we cannot use the pandas version because Dask does not support .iloc
-    See https://docs.dask.org/en/latest/dataframe-indexing.html. .loc will
-    only work if our index lines up with the label.
+    """Execute a masked `ops.Arbitrary` operation.
+
+    We cannot use the pandas version because
+    [Dask does not support `.iloc`](https://docs.dask.org/en/latest/dataframe-indexing.html).
+    `.loc` will only work if our index lines up with the label.
     """
     data = data[mask] if mask is not None else data
     if op.how == 'first':
@@ -265,6 +256,29 @@ def execute_cast_series_group_by(op, data, type, **kwargs):
     return result.groupby(data.index)
 
 
+def cast_scalar_to_timestamp(data, tz):
+    if isinstance(data, str):
+        return pd.Timestamp(data, tz=tz)
+    return pd.Timestamp(data, unit="s", tz=tz)
+
+
+@execute_node.register(ops.Cast, dd.core.Scalar, dt.Timestamp)
+def execute_cast_scalar_timestamp(op, data, type, **kwargs):
+    return dd.map_partitions(
+        cast_scalar_to_timestamp, data, tz=type.timezone, meta="datetime64[ns]"
+    )
+
+
+def cast_series_to_timestamp(data, tz):
+    if pd.api.types.is_string_dtype(data):
+        timestamps = to_datetime(data)
+    else:
+        timestamps = to_datetime(data, unit="s")
+    if getattr(timestamps.dtype, "tz", None) is not None:
+        return timestamps.dt.tz_convert(tz)
+    return timestamps.dt.tz_localize(tz)
+
+
 @execute_node.register(ops.Cast, dd.Series, dt.Timestamp)
 def execute_cast_series_timestamp(op, data, type, **kwargs):
     arg = op.arg
@@ -274,22 +288,24 @@ def execute_cast_series_timestamp(op, data, type, **kwargs):
         return data
 
     tz = type.timezone
+    dtype = 'M8[ns]' if tz is None else DatetimeTZDtype('ns', tz)
 
-    if isinstance(from_type, (dt.Timestamp, dt.Date)):
-        return data.astype('M8[ns]' if tz is None else DatetimeTZDtype('ns', tz))
-
-    if isinstance(from_type, (dt.String, dt.Integer)):
-        timestamps = data.map_partitions(
-            to_datetime,
-            infer_datetime_format=True,
-            meta=(data.name, 'datetime64[ns]'),
+    if from_type.is_timestamp():
+        from_tz = from_type.timezone
+        if tz is None and from_tz is None:
+            return data
+        elif tz is None or from_tz is None:
+            return data.dt.tz_localize(tz)
+        elif tz is not None and from_tz is not None:
+            return data.dt.tz_convert(tz)
+    elif from_type.is_date():
+        return data if tz is None else data.dt.tz_localize(tz)
+    elif from_type.is_string() or from_type.is_integer():
+        return data.map_partitions(
+            cast_series_to_timestamp,
+            tz,
+            meta=(data.name, dtype),
         )
-        # TODO - is there a better way to do this
-        timestamps = timestamps.astype(timestamps.head(1).dtype)
-        if getattr(timestamps.dtype, "tz", None) is not None:
-            return timestamps.dt.tz_convert(tz)
-        else:
-            return timestamps.dt.tz_localize(tz)
 
     raise TypeError(f"Don't know how to cast {from_type} to {type}")
 
@@ -305,21 +321,17 @@ def execute_cast_series_date(op, data, type, **kwargs):
     # TODO - we return slightly different things depending on the branch
     # double check what the logic should be
 
-    if isinstance(from_type, dt.Timestamp):
+    if from_type.is_timestamp():
         return data.dt.normalize()
 
     if from_type.equals(dt.string):
         # TODO - this is broken
-        datetimes = data.map_partitions(
-            to_datetime,
-            infer_datetime_format=True,
-            meta=(data.name, 'datetime64[ns]'),
-        )
+        datetimes = data.map_partitions(to_datetime, meta=(data.name, 'datetime64[ns]'))
 
         # TODO - we are getting rid of the index here
         return datetimes.dt.normalize()
 
-    if isinstance(from_type, dt.Integer):
+    if from_type.is_integer():
         return data.map_partitions(
             to_datetime, unit='D', meta=(data.name, 'datetime64[ns]')
         )
@@ -355,6 +367,9 @@ def execute_not_scalar_or_series(op, data, **kwargs):
 @execute_node.register((ops.Comparison, ops.Add, ops.Multiply), str, dd.Series)
 @execute_node.register(ops.Comparison, dd.Series, timestamp_types)
 @execute_node.register(ops.Comparison, timestamp_types, dd.Series)
+@execute_node.register(ops.BitwiseBinary, integer_types, integer_types)
+@execute_node.register(ops.BitwiseBinary, dd.Series, integer_types)
+@execute_node.register(ops.BitwiseBinary, integer_types, dd.Series)
 def execute_binary_op(op, left, right, **kwargs):
     return _execute_binary_op_impl(op, left, right, **kwargs)
 
@@ -437,8 +452,7 @@ def execute_node_ifnull_scalar_series(op, value, replacement, **kwargs):
 
 @execute_node.register(ops.NullIf, simple_types, dd.Series)
 def execute_node_nullif_scalar_series(op, value, series, **kwargs):
-    # TODO - not preserving the index
-    return dd.from_array(da.where(series.eq(value).values, np.nan, value))
+    return series.where(series != value)
 
 
 def wrap_case_result(raw: np.ndarray, expr: ir.Value):
@@ -468,14 +482,17 @@ def wrap_case_result(raw: np.ndarray, expr: ir.Value):
     return result
 
 
-@execute_node.register(ops.SearchedCase, list, list, object)
-def execute_searched_case_dask(op, whens, thens, otherwise, **kwargs):
+@execute_node.register(ops.SearchedCase, tuple, tuple, object)
+def execute_searched_case_dask(op, when_nodes, then_nodes, otherwise, **kwargs):
+    whens = [execute(arg, **kwargs) for arg in when_nodes]
+    thens = [execute(arg, **kwargs) for arg in then_nodes]
     if not isinstance(whens[0], dd.Series):
         # if we are not dealing with dask specific objects, fallback to the
         # pandas logic. For example, in the case of ibis literals.
         # See `test_functions/test_ifelse_returning_bool` or
         # `test_operations/test_searched_case_scalar` for code that hits this.
-        return execute_searched_case(op, whens, thens, otherwise, **kwargs)
+        return execute_searched_case(op, when_nodes, then_nodes, otherwise, **kwargs)
+
     if otherwise is None:
         otherwise = np.nan
     idx = whens[0].index
@@ -494,9 +511,30 @@ def execute_searched_case_dask(op, whens, thens, otherwise, **kwargs):
     return out
 
 
-@execute_node.register(ops.SimpleCase, dd.Series, list, list, object)
+@execute_node.register(ops.SimpleCase, dd.Series, tuple, tuple, object)
 def execute_simple_case_series(op, value, whens, thens, otherwise, **kwargs):
+    whens = [execute(arg, **kwargs) for arg in whens]
+    thens = [execute(arg, **kwargs) for arg in thens]
     if otherwise is None:
         otherwise = np.nan
     raw = np.select([value == when for when in whens], thens, otherwise)
     return wrap_case_result(raw, op.to_expr())
+
+
+@execute_node.register(ops.Greatest, tuple)
+def execute_node_greatest_list(op, values, **kwargs):
+    values = [execute(arg, **kwargs) for arg in values]
+    return compute_row_reduction(np.maximum.reduce, values, axis=0)
+
+
+@execute_node.register(ops.Least, tuple)
+def execute_node_least_list(op, values, **kwargs):
+    values = [execute(arg, **kwargs) for arg in values]
+    return compute_row_reduction(np.minimum.reduce, values, axis=0)
+
+
+@execute_node.register(ops.Coalesce, tuple)
+def execute_node_coalesce(op, values, **kwargs):
+    # TODO: this is slow
+    values = [execute(arg, **kwargs) for arg in values]
+    return compute_row_reduction(coalesce, values)

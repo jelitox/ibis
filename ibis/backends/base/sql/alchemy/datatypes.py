@@ -1,50 +1,78 @@
 from __future__ import annotations
 
-import functools
-from typing import Iterable
+from typing import Mapping
 
 import sqlalchemy as sa
-from sqlalchemy.dialects import mysql, postgresql, sqlite
-from sqlalchemy.dialects.mysql.base import MySQLDialect
-from sqlalchemy.dialects.postgresql.base import PGDialect
-from sqlalchemy.dialects.sqlite.base import SQLiteDialect
+import sqlalchemy.types as sat
+from multipledispatch import Dispatcher
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.engine.default import DefaultDialect
 from sqlalchemy.engine.interfaces import Dialect
 from sqlalchemy.ext.compiler import compiles
-from sqlalchemy.types import UserDefinedType
 
 import ibis.expr.datatypes as dt
 import ibis.expr.schema as sch
 from ibis.backends.base.sql.alchemy.geospatial import geospatial_supported
+from ibis.common.collections import FrozenDict
 
 if geospatial_supported:
     import geoalchemy2 as ga
 
 
-class StructType(UserDefinedType):
-    def __init__(
-        self,
-        pairs: Iterable[tuple[str, sa.types.TypeEngine]],
-    ):
-        self.pairs = [(name, sa.types.to_instance(type)) for name, type in pairs]
-
-    def get_col_spec(self, **_):
-        pairs = ", ".join(f"{k} {v}" for k, v in self.pairs)
-        return f"STRUCT({pairs})"
+class ArrayType(sat.UserDefinedType):
+    def __init__(self, value_type: sat.TypeEngine):
+        self.value_type = sat.to_instance(value_type)
 
 
-class UInt64(sa.types.Integer):
+@compiles(ArrayType, "default")
+def compiles_array(element, compiler, **kw):
+    return f"ARRAY({compiler.process(element.value_type, **kw)})"
+
+
+class StructType(sat.UserDefinedType):
+    cache_ok = True
+
+    def __init__(self, fields: Mapping[str, sat.TypeEngine]) -> None:
+        self.fields = FrozenDict(
+            {name: sat.to_instance(typ) for name, typ in fields.items()}
+        )
+
+
+@compiles(StructType, "default")
+def compiles_struct(element, compiler, **kw):
+    content = ", ".join(
+        f"{field} {compiler.process(typ, **kw)}"
+        for field, typ in element.fields.items()
+    )
+    return f"STRUCT({content})"
+
+
+class MapType(sat.UserDefinedType):
+    def __init__(self, key_type: sat.TypeEngine, value_type: sat.TypeEngine):
+        self.key_type = sat.to_instance(key_type)
+        self.value_type = sat.to_instance(value_type)
+
+
+@compiles(MapType, "default")
+def compiles_map(element, compiler, **kw):
+    key_type = compiler.process(element.key_type, **kw)
+    value_type = compiler.process(element.value_type, **kw)
+    return f"MAP({key_type}, {value_type})"
+
+
+class UInt64(sat.Integer):
     pass
 
 
-class UInt32(sa.types.Integer):
+class UInt32(sat.Integer):
     pass
 
 
-class UInt16(sa.types.Integer):
+class UInt16(sat.Integer):
     pass
 
 
-class UInt8(sa.types.Integer):
+class UInt8(sat.Integer):
     pass
 
 
@@ -52,14 +80,26 @@ class UInt8(sa.types.Integer):
 @compiles(UInt32, "postgresql")
 @compiles(UInt16, "postgresql")
 @compiles(UInt8, "postgresql")
+@compiles(UInt64, "mssql")
+@compiles(UInt32, "mssql")
+@compiles(UInt16, "mssql")
+@compiles(UInt8, "mssql")
 @compiles(UInt64, "mysql")
 @compiles(UInt32, "mysql")
 @compiles(UInt16, "mysql")
 @compiles(UInt8, "mysql")
+@compiles(UInt64, "snowflake")
+@compiles(UInt32, "snowflake")
+@compiles(UInt16, "snowflake")
+@compiles(UInt8, "snowflake")
 @compiles(UInt64, "sqlite")
 @compiles(UInt32, "sqlite")
 @compiles(UInt16, "sqlite")
 @compiles(UInt8, "sqlite")
+@compiles(UInt64, "trino")
+@compiles(UInt32, "trino")
+@compiles(UInt16, "trino")
+@compiles(UInt8, "trino")
 def compile_uint(element, compiler, **kw):
     dialect_name = compiler.dialect.name
     raise TypeError(
@@ -67,21 +107,24 @@ def compile_uint(element, compiler, **kw):
     )
 
 
-def table_from_schema(name, meta, schema, database: str | None = None):
-    # Convert Ibis schema to SQLA table
-    columns = []
+try:
+    UUID = sa.UUID
+except AttributeError:
+    pass
+else:
 
-    for colname, dtype in zip(schema.names, schema.types):
-        satype = to_sqla_type(dtype)
-        column = sa.Column(colname, satype, nullable=dtype.nullable)
-        columns.append(column)
+    @compiles(UUID, "default")
+    def compiles_uuid(element, compiler, **kw):
+        return "UUID"
 
-    return sa.Table(name, meta, schema=database, *columns)
+
+class Unknown(sa.Text):
+    pass
 
 
 # TODO(cleanup)
 ibis_type_to_sqla = {
-    dt.Null: sa.types.NullType,
+    dt.Null: sat.NullType,
     dt.Date: sa.Date,
     dt.Time: sa.Time,
     dt.Boolean: sa.Boolean,
@@ -104,85 +147,77 @@ ibis_type_to_sqla = {
     dt.UInt32: UInt32,
     dt.UInt64: UInt64,
     dt.JSON: sa.JSON,
+    dt.Interval: sa.Interval,
+    dt.Unknown: Unknown,
 }
 
 
-@functools.singledispatch
-def to_sqla_type(itype, type_map=None):
-    if type_map is None:
-        type_map = ibis_type_to_sqla
-    return type_map[type(itype)]
+_DEFAULT_DIALECT = DefaultDialect()
+
+to_sqla_type = Dispatcher("to_sqla_type")
 
 
-@to_sqla_type.register(dt.Decimal)
-def _(itype, **kwargs):
-    return sa.types.NUMERIC(itype.precision, itype.scale)
+@to_sqla_type.register(Dialect, dt.DataType)
+def _default(_, itype):
+    return ibis_type_to_sqla[type(itype)]
 
 
-@to_sqla_type.register(dt.Interval)
-def _(itype, **kwargs):
-    return sa.types.Interval()
+@to_sqla_type.register(Dialect, dt.Decimal)
+def _decimal(_, itype):
+    return sat.NUMERIC(itype.precision, itype.scale)
 
 
-@to_sqla_type.register(dt.Date)
-def _(itype, **kwargs):
-    return sa.Date()
+@to_sqla_type.register(Dialect, dt.Timestamp)
+def _timestamp(_, itype):
+    return sa.TIMESTAMP(timezone=bool(itype.timezone))
 
 
-@to_sqla_type.register(dt.Timestamp)
-def _(itype, **kwargs):
-    return sa.TIMESTAMP(bool(itype.timezone))
+@to_sqla_type.register(Dialect, dt.Array)
+def _array(dialect, itype):
+    return ArrayType(to_sqla_type(dialect, itype.value_type))
 
 
-@to_sqla_type.register(dt.Array)
-def _(itype, **kwargs):
-    # Unwrap the array element type because sqlalchemy doesn't allow arrays of
-    # arrays. This doesn't affect the underlying data.
-    while isinstance(itype, dt.Array):
-        itype = itype.value_type
-    return sa.ARRAY(to_sqla_type(itype, **kwargs))
-
-
-@to_sqla_type.register(dt.Struct)
-def _(itype, **_):
+@to_sqla_type.register(Dialect, dt.Struct)
+def _struct(dialect, itype):
     return StructType(
-        [(name, to_sqla_type(type)) for name, type in itype.pairs.items()]
+        {name: to_sqla_type(dialect, type) for name, type in itype.fields.items()}
     )
 
 
-@to_sqla_type.register(dt.GeoSpatial)
-def _(itype, **kwargs):
-    if itype.geotype == 'geometry':
-        return ga.Geometry
-    elif itype.geotype == 'geography':
-        return ga.Geography
-    else:
-        return ga.types._GISType
+@to_sqla_type.register(Dialect, dt.Map)
+def _map(dialect, itype):
+    return MapType(
+        to_sqla_type(dialect, itype.key_type), to_sqla_type(dialect, itype.value_type)
+    )
 
 
-@dt.dtype.register(Dialect, sa.types.NullType)
+@to_sqla_type.register(Dialect, dt.UUID)
+def _uuid(dialect, itype):
+    try:
+        return sa.UUID()
+    except AttributeError:
+        return postgresql.UUID(as_uuid=True)
+
+
+@dt.dtype.register(Dialect, sat.NullType)
 def sa_null(_, satype, nullable=True):
     return dt.null
 
 
-@dt.dtype.register(Dialect, sa.types.Boolean)
+@dt.dtype.register(Dialect, sat.Boolean)
 def sa_boolean(_, satype, nullable=True):
     return dt.Boolean(nullable=nullable)
 
 
-@dt.dtype.register(MySQLDialect, mysql.NUMERIC)
-@dt.dtype.register(MySQLDialect, sa.NUMERIC)
-def sa_mysql_numeric(_, satype, nullable=True):
-    # https://dev.mysql.com/doc/refman/8.0/en/fixed-point-types.html
-    return dt.Decimal(satype.precision or 10, satype.scale or 0, nullable=nullable)
+try:
+    UUID = sa.UUID
+except AttributeError:
+    pass
+else:
 
-
-@dt.dtype.register(MySQLDialect, mysql.TINYBLOB)
-@dt.dtype.register(MySQLDialect, mysql.MEDIUMBLOB)
-@dt.dtype.register(MySQLDialect, mysql.BLOB)
-@dt.dtype.register(MySQLDialect, mysql.LONGBLOB)
-def sa_mysql_blob(_, satype, nullable=True):
-    return dt.Binary(nullable=nullable)
+    @dt.dtype.register(Dialect, UUID)
+    def sa_uuid(_, satype, nullable=True):
+        return dt.UUID(nullable=nullable)
 
 
 _FLOAT_PREC_TO_TYPE = {
@@ -192,7 +227,7 @@ _FLOAT_PREC_TO_TYPE = {
 }
 
 
-@dt.dtype.register(Dialect, sa.types.Float)
+@dt.dtype.register(Dialect, sat.Float)
 def sa_float(_, satype, nullable=True):
     precision = satype.precision
     if (typ := _FLOAT_PREC_TO_TYPE.get(precision)) is not None:
@@ -200,28 +235,22 @@ def sa_float(_, satype, nullable=True):
     return dt.Decimal(precision, satype.scale, nullable=nullable)
 
 
-@dt.dtype.register(Dialect, sa.types.Numeric)
-@dt.dtype.register(SQLiteDialect, sqlite.NUMERIC)
+@dt.dtype.register(Dialect, sat.Numeric)
 def sa_numeric(_, satype, nullable=True):
     return dt.Decimal(satype.precision, satype.scale, nullable=nullable)
 
 
-@dt.dtype.register(Dialect, sa.types.SmallInteger)
+@dt.dtype.register(Dialect, sat.SmallInteger)
 def sa_smallint(_, satype, nullable=True):
     return dt.Int16(nullable=nullable)
 
 
-@dt.dtype.register(Dialect, sa.types.Integer)
+@dt.dtype.register(Dialect, sat.Integer)
 def sa_integer(_, satype, nullable=True):
     return dt.Int32(nullable=nullable)
 
 
-@dt.dtype.register(Dialect, mysql.TINYINT)
-def sa_mysql_tinyint(_, satype, nullable=True):
-    return dt.Int8(nullable=nullable)
-
-
-@dt.dtype.register(Dialect, sa.types.BigInteger)
+@dt.dtype.register(Dialect, sat.BigInteger)
 def sa_bigint(_, satype, nullable=True):
     return dt.Int64(nullable=nullable)
 
@@ -232,25 +261,8 @@ def sa_real(_, satype, nullable=True):
 
 
 @dt.dtype.register(Dialect, sa.FLOAT)
-@dt.dtype.register(SQLiteDialect, sa.REAL)
-@dt.dtype.register(PGDialect, postgresql.DOUBLE_PRECISION)
 def sa_double(_, satype, nullable=True):
     return dt.Float64(nullable=nullable)
-
-
-@dt.dtype.register(PGDialect, postgresql.UUID)
-def sa_uuid(_, satype, nullable=True):
-    return dt.UUID(nullable=nullable)
-
-
-@dt.dtype.register(PGDialect, postgresql.MACADDR)
-def sa_macaddr(_, satype, nullable=True):
-    return dt.MACADDR(nullable=nullable)
-
-
-@dt.dtype.register(PGDialect, postgresql.INET)
-def sa_inet(_, satype, nullable=True):
-    return dt.INET(nullable=nullable)
 
 
 @dt.dtype.register(Dialect, sa.types.JSON)
@@ -258,16 +270,16 @@ def sa_json(_, satype, nullable=True):
     return dt.JSON(nullable=nullable)
 
 
-@dt.dtype.register(PGDialect, postgresql.JSONB)
-def sa_jsonb(_, satype, nullable=True):
-    return dt.JSONB(nullable=nullable)
+@dt.dtype.register(Dialect, Unknown)
+def sa_unknown(_, satype, nullable=True):
+    return dt.Unknown(nullable=nullable)
 
 
 if geospatial_supported:
 
     @dt.dtype.register(Dialect, (ga.Geometry, ga.types._GISType))
     def ga_geometry(_, gatype, nullable=True):
-        t = gatype.geometry_type
+        t = gatype.geometry_type.upper()
         if t == 'POINT':
             return dt.Point(nullable=nullable)
         if t == 'LINESTRING':
@@ -280,49 +292,22 @@ if geospatial_supported:
             return dt.MultiPoint(nullable=nullable)
         if t == 'MULTIPOLYGON':
             return dt.MultiPolygon(nullable=nullable)
-        if t == 'GEOMETRY':
-            return dt.Geometry(nullable=nullable)
+        if t in ('GEOMETRY', 'GEOGRAPHY'):
+            return getattr(dt, gatype.name.lower())(nullable=nullable)
         else:
             raise ValueError(f"Unrecognized geometry type: {t}")
 
-
-POSTGRES_FIELD_TO_IBIS_UNIT = {
-    "YEAR": "Y",
-    "MONTH": "M",
-    "DAY": "D",
-    "HOUR": "h",
-    "MINUTE": "m",
-    "SECOND": "s",
-    "YEAR TO MONTH": "M",
-    "DAY TO HOUR": "h",
-    "DAY TO MINUTE": "m",
-    "DAY TO SECOND": "s",
-    "HOUR TO MINUTE": "m",
-    "HOUR TO SECOND": "s",
-    "MINUTE TO SECOND": "s",
-}
+    @to_sqla_type.register(Dialect, dt.GeoSpatial)
+    def _(_, itype, **kwargs):
+        if itype.geotype == 'geometry':
+            return ga.Geometry
+        elif itype.geotype == 'geography':
+            return ga.Geography
+        else:
+            return ga.types._GISType
 
 
-@dt.dtype.register(PGDialect, postgresql.INTERVAL)
-def sa_postgres_interval(_, satype, nullable=True):
-    field = satype.fields.upper()
-    unit = POSTGRES_FIELD_TO_IBIS_UNIT.get(field, None)
-    if unit is None:
-        raise ValueError(f"Unknown PostgreSQL interval field {field!r}")
-    elif unit in {"Y", "M"}:
-        raise ValueError(
-            "Variable length timedeltas are not yet supported with PostgreSQL"
-        )
-    return dt.Interval(unit=unit, nullable=nullable)
-
-
-@dt.dtype.register(MySQLDialect, mysql.DOUBLE)
-def sa_mysql_double(_, satype, nullable=True):
-    # TODO: handle asdecimal=True
-    return dt.Float64(nullable=nullable)
-
-
-@dt.dtype.register(Dialect, sa.types.String)
+@dt.dtype.register(Dialect, sa.String)
 def sa_string(_, satype, nullable=True):
     return dt.String(nullable=nullable)
 
@@ -348,45 +333,50 @@ def sa_datetime(_, satype, nullable=True, default_timezone='UTC'):
     return dt.Timestamp(timezone=timezone, nullable=nullable)
 
 
-@dt.dtype.register(Dialect, sa.ARRAY)
-def sa_array(dialect, satype, nullable=True):
-    dimensions = satype.dimensions
-    if dimensions is not None and dimensions != 1:
-        raise NotImplementedError('Nested array types not yet supported')
-
-    value_dtype = dt.dtype(dialect, satype.item_type)
-    return dt.Array(value_dtype, nullable=nullable)
-
-
 @dt.dtype.register(Dialect, StructType)
 def sa_struct(dialect, satype, nullable=True):
-    pairs = [(name, dt.dtype(dialect, typ)) for name, typ in satype.pairs]
-    return dt.Struct.from_tuples(pairs, nullable=nullable)
+    return dt.Struct(
+        {name: dt.dtype(dialect, typ) for name, typ in satype.fields.items()},
+        nullable=nullable,
+    )
 
 
-@sch.infer.register((sa.Table, sa.sql.TableClause))
-def schema_from_table(table, schema=None):
-    """Retrieve an ibis schema from a SQLAlchemy ``Table``.
+@dt.dtype.register(Dialect, ArrayType)
+def sa_array(dialect, satype, nullable=True):
+    return dt.Array(dt.dtype(dialect, satype.value_type), nullable=nullable)
+
+
+@sch.infer.register(sa.sql.TableClause)
+def schema_from_table(
+    table: sa.sql.TableClause,
+    schema: sch.Schema | None = None,
+    dialect: sa.engine.interfaces.Dialect | None = None,
+) -> sch.Schema:
+    """Retrieve an ibis schema from a SQLAlchemy `Table`.
 
     Parameters
     ----------
-    table : sa.Table
+    table
+        Table whose schema to infer
+    schema
+        Schema to pull types from
+    dialect
+        Optional sqlalchemy dialect
 
     Returns
     -------
-    schema : ibis.expr.datatypes.Schema
+    schema
         An ibis schema corresponding to the types of the columns in `table`.
     """
     schema = schema if schema is not None else {}
     pairs = []
-    for name, column in zip(table.columns.keys(), table.columns):
+    if dialect is None:
+        dialect = _DEFAULT_DIALECT
+    for column in table.columns:
+        name = column.name
         if name in schema:
             dtype = dt.dtype(schema[name])
         else:
-            dtype = dt.dtype(
-                getattr(table.bind, 'dialect', Dialect()),
-                column.type,
-                nullable=column.nullable,
-            )
+            dtype = dt.dtype(dialect, column.type, nullable=column.nullable)
         pairs.append((name, dtype))
     return sch.schema(pairs)

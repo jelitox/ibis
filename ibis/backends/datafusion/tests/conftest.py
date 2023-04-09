@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 import pytest
@@ -14,7 +16,7 @@ class TestConf(BackendTest, RoundAwayFromZero):
     # additional_skipped_operations = frozenset({ops.StringSQLLike})
     # supports_divide_by_zero = True
     # returned_timestamp_unit = 'ns'
-    bool_is_int = True
+    native_bool = False
     supports_structs = False
     supports_json = False
 
@@ -25,9 +27,9 @@ class TestConf(BackendTest, RoundAwayFromZero):
         #   parquet file path
         #   csv file path
         client = ibis.datafusion.connect({})
-        client.register_csv(
-            name='functional_alltypes',
-            path=data_directory / 'functional_alltypes.csv',
+        client.register(
+            data_directory / 'functional_alltypes.csv',
+            table_name='functional_alltypes',
             schema=pa.schema(
                 [
                     ('index', 'int64'),
@@ -48,10 +50,11 @@ class TestConf(BackendTest, RoundAwayFromZero):
                 ]
             ),
         )
-        client.register_csv(name='batting', path=data_directory / 'batting.csv')
-        client.register_csv(
-            name='awards_players', path=data_directory / 'awards_players.csv'
+        client.register(data_directory / 'batting.csv', table_name='batting')
+        client.register(
+            data_directory / 'awards_players.csv', table_name='awards_players'
         )
+        client.register(data_directory / 'diamonds.csv', table_name='diamonds')
         return client
 
     @property

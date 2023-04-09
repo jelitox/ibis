@@ -10,18 +10,18 @@ import re
 import weakref
 from pathlib import Path
 from posixpath import join as pjoin
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import fsspec
 import numpy as np
-import pandas as pd
 
 import ibis.common.exceptions as com
 import ibis.config
 import ibis.expr.datatypes as dt
 import ibis.expr.rules as rlz
 import ibis.expr.schema as sch
-import ibis.util as util
+import ibis.expr.types as ir
+from ibis import util
 from ibis.backends.base.sql import BaseSQLBackend
 from ibis.backends.base.sql.ddl import (
     CTAS,
@@ -40,13 +40,25 @@ from ibis.backends.impala.client import ImpalaConnection, ImpalaDatabase, Impala
 from ibis.backends.impala.compat import HS2Error, ImpylaError
 from ibis.backends.impala.compiler import ImpalaCompiler
 from ibis.backends.impala.pandas_interop import DataFrameWriter
-from ibis.backends.impala.udf import (  # noqa F408
+from ibis.backends.impala.udf import (
     aggregate_function,
     scalar_function,
     wrap_uda,
     wrap_udf,
 )
 from ibis.config import options
+
+if TYPE_CHECKING:
+    import pandas as pd
+
+
+__all__ = (
+    "Backend",
+    "aggregate_function",
+    "scalar_function",
+    "wrap_uda",
+    "wrap_udf",
+)
 
 _HS2_TTypeId_to_dtype = {
     'BOOLEAN': 'bool',
@@ -76,7 +88,6 @@ _arg_type = re.compile(r'(.*)\.\.\.|([^\.]*)')
 
 
 class _type_parser:
-
     NORMAL, IN_PAREN = 0, 1
 
     def __init__(self, value):
@@ -159,6 +170,8 @@ def _chunks_to_pandas_array(chunks):
 
 
 def _column_batches_to_dataframe(names, batches):
+    import pandas as pd
+
     cols = {}
     for name, chunks in zip(names, zip(*(b.columns for b in batches))):
         cols[name] = _chunks_to_pandas_array(chunks)
@@ -241,6 +254,10 @@ class Backend(BaseSQLBackend):
             | `'GSSAPI'` | Kerberos-secured clusters      |
         kerberos_service_name
             Specify a particular `impalad` service principal.
+        pool_size
+            Size of the connection pool. Typically this is not necessary to configure.
+        hdfs_client
+            An existing HDFS client.
 
         Examples
         --------
@@ -364,16 +381,6 @@ class Backend(BaseSQLBackend):
         tuples = cur.fetchall()
         return list(map(operator.itemgetter(0), tuples))
 
-    @util.deprecated(
-        version='2.0',
-        instead='use a new connection to the database',
-    )
-    def set_database(self, name):
-        # XXX The parent `Client` has a generic method that calls this same
-        # method in the backend. But for whatever reason calling this code from
-        # that method doesn't seem to work. Maybe `con` is a copy?
-        self.con.set_database(name)
-
     @property
     def current_database(self):
         # XXX The parent `Client` has a generic method that calls this same
@@ -440,13 +447,11 @@ class Backend(BaseSQLBackend):
                     database=name,
                     force=True,
                 )
-        else:
-            if len(tables) > 0 or len(udfs) > 0 or len(udas) > 0:
-                raise com.IntegrityError(
-                    'Database {} must be empty before '
-                    'being dropped, or set '
-                    'force=True'.format(name)
-                )
+        elif tables or udfs or udas:
+            raise com.IntegrityError(
+                f"Database {name} must be empty before "
+                "being dropped, or set force=True"
+            )
         statement = DropDatabase(name, must_exist=not force)
         return self.raw_sql(statement)
 
@@ -474,10 +479,11 @@ class Backend(BaseSQLBackend):
 
         # only pull out the first two columns which are names and types
         pairs = [row[:2] for row in self.con.fetchall(query)]
-
         names, types = zip(*pairs)
+
         ibis_types = [udf.parse_type(type.lower()) for type in types]
-        return sch.Schema(names, ibis_types)
+        ibis_fields = dict(zip(names, ibis_types))
+        return sch.Schema(ibis_fields)
 
     @property
     def client_options(self):
@@ -505,40 +511,28 @@ class Backend(BaseSQLBackend):
 
         self.set_options({'COMPRESSION_CODEC': codec})
 
-    def create_view(self, name, expr, database=None):
-        """Create an Impala view from a table expression.
-
-        Parameters
-        ----------
-        name
-            View name
-        expr : ibis Table
-            Ibis table expression
-        database
-            Database name
-        """
-        ast = self.compiler.to_ast(expr)
+    def create_view(
+        self,
+        name: str,
+        obj: ir.Table,
+        *,
+        database: str | None = None,
+        overwrite: bool = False,
+    ) -> ir.Table:
+        ast = self.compiler.to_ast(obj)
         select = ast.queries[0]
-        statement = CreateView(name, select, database=database)
-        return self.raw_sql(statement)
+        statement = CreateView(name, select, database=database, can_exist=overwrite)
+        self.raw_sql(statement)
+        return self.table(name, database=database)
 
     def drop_view(self, name, database=None, force=False):
-        """Drop an Impala view.
-
-        Parameters
-        ----------
-        name
-            Table name
-        database
-            Database
-        force
-            Database may throw exception if table does not exist
-        """
         statement = DropView(name, database=database, must_exist=not force)
         return self.raw_sql(statement)
 
     @contextlib.contextmanager
     def _setup_insert(self, obj):
+        import pandas as pd
+
         if isinstance(obj, pd.DataFrame):
             with DataFrameWriter(self, obj) as writer:
                 yield writer.delimited_table(writer.write_temp_csv())
@@ -547,25 +541,27 @@ class Backend(BaseSQLBackend):
 
     def create_table(
         self,
-        table_name,
-        obj=None,
+        name: str,
+        obj: ir.Table | None = None,
+        *,
         schema=None,
         database=None,
-        external=False,
-        force=False,
+        temp: bool | None = None,
+        overwrite: bool = False,
+        external: bool = False,
         # HDFS options
         format='parquet',
         location=None,
         partition=None,
         like_parquet=None,
-    ):
+    ) -> ir.Table:
         """Create a new table in Impala using an Ibis table expression.
 
         This is currently designed for tables whose data is stored in HDFS.
 
         Parameters
         ----------
-        table_name
+        name
             Table name
         obj
             If passed, creates table from select statement results
@@ -574,7 +570,9 @@ class Backend(BaseSQLBackend):
             particular schema
         database
             Database name
-        force
+        temp
+            Whether a table is temporary
+        overwrite
             Do not create table if table with indicated name already exists
         external
             Create an external table; Impala will not delete the underlying
@@ -589,11 +587,14 @@ class Backend(BaseSQLBackend):
             expression.
         like_parquet
             Can specify instead of a schema
-
-        Examples
-        --------
-        >>> con.create_table('new_table_name', table_expr)  # doctest: +SKIP
         """
+        if obj is None and schema is None:
+            raise com.IbisError("The schema or obj parameter is required")
+
+        if temp is not None:
+            raise NotImplementedError(
+                "Impala backend does not yet support temporary tables"
+            )
         if like_parquet is not None:
             raise NotImplementedError
 
@@ -602,33 +603,34 @@ class Backend(BaseSQLBackend):
                 ast = self.compiler.to_ast(to_insert)
                 select = ast.queries[0]
 
+                if overwrite:
+                    self.drop_table(name, force=True)
                 self.raw_sql(
                     CTAS(
-                        table_name,
+                        name,
                         select,
                         database=database,
-                        can_exist=force,
                         format=format,
                         external=external,
                         partition=partition,
                         path=location,
                     )
                 )
-        elif schema is not None:
+        else:  # schema is not None
+            if overwrite:
+                self.drop_table(name, force=True)
             self.raw_sql(
                 CreateTableWithSchema(
-                    table_name,
+                    name,
                     schema,
                     database=database,
                     format=format,
-                    can_exist=force,
                     external=external,
                     path=location,
                     partition=partition,
                 )
             )
-        else:
-            raise com.IbisError('Must pass obj or schema')
+        return self.table(name, database=database)
 
     def avro_file(
         self,
@@ -700,6 +702,8 @@ class Backend(BaseSQLBackend):
             Database to create the table in
         delimiter
             Character used to delimit columns
+        na_rep
+            Character used to represent NULL values
         escapechar
             Character used to escape special characters
         lineterminator
@@ -902,6 +906,9 @@ class Backend(BaseSQLBackend):
             validate=validate,
         )
 
+    @util.deprecated(
+        as_of="5.0", removed_in="6.0", instead="Use create_table(overwrite=True)"
+    )
     def load_data(
         self,
         table_name,
@@ -914,12 +921,14 @@ class Backend(BaseSQLBackend):
         table = self.table(table_name, database=database)
         return table.load_data(path, overwrite=overwrite, partition=partition)
 
-    def drop_table(self, table_name, database=None, force=False):
+    def drop_table(
+        self, name: str, *, database: str | None = None, force: bool = False
+    ) -> None:
         """Drop an Impala table.
 
         Parameters
         ----------
-        table_name
+        name
             Table name
         database
             Database name
@@ -932,33 +941,33 @@ class Backend(BaseSQLBackend):
         >>> db = 'operations'
         >>> con.drop_table(table, database=db, force=True)  # doctest: +SKIP
         """
-        statement = DropTable(table_name, database=database, must_exist=not force)
+        statement = DropTable(name, database=database, must_exist=not force)
         self.raw_sql(statement)
 
-    def truncate_table(self, table_name, database=None):
+    def truncate_table(self, name: str, database: str | None = None) -> None:
         """Delete all rows from an existing table.
 
         Parameters
         ----------
-        table_name
+        name
             Table name
         database
             Database name
         """
-        statement = TruncateTable(table_name, database=database)
+        statement = TruncateTable(name, database=database)
         self.raw_sql(statement)
 
-    def drop_table_or_view(self, name, database=None, force=False):
+    def drop_table_or_view(self, name, *, database=None, force=False):
         """Drop view or table."""
         try:
             self.drop_table(name, database=database)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             try:
                 self.drop_view(name, database=database)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 raise e
 
-    def cache_table(self, table_name, database=None, pool='default'):
+    def cache_table(self, table_name, *, database=None, pool='default'):
         """Caches a table in cluster memory in the given pool.
 
         Parameters
@@ -968,7 +977,7 @@ class Backend(BaseSQLBackend):
         database
             Database name
         pool
-           The name of the pool in which to cache the table
+            The name of the pool in which to cache the table
 
         Examples
         --------
@@ -976,18 +985,18 @@ class Backend(BaseSQLBackend):
         >>> db = 'operations'
         >>> pool = 'op_4GB_pool'
         >>> con.cache_table('my_table', database=db, pool=pool)  # doctest: +SKIP
-        """  # noqa: E501
+        """
         statement = ddl.CacheTable(table_name, database=database, pool=pool)
         self.raw_sql(statement)
 
     def _get_schema_using_query(self, query):
-        cur = self.raw_sql(query)
+        cur = self.raw_sql(f"SELECT * FROM ({query}) t0 LIMIT 0")
         # resets the state of the cursor and closes operation
         cur.fetchall()
-        names, ibis_types = self._adapt_types(cur.description)
+        ibis_fields = self._adapt_types(cur.description)
         cur.release()
 
-        return sch.Schema(names, ibis_types)
+        return sch.Schema(ibis_fields)
 
     def create_function(self, func, name=None, database=None):
         """Create a function within Impala.
@@ -1055,9 +1064,7 @@ class Backend(BaseSQLBackend):
                     return
                 else:
                     raise Exception(
-                        "More than one function "
-                        + f"with {name} found."
-                        + "Please specify force=True"
+                        f"More than one function with {name} found. Please specify force=True"
                     )
             elif len(result) == 1:
                 func = result.pop()
@@ -1317,7 +1324,7 @@ class Backend(BaseSQLBackend):
                 adapted_types.append(dt.Decimal(precision, scale))
             else:
                 adapted_types.append(typename)
-        return names, adapted_types
+        return dict(zip(names, adapted_types))
 
     def write_dataframe(
         self,

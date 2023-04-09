@@ -9,13 +9,12 @@ from typing import Any, Callable, Deque, Iterable, Mapping, Tuple
 import rich.pretty
 
 import ibis
-import ibis.common.graph as graph
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
-import ibis.expr.window as win
-import ibis.util as util
+from ibis import util
+from ibis.common import graph
 
 Aliases = Mapping[ops.TableNode, int]
 Deps = Deque[Tuple[int, ops.TableNode]]
@@ -81,22 +80,10 @@ def fmt_truncated(
 
 
 def selection_maxlen(nodes: Iterable[ops.Node]) -> int:
-    """Compute the length of the longest name of input expressions.
-
-    Parameters
-    ----------
-    expressions
-        Expressions whose name to compute the maximum length of
-
-    Returns
-    -------
-    int
-        Max length
-    """
-    try:
-        return max(len(node.name) for node in nodes if isinstance(node, ops.Named))
-    except ValueError:
-        return 0
+    """Compute the length of the longest name of input expressions."""
+    return max(
+        (len(node.name) for node in nodes if isinstance(node, ops.Named)), default=0
+    )
 
 
 @functools.singledispatch
@@ -122,6 +109,14 @@ def _fmt_root_value_op(op: ops.Value, *, name: str, aliases: Aliases, **_: Any) 
     return f"{prefix}{value}{type_info(op.to_expr().type())}"
 
 
+@fmt_root.register
+def _fmt_root_literal_op(
+    op: ops.Literal, *, name: str, aliases: Aliases, **_: Any
+) -> str:
+    value = fmt_value(op, aliases=aliases)
+    return f"{value}{type_info(op.to_expr().type())}"
+
+
 @fmt_root.register(ops.SortKey)
 def _fmt_root_sort_key(op: ops.SortKey, *, aliases: Aliases, **_: Any) -> str:
     return fmt_value(op, aliases=aliases)
@@ -129,7 +124,7 @@ def _fmt_root_sort_key(op: ops.SortKey, *, aliases: Aliases, **_: Any) -> str:
 
 @functools.singledispatch
 def fmt_table_op(op: ops.TableNode, **_: Any) -> str:
-    assert False, f"`fmt_table_op` not implemented for operation: {type(op)}"
+    raise AssertionError(f'`fmt_table_op` not implemented for operation: {type(op)}')
 
 
 @fmt_table_op.register
@@ -218,7 +213,7 @@ def _fmt_table_op_sql_view(
 
 @functools.singledispatch
 def fmt_join(op: ops.Join, *, aliases: Aliases) -> tuple[str, str]:
-    assert False, f"join type {type(op)} not implemented"
+    raise AssertionError(f'join type {type(op)} not implemented')
 
 
 @fmt_join.register(ops.Join)
@@ -436,11 +431,17 @@ def _fmt_table_op_in_memory_table(op: ops.InMemoryTable, **_: Any) -> str:
     )
 
 
+@fmt_table_op.register
+def _fmt_table_op_dummy_table(op: ops.DummyTable, **_: Any) -> str:
+    formatted_schema = fmt_schema(op.schema)
+    schema_field = util.indent(f"schema:\n{formatted_schema}", spaces=2)
+    return "\n".join([op.__class__.__name__, schema_field])
+
+
 @functools.singledispatch
 def fmt_selection_column(value_expr: object, **_: Any) -> str:
-    assert False, (
-        "expression type not implemented for "
-        f"fmt_selection_column: {type(value_expr)}"
+    raise AssertionError(
+        f'expression type not implemented for fmt_selection_column: {type(value_expr)}'
     )
 
 
@@ -450,7 +451,7 @@ def type_info(datatype: dt.DataType) -> str:
 
 
 @fmt_selection_column.register
-def _fmt_selection_column_sequence(node: ops.NodeList, **kwargs):
+def _fmt_selection_column_sequence(node: tuple, **kwargs):
     return "\n".join(fmt_selection_column(value, **kwargs) for value in node.values)
 
 
@@ -528,11 +529,11 @@ def _fmt_value_function_type(func: types.FunctionType, **_: Any) -> str:
 
 @fmt_value.register
 def _fmt_value_node(op: ops.Node, **_: Any) -> str:
-    assert False, f"`fmt_value` not implemented for operation: {type(op)}"
+    raise AssertionError(f'`fmt_value` not implemented for operation: {type(op)}')
 
 
 @fmt_value.register
-def _fmt_value_sequence(op: ops.NodeList, **kwargs: Any) -> str:
+def _fmt_value_sequence(op: tuple, **kwargs: Any) -> str:
     return ", ".join([fmt_value(value, **kwargs) for value in op])
 
 
@@ -559,14 +560,14 @@ def _fmt_value_binary_op(op: ops.Binary, *, aliases: Aliases) -> str:
 
 @fmt_value.register
 def _fmt_value_negate(op: ops.Negate, *, aliases: Aliases) -> str:
-    op_name = "Not" if isinstance(op.output_dtype, dt.Boolean) else "Negate"
+    op_name = "Not" if op.output_dtype.is_boolean() else "Negate"
     operand = fmt_value(op.arg, aliases=aliases)
     return f"{op_name}({operand})"
 
 
 @fmt_value.register
 def _fmt_value_literal(op: ops.Literal, **_: Any) -> str:
-    if isinstance(op.dtype, dt.Interval):
+    if op.dtype.is_interval():
         return f"{op.value} {op.dtype.unit}"
     return repr(op.value)
 
@@ -655,15 +656,13 @@ def _fmt_value_string_sql_like(op: ops.StringSQLLike, *, aliases: Aliases) -> st
 
 
 @fmt_value.register
-def _fmt_value_window(win: win.Window, *, aliases: Aliases) -> str:
+def _fmt_value_window(win: ops.WindowFrame, *, aliases: Aliases) -> str:
     args = []
     for field, value in (
-        ("_group_by", win._group_by),
-        ("_order_by", win._order_by),
-        ("preceding", win.preceding),
-        ("following", win.following),
-        ("max_lookback", win.max_lookback),
-        ("how", win.how),
+        ("group_by", win.group_by),
+        ("order_by", win.order_by),
+        ("start", win.start),
+        ("end", win.end),
     ):
         disp_field = field.lstrip("_")
         if value is not None:

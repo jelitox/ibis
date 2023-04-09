@@ -1,37 +1,41 @@
+from __future__ import annotations
+
+import contextlib
 import functools
 import operator
-from typing import Any, Dict
+from typing import Any
 
 import sqlalchemy as sa
+from sqlalchemy.sql.functions import FunctionElement, GenericFunction
 
-import ibis
 import ibis.common.exceptions as com
-import ibis.expr.analysis as L
+import ibis.expr.analysis as an
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
-import ibis.expr.window as W
 from ibis.backends.base.sql.alchemy.database import AlchemyTable
-from ibis.backends.base.sql.alchemy.geospatial import geospatial_supported
-from ibis.expr.rules import Shape
 
 
-def variance_reduction(func_name):
-    suffix = {'sample': 'samp', 'pop': 'pop'}
+class substr(GenericFunction):
+    """A generic substr function, so dialects can customize compilation."""
+
+    type = sa.types.String()
+    inherit_cache = True
+
+
+def variance_reduction(func_name, suffix=None):
+    suffix = suffix or {'sample': '_samp', 'pop': '_pop'}
 
     def variance_compiler(t, op):
-        arg, how, where = op.args
+        arg = op.arg
 
-        if isinstance(op.arg.output_dtype, dt.Boolean):
+        if arg.output_dtype.is_boolean():
             arg = ops.Cast(op.arg, to=dt.int32)
-        else:
-            arg = op.arg
 
-        func = getattr(sa.func, f'{func_name}_{suffix[op.how]}')
+        func = getattr(sa.func, f'{func_name}{suffix[op.how]}')
 
         if op.where is not None:
-            # TODO(kszucs): avoid roundtripping to expression
-            arg = op.where.to_expr().ifelse(arg, None).op()
+            arg = ops.Where(op.where, arg, None)
 
         return func(t.translate(arg))
 
@@ -39,12 +43,12 @@ def variance_reduction(func_name):
 
 
 def fixed_arity(sa_func, arity):
-    if isinstance(sa_func, str):
-        sa_func = getattr(sa.func, sa_func)
-
     def formatter(t, op):
-        if arity != len(op.args):
-            raise com.IbisError('incorrect number of args')
+        arg_count = len(op.args)
+        if arity != arg_count:
+            raise com.IbisError(
+                f'Incorrect number of args. Expected: {arity}. Current: {arg_count}'
+            )
 
         return _varargs_call(sa_func, t, op.args)
 
@@ -55,17 +59,15 @@ def _varargs_call(sa_func, t, args):
     trans_args = []
     for raw_arg in args:
         arg = t.translate(raw_arg)
-        try:
+        with contextlib.suppress(AttributeError):
             arg = arg.scalar_subquery()
-        except AttributeError:
-            pass
         trans_args.append(arg)
     return sa_func(*trans_args)
 
 
 def varargs(sa_func):
     def formatter(t, op):
-        return _varargs_call(sa_func, t, op.args)
+        return _varargs_call(sa_func, t, op.arg)
 
     return formatter
 
@@ -77,33 +79,35 @@ def get_sqla_table(ctx, table):
         while sa_table is None and ctx_level.parent is not ctx_level:
             ctx_level = ctx_level.parent
             sa_table = ctx_level.get_ref(table)
+    elif isinstance(table, AlchemyTable):
+        sa_table = table.sqla_table
     else:
-        if isinstance(table, AlchemyTable):
-            sa_table = table.sqla_table
-        else:
-            sa_table = ctx.get_compiled_expr(table)
+        sa_table = ctx.get_compiled_expr(table)
 
     return sa_table
 
 
-def get_col_or_deferred_col(sa_table, colname):
-    """Get a `Column`, or create a "deferred" column.
+def get_col(sa_table, op: ops.TableColumn) -> sa.sql.ColumnClause:
+    """Extract a column from a table."""
+    cols = sa_table.exported_columns
+    colname = op.name
 
-    This is to handle the case when selecting a column from a join, which
-    happens when a join expression is cached during join traversal
+    if (col := cols.get(colname)) is not None:
+        return col
 
-    We'd like to avoid generating a subquery just for selection but in
-    sqlalchemy the Join object is not selectable. However, at this point
-    know that the column can be referred to unambiguously
-
-    Later the expression is assembled into
-    `sa.select([sa.column(colname)]).select_from(table_set)` (roughly)
-    where `table_set` is `sa_table` above.
-    """
-    try:
-        return sa_table.exported_columns[colname]
-    except KeyError:
-        return sa.column(colname)
+    # `cols` is a SQLAlchemy column collection that contains columns
+    # with names that are secretly prefixed by table that contains them
+    #
+    # for example, in `t0.join(t1).select(t0.a, t1.b)` t0.a will be named `t0_a`
+    # and t1.b will be named `t1_b`
+    #
+    # unfortunately SQLAlchemy doesn't let you select by the *un*prefixed
+    # column name despite the uniqueness of `colname`
+    #
+    # however, in ibis we have already deduplicated column names so we can
+    # refer to the name by position
+    colindex = op.table.schema._name_locs[colname]
+    return cols[colindex]
 
 
 def _table_column(t, op):
@@ -112,8 +116,8 @@ def _table_column(t, op):
 
     sa_table = get_sqla_table(ctx, table)
 
-    out_expr = get_col_or_deferred_col(sa_table, op.name)
-    out_expr.quote = t._always_quote_columns
+    out_expr = get_col(sa_table, op)
+    out_expr.quote = t._quote_column_names
 
     # If the column does not originate from the table set in the current SELECT
     # context, we should format as a subquery
@@ -128,14 +132,21 @@ def _table_column(t, op):
 
 
 def _table_array_view(t, op):
+    # the table that the TableArrayView op contains (op.table) has
+    # one or more input relations that we need to "pin" for sqlalchemy's
+    # auto correlation functionality -- this is what `.correlate_except` does
+    #
+    # every relation that is NOT passed to `correlate_except` is considered an
+    # outer-query table
     ctx = t.context
     table = ctx.get_compiled_expr(op.table)
-    return table
+    # TODO: handle the case of `op.table` being a join
+    first, *_ = an.find_immediate_parent_tables(op.table, keep_input=False)
+    ref = ctx.get_ref(first)
+    return table.correlate_except(ref)
 
 
 def _exists_subquery(t, op):
-    from ibis.backends.base.sql.alchemy.query_builder import AlchemyCompiler
-
     ctx = t.context
 
     # TODO(kszucs): avoid converting the predicates to expressions
@@ -143,11 +154,11 @@ def _exists_subquery(t, op):
     filtered = (
         op.foreign_table.to_expr()
         .filter([pred.to_expr() for pred in op.predicates])
-        .projection([ir.literal(1).name(ir.core.unnamed)])
+        .select(ir.literal(1).name(""))
     )
 
     sub_ctx = ctx.subcontext()
-    clause = AlchemyCompiler.to_sql(filtered, sub_ctx, exists=True)
+    clause = ctx.compiler.to_sql(filtered, sub_ctx, exists=True)
 
     if isinstance(op, ops.NotExistsSubquery):
         clause = sa.not_(clause)
@@ -158,60 +169,45 @@ def _exists_subquery(t, op):
 def _cast(t, op):
     arg = op.arg
     typ = op.to
+    arg_dtype = arg.output_dtype
 
     sa_arg = t.translate(arg)
-    sa_type = t.get_sqla_type(typ)
-
-    if isinstance(arg, ir.CategoryValue) and typ == dt.int32:
-        return sa_arg
 
     # specialize going from an integer type to a timestamp
-    if isinstance(arg.output_dtype, dt.Integer) and isinstance(sa_type, sa.DateTime):
-        return t.integer_to_timestamp(sa_arg)
+    if arg_dtype.is_integer() and typ.is_timestamp():
+        return t.integer_to_timestamp(sa_arg, tz=typ.timezone)
 
-    if isinstance(arg.output_dtype, dt.Binary) and isinstance(typ, dt.String):
+    if arg_dtype.is_binary() and typ.is_string():
         return sa.func.encode(sa_arg, 'escape')
 
-    if isinstance(typ, dt.Binary):
+    if typ.is_binary():
         #  decode yields a column of memoryview which is annoying to deal with
         # in pandas. CAST(expr AS BYTEA) is correct and returns byte strings.
         return sa.cast(sa_arg, sa.LargeBinary())
 
-    if isinstance(typ, dt.JSON) and not t.native_json_type:
+    if typ.is_json() and not t.native_json_type:
         return sa_arg
-    return sa.cast(sa_arg, sa_type)
+
+    return sa.cast(sa_arg, t.get_sqla_type(typ))
 
 
 def _contains(func):
     def translate(t, op):
         left = t.translate(op.value)
-        right = t.translate(op.options)
 
-        if (
-            # not a list expr
-            not isinstance(op.options, ops.NodeList)
-            # but still a column expr
-            and op.options.output_shape is Shape.COLUMNAR
-            # wasn't already compiled into a select statement
-            and not isinstance(right, sa.sql.Selectable)
-        ):
-            right = sa.select(right)
+        options = op.options
+        if isinstance(options, tuple):
+            right = [t.translate(x) for x in op.options]
+        elif options.output_shape.is_columnar():
+            right = t.translate(ops.TableArrayView(options.to_expr().as_table()))
+            if not isinstance(right, sa.sql.Selectable):
+                right = sa.select(right)
         else:
-            right = t.translate(op.options)
+            right = t.translate(options)
 
         return func(left, right)
 
     return translate
-
-
-def _group_concat(t, op):
-    sep = t.translate(op.sep)
-    if op.where is not None:
-        # TODO(kszucs): avoid expression roundtrip
-        arg = t.translate(op.where.to_expr().ifelse(op.arg, ibis.NA).op())
-    else:
-        arg = t.translate(op.arg)
-    return sa.func.group_concat(arg, sep)
 
 
 def _alias(t, op):
@@ -224,14 +220,15 @@ def _literal(_, op):
     dtype = op.output_dtype
     value = op.value
 
-    if isinstance(dtype, dt.Set):
+    if value is None:
+        return sa.null()
+
+    if dtype.is_set():
         return list(map(sa.literal, value))
+    elif dtype.is_array():
+        value = list(value)
 
     return sa.literal(value)
-
-
-def _value_list(t, op):
-    return [t.translate(x) for x in op.values]
 
 
 def _is_null(t, op):
@@ -241,7 +238,7 @@ def _is_null(t, op):
 
 def _not_null(t, op):
     arg = t.translate(op.arg)
-    return arg.isnot(sa.null())
+    return arg.is_not(sa.null())
 
 
 def _round(t, op):
@@ -263,27 +260,24 @@ def _floor_divide(t, op):
 
 
 def _simple_case(t, op):
-    cases = [ops.Equals(op.base, case) for case in op.cases.values]
-    return _translate_case(t, cases, op.results.values, op.default)
+    return _translate_case(t, op, value=t.translate(op.base))
 
 
 def _searched_case(t, op):
-    return _translate_case(t, op.cases.values, op.results.values, op.default)
+    return _translate_case(t, op, value=None)
 
 
-def _translate_case(t, cases, results, default):
-    case_args = [t.translate(arg) for arg in cases]
-    result_args = [t.translate(arg) for arg in results]
-
-    whens = zip(case_args, result_args)
-    default = t.translate(default)
-
-    return sa.case(list(whens), else_=default)
+def _translate_case(t, op, *, value):
+    return sa.case(
+        *zip(map(t.translate, op.cases), map(t.translate, op.results)),
+        value=value,
+        else_=t.translate(op.default),
+    )
 
 
 def _negate(t, op):
     arg = t.translate(op.arg)
-    return sa.not_(arg) if isinstance(op.arg.output_dtype, dt.Boolean) else -arg
+    return sa.not_(arg) if op.arg.output_dtype.is_boolean() else -arg
 
 
 def unary(sa_func):
@@ -313,82 +307,73 @@ _cumulative_to_reduction = {
 }
 
 
-def _cumulative_to_window(translator, op, window):
-    win = W.cumulative_window()
-    win = win.group_by(window._group_by).order_by(window._order_by)
-
+def _cumulative_to_window(translator, op, frame):
     klass = _cumulative_to_reduction[type(op)]
     new_op = klass(*op.args)
     new_expr = new_op.to_expr().name(op.name)
+    new_frame = frame.copy(start=None, end=0)
 
     if type(new_op) in translator._rewrites:
         new_expr = translator._rewrites[type(new_op)](new_expr)
 
     # TODO(kszucs): rewrite to receive and return an ops.Node
-    return L.windowize_function(new_expr, win)
+    return an.windowize_function(new_expr, frame=new_frame)
 
 
-def _window(t, op):
-    arg, window = op.args
-    reduction = t.translate(arg)
+def _translate_window_boundary(boundary):
+    if boundary is None:
+        return None
 
-    window_op = arg
+    if isinstance(boundary.value, ops.Literal):
+        if boundary.preceding:
+            return -boundary.value.value
+        else:
+            return boundary.value.value
 
-    _require_order_by = (
-        ops.DenseRank,
-        ops.MinRank,
-        ops.NTile,
-        ops.PercentRank,
-        ops.CumeDist,
-    )
+    raise com.TranslationError("Window boundaries must be literal values")
 
-    if isinstance(window_op, ops.CumulativeOp):
-        arg = _cumulative_to_window(t, arg, window).op()
-        return t.translate(arg)
 
-    if window.max_lookback is not None:
-        raise NotImplementedError(
-            'Rows with max lookback is not implemented '
-            'for SQLAlchemy-based backends.'
-        )
+def _window_function(t, window):
+    if isinstance(window.func, ops.CumulativeOp):
+        func = _cumulative_to_window(t, window.func, window.frame).op()
+        return t.translate(func)
+
+    reduction = t.translate(window.func)
 
     # Some analytic functions need to have the expression of interest in
     # the ORDER BY part of the window clause
-    if isinstance(window_op, _require_order_by) and not window._order_by:
-        order_by = t.translate(window_op.args[0])
+    if isinstance(window.func, t._require_order_by) and not window.frame.order_by:
+        order_by = t.translate(window.func.arg)  # .args[0])
     else:
-        order_by = [t.translate(arg) for arg in window._order_by]
+        order_by = [t.translate(arg) for arg in window.frame.order_by]
 
-    partition_by = [t.translate(arg) for arg in window._group_by]
+    partition_by = [t.translate(arg) for arg in window.frame.group_by]
 
-    frame_clause_not_allowed = (
-        ops.Lag,
-        ops.Lead,
-        ops.DenseRank,
-        ops.MinRank,
-        ops.NTile,
-        ops.PercentRank,
-        ops.CumeDist,
-        ops.RowNumber,
-    )
-
-    how = {'range': 'range_'}.get(window.how, window.how)
-    preceding = window.preceding
-    additional_params = (
-        {}
-        if isinstance(window_op, frame_clause_not_allowed)
-        else {
-            how: (
-                -preceding if preceding is not None else preceding,
-                window.following,
+    if isinstance(window.frame, ops.RowsWindowFrame):
+        if window.frame.max_lookback is not None:
+            raise NotImplementedError(
+                'Rows with max lookback is not implemented for SQLAlchemy-based '
+                'backends.'
             )
-        }
-    )
-    result = reduction.over(
-        partition_by=partition_by, order_by=order_by, **additional_params
+        how = 'rows'
+    elif isinstance(window.frame, ops.RangeWindowFrame):
+        how = 'range_'
+    else:
+        raise NotImplementedError(type(window.frame))
+
+    if t._forbids_frame_clause and isinstance(window.func, t._forbids_frame_clause):
+        # some functions on some backends don't support frame clauses
+        additional_params = {}
+    else:
+        start = _translate_window_boundary(window.frame.start)
+        end = _translate_window_boundary(window.frame.end)
+        additional_params = {how: (start, end)}
+
+    result = sa.over(
+        reduction, partition_by=partition_by, order_by=order_by, **additional_params
     )
 
-    if isinstance(window_op, (ops.RowNumber, ops.DenseRank, ops.MinRank, ops.NTile)):
+    if isinstance(window.func, (ops.RowNumber, ops.DenseRank, ops.MinRank, ops.NTile)):
         return result - 1
     else:
         return result
@@ -421,7 +406,7 @@ def _sort_key(t, op):
 
 
 def _string_join(t, op):
-    return sa.func.concat_ws(t.translate(op.sep), *map(t.translate, op.arg.values))
+    return sa.func.concat_ws(t.translate(op.sep), *map(t.translate, op.arg))
 
 
 def reduction(sa_func):
@@ -434,18 +419,27 @@ def reduction(sa_func):
 def _zero_if_null(t, op):
     sa_arg = t.translate(op.arg)
     return sa.case(
-        [(sa_arg.is_(None), sa.cast(0, t.get_sqla_type(op.output_dtype)))],
+        (sa_arg.is_(None), sa.cast(0, t.get_sqla_type(op.output_dtype))),
         else_=sa_arg,
     )
 
 
 def _substring(t, op):
-    args = t.translate(op.arg), t.translate(op.start) + 1
-
-    if (length := op.length) is not None:
-        args += (t.translate(length),)
-
-    return sa.func.substr(*args)
+    sa_arg = t.translate(op.arg)
+    sa_start = t.translate(op.start) + 1
+    # Start is an expression, need a runtime branch
+    sa_arg_length = t.translate(ops.StringLength(op.arg))
+    if op.length is None:
+        return sa.case(
+            ((sa_start >= 1), sa.func.substr(sa_arg, sa_start)),
+            else_=sa.func.substr(sa_arg, sa_start + sa_arg_length),
+        )
+    else:
+        sa_length = t.translate(op.length)
+        return sa.case(
+            ((sa_start >= 1), sa.func.substr(sa_arg, sa_start, sa_length)),
+            else_=sa.func.substr(sa_arg, sa_start + sa_arg_length, sa_length),
+        )
 
 
 def _gen_string_find(func):
@@ -463,21 +457,6 @@ def _gen_string_find(func):
 
 def _nth_value(t, op):
     return sa.func.nth_value(t.translate(op.arg), t.translate(op.nth) + 1)
-
-
-def _clip(*, min_func, max_func):
-    def translate(t, op):
-        arg = t.translate(op.arg)
-
-        if (upper := op.upper) is not None:
-            arg = min_func(t.translate(upper), arg)
-
-        if (lower := op.lower) is not None:
-            arg = max_func(t.translate(lower), arg)
-
-        return arg
-
-    return translate
 
 
 def _bitwise_op(operator):
@@ -507,7 +486,22 @@ def _count_star(t, op):
     return sa.func.count(t.translate(ops.Where(where, 1, None)))
 
 
-sqlalchemy_operation_registry: Dict[Any, Any] = {
+def _extract(fmt: str):
+    def translator(t, op: ops.Node):
+        return sa.cast(sa.extract(fmt, t.translate(op.arg)), sa.SMALLINT)
+
+    return translator
+
+
+class array_map(FunctionElement):
+    pass
+
+
+class array_filter(FunctionElement):
+    pass
+
+
+sqlalchemy_operation_registry: dict[Any, Any] = {
     ops.Alias: _alias,
     ops.And: fixed_arity(operator.and_, 2),
     ops.Or: fixed_arity(operator.or_, 2),
@@ -531,17 +525,14 @@ sqlalchemy_operation_registry: Dict[Any, Any] = {
     ops.BitOr: reduction(sa.func.bit_or),
     ops.BitXor: reduction(sa.func.bit_xor),
     ops.CountDistinct: reduction(lambda arg: sa.func.count(arg.distinct())),
-    ops.HLLCardinality: reduction(lambda arg: sa.func.count(arg.distinct())),
     ops.ApproxCountDistinct: reduction(lambda arg: sa.func.count(arg.distinct())),
-    ops.GroupConcat: _group_concat,
+    ops.GroupConcat: reduction(sa.func.group_concat),
     ops.Between: fixed_arity(sa.between, 3),
     ops.IsNull: _is_null,
     ops.NotNull: _not_null,
     ops.Negate: _negate,
     ops.Round: _round,
-    ops.TypeOf: unary(sa.func.typeof),
     ops.Literal: _literal,
-    ops.NodeList: _value_list,
     ops.NullLiteral: lambda *_: sa.null(),
     ops.SimpleCase: _simple_case,
     ops.SearchedCase: _searched_case,
@@ -553,6 +544,11 @@ sqlalchemy_operation_registry: Dict[Any, Any] = {
     ops.Least: varargs(sa.func.least),
     ops.Greatest: varargs(sa.func.greatest),
     # string
+    ops.Capitalize: unary(
+        lambda arg: sa.func.concat(
+            sa.func.upper(sa.func.substr(arg, 1, 1)), sa.func.substr(arg, 2)
+        )
+    ),
     ops.LPad: fixed_arity(sa.func.lpad, 3),
     ops.RPad: fixed_arity(sa.func.rpad, 3),
     ops.Strip: unary(sa.func.trim),
@@ -599,7 +595,7 @@ sqlalchemy_operation_registry: Dict[Any, Any] = {
     ops.DateFromYMD: fixed_arity(sa.func.date, 3),
     ops.TimeFromHMS: fixed_arity(sa.func.time, 3),
     ops.TimestampFromYMDHMS: lambda t, op: sa.func.make_timestamp(
-        *map(t.translate, op.args[:6])  # ignore timezone
+        *map(t.translate, op.args)
     ),
     ops.Degrees: unary(sa.func.degrees),
     ops.Radians: unary(sa.func.radians),
@@ -623,10 +619,9 @@ sqlalchemy_operation_registry: Dict[Any, Any] = {
     ops.IdenticalTo: fixed_arity(
         sa.sql.expression.ColumnElement.is_not_distinct_from, 2
     ),
-    ops.Clip: _clip(min_func=sa.func.least, max_func=sa.func.greatest),
     ops.Where: fixed_arity(
         lambda predicate, value_if_true, value_if_false: sa.case(
-            [(predicate, value_if_true)],
+            (predicate, value_if_true),
             else_=value_if_false,
         ),
         3,
@@ -638,6 +633,14 @@ sqlalchemy_operation_registry: Dict[Any, Any] = {
     ops.BitwiseRightShift: _bitwise_op(">>"),
     ops.BitwiseNot: _bitwise_not,
     ops.JSONGetItem: fixed_arity(lambda x, y: x.op("->")(y), 2),
+    ops.ExtractYear: _extract('year'),
+    ops.ExtractQuarter: _extract('quarter'),
+    ops.ExtractMonth: _extract('month'),
+    ops.ExtractDay: _extract('day'),
+    ops.ExtractHour: _extract('hour'),
+    ops.ExtractMinute: _extract('minute'),
+    ops.ExtractSecond: _extract('second'),
+    ops.Time: fixed_arity(lambda arg: sa.cast(arg, sa.TIME), 1),
 }
 
 
@@ -653,75 +656,73 @@ sqlalchemy_window_functions_registry = {
     ops.PercentRank: unary(lambda _: sa.func.percent_rank()),
     ops.CumeDist: unary(lambda _: sa.func.cume_dist()),
     ops.NthValue: _nth_value,
-    ops.Window: _window,
-    ops.CumulativeOp: _window,
+    ops.WindowFunction: _window_function,
     ops.CumulativeMax: unary(sa.func.max),
     ops.CumulativeMin: unary(sa.func.min),
     ops.CumulativeSum: unary(sa.func.sum),
     ops.CumulativeMean: unary(sa.func.avg),
+    ops.CumulativeAny: unary(sa.func.bool_or),
+    ops.CumulativeAll: unary(sa.func.bool_and),
 }
 
-if geospatial_supported:
-    _geospatial_functions = {
-        ops.GeoArea: unary(sa.func.ST_Area),
-        ops.GeoAsBinary: unary(sa.func.ST_AsBinary),
-        ops.GeoAsEWKB: unary(sa.func.ST_AsEWKB),
-        ops.GeoAsEWKT: unary(sa.func.ST_AsEWKT),
-        ops.GeoAsText: unary(sa.func.ST_AsText),
-        ops.GeoAzimuth: fixed_arity(sa.func.ST_Azimuth, 2),
-        ops.GeoBuffer: fixed_arity(sa.func.ST_Buffer, 2),
-        ops.GeoCentroid: unary(sa.func.ST_Centroid),
-        ops.GeoContains: fixed_arity(sa.func.ST_Contains, 2),
-        ops.GeoContainsProperly: fixed_arity(sa.func.ST_Contains, 2),
-        ops.GeoCovers: fixed_arity(sa.func.ST_Covers, 2),
-        ops.GeoCoveredBy: fixed_arity(sa.func.ST_CoveredBy, 2),
-        ops.GeoCrosses: fixed_arity(sa.func.ST_Crosses, 2),
-        ops.GeoDFullyWithin: fixed_arity(sa.func.ST_DFullyWithin, 3),
-        ops.GeoDifference: fixed_arity(sa.func.ST_Difference, 2),
-        ops.GeoDisjoint: fixed_arity(sa.func.ST_Disjoint, 2),
-        ops.GeoDistance: fixed_arity(sa.func.ST_Distance, 2),
-        ops.GeoDWithin: fixed_arity(sa.func.ST_DWithin, 3),
-        ops.GeoEndPoint: unary(sa.func.ST_EndPoint),
-        ops.GeoEnvelope: unary(sa.func.ST_Envelope),
-        ops.GeoEquals: fixed_arity(sa.func.ST_Equals, 2),
-        ops.GeoGeometryN: fixed_arity(sa.func.ST_GeometryN, 2),
-        ops.GeoGeometryType: unary(sa.func.ST_GeometryType),
-        ops.GeoIntersection: fixed_arity(sa.func.ST_Intersection, 2),
-        ops.GeoIntersects: fixed_arity(sa.func.ST_Intersects, 2),
-        ops.GeoIsValid: unary(sa.func.ST_IsValid),
-        ops.GeoLineLocatePoint: fixed_arity(sa.func.ST_LineLocatePoint, 2),
-        ops.GeoLineMerge: unary(sa.func.ST_LineMerge),
-        ops.GeoLineSubstring: fixed_arity(sa.func.ST_LineSubstring, 3),
-        ops.GeoLength: unary(sa.func.ST_Length),
-        ops.GeoNPoints: unary(sa.func.ST_NPoints),
-        ops.GeoOrderingEquals: fixed_arity(sa.func.ST_OrderingEquals, 2),
-        ops.GeoOverlaps: fixed_arity(sa.func.ST_Overlaps, 2),
-        ops.GeoPerimeter: unary(sa.func.ST_Perimeter),
-        ops.GeoSimplify: fixed_arity(sa.func.ST_Simplify, 3),
-        ops.GeoSRID: unary(sa.func.ST_SRID),
-        ops.GeoSetSRID: fixed_arity(sa.func.ST_SetSRID, 2),
-        ops.GeoStartPoint: unary(sa.func.ST_StartPoint),
-        ops.GeoTouches: fixed_arity(sa.func.ST_Touches, 2),
-        ops.GeoTransform: fixed_arity(sa.func.ST_Transform, 2),
-        ops.GeoUnaryUnion: unary(sa.func.ST_Union),
-        ops.GeoUnion: fixed_arity(sa.func.ST_Union, 2),
-        ops.GeoWithin: fixed_arity(sa.func.ST_Within, 2),
-        ops.GeoX: unary(sa.func.ST_X),
-        ops.GeoY: unary(sa.func.ST_Y),
-        # Missing Geospatial ops:
-        #   ST_AsGML
-        #   ST_AsGeoJSON
-        #   ST_AsKML
-        #   ST_AsRaster
-        #   ST_AsSVG
-        #   ST_AsTWKB
-        #   ST_Distance_Sphere
-        #   ST_Dump
-        #   ST_DumpPoints
-        #   ST_GeogFromText
-        #   ST_GeomFromEWKB
-        #   ST_GeomFromEWKT
-        #   ST_GeomFromText
-    }
-else:
-    _geospatial_functions = {}
+geospatial_functions = {
+    ops.GeoArea: unary(sa.func.ST_Area),
+    ops.GeoAsBinary: unary(sa.func.ST_AsBinary),
+    ops.GeoAsEWKB: unary(sa.func.ST_AsEWKB),
+    ops.GeoAsEWKT: unary(sa.func.ST_AsEWKT),
+    ops.GeoAsText: unary(sa.func.ST_AsText),
+    ops.GeoAzimuth: fixed_arity(sa.func.ST_Azimuth, 2),
+    ops.GeoBuffer: fixed_arity(sa.func.ST_Buffer, 2),
+    ops.GeoCentroid: unary(sa.func.ST_Centroid),
+    ops.GeoContains: fixed_arity(sa.func.ST_Contains, 2),
+    ops.GeoContainsProperly: fixed_arity(sa.func.ST_Contains, 2),
+    ops.GeoCovers: fixed_arity(sa.func.ST_Covers, 2),
+    ops.GeoCoveredBy: fixed_arity(sa.func.ST_CoveredBy, 2),
+    ops.GeoCrosses: fixed_arity(sa.func.ST_Crosses, 2),
+    ops.GeoDFullyWithin: fixed_arity(sa.func.ST_DFullyWithin, 3),
+    ops.GeoDifference: fixed_arity(sa.func.ST_Difference, 2),
+    ops.GeoDisjoint: fixed_arity(sa.func.ST_Disjoint, 2),
+    ops.GeoDistance: fixed_arity(sa.func.ST_Distance, 2),
+    ops.GeoDWithin: fixed_arity(sa.func.ST_DWithin, 3),
+    ops.GeoEndPoint: unary(sa.func.ST_EndPoint),
+    ops.GeoEnvelope: unary(sa.func.ST_Envelope),
+    ops.GeoEquals: fixed_arity(sa.func.ST_Equals, 2),
+    ops.GeoGeometryN: fixed_arity(sa.func.ST_GeometryN, 2),
+    ops.GeoGeometryType: unary(sa.func.ST_GeometryType),
+    ops.GeoIntersection: fixed_arity(sa.func.ST_Intersection, 2),
+    ops.GeoIntersects: fixed_arity(sa.func.ST_Intersects, 2),
+    ops.GeoIsValid: unary(sa.func.ST_IsValid),
+    ops.GeoLineLocatePoint: fixed_arity(sa.func.ST_LineLocatePoint, 2),
+    ops.GeoLineMerge: unary(sa.func.ST_LineMerge),
+    ops.GeoLineSubstring: fixed_arity(sa.func.ST_LineSubstring, 3),
+    ops.GeoLength: unary(sa.func.ST_Length),
+    ops.GeoNPoints: unary(sa.func.ST_NPoints),
+    ops.GeoOrderingEquals: fixed_arity(sa.func.ST_OrderingEquals, 2),
+    ops.GeoOverlaps: fixed_arity(sa.func.ST_Overlaps, 2),
+    ops.GeoPerimeter: unary(sa.func.ST_Perimeter),
+    ops.GeoSimplify: fixed_arity(sa.func.ST_Simplify, 3),
+    ops.GeoSRID: unary(sa.func.ST_SRID),
+    ops.GeoSetSRID: fixed_arity(sa.func.ST_SetSRID, 2),
+    ops.GeoStartPoint: unary(sa.func.ST_StartPoint),
+    ops.GeoTouches: fixed_arity(sa.func.ST_Touches, 2),
+    ops.GeoTransform: fixed_arity(sa.func.ST_Transform, 2),
+    ops.GeoUnaryUnion: unary(sa.func.ST_Union),
+    ops.GeoUnion: fixed_arity(sa.func.ST_Union, 2),
+    ops.GeoWithin: fixed_arity(sa.func.ST_Within, 2),
+    ops.GeoX: unary(sa.func.ST_X),
+    ops.GeoY: unary(sa.func.ST_Y),
+    # Missing Geospatial ops:
+    #   ST_AsGML
+    #   ST_AsGeoJSON
+    #   ST_AsKML
+    #   ST_AsRaster
+    #   ST_AsSVG
+    #   ST_AsTWKB
+    #   ST_Distance_Sphere
+    #   ST_Dump
+    #   ST_DumpPoints
+    #   ST_GeogFromText
+    #   ST_GeomFromEWKB
+    #   ST_GeomFromEWKT
+    #   ST_GeomFromText
+}

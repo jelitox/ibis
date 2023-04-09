@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 
 import ibis.expr.datatypes as dt
@@ -11,7 +13,7 @@ _format_aliases = {'TEXT': 'TEXTFILE'}
 
 def _sanitize_format(format):
     if format is None:
-        return
+        return None
     format = format.upper()
     format = _format_aliases.get(format, format)
     if format not in ('PARQUET', 'AVRO', 'TEXTFILE'):
@@ -94,16 +96,14 @@ def _serdeproperties(props):
 class _BaseQualifiedSQLStatement:
     def _get_scoped_name(self, obj_name, database):
         if database:
-            scoped_name = f'{database}.`{obj_name}`'
-        else:
-            if not is_fully_qualified(obj_name):
-                if _is_quoted(obj_name):
-                    return obj_name
-                else:
-                    return f'`{obj_name}`'
-            else:
+            return f'{database}.`{obj_name}`'
+        elif not is_fully_qualified(obj_name):
+            if _is_quoted(obj_name):
                 return obj_name
-        return scoped_name
+            else:
+                return f'`{obj_name}`'
+        else:
+            return obj_name
 
 
 class BaseDDL(DDL, _BaseQualifiedSQLStatement):
@@ -120,15 +120,6 @@ class _CreateDDL(BaseDDL):
 
 
 class CreateTable(_CreateDDL):
-
-    """
-
-    Parameters
-    ----------
-    partition :
-
-    """
-
     def __init__(
         self,
         table_name,
@@ -177,7 +168,6 @@ class CreateTable(_CreateDDL):
 
 
 class CTAS(CreateTable):
-
     """Create Table As Select."""
 
     def __init__(
@@ -219,7 +209,6 @@ class CTAS(CreateTable):
 
 
 class CreateView(CTAS):
-
     """Create a view."""
 
     def __init__(self, table_name, select, database=None, can_exist=False):
@@ -247,17 +236,16 @@ class CreateTableWithSchema(CreateTable):
             main_schema = self.schema
             part_schema = self.partition
             if not isinstance(part_schema, sch.Schema):
-                part_schema = sch.Schema(
-                    part_schema, [self.schema[name] for name in part_schema]
-                )
+                part_fields = {name: self.schema[name] for name in part_schema}
+                part_schema = sch.Schema(part_fields)
 
-            to_delete = []
-            for name in self.partition:
-                if name in self.schema:
-                    to_delete.append(name)
-
-            if len(to_delete):
-                main_schema = main_schema.delete(to_delete)
+            to_delete = {name for name in self.partition if name in self.schema}
+            fields = {
+                name: dtype
+                for name, dtype in main_schema.items()
+                if name not in to_delete
+            }
+            main_schema = sch.Schema(fields)
 
             yield format_schema(main_schema)
             yield f'PARTITIONED BY {format_schema(part_schema)}'
@@ -300,7 +288,6 @@ class DropObject(BaseDDL):
 
 
 class DropDatabase(DropObject):
-
     _object_type = 'DATABASE'
 
     def __init__(self, name, must_exist=True):
@@ -312,7 +299,6 @@ class DropDatabase(DropObject):
 
 
 class DropTable(DropObject):
-
     _object_type = 'TABLE'
 
     def __init__(self, table_name, database=None, must_exist=True):
@@ -325,12 +311,10 @@ class DropTable(DropObject):
 
 
 class DropView(DropTable):
-
     _object_type = 'VIEW'
 
 
 class TruncateTable(BaseDDL):
-
     _object_type = 'TABLE'
 
     def __init__(self, table_name, database=None):

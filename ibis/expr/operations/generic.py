@@ -10,21 +10,15 @@ import uuid
 from operator import attrgetter
 
 import numpy as np
-import pandas as pd
 from public import public
 
 import ibis.expr.datatypes as dt
 import ibis.expr.rules as rlz
 from ibis.common import exceptions as com
 from ibis.common.annotations import attribute
+from ibis.common.collections import frozendict
 from ibis.common.grounds import Singleton
-from ibis.expr.operations.core import Named, Unary, Value, Variadic
-from ibis.util import frozendict
-
-try:
-    from shapely.geometry.base import BaseGeometry
-except ImportError:
-    BaseGeometry = type(None)
+from ibis.expr.operations.core import Named, Unary, Value
 
 
 @public
@@ -41,7 +35,11 @@ class TableColumn(Value, Named):
             name = table.schema.name_at_position(name)
 
         if name not in table.schema:
-            raise com.IbisTypeError(f"value {name!r} is not a field in {table.schema}")
+            columns_formatted = ', '.join(map(repr, table.schema.names))
+            raise com.IbisTypeError(
+                f"Column {name!r} is not found in table. "
+                f"Existing columns: {columns_formatted}."
+            )
 
         super().__init__(table=table, name=name)
 
@@ -55,16 +53,14 @@ class RowID(Value, Named):
     """The row number (an autonumeric) of the returned result."""
 
     name = "rowid"
-
+    table = rlz.table
     output_shape = rlz.Shape.COLUMNAR
     output_dtype = dt.int64
 
 
 @public
 class TableArrayView(Value, Named):
-
-    """(Temporary?) Helper operation class for SQL translation (fully formed
-    table subqueries to be viewed as arrays)"""
+    """Helper operation class for creating scalar subqueries."""
 
     table = rlz.table
 
@@ -132,14 +128,10 @@ class ZeroIfNull(Unary):
 
 @public
 class IfNull(Value):
-    """Equivalent to (but perhaps implemented differently):
-
-    case().when(expr.notnull(), expr)       .else_(null_substitute_expr)
-    """
+    """Set values to ifnull_expr if they are equal to NULL."""
 
     arg = rlz.any
     ifnull_expr = rlz.any
-
     output_dtype = rlz.dtype_like("args")
     output_shape = rlz.shape_like("args")
 
@@ -155,46 +147,53 @@ class NullIf(Value):
 
 
 @public
-class Coalesce(Variadic):
-    arg = rlz.variadic(rlz.any)
+class Coalesce(Value):
+    arg = rlz.tuple_of(rlz.any)
+    output_shape = rlz.shape_like('arg')
+    output_dtype = rlz.dtype_like('arg')
 
 
 @public
-class Greatest(Variadic):
-    arg = rlz.variadic(rlz.any)
+class Greatest(Value):
+    arg = rlz.tuple_of(rlz.any)
+    output_shape = rlz.shape_like('arg')
+    output_dtype = rlz.dtype_like('arg')
 
 
 @public
-class Least(Variadic):
-    arg = rlz.variadic(rlz.any)
+class Least(Value):
+    arg = rlz.tuple_of(rlz.any)
+    output_shape = rlz.shape_like('arg')
+    output_dtype = rlz.dtype_like('arg')
 
 
 @public
 class Literal(Value):
-    value = rlz.instance_of(
+    __valid_input_types__ = (
+        bytes,
+        datetime.date,
+        datetime.datetime,
+        datetime.time,
+        datetime.timedelta,
+        enum.Enum,
+        float,
+        frozenset,
+        int,
+        ipaddress.IPv4Address,
+        ipaddress.IPv6Address,
+        frozendict,
+        np.generic,
+        np.ndarray,
+        str,
+        tuple,
+        type(None),
+        uuid.UUID,
+        decimal.Decimal,
+    )
+    value = rlz.one_of(
         (
-            BaseGeometry,
-            bytes,
-            datetime.date,
-            datetime.datetime,
-            datetime.time,
-            datetime.timedelta,
-            decimal.Decimal,
-            enum.Enum,
-            float,
-            frozendict,
-            frozenset,
-            int,
-            ipaddress.IPv4Address,
-            ipaddress.IPv6Address,
-            np.generic,
-            np.ndarray,
-            pd.Timedelta,
-            pd.Timestamp,
-            str,
-            tuple,
-            type(None),
-            uuid.UUID,
+            rlz.instance_of(__valid_input_types__),
+            rlz.lazy_instance_of("shapely.geometry.BaseGeometry"),
         )
     )
     dtype = rlz.datatype
@@ -238,7 +237,7 @@ class ScalarParameter(Value, Named):
 
 
 @public
-class Constant(Value):
+class Constant(Value, Singleton):
     output_shape = rlz.Shape.SCALAR
 
 
@@ -260,18 +259,6 @@ class E(Constant):
 @public
 class Pi(Constant):
     output_dtype = dt.float64
-
-
-@public
-class DecimalPrecision(Unary):
-    arg = rlz.decimal
-    output_dtype = dt.int32
-
-
-@public
-class DecimalScale(Unary):
-    arg = rlz.decimal
-    output_dtype = dt.int32
 
 
 @public
@@ -298,8 +285,8 @@ class HashBytes(Value):
 @public
 class SimpleCase(Value):
     base = rlz.any
-    cases = rlz.nodes_of(rlz.any)
-    results = rlz.nodes_of(rlz.any)
+    cases = rlz.tuple_of(rlz.any)
+    results = rlz.tuple_of(rlz.any)
     default = rlz.any
 
     output_shape = rlz.shape_like("base")
@@ -316,8 +303,8 @@ class SimpleCase(Value):
 
 @public
 class SearchedCase(Value):
-    cases = rlz.nodes_of(rlz.boolean)
-    results = rlz.nodes_of(rlz.any)
+    cases = rlz.tuple_of(rlz.boolean)
+    results = rlz.tuple_of(rlz.any)
     default = rlz.any
 
     def __init__(self, cases, results, default):

@@ -1,8 +1,7 @@
-DROP SEQUENCE IF EXISTS test_sequence;
-CREATE SEQUENCE IF NOT EXISTS test_sequence;
-
+CREATE EXTENSION IF NOT EXISTS hstore;
 CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE EXTENSION IF NOT EXISTS plpython3u;
+CREATE EXTENSION IF NOT EXISTS vector;
 
 DROP TABLE IF EXISTS diamonds CASCADE;
 
@@ -54,7 +53,11 @@ CREATE TABLE awards_players (
     "yearID" BIGINT,
     "lgID" TEXT,
     tie TEXT,
-    notes TEXT
+    notes TEXT,
+    search TSVECTOR GENERATED ALWAYS AS (
+      setweight(to_tsvector('simple', notes), 'A')::TSVECTOR
+    ) STORED,
+    simvec VECTOR GENERATED always AS ('[1,2,3]'::VECTOR) STORED
 );
 
 DROP TABLE IF EXISTS functional_alltypes CASCADE;
@@ -195,3 +198,18 @@ INSERT INTO json_t VALUES
     ('null'),
     ('[42,47,55]'),
     ('[]');
+
+DROP TABLE IF EXISTS win CASCADE;
+CREATE TABLE win (g TEXT, x BIGINT, y BIGINT);
+INSERT INTO win VALUES
+    ('a', 0, 3),
+    ('a', 1, 2),
+    ('a', 2, 0),
+    ('a', 3, 1),
+    ('a', 4, 1);
+
+DROP TABLE IF EXISTS map CASCADE;
+CREATE TABLE map (kv HSTORE);
+INSERT INTO map VALUES
+    ('a=>1,b=>2,c=>3'),
+    ('d=>4,e=>5,c=>6');

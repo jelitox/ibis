@@ -1,12 +1,15 @@
 """Code for computing window functions in the dask backend."""
 
-from typing import Any, Optional, Union
+from __future__ import annotations
+
+from typing import Any
 
 import dask.dataframe as dd
 
 import ibis.expr.analysis as an
 import ibis.expr.operations as ops
-import ibis.expr.window as win
+from ibis.backends.base.df.scope import Scope
+from ibis.backends.base.df.timecontext import TimeContext
 from ibis.backends.dask.core import execute, execute_with_scope
 from ibis.backends.dask.dispatch import execute_node
 from ibis.backends.dask.execution.util import (
@@ -15,14 +18,12 @@ from ibis.backends.dask.execution.util import (
     add_partitioned_sorted_column,
     make_meta_series,
 )
-from ibis.expr.scope import Scope
-from ibis.expr.typing import TimeContext
 
 
 def _post_process_empty(
     result: Any,
-    parent: Union[dd.Series, dd.DataFrame],
-    timecontext: Optional[TimeContext],
+    parent: dd.Series | dd.DataFrame,
+    timecontext: TimeContext | None,
 ) -> dd.Series:
     """Post process non grouped, non ordered windows.
 
@@ -51,37 +52,29 @@ def _post_process_empty(
         return parent.apply(lambda row: result, meta=(None, 'object'))
 
 
-@execute_node.register(ops.Window, dd.Series, win.Window)
-def execute_window_op(
+@execute_node.register(ops.Window, dd.Series)
+def execute_window_frame(
     op,
     data,
-    window,
     scope: Scope,
-    timecontext: Optional[TimeContext] = None,
+    timecontext: TimeContext | None = None,
     aggcontext=None,
     clients=None,
     **kwargs,
 ):
     # Currently this acts as an "unwrapper" for trivial windows (i.e. those
     # with no ordering/grouping/preceding/following functionality).
-    if not all(
-        [
-            window.preceding is None,
-            window.following is None,
-            not window._order_by,
-        ]
-    ):
+    if not all([op.frame.start is None, op.frame.end is None, not op.frame.order_by]):
         raise NotImplementedError(
             "Window operations are unsupported in the dask backend"
         )
 
-    if window._group_by:
+    if op.frame.group_by:
         # there's lots of complicated logic that only applies to grouped
         # windows
         return execute_grouped_window_op(
             op,
             data,
-            window,
             scope,
             timecontext,
             aggcontext,
@@ -90,7 +83,7 @@ def execute_window_op(
         )
 
     result = execute_with_scope(
-        op.expr,
+        op.func,
         scope=scope,
         timecontext=timecontext,
         aggcontext=aggcontext,
@@ -103,7 +96,6 @@ def execute_window_op(
 def execute_grouped_window_op(
     op,
     data,
-    window,
     scope,
     timecontext,
     aggcontext,
@@ -122,20 +114,19 @@ def execute_grouped_window_op(
         **kwargs,
     )
 
-    group_by = window._group_by
-    grouping_keys = [key.name for key in group_by]
+    grouping_keys = [key.name for key in op.frame.group_by]
 
     grouped_root_data = root_data.groupby(grouping_keys)
     scope = scope.merge_scopes(
         [
             Scope({t: grouped_root_data}, timecontext)
-            for t in an.find_immediate_parent_tables(op.expr)
+            for t in an.find_immediate_parent_tables(op.func)
         ],
         overwrite=True,
     )
 
     result = execute_with_scope(
-        op.expr,
+        op.func,
         scope=scope,
         timecontext=timecontext,
         aggcontext=aggcontext,
@@ -144,7 +135,7 @@ def execute_grouped_window_op(
     )
     # If the grouped operation we performed is not an analytic UDF we have to
     # realign the output to the input.
-    if not isinstance(op.expr, ops.AnalyticVectorizedUDF):
+    if not isinstance(op.func, ops.AnalyticVectorizedUDF):
         result = dd.merge(
             root_data[result.index.name].to_frame(),
             result.to_frame(),

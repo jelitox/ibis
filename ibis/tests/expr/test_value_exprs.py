@@ -14,14 +14,15 @@ from pytest import param
 
 import ibis
 import ibis.common.exceptions as com
-import ibis.expr.analysis as L
-import ibis.expr.api as api
+import ibis.expr.analysis as an
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.rules as rlz
 import ibis.expr.types as ir
 from ibis import _, literal
+from ibis.common.collections import frozendict
 from ibis.common.exceptions import IbisTypeError
+from ibis.expr import api
 from ibis.tests.util import assert_equal
 
 
@@ -37,6 +38,12 @@ def test_null():
     assert expr is expr2
     assert expr.type().equals(dt.null)
     assert expr2.type().equals(dt.null)
+
+
+def test_literal_mixed_type_fails():
+    data = [1, 'a']
+    with pytest.raises(TypeError):
+        ibis.literal(data)
 
 
 @pytest.mark.parametrize(
@@ -263,17 +270,6 @@ def test_literal_array():
     assert expr.type().equals(dt.Array(dt.null))
 
 
-def test_mixed_arity(table):
-    what = ["bar", table.g, "foo"]
-    expr = api.sequence(what)
-
-    values = expr.op().values
-    assert isinstance(values[1], ops.TableColumn)
-
-    # it works!
-    repr(expr)
-
-
 @pytest.mark.parametrize('container', [list, tuple, set, frozenset])
 def test_isin_notin_list(table, container):
     values = container([1, 2, 3, 4])
@@ -325,8 +321,7 @@ def test_distinct_table(functional_alltypes):
 
 def test_nunique(functional_alltypes):
     expr = functional_alltypes.string_col.nunique()
-    assert isinstance(expr.op(), ops.Alias)
-    assert isinstance(expr.op().arg, ops.CountDistinct)
+    assert isinstance(expr.op(), ops.CountDistinct)
 
 
 def test_isnull(table):
@@ -493,7 +488,7 @@ def test_negate_boolean_column(table, op):
 
 
 @pytest.mark.parametrize('column', ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'])
-@pytest.mark.parametrize('how', [None, 'first', 'last', 'heavy'])
+@pytest.mark.parametrize('how', ['first', 'last', 'heavy'])
 @pytest.mark.parametrize('condition_fn', [lambda t: None, lambda t: t.a > 8])
 def test_arbitrary(table, column, how, condition_fn):
     col = table[column]
@@ -501,7 +496,7 @@ def test_arbitrary(table, column, how, condition_fn):
     expr = col.arbitrary(how=how, where=where)
     assert expr.type() == col.type()
     assert isinstance(expr, ir.Scalar)
-    assert L.is_reduction(expr.op())
+    assert an.is_reduction(expr.op())
 
 
 @pytest.mark.parametrize(
@@ -517,7 +512,7 @@ def test_arbitrary(table, column, how, condition_fn):
 def test_any_all_notany(table, column, operation):
     expr = operation(table[column])
     assert isinstance(expr, ir.BooleanScalar)
-    assert L.is_reduction(expr.op())
+    assert an.is_reduction(expr.op())
 
 
 @pytest.mark.parametrize(
@@ -633,18 +628,18 @@ def test_null_column_union():
 
 def test_string_compare_numeric_array(table):
     with pytest.raises(TypeError):
-        table.g == table.f
+        table.g == table.f  # noqa: B015
 
     with pytest.raises(TypeError):
-        table.g == table.c
+        table.g == table.c  # noqa: B015
 
 
 def test_string_compare_numeric_literal(table):
     with pytest.raises(TypeError):
-        table.g == ibis.literal(1.5)
+        table.g == ibis.literal(1.5)  # noqa: B015
 
     with pytest.raises(TypeError):
-        table.g == ibis.literal(5)
+        table.g == ibis.literal(5)  # noqa: B015
 
 
 def test_between(table):
@@ -676,7 +671,7 @@ def test_between(table):
 
 def test_chained_comparisons_not_allowed(table):
     with pytest.raises(ValueError):
-        0 < table.f < 1
+        0 < table.f < 1  # noqa: B015
 
 
 @pytest.mark.parametrize(
@@ -829,7 +824,7 @@ def test_not_without_boolean(typ):
     t = ibis.table([('a', typ)], name='t')
     c = t.a
     with pytest.raises(TypeError):
-        ~c
+        ~c  # noqa: B018
 
 
 @pytest.mark.parametrize(
@@ -1264,7 +1259,7 @@ def test_invalid_negate(value, expected_type):
     expr = ibis.literal(value)
     assert expr.type() == expected_type
     with pytest.raises(TypeError):
-        -expr
+        -expr  # noqa: B018
 
 
 @pytest.mark.parametrize(
@@ -1291,27 +1286,6 @@ def test_invalid_negate(value, expected_type):
 def test_valid_negate(type):
     expr = ibis.literal(1)
     assert -expr is not None
-
-
-@pytest.mark.parametrize(
-    ('kind', 'begin', 'end'),
-    [
-        ('preceding', None, None),
-        ('preceding', 1, None),
-        ('preceding', -1, 1),
-        ('preceding', 1, -1),
-        ('preceding', -1, -1),
-        ('following', None, None),
-        ('following', None, 1),
-        ('following', -1, 1),
-        ('following', 1, -1),
-        ('following', -1, -1),
-    ],
-)
-def test_window_unbounded_invalid(kind, begin, end):
-    kwargs = {kind: (begin, end)}
-    with pytest.raises(com.IbisInputError):
-        ibis.window(**kwargs)
 
 
 @pytest.mark.parametrize(
@@ -1535,24 +1509,12 @@ def test_non_null_with_null_precedence(expr_fn, expected_type):
     assert expr.type() == expected_type
 
 
-@pytest.mark.parametrize(
-    ("name", "expected"),
-    [
-        ("names", ("a", "b", "c")),
-        ("types", (dt.int8, dt.string, dt.Array(dt.Array(dt.float64)))),
-        (
-            "fields",
-            ibis.util.frozendict(
-                a=dt.int8,
-                b=dt.string,
-                c=dt.Array(dt.Array(dt.float64)),
-            ),
-        ),
-    ],
-)
-def test_struct_names_types_fields(name, expected):
+def test_struct_names_types_fields():
     s = ibis.struct(dict(a=1, b="2", c=[[1.0], [], [None]]))
-    assert getattr(s, name) == expected
+    assert s.names == ("a", "b", "c")
+    assert s.types == (dt.int8, dt.string, dt.Array(dt.Array(dt.float64)))
+    assert s.fields == dict(a=dt.int8, b=dt.string, c=dt.Array(dt.Array(dt.float64)))
+    assert isinstance(s.fields, frozendict)
 
 
 @pytest.mark.parametrize(
@@ -1577,6 +1539,24 @@ def test_array_length_scalar():
     assert isinstance(expr.op(), ops.ArrayLength)
 
 
+def double_int(x):
+    return x * 2
+
+
+def double_float(x):
+    return x * 2.0
+
+
+def test_array_map():
+    arr = ibis.array([1, 2, 3])
+
+    result_int = arr.map(double_int)
+    result_float = arr.map(double_float)
+
+    assert result_int.type() == dt.Array(dt.int16)
+    assert result_float.type() == dt.Array(dt.float64)
+
+
 @pytest.mark.parametrize(
     ("func", "expected_type"),
     [
@@ -1597,7 +1577,7 @@ def test_array_length_scalar():
     ]
     + [
         param(
-            lambda ts: func(ts.notnull(), ts, ts - ibis.interval(days=1)),
+            lambda ts, func=func: func(ts.notnull(), ts, ts - ibis.interval(days=1)),
             dt.timestamp,
             id=func.__name__,
         )
@@ -1627,28 +1607,16 @@ def test_numpy_ufuncs_dont_cast_columns():
 
 @pytest.mark.parametrize(
     'operation',
-    [
-        operator.lt,
-        operator.gt,
-        operator.ge,
-        operator.le,
-        operator.eq,
-        operator.ne,
-    ],
+    [operator.lt, operator.gt, operator.ge, operator.le, operator.eq, operator.ne],
 )
 def test_logical_comparison_rlz_incompatible_error(table, operation):
-    with pytest.raises(TypeError) as exc_info:
+    with pytest.raises(TypeError, match=r"b:int16 and Literal\(foo\):string"):
         operation(table.b, "foo")
-
-    assert "b:int16 and Literal(foo):string" in str(exc_info.value)
 
 
 def test_case_rlz_incompatible_error(table):
-    case, result = "foo", table.a
-    with pytest.raises(TypeError) as exc_info:
-        table.g.case().when(case == result, result).end()
-
-    assert "a:int8 and Literal(foo):string" in str(exc_info.value)
+    with pytest.raises(TypeError, match=r"a:int8 and Literal\(foo\):string"):
+        table.a == 'foo'  # noqa: B015
 
 
 @pytest.mark.parametrize("func", [ibis.asc, ibis.desc])
@@ -1658,3 +1626,41 @@ def test_group_by_order_by_deferred(func):
     table = ibis.table(dict(x="string", y="int"), name="t")
     expr = table.group_by(_.x).aggregate(mean_y=_.y.mean()).order_by(func(_.mean_y))
     assert isinstance(expr, ir.Table)
+
+
+def test_rowid_only_physical_tables():
+    table = ibis.table({"x": "int", "y": "string"}, name="t")
+
+    table.rowid()  # works
+    table[table.rowid(), table.x].filter(_.x > 10)  # works
+    with pytest.raises(com.IbisTypeError, match="only valid for physical tables"):
+        table.filter(table.x > 0).rowid()
+
+
+def test_where_output_shape():
+    # GH-5191
+    t = ibis.table(dict(a="int64", b="string"), name="t")
+    expr = ibis.literal(True).ifelse(t.a, -t.a)
+    assert isinstance(expr, ir.IntegerColumn)
+    assert isinstance(expr, ir.ColumnExpr)
+
+
+def test_quantile_shape():
+    t = ibis.table([("a", "float64")])
+
+    b1 = t.a.quantile(0.25).name("br2")
+    assert isinstance(b1, ir.Scalar)
+
+    projs = [b1]
+    expr = t.select(projs)
+    (b1,) = expr.op().selections
+
+    assert b1.output_shape.is_columnar()
+
+
+def test_sequence():
+    with pytest.warns(FutureWarning):
+        exprs = ibis.sequence([3, 2])
+
+    for expr in exprs:
+        assert isinstance(expr, ir.ScalarExpr)

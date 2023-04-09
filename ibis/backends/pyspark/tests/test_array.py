@@ -134,7 +134,7 @@ def test_array_concat_scalar(client, op):
 def test_array_repeat(client, n, mul):
     table = client.table('array_table')
 
-    expr = table.projection([mul(table.array_int, n).name('repeated')])
+    expr = table.select(mul(table.array_int, n).name('repeated'))
     result = expr.execute()
 
     df = table.compile().toPandas()
@@ -165,4 +165,18 @@ def test_array_collect(client):
         .reset_index()
         .rename(columns={'array_int': 'collected'})
     )
+    tm.assert_frame_equal(result, expected)
+
+
+def test_array_filter(client):
+    table = client.table('array_table')
+    expr = table.select(
+        table.array_int.filter(lambda item: item != 3).name('array_int')
+    )
+    result = expr.execute()
+    df = table.compile().toPandas()
+    df['array_int'] = df['array_int'].apply(
+        lambda ar: [item for item in ar if item != 3]
+    )
+    expected = df[['array_int']]
     tm.assert_frame_equal(result, expected)

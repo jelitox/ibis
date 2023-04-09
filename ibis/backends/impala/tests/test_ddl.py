@@ -6,7 +6,7 @@ import ibis
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.types as ir
-import ibis.util as util
+from ibis import util
 from ibis.backends.base.sql.ddl import fully_qualified_re
 from ibis.tests.util import assert_equal
 
@@ -18,14 +18,12 @@ def test_create_exists_view(con, temp_view):
     tmp_name = temp_view
     assert tmp_name not in con.list_tables()
 
-    expr = con.table('functional_alltypes').group_by('string_col').size()
+    t1 = con.table('functional_alltypes').group_by('string_col').size()
+    t2 = con.create_view(tmp_name, t1)
 
-    con.create_view(tmp_name, expr)
     assert tmp_name in con.list_tables()
-
     # just check it works for now
-    expr2 = con.table(tmp_name)
-    assert expr2.execute() is not None
+    assert t2.execute() is not None
 
 
 def test_drop_non_empty_database(con, alltypes, temp_table_db):
@@ -403,4 +401,4 @@ def test_kudu_property_raises_useful_error(con):
         NotImplementedError,
         match="kudu support using kudu-python",
     ):
-        con.kudu
+        con.kudu  # noqa: B018

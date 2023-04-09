@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -9,13 +9,16 @@ import pytest
 
 import ibis
 from ibis import util
+from ibis.backends.conftest import TEST_TABLES, _random_identifier
+from ibis.backends.pyspark.datatypes import spark_dtype
 from ibis.backends.tests.base import BackendTest, RoundAwayFromZero
+from ibis.backends.tests.data import win
 
 pytest.importorskip("pyspark")
 
 import pyspark.sql.functions as F  # noqa: E402
 import pyspark.sql.types as pt  # noqa: E402
-from pyspark.sql import SparkSession  # noqa: E402
+from pyspark.sql import Row, SparkSession  # noqa: E402
 
 
 def get_common_spark_testing_client(data_directory, connect):
@@ -44,101 +47,61 @@ def get_common_spark_testing_client(data_directory, connect):
     s = _spark_testing_client._session
     num_partitions = 4
 
-    df_functional_alltypes = (
-        s.read.csv(
-            path=str(data_directory / 'functional_alltypes.csv'),
-            schema=pt.StructType(
-                [
-                    pt.StructField('index', pt.IntegerType(), True),
-                    pt.StructField('Unnamed: 0', pt.IntegerType(), True),
-                    pt.StructField('id', pt.IntegerType(), True),
+    s.read.csv(
+        path=str(data_directory / 'functional_alltypes.csv'),
+        schema=spark_dtype(
+            ibis.schema(
+                {
                     # cast below, Spark can't read 0/1 as bool
-                    pt.StructField('bool_col', pt.ByteType(), True),
-                    pt.StructField('tinyint_col', pt.ByteType(), True),
-                    pt.StructField('smallint_col', pt.ShortType(), True),
-                    pt.StructField('int_col', pt.IntegerType(), True),
-                    pt.StructField('bigint_col', pt.LongType(), True),
-                    pt.StructField('float_col', pt.FloatType(), True),
-                    pt.StructField('double_col', pt.DoubleType(), True),
-                    pt.StructField('date_string_col', pt.StringType(), True),
-                    pt.StructField('string_col', pt.StringType(), True),
-                    pt.StructField('timestamp_col', pt.TimestampType(), True),
-                    pt.StructField('year', pt.IntegerType(), True),
-                    pt.StructField('month', pt.IntegerType(), True),
-                ]
-            ),
-            mode='FAILFAST',
-            header=True,
-        )
-        .repartition(num_partitions)
-        .sort('index')
+                    name: {"bool_col": "int8"}.get(name, dtype)
+                    for name, dtype in TEST_TABLES["functional_alltypes"].items()
+                }
+            )
+        ),
+        mode='FAILFAST',
+        header=True,
+    ).repartition(num_partitions).sort('index').withColumn(
+        "bool_col", F.column("bool_col").cast("boolean")
+    ).createOrReplaceTempView(
+        'functional_alltypes'
     )
 
-    df_functional_alltypes = df_functional_alltypes.withColumn(
-        "bool_col", df_functional_alltypes["bool_col"].cast("boolean")
-    )
-    df_functional_alltypes.createOrReplaceTempView('functional_alltypes')
-
-    df_batting = (
-        s.read.csv(
-            path=str(data_directory / 'batting.csv'),
-            schema=pt.StructType(
-                [
-                    pt.StructField('playerID', pt.StringType(), True),
-                    pt.StructField('yearID', pt.IntegerType(), True),
-                    pt.StructField('stint', pt.IntegerType(), True),
-                    pt.StructField('teamID', pt.StringType(), True),
-                    pt.StructField('lgID', pt.StringType(), True),
-                    pt.StructField('G', pt.IntegerType(), True),
-                    pt.StructField('AB', pt.DoubleType(), True),
-                    pt.StructField('R', pt.DoubleType(), True),
-                    pt.StructField('H', pt.DoubleType(), True),
-                    pt.StructField('X2B', pt.DoubleType(), True),
-                    pt.StructField('X3B', pt.DoubleType(), True),
-                    pt.StructField('HR', pt.DoubleType(), True),
-                    pt.StructField('RBI', pt.DoubleType(), True),
-                    pt.StructField('SB', pt.DoubleType(), True),
-                    pt.StructField('CS', pt.DoubleType(), True),
-                    pt.StructField('BB', pt.DoubleType(), True),
-                    pt.StructField('SO', pt.DoubleType(), True),
-                    pt.StructField('IBB', pt.DoubleType(), True),
-                    pt.StructField('HBP', pt.DoubleType(), True),
-                    pt.StructField('SH', pt.DoubleType(), True),
-                    pt.StructField('SF', pt.DoubleType(), True),
-                    pt.StructField('GIDP', pt.DoubleType(), True),
-                ]
-            ),
-            header=True,
-        )
-        .repartition(num_partitions)
-        .sort('playerID')
-    )
-    df_batting.createOrReplaceTempView("batting")
-
-    df_awards_players = (
-        s.read.csv(
-            path=str(data_directory / 'awards_players.csv'),
-            schema=pt.StructType(
-                [
-                    pt.StructField('playerID', pt.StringType(), True),
-                    pt.StructField('awardID', pt.StringType(), True),
-                    pt.StructField('yearID', pt.IntegerType(), True),
-                    pt.StructField('lgID', pt.StringType(), True),
-                    pt.StructField('tie', pt.StringType(), True),
-                    pt.StructField('notes', pt.StringType(), True),
-                ]
-            ),
-            header=True,
-        )
-        .repartition(num_partitions)
-        .sort('playerID')
-    )
-    df_awards_players.createOrReplaceTempView('awards_players')
+    for name, schema in TEST_TABLES.items():
+        if name != "functional_alltypes":
+            s.read.csv(
+                path=str(data_directory / f'{name}.csv'),
+                schema=spark_dtype(schema),
+                header=True,
+            ).repartition(num_partitions).createOrReplaceTempView(name)
 
     df_simple = s.createDataFrame([(1, 'a')], ['foo', 'bar'])
     df_simple.createOrReplaceTempView('simple')
 
-    df_struct = s.createDataFrame([((1, 2, 'a'),)], ['struct_col'])
+    df_struct = s.createDataFrame(
+        [
+            Row(abc=Row(a=1.0, b='banana', c=2)),
+            Row(abc=Row(a=2.0, b='apple', c=3)),
+            Row(abc=Row(a=3.0, b='orange', c=4)),
+            Row(abc=Row(a=None, b='banana', c=2)),
+            Row(abc=Row(a=2.0, b=None, c=3)),
+            Row(abc=None),
+            Row(abc=Row(a=3.0, b='orange', c=None)),
+        ],
+        schema=pt.StructType(
+            [
+                pt.StructField(
+                    "abc",
+                    pt.StructType(
+                        [
+                            pt.StructField("a", pt.DoubleType(), True),
+                            pt.StructField("b", pt.StringType(), True),
+                            pt.StructField("c", pt.IntegerType(), True),
+                        ]
+                    ),
+                )
+            ]
+        ),
+    )
     df_struct.createOrReplaceTempView('struct')
 
     df_nested_types = s.createDataFrame(
@@ -239,11 +202,18 @@ def get_common_spark_testing_client(data_directory, connect):
     )
     df_json_t.createOrReplaceTempView("json_t")
 
+    win_t = s.createDataFrame(win)
+    win_t.createOrReplaceTempView("win")
+
     return _spark_testing_client
 
 
 def get_pyspark_testing_client(data_directory):
     return get_common_spark_testing_client(data_directory, ibis.pyspark.connect)
+
+
+def set_pyspark_database(client, database):
+    client._session.catalog.setCurrentDatabase(database)
 
 
 class TestConf(BackendTest, RoundAwayFromZero):
@@ -306,6 +276,63 @@ def client(data_directory):
 
     df_time_indexed.createTempView('time_indexed_table')
 
+    df_interval = client._session.createDataFrame(
+        [
+            [
+                timedelta(days=10),
+                timedelta(hours=10),
+                timedelta(minutes=10),
+                timedelta(seconds=10),
+            ]
+        ],
+        pt.StructType(
+            [
+                pt.StructField(
+                    "interval_day",
+                    pt.DayTimeIntervalType(
+                        pt.DayTimeIntervalType.DAY, pt.DayTimeIntervalType.DAY
+                    ),
+                ),
+                pt.StructField(
+                    "interval_hour",
+                    pt.DayTimeIntervalType(
+                        pt.DayTimeIntervalType.HOUR, pt.DayTimeIntervalType.HOUR
+                    ),
+                ),
+                pt.StructField(
+                    "interval_minute",
+                    pt.DayTimeIntervalType(
+                        pt.DayTimeIntervalType.MINUTE, pt.DayTimeIntervalType.MINUTE
+                    ),
+                ),
+                pt.StructField(
+                    "interval_second",
+                    pt.DayTimeIntervalType(
+                        pt.DayTimeIntervalType.SECOND, pt.DayTimeIntervalType.SECOND
+                    ),
+                ),
+            ]
+        ),
+    )
+
+    df_interval.createTempView('interval_table')
+
+    df_interval_invalid = client._session.createDataFrame(
+        [[timedelta(days=10, hours=10, minutes=10, seconds=10)]],
+        pt.StructType(
+            [
+                pt.StructField(
+                    "interval_day_hour",
+                    pt.DayTimeIntervalType(
+                        pt.DayTimeIntervalType.DAY, pt.DayTimeIntervalType.HOUR
+                    ),
+                )
+            ]
+        ),
+    )
+
+    df_interval_invalid.createTempView('invalid_interval_table')
+
     return client
 
 
@@ -332,16 +359,12 @@ def ibis_windows(request):
     return IbisWindow(request.param).get_windows()
 
 
-def _random_identifier(suffix):
-    return f'__ibis_test_{suffix}_{util.guid()}'
-
-
 @pytest.fixture(scope='session', autouse=True)
 def test_data_db(client):
     name = os.environ.get('IBIS_TEST_DATA_DB', 'ibis_testing')
     client.create_database(name)
     try:
-        client.set_database(name)
+        set_pyspark_database(client, name)
         yield name
     finally:
         client.drop_database(name, force=True)
@@ -354,7 +377,7 @@ def temp_database(client, test_data_db):
     try:
         yield name
     finally:
-        client.set_database(test_data_db)
+        set_pyspark_database(client, test_data_db)
         client.drop_database(name, force=True)
 
 

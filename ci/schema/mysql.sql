@@ -66,7 +66,7 @@ CREATE TABLE functional_alltypes (
     double_col DOUBLE,
     date_string_col TEXT,
     string_col TEXT,
-    timestamp_col TIMESTAMP,
+    timestamp_col DATETIME,
     year INTEGER,
     month INTEGER
 ) DEFAULT CHARACTER SET = utf8;
@@ -84,3 +84,13 @@ INSERT INTO json_t VALUES
     ('null'),
     ('[42,47,55]'),
     ('[]');
+
+DROP TABLE IF EXISTS win CASCADE;
+
+CREATE TABLE win (g TEXT, x BIGINT, y BIGINT);
+INSERT INTO win VALUES
+    ('a', 0, 3),
+    ('a', 1, 2),
+    ('a', 2, 0),
+    ('a', 3, 1),
+    ('a', 4, 1);

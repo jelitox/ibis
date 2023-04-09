@@ -10,9 +10,8 @@ import ibis.expr.schema as sch
 _to_polars_types = {
     dt.Boolean: pl.Boolean,
     dt.Null: pl.Null,
-    dt.Array: pl.List,
     dt.String: pl.Utf8,
-    dt.Binary: pl.Object,
+    dt.Binary: pl.Binary,
     dt.Date: pl.Date,
     dt.Time: pl.Time,
     dt.Int8: pl.Int8,
@@ -25,16 +24,19 @@ _to_polars_types = {
     dt.UInt64: pl.UInt64,
     dt.Float32: pl.Float32,
     dt.Float64: pl.Float64,
-    dt.Decimal: pl.Object,
 }
 
 _to_ibis_dtypes = {v: k for k, v in _to_polars_types.items()}
+_to_ibis_dtypes[pl.Categorical] = dt.String
 
 
 @functools.singledispatch
 def to_polars_type(dtype):
     """Convert ibis dtype to the polars counterpart."""
-    return _to_polars_types[dtype.__class__]  # else return  pl.Object?
+    try:
+        return _to_polars_types[dtype.__class__]  # else return  pl.Object?
+    except KeyError:
+        raise NotImplementedError(f"Unsupported type: {dtype!r}")
 
 
 @to_polars_type.register(dt.Timestamp)
@@ -54,14 +56,9 @@ def from_ibis_interval(dtype):
 def from_ibis_struct(dtype):
     fields = [
         pl.Field(name=name, dtype=to_polars_type(dtype))
-        for name, dtype in dtype.pairs.items()
+        for name, dtype in dtype.fields.items()
     ]
     return pl.Struct(fields)
-
-
-@to_polars_type.register(dt.Category)
-def from_ibis_category(dtype):
-    return pl.Categorical
 
 
 @to_polars_type.register(dt.Array)
@@ -78,8 +75,12 @@ def to_ibis_dtype(typ):
 
 @to_ibis_dtype.register(pl.Datetime)
 def from_polars_datetime(typ):
-    # TODO(kszucs): handle timezone?
-    return dt.Timestamp()
+    return dt.Timestamp(timezone=typ.tz)
+
+
+@to_ibis_dtype.register(pl.Duration)
+def from_polars_duration(typ):
+    return dt.Interval(unit=typ.tu)
 
 
 @to_ibis_dtype.register(pl.List)
@@ -92,10 +93,6 @@ def from_polars_struct(typ):
     return dt.Struct.from_tuples(
         [(field.name, to_ibis_dtype(field.dtype)) for field in typ.fields]
     )
-
-
-# Can't register here since polars datatypes are classes
-# @dt.dtype.register(pl.DataType)
 
 
 @sch.infer.register(pl.LazyFrame)

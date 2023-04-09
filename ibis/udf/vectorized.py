@@ -5,11 +5,12 @@ Warning: This is an experimental module and API here can change without notice.
 DO NOT USE DIRECTLY.
 """
 
+from __future__ import annotations
+
 import functools
-from typing import Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import pandas as pd
 
 import ibis.expr.datatypes as dt
 import ibis.udf.validate as v
@@ -19,12 +20,15 @@ from ibis.expr.operations import (
     ReductionVectorizedUDF,
 )
 
+if TYPE_CHECKING:
+    import pandas as pd
+
 
 def _coerce_to_dict(
-    data: Union[List, np.ndarray, pd.Series],
+    data: list | np.ndarray | pd.Series,
     output_type: dt.Struct,
-    index: Optional[pd.Index] = None,
-) -> Tuple:
+    index: pd.Index | None = None,
+) -> tuple:
     """Coerce the following shapes to a tuple.
 
     - [`list`][list]
@@ -35,9 +39,9 @@ def _coerce_to_dict(
 
 
 def _coerce_to_np_array(
-    data: Union[List, np.ndarray, pd.Series],
+    data: list | np.ndarray | pd.Series,
     output_type: dt.Struct,
-    index: Optional[pd.Index] = None,
+    index: pd.Index | None = None,
 ) -> np.ndarray:
     """Coerce the following shapes to an np.ndarray.
 
@@ -49,9 +53,9 @@ def _coerce_to_np_array(
 
 
 def _coerce_to_series(
-    data: Union[List, np.ndarray, pd.Series],
+    data: list | np.ndarray | pd.Series,
     output_type: dt.DataType,
-    original_index: Optional[pd.Index] = None,
+    original_index: pd.Index | None = None,
 ) -> pd.Series:
     """Coerce the following shapes to a Series.
 
@@ -78,6 +82,8 @@ def _coerce_to_series(
     pd.Series
         Output Series
     """
+    import pandas as pd
+
     if isinstance(data, (list, np.ndarray)):
         result = pd.Series(data)
     elif isinstance(data, pd.Series):
@@ -94,7 +100,7 @@ def _coerce_to_series(
 def _coerce_to_dataframe(
     data: Any,
     output_type: dt.Struct,
-    original_index: Optional[pd.Index] = None,
+    original_index: pd.Index | None = None,
 ) -> pd.DataFrame:
     """Coerce the following shapes to a DataFrame.
 
@@ -127,29 +133,28 @@ def _coerce_to_dataframe(
 
     Examples
     --------
-    >>> _coerce_to_dataframe(pd.DataFrame({'a': [1, 2, 3]}), dt.Struct([('b', 'int32')]))  # noqa: E501
+    >>> import pandas as pd
+    >>> _coerce_to_dataframe(pd.DataFrame({'a': [1, 2, 3]}), dt.Struct(dict(b="int32")))  # noqa: E501
        b
     0  1
     1  2
     2  3
-    dtype: int32
-    >>> _coerce_to_dataframe(pd.Series([[1, 2, 3]]), dt.Struct([('a', 'int32'), ('b', 'int32'), ('c', 'int32')]))  # noqa: E501
+    >>> _coerce_to_dataframe(pd.Series([[1, 2, 3]]), dt.Struct(dict.fromkeys('abc', 'int32')))  # noqa: E501
        a  b  c
     0  1  2  3
-    dtypes: [int32, int32, int32]
-    >>> _coerce_to_dataframe(pd.Series([range(3), range(3)]), dt.Struct([('a', 'int32'), ('b', 'int32'), ('c', 'int32')]))  # noqa: E501
+    >>> _coerce_to_dataframe(pd.Series([range(3), range(3)]), dt.Struct(dict.fromkeys('abc', 'int32')))  # noqa: E501
        a  b  c
     0  0  1  2
     1  0  1  2
-    dtypes: [int32, int32, int32]
-    >>> _coerce_to_dataframe([pd.Series(x) for x in [1, 2, 3]], dt.Struct([('a', 'int32'), ('b', 'int32'), ('c', 'int32')]))  # noqa: E501
+    >>> _coerce_to_dataframe([pd.Series(x) for x in [1, 2, 3]], dt.Struct(dict.fromkeys('abc', 'int32')))  # noqa: E501
        a  b  c
     0  1  2  3
-    >>>  _coerce_to_dataframe([1, 2, 3], dt.Struct([('a', 'int32'), ('b', 'int32'), ('c', 'int32')]))  # noqa: E501
+    >>> _coerce_to_dataframe([1, 2, 3], dt.Struct(dict.fromkeys('abc', 'int32')))  # noqa: E501
        a  b  c
     0  1  2  3
-    dtypes: [int32, int32, int32]
     """
+    import pandas as pd
+
     if isinstance(data, pd.DataFrame):
         result = data
     elif isinstance(data, pd.Series):
@@ -157,7 +162,7 @@ def _coerce_to_dataframe(
             result = data.to_frame()
         else:
             num_cols = len(data.iloc[0])
-            series = [data.apply(lambda t: t[i]) for i in range(num_cols)]
+            series = [data.apply(lambda t, i=i: t[i]) for i in range(num_cols)]
             result = pd.concat(series, axis=1)
     elif isinstance(data, (tuple, list, np.ndarray)):
         if isinstance(data[0], pd.Series):
@@ -194,9 +199,8 @@ class UserDefinedFunction:
         self.coercion_fn = self._get_coercion_function()
 
     def _get_coercion_function(self):
-        """Return the appropriate function to coerce the result of the UDF,
-        according to the func type and output type of the UDF."""
-        if isinstance(self.output_type, dt.Struct):
+        """Return the appropriate function to coerce the result of the UDF."""
+        if self.output_type.is_struct():
             # Case 1: Struct output, non-reduction UDF -> coerce to DataFrame
             if (
                 self.func_type is ElementWiseVectorizedUDF
@@ -213,7 +217,7 @@ class UserDefinedFunction:
         ):
             return _coerce_to_series
         # Case 4: Array output type, reduction UDF -> coerce to np.ndarray
-        elif isinstance(self.output_type, dt.Array):
+        elif self.output_type.is_array():
             return _coerce_to_np_array
         else:
             # Case 5: Default, do nothing (e.g. reduction UDF returning
@@ -254,8 +258,7 @@ def _udf_decorator(node_type, input_type, output_type):
 
 
 def analytic(input_type, output_type):
-    """Define an *analytic* user-defined function that takes N pandas Series or
-    scalar values as inputs and produces N rows of output.
+    """Define an analytic UDF that produces the same of rows as the input.
 
     Parameters
     ----------
@@ -279,7 +282,7 @@ def analytic(input_type, output_type):
 
     >>> @analytic(
     ...     input_type=[dt.double],
-    ...     output_type=dt.Struct(['demean', 'zscore'], [dt.double, dt.double])
+    ...     output_type=dt.Struct(dict(demean="double", zscore="double")),
     ... )
     ... def demean_and_zscore(v):
     ...     mean = v.mean()
@@ -288,7 +291,7 @@ def analytic(input_type, output_type):
     >>>
     >>> win = ibis.window(preceding=None, following=None, group_by='key')
     >>> # add two columns "demean" and "zscore"
-    >>> table = table.mutate(
+    >>> table = table.mutate(  # doctest: +SKIP
     ...     demean_and_zscore(table['v']).over(win).destructure()
     ... )
     """
@@ -296,8 +299,7 @@ def analytic(input_type, output_type):
 
 
 def elementwise(input_type, output_type):
-    """Define a UDF (user-defined function) that operates element wise on a
-    Pandas Series.
+    """Define a UDF that operates element-wise on a Pandas Series.
 
     Parameters
     ----------
@@ -327,20 +329,19 @@ def elementwise(input_type, output_type):
 
     >>> @elementwise(
     ...     input_type=[dt.string],
-    ...     output_type=dt.Struct(['year', 'monthday'], [dt.string, dt.string])
+    ...     output_type=dt.Struct(dict(year=dt.string, monthday=dt.string))
     ... )
     ... def year_monthday(date):
     ...     return date.str.slice(0, 4), date.str.slice(4, 8)
     >>>
     >>> # add two columns "year" and "monthday"
-    >>> table = table.mutate(year_monthday(table['date']).destructure())
+    >>> table = table.mutate(year_monthday(table['date']).destructure())  # doctest: +SKIP
     """
     return _udf_decorator(ElementWiseVectorizedUDF, input_type, output_type)
 
 
 def reduction(input_type, output_type):
-    """Define a user-defined reduction function that takes N pandas Series or
-    scalar values as inputs and produces one row of output.
+    """Define a UDF reduction function that produces 1 row of output for N rows of input.
 
     Parameters
     ----------
@@ -364,13 +365,13 @@ def reduction(input_type, output_type):
 
     >>> @reduction(
     ...     input_type=[dt.double],
-    ...     output_type=dt.Struct(['mean', 'std'], [dt.double, dt.double])
+    ...     output_type=dt.Struct(dict(mean="double", std="double"))
     ... )
     ... def mean_and_std(v):
     ...     return v.mean(), v.std()
     >>>
     >>> # create aggregation columns "mean" and "std"
-    >>> table = table.group_by('key').aggregate(
+    >>> table = table.group_by('key').aggregate(  # doctest: +SKIP
     ...     mean_and_std(table['v']).destructure()
     ... )
     """

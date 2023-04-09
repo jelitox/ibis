@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import collections
 import concurrent.futures
+import contextlib
 import itertools
 import os
 import subprocess
@@ -13,12 +14,12 @@ import pytest
 
 import ibis
 import ibis.expr.types as ir
-import ibis.util as util
-from ibis import options
+from ibis import options, util
 from ibis.backends.base import BaseBackend
-from ibis.backends.conftest import TEST_TABLES
+from ibis.backends.conftest import TEST_TABLES, _random_identifier
 from ibis.backends.impala.compiler import ImpalaCompiler, ImpalaExprTranslator
 from ibis.backends.tests.base import BackendTest, RoundAwayFromZero, UnorderedComparator
+from ibis.backends.tests.data import win
 from ibis.tests.expr.mocks import MockBackend
 
 
@@ -43,6 +44,20 @@ class TestConf(UnorderedComparator, BackendTest, RoundAwayFromZero):
             Location of scripts defining schemas
         """
         fsspec = pytest.importorskip("fsspec")
+        fs = fsspec.filesystem("file")
+
+        data_files = {
+            data_file
+            for data_file in fs.find(data_dir)
+            # ignore sqlite databases and markdown files
+            if not data_file.endswith((".db", ".md"))
+            # ignore files in the test data .git directory
+            if (
+                # ignore .git
+                os.path.relpath(data_file, data_dir).split(os.sep, 1)[0]
+                != ".git"
+            )
+        }
 
         # without setting the pool size
         # connections are dropped from the urllib3
@@ -51,84 +66,64 @@ class TestConf(UnorderedComparator, BackendTest, RoundAwayFromZero):
         URLLIB_DEFAULT_POOL_SIZE = 10
 
         env = IbisTestEnv()
-        con = ibis.impala.connect(
-            host=env.impala_host,
-            port=env.impala_port,
-            hdfs_client=fsspec.filesystem(
-                env.hdfs_protocol,
-                host=env.nn_host,
-                port=env.hdfs_port,
-                user=env.hdfs_user,
-            ),
-            pool_size=URLLIB_DEFAULT_POOL_SIZE,
-        )
-
-        try:
-            fs = fsspec.filesystem("file")
-
-            data_files = {
-                data_file
-                for data_file in fs.find(data_dir)
-                # ignore sqlite databases and markdown files
-                if not data_file.endswith((".db", ".md"))
-                # ignore files in the test data .git directory
-                if (
-                    # ignore .git
-                    os.path.relpath(data_file, data_dir).split(os.sep, 1)[0]
-                    != ".git"
-                )
+        with contextlib.closing(
+            ibis.impala.connect(
+                host=env.impala_host,
+                port=env.impala_port,
+                hdfs_client=fsspec.filesystem(
+                    env.hdfs_protocol,
+                    host=env.nn_host,
+                    port=env.hdfs_port,
+                    user=env.hdfs_user,
+                ),
+                pool_size=URLLIB_DEFAULT_POOL_SIZE,
+            )
+        ) as con, concurrent.futures.ThreadPoolExecutor(
+            max_workers=int(
+                os.environ.get("IBIS_DATA_MAX_WORKERS", URLLIB_DEFAULT_POOL_SIZE)
+            )
+        ) as executor:
+            hdfs = con.hdfs
+            tasks = {
+                # make the database
+                executor.submit(impala_create_test_database, con, env),
+                # build and upload UDFs
+                *itertools.starmap(
+                    executor.submit,
+                    impala_build_and_upload_udfs(hdfs, env, fs=fs),
+                ),
+                # upload data files
+                *(
+                    executor.submit(
+                        hdfs_make_dir_and_put_file,
+                        hdfs,
+                        data_file,
+                        os.path.join(
+                            env.test_data_dir,
+                            os.path.relpath(data_file, data_dir),
+                        ),
+                    )
+                    for data_file in data_files
+                ),
             }
 
-            hdfs = con.hdfs
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=int(
-                    os.environ.get(
-                        "IBIS_DATA_MAX_WORKERS",
-                        URLLIB_DEFAULT_POOL_SIZE,
-                    )
+            for future in concurrent.futures.as_completed(tasks):
+                future.result()
+
+            # create the tables and compute stats
+            for future in concurrent.futures.as_completed(
+                executor.submit(table_future.result().compute_stats)
+                for table_future in concurrent.futures.as_completed(
+                    impala_create_tables(con, env, executor=executor)
                 )
-            ) as executor:
-                tasks = {
-                    # make the database
-                    executor.submit(impala_create_test_database, con, env),
-                    # build and upload UDFs
-                    *itertools.starmap(
-                        executor.submit,
-                        impala_build_and_upload_udfs(hdfs, env, fs=fs),
-                    ),
-                    # upload data files
-                    *(
-                        executor.submit(
-                            hdfs_make_dir_and_put_file,
-                            hdfs,
-                            data_file,
-                            os.path.join(
-                                env.test_data_dir,
-                                os.path.relpath(data_file, data_dir),
-                            ),
-                        )
-                        for data_file in data_files
-                    ),
-                }
-
-                for future in concurrent.futures.as_completed(tasks):
-                    future.result()
-
-                # create the tables and compute stats
-                for future in concurrent.futures.as_completed(
-                    executor.submit(table_future.result().compute_stats)
-                    for table_future in concurrent.futures.as_completed(
-                        impala_create_tables(con, env, executor=executor)
-                    )
-                ):
-                    future.result()
-        finally:
-            con.close()
+            ):
+                future.result()
 
     @staticmethod
     def connect(
         data_directory: Path,
-        database: str | None = os.environ.get("IBIS_TEST_DATA_DB", "ibis_testing"),
+        database: str
+        | None = os.environ.get("IBIS_TEST_DATA_DB", "ibis_testing"),  # noqa: B008
         with_hdfs: bool = True,
     ):
         fsspec = pytest.importorskip("fsspec")
@@ -150,12 +145,7 @@ class TestConf(UnorderedComparator, BackendTest, RoundAwayFromZero):
         )
 
     def _get_original_column_names(self, tablename: str) -> list[str]:
-        import pyarrow.parquet as pq
-
-        pq_file = pq.ParquetFile(
-            self.data_directory / "parquet" / tablename / f"{tablename}.parquet"
-        )
-        return pq_file.schema.names
+        return list(TEST_TABLES[tablename].names)
 
     def _get_renamed_table(self, tablename: str) -> ir.Table:
         t = self.connection.table(tablename)
@@ -316,17 +306,14 @@ def tmp_db(env, con, test_data_db):
     try:
         yield tmp_db
     finally:
-        con.set_database(test_data_db)
-        try:
-            con.drop_database(tmp_db, force=True)
-        except impala.error.HiveServer2Error:
+        with contextlib.suppress(impala.error.HiveServer2Error):
             # The database can be dropped by another process during tear down
             # in the middle of dropping this one if tests are running in
             # parallel.
             #
             # We only care that it gets dropped before all tests are finished
             # running.
-            pass
+            con.drop_database(tmp_db, force=True)
 
 
 @pytest.fixture(scope="module")
@@ -351,10 +338,6 @@ def alltypes_df(alltypes):
     return alltypes.execute()
 
 
-def _random_identifier(suffix):
-    return f'__ibis_test_{suffix}_{util.guid()}'
-
-
 @pytest.fixture
 def temp_database(con, test_data_db):
     name = _random_identifier('database')
@@ -362,7 +345,6 @@ def temp_database(con, test_data_db):
     try:
         yield name
     finally:
-        con.set_database(test_data_db)
         con.drop_database(name, force=True)
 
 
@@ -497,11 +479,21 @@ def impala_create_test_database(con, env):
         ),
         database=env.test_data_db,
     )
+    con.create_table(
+        "win",
+        schema=ibis.schema(dict(g="string", x="int64", y="int64")),
+        database=env.test_data_db,
+    )
+    con.table("win", database=env.test_data_db).insert(win, overwrite=True)
 
 
 PARQUET_SCHEMAS = {
-    'functional_alltypes': TEST_TABLES["functional_alltypes"].delete(
-        ["index", "Unnamed: 0"]
+    "functional_alltypes": ibis.schema(
+        {
+            name: dtype
+            for name, dtype in TEST_TABLES["functional_alltypes"].items()
+            if name not in {"index", "Unnamed: 0"}
+        }
     ),
     "tpch_region": ibis.schema(
         [

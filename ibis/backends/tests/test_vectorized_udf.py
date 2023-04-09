@@ -6,8 +6,9 @@ from pytest import param
 import ibis
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
-from ibis.expr.window import window
 from ibis.udf.vectorized import analytic, elementwise, reduction
+
+pytestmark = pytest.mark.notimpl(["druid"])
 
 
 def _format_udf_return_type(func, result_formatter):
@@ -85,7 +86,7 @@ def add_one_struct(v):
 def create_add_one_struct_udf(result_formatter):
     return elementwise(
         input_type=[dt.double],
-        output_type=dt.Struct(['col1', 'col2'], [dt.double, dt.double]),
+        output_type=dt.Struct({'col1': dt.double, 'col2': dt.double}),
     )(_format_struct_udf_return_type(add_one_struct, result_formatter))
 
 
@@ -127,7 +128,7 @@ add_one_struct_udfs = [
 
 @elementwise(
     input_type=[dt.double],
-    output_type=dt.Struct(['double_col', 'col2'], [dt.double, dt.double]),
+    output_type=dt.Struct({'double_col': dt.double, 'col2': dt.double}),
 )
 def overwrite_struct_elementwise(v):
     assert isinstance(v, pd.Series)
@@ -137,7 +138,7 @@ def overwrite_struct_elementwise(v):
 @elementwise(
     input_type=[dt.double],
     output_type=dt.Struct(
-        ['double_col', 'col2', 'float_col'], [dt.double, dt.double, dt.double]
+        {'double_col': dt.double, 'col2': dt.double, 'float_col': dt.double}
     ),
 )
 def multiple_overwrite_struct_elementwise(v):
@@ -147,7 +148,7 @@ def multiple_overwrite_struct_elementwise(v):
 
 @analytic(
     input_type=[dt.double, dt.double],
-    output_type=dt.Struct(['double_col', 'demean_weight'], [dt.double, dt.double]),
+    output_type=dt.Struct({'double_col': dt.double, 'demean_weight': dt.double}),
 )
 def overwrite_struct_analytic(v, w):
     assert isinstance(v, pd.Series)
@@ -165,7 +166,7 @@ def demean_struct(v, w):
 def create_demean_struct_udf(result_formatter):
     return analytic(
         input_type=[dt.double, dt.double],
-        output_type=dt.Struct(['demean', 'demean_weight'], [dt.double, dt.double]),
+        output_type=dt.Struct({'demean': dt.double, 'demean_weight': dt.double}),
     )(_format_struct_udf_return_type(demean_struct, result_formatter))
 
 
@@ -202,8 +203,8 @@ def mean_struct(v, w):
 
 def create_mean_struct_udf(result_formatter):
     return reduction(
-        input_type=[dt.double, dt.double],
-        output_type=dt.Struct(['mean', 'mean_weight'], [dt.double, dt.double]),
+        input_type=[dt.double, dt.int64],
+        output_type=dt.Struct({'mean': dt.double, 'mean_weight': dt.double}),
     )(_format_struct_udf_return_type(mean_struct, result_formatter))
 
 
@@ -219,8 +220,8 @@ mean_struct_udfs = [
 
 
 @reduction(
-    input_type=[dt.double, dt.double],
-    output_type=dt.Struct(['double_col', 'mean_weight'], [dt.double, dt.double]),
+    input_type=[dt.double, dt.int64],
+    output_type=dt.Struct({'double_col': dt.double, 'mean_weight': dt.double}),
 )
 def overwrite_struct_reduction(v, w):
     assert isinstance(v, (np.ndarray, pd.Series))
@@ -495,7 +496,7 @@ def test_elementwise_udf_destructure_exact_once(
 ):
     @elementwise(
         input_type=[dt.double],
-        output_type=dt.Struct(['col1', 'col2'], [dt.double, dt.double]),
+        output_type=dt.Struct({'col1': dt.double, 'col2': dt.double}),
     )
     def add_one_struct_exact_once(v):
         key = v.iloc[0]
@@ -550,7 +551,6 @@ def test_elementwise_udf_named_destruct(udf_backend, udf_alltypes):
         )
 
 
-@pytest.mark.notimpl(["dask", "pandas"])
 def test_elementwise_udf_struct(udf_backend, udf_alltypes):
     add_one_struct_udf = create_add_one_struct_udf(
         result_formatter=lambda v1, v2: (v1, v2)
@@ -559,8 +559,8 @@ def test_elementwise_udf_struct(udf_backend, udf_alltypes):
         new_col=add_one_struct_udf(udf_alltypes['double_col'])
     ).execute()
     result = result.assign(
-        col1=result['new_col'].apply(lambda x: x[0]),
-        col2=result['new_col'].apply(lambda x: x[1]),
+        col1=result['new_col'].apply(lambda x: x['col1']),
+        col2=result['new_col'].apply(lambda x: x['col2']),
     )
     result = result.drop('new_col', axis=1)
     expected = udf_alltypes.mutate(
@@ -573,8 +573,9 @@ def test_elementwise_udf_struct(udf_backend, udf_alltypes):
 
 @pytest.mark.parametrize('udf', demean_struct_udfs)
 @pytest.mark.notimpl(["pyspark"])
+@pytest.mark.broken(["dask"], strict=False)
 def test_analytic_udf_destruct(udf_backend, udf_alltypes, udf):
-    w = window(preceding=None, following=None, group_by='year')
+    w = ibis.window(preceding=None, following=None, group_by='year')
 
     result = udf_alltypes.mutate(
         udf(udf_alltypes['double_col'], udf_alltypes['int_col']).over(w).destructure()
@@ -589,7 +590,7 @@ def test_analytic_udf_destruct(udf_backend, udf_alltypes, udf):
 
 @pytest.mark.notimpl(["pyspark"])
 def test_analytic_udf_destruct_no_group_by(udf_backend, udf_alltypes):
-    w = window(preceding=None, following=None)
+    w = ibis.window(preceding=None, following=None)
 
     demean_struct_udf = create_demean_struct_udf(
         result_formatter=lambda v1, v2: (v1, v2)
@@ -609,8 +610,9 @@ def test_analytic_udf_destruct_no_group_by(udf_backend, udf_alltypes):
 
 
 @pytest.mark.notimpl(["pyspark"])
+@pytest.mark.xfail_version(dask=["pandas>=2"])
 def test_analytic_udf_destruct_overwrite(udf_backend, udf_alltypes):
-    w = window(preceding=None, following=None, group_by='year')
+    w = ibis.window(preceding=None, following=None, group_by='year')
 
     result = udf_alltypes.mutate(
         overwrite_struct_analytic(udf_alltypes['double_col'], udf_alltypes['int_col'])
@@ -696,7 +698,7 @@ def test_reduction_udf_destruct_no_group_by_overwrite(udf_backend, udf_alltypes)
 # TODO - windowing - #2553
 @pytest.mark.notimpl(["dask", "pyspark"])
 def test_reduction_udf_destruct_window(udf_backend, udf_alltypes):
-    win = window(
+    win = ibis.window(
         preceding=ibis.interval(hours=2),
         following=0,
         group_by='year',

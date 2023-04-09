@@ -1,16 +1,18 @@
 """Dispatching code for Selection operations."""
 
+from __future__ import annotations
 
 import functools
 import operator
-from typing import List, Optional
 
 import dask.dataframe as dd
-import pandas
+import pandas as pd
 from toolz import concatv
 
 import ibis.expr.analysis as an
 import ibis.expr.operations as ops
+from ibis.backends.base.df.scope import Scope
+from ibis.backends.base.df.timecontext import TimeContext
 from ibis.backends.dask.core import execute
 from ibis.backends.dask.dispatch import execute_node
 from ibis.backends.dask.execution.util import (
@@ -25,9 +27,6 @@ from ibis.backends.pandas.execution.selection import (
     remap_overlapping_column_names,
 )
 from ibis.backends.pandas.execution.util import get_join_suffix_for_op
-from ibis.expr.rules import Shape
-from ibis.expr.scope import Scope
-from ibis.expr.typing import TimeContext
 
 
 # TODO(kszucs): deduplicate with pandas.compute_projection() since it is almost
@@ -37,27 +36,13 @@ def compute_projection(
     parent,
     data,
     scope: Scope = None,
-    timecontext: Optional[TimeContext] = None,
+    timecontext: TimeContext | None = None,
     **kwargs,
 ):
     """Compute a projection.
 
-    Parameters
-    ----------
-    node : Union[ops.Scalar, ops.Column, ops.TableNode]
-    parent : ops.Selection
-    data : pd.DataFrame
-    scope : Scope
-    timecontext:Optional[TimeContext]
-
-    Returns
-    -------
-    value : scalar, pd.Series, pd.DataFrame
-
-    Notes
-    -----
-    :class:`~ibis.expr.types.Scalar` instances occur when a specific column
-    projection is a window operation.
+    `ibis.expr.types.Scalar` instances occur when a specific column projection
+    is a window operation.
     """
     if isinstance(node, ops.TableNode):
         if node == parent.table:
@@ -76,7 +61,7 @@ def compute_projection(
         name = node.name
         assert name is not None, 'Value selection name is None'
 
-        if node.output_shape is Shape.SCALAR:
+        if node.output_shape.is_scalar():
             data_columns = frozenset(data.columns)
 
             if scope is None:
@@ -133,13 +118,12 @@ def compute_projection(
 
 
 def build_df_from_projection(
-    selections: List[ops.Node],
+    selections: list[ops.Node],
     op: ops.Selection,
     data: dd.DataFrame,
     **kwargs,
 ) -> dd.DataFrame:
-    """Build up a df from individual pieces by dispatching to
-    `compute_projection` for each expression."""
+    """Build up projection from individual pieces."""
     # Fast path for when we're assigning columns into the same table.
     if (selections[0] is op.table) and all(is_row_order_preserving(selections[1:])):
         for node in selections[1:]:
@@ -164,7 +148,7 @@ def execute_selection_dataframe(
     op,
     data,
     scope: Scope,
-    timecontext: Optional[TimeContext],
+    timecontext: TimeContext | None,
     **kwargs,
 ):
     result = data
@@ -221,7 +205,7 @@ def execute_selection_dataframe(
         return result
 
     # create a sequence of columns that we need to drop
-    temporary_columns = pandas.Index(concatv(grouping_keys, ordering_keys)).difference(
+    temporary_columns = pd.Index(concatv(grouping_keys, ordering_keys)).difference(
         data.columns
     )
 
@@ -238,29 +222,13 @@ def _compute_predicates(
     predicates,
     data,
     scope: Scope,
-    timecontext: Optional[TimeContext],
+    timecontext: TimeContext | None,
     **kwargs,
 ):
     """Compute the predicates for a table operation.
 
-    Parameters
-    ----------
-    table_op : TableNode
-    predicates : List[ir.Column]
-    data : pd.DataFrame
-    scope : Scope
-    timecontext: Optional[TimeContext]
-    kwargs : dict
-
-    Returns
-    -------
-    computed_predicate : pd.Series[bool]
-
-    Notes
-    -----
-    This handles the cases where the predicates are computed columns, in
-    addition to the simple case of named columns coming directly from the input
-    table.
+    This handles the cases where `predicates` are computed columns, in addition
+    to the simple case of named columns coming directly from the input table.
     """
     for predicate in predicates:
         # Map each root table of the predicate to the data so that we compute

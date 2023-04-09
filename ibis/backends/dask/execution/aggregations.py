@@ -1,4 +1,4 @@
-"""Execution rules for Aggregatons - mostly TODO
+"""Execution rules for Aggregatons - mostly TODO.
 
 - ops.Aggregation
 - ops.Any
@@ -8,27 +8,28 @@
 
 """
 
+from __future__ import annotations
+
 import functools
 import operator
-from typing import Optional
 
 import dask.dataframe as dd
 import dask.dataframe.groupby as ddgb
 
 import ibis.expr.operations as ops
+from ibis.backends.base.df.scope import Scope
+from ibis.backends.base.df.timecontext import TimeContext
 from ibis.backends.dask.core import execute
 from ibis.backends.dask.dispatch import execute_node
 from ibis.backends.dask.execution.util import coerce_to_output, safe_concat
 from ibis.backends.pandas.execution.generic import agg_ctx
-from ibis.expr.scope import Scope
-from ibis.expr.typing import TimeContext
 
 
 # TODO - aggregations - #2553
 # Not all code paths work cleanly here
 @execute_node.register(ops.Aggregation, dd.DataFrame)
 def execute_aggregation_dataframe(
-    op, data, scope=None, timecontext: Optional[TimeContext] = None, **kwargs
+    op, data, scope=None, timecontext: TimeContext | None = None, **kwargs
 ):
     assert op.metrics, 'no metrics found during aggregation execution'
 
@@ -103,38 +104,59 @@ def execute_aggregation_dataframe(
     return result
 
 
-@execute_node.register((ops.Any, ops.All), (dd.Series, ddgb.SeriesGroupBy))
-def execute_any_all_series(op, data, aggcontext=None, **kwargs):
+@execute_node.register((ops.Any, ops.All), dd.Series, (dd.Series, type(None)))
+def execute_any_all_series(op, data, mask, aggcontext=None, **kwargs):
+    if mask is not None:
+        data = data.loc[mask]
+
+    name = type(op).__name__.lower()
     if isinstance(aggcontext, (agg_ctx.Summarize, agg_ctx.Transform)):
-        result = aggcontext.agg(data, type(op).__name__.lower())
+        result = aggcontext.agg(data, name)
     else:
         # Note this branch is not currently hit in the dask backend but is
         # here for future scafolding.
-        result = aggcontext.agg(
-            data, lambda data: getattr(data, type(op).__name__.lower())()
-        )
+        result = aggcontext.agg(data, operator.methodcaller(name))
     return result
 
 
-@execute_node.register(ops.NotAny, (dd.Series, ddgb.SeriesGroupBy))
-def execute_notany_series(op, data, aggcontext=None, **kwargs):
+@execute_node.register((ops.Any, ops.All), ddgb.SeriesGroupBy, type(None))
+def execute_any_all_series_group_by(op, data, mask, aggcontext=None, **kwargs):
+    name = type(op).__name__.lower()
     if isinstance(aggcontext, (agg_ctx.Summarize, agg_ctx.Transform)):
-        result = ~(aggcontext.agg(data, 'any'))
+        result = aggcontext.agg(data, name)
     else:
         # Note this branch is not currently hit in the dask backend but is
         # here for future scafolding.
-        result = aggcontext.agg(data, lambda data: ~(data.any()))
+        result = aggcontext.agg(data, operator.methodcaller(name))
+    return result
+
+
+@execute_node.register((ops.NotAny, ops.NotAll), dd.Series, (dd.Series, type(None)))
+def execute_notany_series(op, data, mask, aggcontext=None, **kwargs):
+    if mask is not None:
+        data = data.loc[mask]
+
+    name = type(op).__name__[len("Not") :].lower()
+    if isinstance(aggcontext, (agg_ctx.Summarize, agg_ctx.Transform)):
+        result = ~aggcontext.agg(data, name)
+    else:
+        # Note this branch is not currently hit in the dask backend but is
+        # here for future scafolding.
+        method = operator.methodcaller(name)
+        result = aggcontext.agg(data, lambda data: ~method(data))
 
     return result
 
 
-@execute_node.register(ops.NotAll, (dd.Series, ddgb.SeriesGroupBy))
-def execute_notall_series(op, data, aggcontext=None, **kwargs):
+@execute_node.register((ops.NotAny, ops.NotAll), ddgb.SeriesGroupBy, type(None))
+def execute_notany_series_group_by(op, data, mask, aggcontext=None, **kwargs):
+    name = type(op).__name__[len("Not") :].lower()
     if isinstance(aggcontext, (agg_ctx.Summarize, agg_ctx.Transform)):
-        result = ~(aggcontext.agg(data, 'all'))
+        result = ~aggcontext.agg(data, name)
     else:
         # Note this branch is not currently hit in the dask backend but is
         # here for future scafolding.
-        result = aggcontext.agg(data, lambda data: ~(data.all()))
+        method = operator.methodcaller(name)
+        result = aggcontext.agg(data, lambda data: ~method(data))
 
     return result

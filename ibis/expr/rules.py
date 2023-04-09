@@ -1,20 +1,29 @@
-import builtins
+from __future__ import annotations
+
 import enum
 import operator
 from itertools import product, starmap
+
+from public import public
 
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
-import ibis.util as util
-from ibis.common.annotations import attribute, optional, variadic  # noqa: F401
-from ibis.common.validators import (  # noqa: F401
+from ibis import util
+from ibis.common.annotations import attribute, optional
+from ibis.common.validators import (
     bool_,
+    callable_with,  # noqa: F401
+    coerced_to,  # noqa: F401
+    equal_to,  # noqa: F401
     instance_of,
     isin,
+    lazy_instance_of,
     map_to,
     one_of,
+    option,  # noqa: F401
+    pair_of,  # noqa: F401
     ref,
     str_,
     tuple_of,
@@ -24,25 +33,25 @@ from ibis.expr.deferred import Deferred
 
 
 # TODO(kszucs): consider to rename to datashape
+@public
 class Shape(enum.IntEnum):
     SCALAR = 0
     COLUMNAR = 1
     # TABULAR = 2
 
     def is_scalar(self):
-        return self == Shape.SCALAR
+        return self is Shape.SCALAR
 
     def is_columnar(self):
-        return self == Shape.COLUMNAR
+        return self is Shape.COLUMNAR
 
 
+@public
 def highest_precedence_shape(nodes):
-    if builtins.any(node.output_shape is Shape.COLUMNAR for node in nodes):
-        return Shape.COLUMNAR
-    else:
-        return Shape.SCALAR
+    return max(node.output_shape for node in nodes)
 
 
+@public
 def highest_precedence_dtype(nodes):
     """Return the highest precedence type from the passed expressions.
 
@@ -63,6 +72,7 @@ def highest_precedence_dtype(nodes):
     return dt.highest_precedence(node.output_dtype for node in nodes)
 
 
+@public
 def castable(source, target):
     """Return whether source ir type is implicitly castable to target.
 
@@ -72,13 +82,12 @@ def castable(source, target):
     return dt.castable(source.output_dtype, target.output_dtype, value=value)
 
 
+@public
 def comparable(left, right):
     return castable(left, right) or castable(right, left)
 
 
 class rule(validator):
-    __slots__ = ()
-
     def _erase_expr(self, value):
         return value.op() if isinstance(value, ir.Expr) else value
 
@@ -94,17 +103,15 @@ class rule(validator):
 # Input type validators / coercion functions
 
 
+@validator
+def expr_of(inner, value, **kwargs):
+    value = inner(value, **kwargs)
+    return value if isinstance(value, ir.Expr) else value.to_expr()
+
+
 @rule
 def just(arg):
     return lambda **_: arg
-
-
-@rule
-def nodes_of(inner, arg, **kwargs):
-    import ibis.expr.operations as ops
-
-    values = tuple_of(inner, arg, **kwargs)
-    return ops.NodeList(*values)
 
 
 @rule
@@ -132,11 +139,16 @@ def sort_key_from(table_ref, key, **kwargs):
     else:
         key, order = key, True
 
-    key = one_of(
-        (function_of(table_ref), column_from(table_ref), any),
-        key,
-        **kwargs,
-    )
+    if isinstance(key, (str, int)):
+        # Actual str/int keys must refer to columns in the table, we don't want
+        # to fallback to converting them to expressions with ibis.literal
+        key = column_from(table_ref, key, **kwargs)
+    else:
+        key = one_of(
+            (function_of(table_ref), column_from(table_ref), any),
+            key,
+            **kwargs,
+        )
 
     if isinstance(order, str):
         order = order.lower()
@@ -179,9 +191,9 @@ def literal(dtype, value, **kwargs):
         try:
             # ensure type correctness: check that the inferred dtype is
             # implicitly castable to the explicitly given dtype and value
-            dtype = inferred_dtype.cast(explicit_dtype, value=value)
+            dtype = dt.cast(inferred_dtype, target=explicit_dtype, value=value)
         except com.IbisTypeError:
-            raise TypeError(f'Value {value!r} cannot be safely coerced to {type}')
+            raise TypeError(f'Value {value!r} cannot be safely coerced to `{dtype}`')
     elif has_explicit:
         dtype = explicit_dtype
     elif has_inferred:
@@ -192,7 +204,7 @@ def literal(dtype, value, **kwargs):
             'passing it explicitly with the `type` keyword.'.format(value)
         )
 
-    if isinstance(dtype, dt.Null):
+    if dtype.is_null():
         return ops.NullLiteral()
 
     value = dt.normalize(dtype, value)
@@ -205,17 +217,26 @@ def value(dtype, arg, **kwargs):
 
     Parameters
     ----------
-    dtype : DataType subclass or DataType instance
-    arg : python literal or an ibis expression
-      If a python literal is given the validator tries to coerce it to an ibis
-      literal.
+    dtype
+        DataType subclass or DataType instance
+    arg
+        If a Python literal is given the validator tries to coerce it to an ibis
+        literal.
+    kwargs
+        Keyword arguments
 
     Returns
     -------
-    arg : Value
-      An ibis value expression with the specified datatype
+    ir.Value
+        An ibis value expression with the specified datatype
     """
     import ibis.expr.operations as ops
+
+    if isinstance(arg, Deferred):
+        raise com.IbisTypeError(
+            "Deferred input is not allowed, try passing a lambda function instead. "
+            "For example, instead of writing `f(_.a)` write `lambda t: f(t.a)`"
+        )
 
     if not isinstance(arg, ops.Value):
         # coerce python literal to ibis literal
@@ -257,7 +278,7 @@ def value(dtype, arg, **kwargs):
 @rule
 def scalar(inner, arg, **kwargs):
     arg = inner(arg, **kwargs)
-    if arg.output_shape is Shape.SCALAR:
+    if arg.output_shape.is_scalar():
         return arg
     else:
         raise com.IbisTypeError(f"{arg} it not a scalar")
@@ -266,7 +287,7 @@ def scalar(inner, arg, **kwargs):
 @rule
 def column(inner, arg, **kwargs):
     arg = inner(arg, **kwargs)
-    if arg.output_shape is Shape.COLUMNAR:
+    if arg.output_shape.is_columnar():
         return arg
     else:
         raise com.IbisTypeError(f"{arg} it not a column")
@@ -282,7 +303,6 @@ floating = value(dt.float64)
 date = value(dt.date)
 time = value(dt.time)
 timestamp = value(dt.Timestamp)
-category = value(dt.category)
 temporal = one_of([timestamp, date, time])
 json = value(dt.json)
 
@@ -304,6 +324,7 @@ multipoint = value(dt.MultiPoint)
 multipolygon = value(dt.MultiPolygon)
 
 
+@public
 @rule
 def interval(arg, units=None, **kwargs):
     arg = value(dt.Interval, arg)
@@ -314,7 +335,8 @@ def interval(arg, units=None, **kwargs):
     return arg
 
 
-@validator
+@public
+@rule
 def client(arg, **kwargs):
     from ibis.backends.base import BaseBackend
 
@@ -325,6 +347,7 @@ def client(arg, **kwargs):
 # Ouput type functions
 
 
+@public
 def dtype_like(name):
     @attribute.default
     def output_dtype(self):
@@ -335,6 +358,7 @@ def dtype_like(name):
     return output_dtype
 
 
+@public
 def shape_like(name):
     @attribute.default
     def output_shape(self):
@@ -351,11 +375,12 @@ def shape_like(name):
 
 
 def _promote_integral_binop(exprs, op):
+    import ibis.expr.operations as ops
+
     bounds, dtypes = [], []
     for arg in exprs:
         dtypes.append(arg.output_dtype)
-        if hasattr(arg, 'value'):
-            # arg.op() is a literal
+        if isinstance(arg, ops.Literal):
             bounds.append([arg.value])
         else:
             bounds.append(arg.output_dtype.bounds)
@@ -364,8 +389,9 @@ def _promote_integral_binop(exprs, op):
     # In some cases, the bounding type might be int8, even though neither
     # of the types are that small. We want to ensure the containing type is
     # _at least_ as large as the smallest type in the expression.
-    values = list(starmap(op, product(*bounds)))
-    dtypes.extend(dt.infer(v, prefer_unsigned=all_unsigned) for v in values)
+    values = starmap(op, product(*bounds))
+    dtypes += [dt.infer(v, prefer_unsigned=all_unsigned) for v in values]
+
     return dt.highest_precedence(dtypes)
 
 
@@ -402,6 +428,7 @@ def _promote_decimal_binop(args, op):
         return highest_precedence_dtype(args)
 
 
+@public
 def numeric_like(name, op):
     @attribute.default
     def output_dtype(self):
@@ -422,18 +449,21 @@ def numeric_like(name, op):
 # TODO(kszucs): it could be as simple as rlz.instance_of(ops.TableNode)
 # we have a single test case testing the schema superset condition, not
 # used anywhere else
+@public
 @rule
 def table(arg, schema=None, **kwargs):
     """A table argument.
 
     Parameters
     ----------
+    arg
+        A table node
     schema
         A validator for the table's columns. Only column subset validators are
         currently supported. Accepts any arguments that `sch.schema` accepts.
         See the example for usage.
-    arg
-        An argument
+    kwargs
+        Keyword arguments
 
     The following op will accept an argument named `'table'`. Note that the
     `schema` argument specifies rules for columns that are required to be in
@@ -442,7 +472,13 @@ def table(arg, schema=None, **kwargs):
     it must be of the specified type. The table may have extra columns not
     specified in the schema.
     """
+    import pandas as pd
+
+    import ibis
     import ibis.expr.operations as ops
+
+    if isinstance(arg, pd.DataFrame):
+        arg = ibis.memtable(arg).op()
 
     if not isinstance(arg, ops.TableNode):
         raise com.IbisTypeError(
@@ -459,6 +495,7 @@ def table(arg, schema=None, **kwargs):
     return arg
 
 
+@public
 @rule
 def column_from(table_ref, column, **kwargs):
     """A column from a named table.
@@ -481,7 +518,7 @@ def column_from(table_ref, column, **kwargs):
 
     if not isinstance(column, ir.Column):
         raise com.IbisTypeError(
-            "value must be an int or str or Column, got " f"{type(column).__name__}"
+            f"value must be an int or str or Column, got {type(column).__name__}"
         )
 
     if not column.has_name():
@@ -497,6 +534,7 @@ def column_from(table_ref, column, **kwargs):
         raise com.IbisTypeError(f"Cannot get column {maybe_column} from {type(table)}")
 
 
+@public
 @rule
 def base_table_of(table_ref, *, this, strict=True):
     from ibis.expr.analysis import find_first_base_table
@@ -508,6 +546,7 @@ def base_table_of(table_ref, *, this, strict=True):
     return base
 
 
+@public
 @rule
 def function_of(table_ref, fn, *, output_rule=any, this=None):
     arg = table_ref(this=this).to_expr()
@@ -524,6 +563,7 @@ def function_of(table_ref, fn, *, output_rule=any, this=None):
     return output_rule(arg, this=this)
 
 
+@public
 @rule
 def reduction(arg, **kwargs):
     from ibis.expr.analysis import is_reduction
@@ -534,57 +574,39 @@ def reduction(arg, **kwargs):
     return arg
 
 
-@rule
-def non_negative_integer(arg, **kwargs):
-    if not isinstance(arg, int):
-        raise com.IbisTypeError(
-            f"positive integer must be int type, got {type(arg).__name__}"
-        )
-    if arg < 0:
-        raise ValueError("got negative value for non-negative integer rule")
-    return arg
-
-
-@rule
-def pair(inner_left, inner_right, arg, **kwargs):
-    try:
-        a, b = arg
-    except TypeError:
-        raise com.IbisTypeError(f"{arg} is not an iterable with two elements")
-    return inner_left(a[0], **kwargs), inner_right(b, **kwargs)
-
-
+@public
 @rule
 def analytic(arg, **kwargs):
     from ibis.expr.analysis import is_analytic
 
     if not is_analytic(arg):
         raise com.IbisInputError('Expression does not contain a valid window operation')
+
     return arg
 
 
-@validator
-def window_from(table_ref, win, **kwargs):
-    from ibis.expr.window import Window
+@public
+@rule
+def window_boundary(inner, arg, **kwargs):
+    import ibis.expr.operations as ops
 
-    if not isinstance(win, Window):
-        raise com.IbisTypeError(
-            "`win` argument should be of type `ibis.expr.window.Window`; "
-            f"got type {type(win).__name__}"
-        )
+    arg = inner(arg, **kwargs)
 
-    table = table_ref(**kwargs)
-    if table is not None:
-        win = win.bind(table.to_expr())
+    if isinstance(arg, ops.WindowBoundary):
+        return arg
+    elif isinstance(arg, ops.Negate):
+        return ops.WindowBoundary(arg.arg, preceding=True)
+    elif isinstance(arg, ops.Literal):
+        new = arg.copy(value=abs(arg.value))
+        return ops.WindowBoundary(new, preceding=arg.value < 0)
+    elif isinstance(arg, ops.Value):
+        return ops.WindowBoundary(arg, preceding=False)
+    else:
+        raise TypeError(f'Invalid window boundary type: {type(arg)}')
 
-    if win.max_lookback is not None:
-        error_msg = "'max lookback' windows must be ordered " "by a timestamp column"
-        if len(win._order_by) != 1:
-            raise com.IbisInputError(error_msg)
-        order_var = win._order_by[0].args[0]
-        if not isinstance(order_var.output_dtype, dt.Timestamp):
-            raise com.IbisInputError(error_msg)
-    return win
+
+row_window_boundary = window_boundary(integer)
+range_window_boundary = window_boundary(one_of([numeric, interval]))
 
 
 def _arg_type_error_format(op):
@@ -594,3 +616,41 @@ def _arg_type_error_format(op):
         return f"Literal({op.value}):{op.output_dtype}"
     else:
         return f"{op.name}:{op.output_dtype}"
+
+
+public(
+    any=any,
+    array=array,
+    bool=bool_,
+    boolean=boolean,
+    date=date,
+    decimal=decimal,
+    double=double,
+    floating=floating,
+    geospatial=geospatial,
+    integer=integer,
+    isin=isin,
+    json=json,
+    lazy_instance_of=lazy_instance_of,
+    linestring=linestring,
+    mapping=mapping,
+    multilinestring=multilinestring,
+    multipoint=multipoint,
+    numeric=numeric,
+    optional=optional,
+    point=point,
+    polygon=polygon,
+    ref=ref,
+    set_=set_,
+    soft_numeric=soft_numeric,
+    str_=str_,
+    strict_numeric=strict_numeric,
+    string=string,
+    struct=struct,
+    temporal=temporal,
+    time=time,
+    timestamp=timestamp,
+    tuple_of=tuple_of,
+    row_window_boundary=row_window_boundary,
+    range_window_boundary=range_window_boundary,
+)

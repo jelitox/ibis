@@ -1,28 +1,33 @@
 """Initialize Ibis module."""
 from __future__ import annotations
 
-# Converting an Ibis schema to a pandas DataFrame requires registering
-# some type conversions that are currently registered in the pandas backend
-import ibis.backends.pandas
-import ibis.config
-import ibis.expr.types as ir
-from ibis import util
+__version__ = "5.0.0"
+
+from ibis import examples, util
 from ibis.backends.base import BaseBackend
 from ibis.common.exceptions import IbisError
 from ibis.config import options
 from ibis.expr import api
-from ibis.expr.api import *  # noqa: F401,F403
+from ibis.expr import types as ir
+from ibis.expr.api import *  # noqa: F403
 
-__all__ = ['api', 'ir', 'util', 'BaseBackend', 'IbisError', 'options']
-__all__ += api.__all__
+__all__ = [  # noqa: PLE0604
+    'api',
+    'examples',
+    'ir',
+    'util',
+    'BaseBackend',
+    'IbisError',
+    'options',
+    *api.__all__,
+]
 
-__version__ = "3.2.0"
-
-_KNOWN_BACKENDS = ['bigquery', 'heavyai']
+_KNOWN_BACKENDS = ['heavyai']
 
 
 def __dir__() -> list[str]:
     """Adds tab completion for ibis backends to the top-level module."""
+
     out = set(__all__)
     out.update(ep.name for ep in util.backend_entry_points())
     return sorted(out)
@@ -60,13 +65,51 @@ def __getattr__(name: str) -> BaseBackend:
             "and just leave the one that needs to be used."
         )
 
+    import types
+
+    import ibis
+
     (entry_point,) = entry_points
     module = entry_point.load()
     backend = module.Backend()
-
     # The first time a backend is loaded, we register its options, and we set
     # it as an attribute of `ibis`, so `__getattr__` is not called again for it
     backend.register_options()
 
-    setattr(ibis, name, backend)
-    return backend
+    # We don't want to expose all the methods on an unconnected backend to the user.
+    # In lieu of a full redesign, we create a proxy module and add only the methods
+    # that are valid to call without a connect call. These are:
+    #
+    # - connect
+    # - compile
+    # - has_operation
+    # - add_operation
+    # - _from_url
+    # - _to_sql
+    # - _sqlglot_dialect (if defined)
+    #
+    # We also copy over the docstring from `do_connect` to the proxy `connect`
+    # method, since that's where all the backend-specific kwargs are currently
+    # documented. This is all admittedly gross, but it works and doesn't
+    # require a backend redesign yet.
+
+    def connect(*args, **kwargs):
+        return backend.connect(*args, **kwargs)
+
+    connect.__doc__ = backend.do_connect.__doc__
+    connect.__wrapped__ = backend.do_connect
+    connect.__module__ = f"ibis.{name}"
+
+    proxy = types.ModuleType(f"ibis.{name}")
+    setattr(ibis, name, proxy)
+    proxy.connect = connect
+    proxy.compile = backend.compile
+    proxy.has_operation = backend.has_operation
+    proxy.add_operation = backend.add_operation
+    proxy.name = name
+    proxy._from_url = backend._from_url
+    proxy._to_sql = backend._to_sql
+    if hasattr(backend, "_sqlglot_dialect"):
+        proxy._sqlglot_dialect = backend._sqlglot_dialect
+
+    return proxy

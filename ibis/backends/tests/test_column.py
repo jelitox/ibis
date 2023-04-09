@@ -1,89 +1,46 @@
-import operator
-
-import numpy as np
-import pandas as pd
 import pytest
 
-
-@pytest.mark.notimpl(
-    [
-        "clickhouse",
-        "dask",
-        "datafusion",
-        "duckdb",
-        "impala",
-        "mysql",
-        "pandas",
-        "postgres",
-        "pyspark",
-        "snowflake",
-        "polars",
-    ]
-)
-def test_rowid(con):
-    t = con.table('functional_alltypes')
-    result = t[t.rowid()].execute()
-    first_value = 1
-    expected = pd.Series(
-        range(first_value, first_value + len(result)),
-        dtype=np.int64,
-        name='rowid',
-    )
-    pd.testing.assert_series_equal(result.iloc[:, 0], expected)
+import ibis.common.exceptions as com
 
 
 @pytest.mark.notimpl(
     [
+        "bigquery",
         "clickhouse",
         "dask",
         "datafusion",
-        "duckdb",
         "impala",
+        "mssql",
         "mysql",
         "pandas",
+        "polars",
         "postgres",
         "pyspark",
         "snowflake",
-        "polars",
-    ]
+        "trino",
+        "druid",
+    ],
+    raises=com.OperationNotDefinedError,
 )
-def test_named_rowid(con):
-    t = con.table('functional_alltypes')
-    result = t[t.rowid().name('number')].execute()
-    first_value = 1
-    expected = pd.Series(
-        range(first_value, first_value + len(result)),
-        dtype=np.int64,
-        name='number',
-    )
-    pd.testing.assert_series_equal(result.iloc[:, 0], expected)
+def test_rowid(backend):
+    t = backend.diamonds
+    result = t.rowid().execute()
+    # Only guarantee is that the values are unique integers
+    assert result.is_unique
+
+    # Can be named
+    result = t.rowid().name("myrowid").execute()
+    assert result.is_unique
+    assert result.name == "myrowid"
 
 
 @pytest.mark.parametrize(
     "column",
     ["string_col", "double_col", "date_string_col", "timestamp_col"],
 )
-@pytest.mark.notimpl(["datafusion"])
+@pytest.mark.notimpl(["datafusion"], raises=com.OperationNotDefinedError)
 def test_distinct_column(alltypes, df, column):
     expr = alltypes[[column]].distinct()
     result = expr.execute()
     expected = df[[column]].drop_duplicates()
     assert set(result) == set(expected)
-
-
-@pytest.mark.parametrize(
-    ("opname", "expected"),
-    [
-        ("year", {2009, 2010}),
-        ("month", set(range(1, 13))),
-        ("day", set(range(1, 32))),
-    ],
-)
-@pytest.mark.notimpl(["datafusion"])
-@pytest.mark.notyet(["impala"])
-def test_date_extract_field(con, opname, expected):
-    op = operator.methodcaller(opname)
-    t = con.table("functional_alltypes")
-    expr = t[op(t.timestamp_col.cast("date")).name("date")].distinct()
-    result = expr.execute()["date"].astype(int)
-    assert set(result) == expected

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from functools import partial
 
 from multipledispatch import Dispatcher
@@ -5,8 +7,8 @@ from multipledispatch import Dispatcher
 import ibis.common.exceptions as com
 import ibis.expr.operations as ops
 from ibis.backends.base import BaseBackend
+from ibis.backends.base.df.scope import Scope
 from ibis.backends.pandas.trace import TraceTwoLevelDispatcher
-from ibis.expr.scope import Scope
 
 # Individual operation execution
 execute_node = TraceTwoLevelDispatcher(
@@ -18,8 +20,15 @@ execute_node = TraceTwoLevelDispatcher(
 )
 
 
-@execute_node.register(ops.Node)
-def execute_node_without_scope(node, **kwargs):
+@execute_node.register(ops.Node, [object])
+def raise_unknown_op(node, *args, **kwargs):
+    raise com.OperationNotDefinedError(
+        f"Operation {type(node).__name__!r} is not implemented for this backend"
+    )
+
+
+@execute_node.register(ops.TableNode)
+def raise_unknown_table_node(node, **kwargs):
     raise com.UnboundExpressionError(
         (
             'Node of type {!r} has no data bound to it. '

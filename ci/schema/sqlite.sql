@@ -13,7 +13,7 @@ CREATE TABLE functional_alltypes (
     double_col REAL,
     date_string_col TEXT,
     string_col TEXT,
-    timestamp_col TEXT,
+    timestamp_col TIMESTAMP,
     year BIGINT,
     month BIGINT,
     CHECK (bool_col IN (0, 1))
@@ -76,7 +76,7 @@ CREATE TABLE diamonds (
 
 DROP TABLE IF EXISTS json_t;
 
-CREATE TABLE IF NOT EXISTS json_t (js JSON);
+CREATE TABLE json_t (js JSON);
 
 INSERT INTO json_t VALUES
     ('{"a": [1,2,3,4], "b": 1}'),
@@ -85,3 +85,12 @@ INSERT INTO json_t VALUES
     ('null'),
     ('[42,47,55]'),
     ('[]');
+
+DROP TABLE IF EXISTS win;
+CREATE TABLE win (g TEXT, x BIGINT, y BIGINT);
+INSERT INTO win VALUES
+    ('a', 0, 3),
+    ('a', 1, 2),
+    ('a', 2, 0),
+    ('a', 3, 1),
+    ('a', 4, 1);

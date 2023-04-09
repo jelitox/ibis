@@ -1,13 +1,16 @@
+from __future__ import annotations
+
+import contextlib
 import time
 import traceback
+from typing import TYPE_CHECKING
 
-import pandas as pd
 import sqlalchemy as sa
 
 import ibis.common.exceptions as com
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
-import ibis.util as util
+from ibis import util
 from ibis.backends.base import Database
 from ibis.backends.base.sql.compiler import DDL, DML
 from ibis.backends.base.sql.ddl import (
@@ -19,16 +22,17 @@ from ibis.backends.base.sql.ddl import (
 from ibis.backends.impala import ddl
 from ibis.backends.impala.compat import HS2Error, impyla
 
+if TYPE_CHECKING:
+    import pandas as pd
+
 
 class ImpalaDatabase(Database):
-    def create_table(self, table_name, obj=None, **kwargs):
+    def create_table(self, name: str, obj=None, **kwargs) -> ir.Table:
         """Dispatch to ImpalaClient.create_table.
 
         See that function's docstring for more
         """
-        return self.client.create_table(
-            table_name, obj=obj, database=self.name, **kwargs
-        )
+        return self.client.create_table(name, obj=obj, database=self.name, **kwargs)
 
     def list_udfs(self, like=None):
         return self.client.list_udfs(like=like, database=self.name)
@@ -66,9 +70,6 @@ class ImpalaConnection:
     def close(self):
         """Close all idle Impyla connections."""
         self.pool.dispose()
-
-    def set_database(self, name):
-        self.database = name
 
     def disable_codegen(self, disabled=True):
         self.options["DISABLE_CODEGEN"] = str(int(disabled))
@@ -109,10 +110,6 @@ class ImpalaConnection:
         wrapper.set_options()
         return wrapper
 
-    @util.deprecated(instead="", version="4.0")
-    def ping(self):  # pragma: no cover
-        self.pool.connect()._cursor.ping()
-
     def release(self, cur):  # pragma: no cover
         pass
 
@@ -125,10 +122,8 @@ class ImpalaCursor:
         self.options = options
 
     def __del__(self):
-        try:
+        with contextlib.suppress(Exception):
             self.close()
-        except Exception:
-            pass
 
     def close(self):
         try:
@@ -289,6 +284,8 @@ class ImpalaTable(ir.Table):
             dict of partition field name to value. For example for the
             partition (year=2007, month=7), this can be either (2007, 7) or
             {'year': 2007, 'month': 7}.
+        values
+            Unsupported and unused
         validate
             If True, do more rigorous validation that schema of table being
             inserted is compatible with the existing table
@@ -313,7 +310,7 @@ class ImpalaTable(ir.Table):
             if partition is not None:
                 partition_schema = self.partition_schema()
                 partition_schema_names = frozenset(partition_schema.names)
-                expr = expr.projection(
+                expr = expr.select(
                     [
                         column
                         for column in expr.columns
@@ -357,6 +354,7 @@ class ImpalaTable(ir.Table):
             path,
             partition=partition,
             partition_schema=partition_schema,
+            overwrite=overwrite,
         )
 
         return self._client.raw_sql(stmt.compile())
@@ -376,7 +374,7 @@ class ImpalaTable(ir.Table):
         statement = RenameTable(self._qualified_name, new_name, new_database=database)
         self._client.raw_sql(statement)
 
-        op = self.op().change_name(statement.new_qualified_name)
+        op = self.op().copy(name=statement.new_qualified_name)
         return type(self)(op)
 
     @property
@@ -397,8 +395,7 @@ class ImpalaTable(ir.Table):
                 break
             partition_fields.append((x, name_to_type[x]))
 
-        pnames, ptypes = zip(*partition_fields)
-        return sch.Schema(pnames, ptypes)
+        return sch.Schema(dict(partition_fields))
 
     def add_partition(self, spec, location=None):
         """Add a new table partition.

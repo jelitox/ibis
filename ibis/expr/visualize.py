@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import contextlib
 import sys
 import tempfile
 from html import escape
@@ -11,10 +14,8 @@ from ibis.common.graph import Graph
 
 
 def get_type(node):
-    try:
+    with contextlib.suppress(AttributeError, NotImplementedError):
         return str(node.output_dtype)
-    except (AttributeError, NotImplementedError):
-        pass
 
     try:
         schema = node.schema
@@ -64,13 +65,13 @@ def get_label(node):
             label_fmt = '<<I>{}</I>: <B>{}</B>{}>'
         else:
             label_fmt = '<<I>{}</I>: <B>{}</B><BR ALIGN="LEFT" />:: {}>'
-        label = label_fmt.format(escape(nodename), escape(name), typename)
+        label = label_fmt.format(escape(nodename), escape(name), escape(typename))
     else:
         if isinstance(node, ops.TableNode):
             label_fmt = '<<B>{}</B>{}>'
         else:
             label_fmt = '<<B>{}</B><BR ALIGN="LEFT" />:: {}>'
-        label = label_fmt.format(escape(name), typename)
+        label = label_fmt.format(escape(name), escape(typename))
     return label
 
 
@@ -92,18 +93,12 @@ def to_graph(expr, node_attr=None, edge_attr=None, label_edges: bool = False):
     edges = set()
 
     for v, us in graph.items():
-        if isinstance(v, ops.NodeList) and not v:
-            continue
-
         vhash = str(hash(v))
         if v not in seen:
             g.node(vhash, label=get_label(v))
             seen.add(v)
 
         for u in us:
-            if isinstance(u, ops.NodeList) and not u:
-                continue
-
             uhash = str(hash(u))
             if u not in seen:
                 g.node(uhash, label=get_label(u))
@@ -112,13 +107,16 @@ def to_graph(expr, node_attr=None, edge_attr=None, label_edges: bool = False):
                 if not label_edges:
                     label = None
                 else:
-                    if isinstance(v, ops.NodeList):
-                        index = v.values.index(u)
-                        arg_name = f"values[{index}]"
+                    for name, arg in zip(v.argnames, v.args):
+                        if isinstance(arg, tuple) and u in arg:
+                            index = arg.index(u)
+                            name = f"{name}[{index}]"
+                            break
+                        elif arg == u:
+                            break
                     else:
-                        index = v.args.index(u)
-                        arg_name = v.argnames[index]
-                    label = f"<.{arg_name}>"
+                        name = None
+                    label = f"<.{name}>"
 
                 g.edge(uhash, vhash, label=label)
                 edges.add(edge)
@@ -127,7 +125,7 @@ def to_graph(expr, node_attr=None, edge_attr=None, label_edges: bool = False):
 
 def draw(graph, path=None, format='png', verbose: bool = False):
     if verbose:
-        print(graph.source, file=sys.stderr)
+        print(graph.source, file=sys.stderr)  # noqa: T201
 
     piped_source = graph.pipe(format=format)
 

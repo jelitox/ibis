@@ -1,42 +1,36 @@
-import operator
+from __future__ import annotations
 
-import pandas as pd
+import contextlib
+import functools
+import operator
+import string
+
 import sqlalchemy as sa
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.sql.functions import GenericFunction
 
 import ibis
 import ibis.common.exceptions as com
-import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 from ibis.backends.base.sql.alchemy import (
     fixed_arity,
     sqlalchemy_operation_registry,
     sqlalchemy_window_functions_registry,
-    to_sqla_type,
     unary,
 )
-from ibis.backends.base.sql.alchemy.registry import _gen_string_find
+from ibis.backends.base.sql.alchemy.geospatial import geospatial_supported
+from ibis.backends.base.sql.alchemy.registry import (
+    _gen_string_find,
+    geospatial_functions,
+)
 
 operation_registry = sqlalchemy_operation_registry.copy()
 
 # NOTE: window functions are available from MySQL 8 and MariaDB 10.2
 operation_registry.update(sqlalchemy_window_functions_registry)
 
-
-def _capitalize(t, op):
-    sa_arg = t.translate(op.arg)
-    return sa.func.concat(
-        sa.func.ucase(sa.func.left(sa_arg, 1)), sa.func.substring(sa_arg, 2)
-    )
-
-
-def _extract(fmt):
-    def translator(t, op):
-        sa_arg = t.translate(op.arg)
-        if fmt == 'millisecond':
-            return sa.extract('microsecond', sa_arg) % 1000
-        return sa.extract(fmt, sa_arg)
-
-    return translator
+if geospatial_supported:
+    operation_registry.update(geospatial_functions)
 
 
 _truncate_formats = {
@@ -59,12 +53,6 @@ def _truncate(t, op):
     return sa.func.date_format(sa_arg, fmt)
 
 
-def _log(t, op):
-    sa_arg = t.translate(op.arg)
-    sa_base = t.translate(op.base)
-    return sa.func.log(sa_base, sa_arg)
-
-
 def _round(t, op):
     sa_arg = t.translate(op.arg)
 
@@ -79,7 +67,7 @@ def _round(t, op):
 def _interval_from_integer(t, op):
     if op.unit in {'ms', 'ns'}:
         raise com.UnsupportedOperationError(
-            'MySQL does not allow operation ' 'with INTERVAL offset {}'.format(op.unit)
+            f'MySQL does not allow operation with INTERVAL offset {op.unit}'
         )
 
     sa_arg = t.translate(op.arg)
@@ -93,25 +81,8 @@ def _interval_from_integer(t, op):
     return sa.text(f'INTERVAL {sa_arg} {text_unit}')
 
 
-def _timestamp_diff(t, op):
-    sa_left = t.translate(op.left)
-    sa_right = t.translate(op.right)
-    return sa.func.timestampdiff(sa.text('SECOND'), sa_right, sa_left)
-
-
-def _string_to_timestamp(t, op):
-    sa_arg = t.translate(op.arg)
-    sa_format_str = t.translate(op.format_str)
-    if (op.timezone is not None) and op.timezone.value != "UTC":
-        raise com.UnsupportedArgumentError(
-            'MySQL backend only supports timezone UTC for converting'
-            'string to timestamp.'
-        )
-    return sa.func.str_to_date(sa_arg, sa_format_str)
-
-
 def _literal(_, op):
-    if isinstance(op.output_dtype, dt.Interval):
+    if op.output_dtype.is_interval():
         if op.output_dtype.unit in {'ms', 'ns'}:
             raise com.UnsupportedOperationError(
                 'MySQL does not allow operation '
@@ -120,71 +91,82 @@ def _literal(_, op):
         text_unit = op.output_dtype.resolution.upper()
         sa_text = sa.text(f'INTERVAL :value {text_unit}')
         return sa_text.bindparams(value=op.value)
-    elif isinstance(op.output_dtype, dt.Set):
+    elif op.output_dtype.is_set():
         return list(map(sa.literal, op.value))
     else:
         value = op.value
-        if isinstance(value, pd.Timestamp):
+        with contextlib.suppress(AttributeError):
             value = value.to_pydatetime()
 
-        lit = sa.literal(value)
-        if isinstance(op.output_dtype, dt.Timestamp):
-            return sa.cast(lit, to_sqla_type(op.output_dtype))
-        return lit
+        return sa.literal(value)
 
 
 def _group_concat(t, op):
     if op.where is not None:
-        # TODO(kszucs): avoid the expression roundtrip
-        case = op.where.to_expr().ifelse(op.arg, ibis.NA).op()
-        arg = t.translate(case)
+        arg = t.translate(ops.Where(op.where, op.arg, ibis.NA))
     else:
         arg = t.translate(op.arg)
     sep = t.translate(op.sep)
     return sa.func.group_concat(arg.op('SEPARATOR')(sep))
 
 
-def _day_of_week_index(t, op):
-    left = sa.func.dayofweek(t.translate(op.arg)) - 2
-    right = 7
-    return (left % right + right) % right
-
-
-def _day_of_week_name(t, op):
-    return sa.func.dayname(t.translate(op.arg))
-
-
-def _find_in_set(t, op):
-    return (
-        sa.func.find_in_set(
-            t.translate(op.needle),
-            sa.func.concat_ws(",", *map(t.translate, op.values.values)),
-        )
-        - 1
-    )
-
-
 def _json_get_item(t, op):
     arg = t.translate(op.arg)
     index = t.translate(op.index)
-    if isinstance(op.index.output_dtype, dt.Integer):
+    if op.index.output_dtype.is_integer():
         path = "$[" + sa.cast(index, sa.TEXT) + "]"
     else:
         path = "$." + index
     return sa.func.json_extract(arg, path)
 
 
+class _mysql_trim(GenericFunction):
+    inherit_cache = True
+
+    def __init__(self, input, side: str) -> None:
+        super().__init__(input)
+        self.type = sa.VARCHAR()
+        self.side = side
+
+
+@compiles(_mysql_trim, "mysql")
+def compiles_mysql_trim(element, compiler, **kw):
+    arg = compiler.function_argspec(element, **kw)
+    side = element.side.upper()
+    # has to be called once for every whitespace character because mysql
+    # interprets `char` literally, not as a set of characters like Python
+    return functools.reduce(
+        lambda arg, char: f"TRIM({side} '{char}' FROM {arg})", string.whitespace, arg
+    )
+
+
 operation_registry.update(
     {
         ops.Literal: _literal,
         ops.IfNull: fixed_arity(sa.func.ifnull, 2),
+        # static checks are not happy with using "if" as a property
+        ops.Where: fixed_arity(getattr(sa.func, 'if'), 3),
         # strings
         ops.StringFind: _gen_string_find(sa.func.locate),
-        ops.FindInSet: _find_in_set,
-        ops.Capitalize: _capitalize,
+        ops.FindInSet: (
+            lambda t, op: (
+                sa.func.find_in_set(
+                    t.translate(op.needle),
+                    sa.func.concat_ws(",", *map(t.translate, op.values)),
+                )
+                - 1
+            )
+        ),
+        # LIKE in mysql is case insensitive
+        ops.StartsWith: fixed_arity(
+            lambda arg, start: arg.op("LIKE BINARY")(sa.func.concat(start, "%")), 2
+        ),
+        ops.EndsWith: fixed_arity(
+            lambda arg, end: arg.op("LIKE BINARY")(sa.func.concat("%", end)), 2
+        ),
         ops.RegexSearch: fixed_arity(lambda x, y: x.op('REGEXP')(y), 2),
         # math
-        ops.Log: _log,
+        ops.Log: fixed_arity(lambda arg, base: sa.func.log(base, arg), 2),
         ops.Log2: unary(sa.func.log2),
         ops.Log10: unary(sa.func.log10),
         ops.Round: _round,
@@ -194,28 +176,46 @@ operation_registry.update(
         ops.DateDiff: fixed_arity(sa.func.datediff, 2),
         ops.TimestampAdd: fixed_arity(operator.add, 2),
         ops.TimestampSub: fixed_arity(operator.sub, 2),
-        ops.TimestampDiff: _timestamp_diff,
-        ops.StringToTimestamp: _string_to_timestamp,
+        ops.TimestampDiff: fixed_arity(
+            lambda left, right: sa.func.timestampdiff(sa.text('SECOND'), right, left), 2
+        ),
+        ops.StringToTimestamp: fixed_arity(
+            lambda arg, format_str: sa.func.str_to_date(arg, format_str), 2
+        ),
         ops.DateTruncate: _truncate,
         ops.TimestampTruncate: _truncate,
         ops.IntervalFromInteger: _interval_from_integer,
         ops.Strftime: fixed_arity(sa.func.date_format, 2),
-        ops.ExtractYear: _extract('year'),
-        ops.ExtractMonth: _extract('month'),
-        ops.ExtractDay: _extract('day'),
         ops.ExtractDayOfYear: unary(sa.func.dayofyear),
-        ops.ExtractQuarter: _extract('quarter'),
         ops.ExtractEpochSeconds: unary(sa.func.UNIX_TIMESTAMP),
         ops.ExtractWeekOfYear: unary(sa.func.weekofyear),
-        ops.ExtractHour: _extract('hour'),
-        ops.ExtractMinute: _extract('minute'),
-        ops.ExtractSecond: _extract('second'),
-        ops.ExtractMillisecond: _extract('millisecond'),
+        ops.ExtractMillisecond: fixed_arity(
+            lambda arg: sa.func.floor(sa.extract('microsecond', arg) / 1000), 1
+        ),
         ops.TimestampNow: fixed_arity(sa.func.now, 0),
         # others
         ops.GroupConcat: _group_concat,
-        ops.DayOfWeekIndex: _day_of_week_index,
-        ops.DayOfWeekName: _day_of_week_name,
+        ops.DayOfWeekIndex: fixed_arity(
+            lambda arg: (sa.func.dayofweek(arg) + 5) % 7, 1
+        ),
+        ops.DayOfWeekName: fixed_arity(lambda arg: sa.func.dayname(arg), 1),
         ops.JSONGetItem: _json_get_item,
+        ops.Strip: unary(lambda arg: _mysql_trim(arg, "both")),
+        ops.LStrip: unary(lambda arg: _mysql_trim(arg, "leading")),
+        ops.RStrip: unary(lambda arg: _mysql_trim(arg, "trailing")),
     }
 )
+
+_invalid_operations = {
+    ops.CumulativeAll,
+    ops.CumulativeAny,
+    ops.CumulativeMax,
+    ops.CumulativeMean,
+    ops.CumulativeMin,
+    ops.CumulativeSum,
+    ops.NTile,
+}
+
+operation_registry = {
+    k: v for k, v in operation_registry.items() if k not in _invalid_operations
+}

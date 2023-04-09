@@ -14,7 +14,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "::set-output name=yesterday::$(date --date=yesterday +%Y-%m-%d)"
+          echo "yesterday=$(date --date=yesterday +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
 
       - name: generate data
         id: generate_data
@@ -39,11 +39,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: google-github-actions/auth@v0
+      - uses: google-github-actions/auth@v1
         with:
           credentials_json: ${{ secrets.GCP_CREDENTIALS }}
 
-      - uses: google-github-actions/setup-gcloud@v0
+      - uses: google-github-actions/setup-gcloud@v1
 
       - run: gcloud info
 
@@ -55,15 +55,3 @@ jobs:
 
           bucket="gs://ibis-workflow-data/${yesterday}"
           gsutil cp -Z workflows.json jobs.json "${bucket}"
-
-          set +e
-
-          exit_code=0
-          for table in workflows jobs; do
-            if ! bq load --autodetect=true --source_format=NEWLINE_DELIMITED_JSON \
-              "workflows_native.${table}" "${bucket}/${table}.json"; then
-              ((++exit_code))
-            fi
-          done
-
-          exit "$exit_code"

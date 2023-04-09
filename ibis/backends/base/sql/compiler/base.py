@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import abc
 from itertools import chain
 
@@ -5,7 +7,7 @@ import toolz
 
 import ibis.expr.analysis as an
 import ibis.expr.operations as ops
-import ibis.util as util
+from ibis import util
 
 
 class DML(abc.ABC):
@@ -21,7 +23,6 @@ class DDL(abc.ABC):
 
 
 class QueryAST:
-
     __slots__ = 'context', 'dml', 'setup_queries', 'teardown_queries'
 
     def __init__(self, context, dml, setup_queries=None, teardown_queries=None):
@@ -67,8 +68,12 @@ class SetOp(DML):
         return map(self.keyword, self.distincts)
 
     def _extract_subqueries(self):
-        self.subqueries = _extract_common_table_expressions(
-            [self.table_set, *self.filters]
+        # extract any subquery to avoid generating incorrect sql when at least
+        # one of the set operands is invalid outside of being a subquery
+        #
+        # for example: SELECT * FROM t ORDER BY x UNION ...
+        self.subqueries = an.find_subqueries(
+            [self.table_set, *self.filters], min_dependents=1
         )
         for subquery in self.subqueries:
             self.context.set_extracted(subquery)
@@ -110,12 +115,3 @@ class SetOp(DML):
             )
         )
         return '\n'.join(buf)
-
-
-def _extract_common_table_expressions(nodes):
-    # filter out None values
-    nodes = list(filter(None, nodes))
-    counts = an.find_subqueries(nodes)
-    duplicates = [op for op, count in counts.items() if count > 1]
-    duplicates.reverse()
-    return duplicates

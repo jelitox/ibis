@@ -2,13 +2,15 @@ import decimal
 
 import numpy as np
 import pandas as pd
-import pandas.testing as tm
 import pytest
+import pytz
 from pytest import param
 
 import ibis
-import ibis.expr.datatypes as dt  # noqa: E402
+import ibis.expr.datatypes as dt
 from ibis.backends.pandas.execution import execute
+from ibis.backends.pandas.tests.conftest import TestConf as tm
+from ibis.common.exceptions import OperationNotDefinedError
 
 TIMESTAMP = "2022-03-13 06:59:10.467417"
 
@@ -47,16 +49,19 @@ def test_cast_string(t, df, from_, to, expected):
 @pytest.mark.parametrize('from_', ['array_of_int64', 'array_of_float64'])
 @pytest.mark.parametrize(
     ('to', 'expected'),
-    [('array<double>', 'float64'), ('array<int32>', 'int32')],
+    [('array<double>', dt.float64), ('array<int64>', dt.int64)],
 )
-def test_cast_array(t, df, from_, to, expected):
+def test_cast_array(t, from_, to, expected):
     c = t[from_].cast(to)
     result = c.execute()
+
     # The Series of arrays
-    assert str(result.dtype) == 'object'
+    assert result.dtype == np.object_
+
     # One of the arrays in the Series
-    assert isinstance(result[0], np.ndarray)
-    assert str(result[0].dtype) == expected
+    res = result[0]
+    assert isinstance(res, list)
+    assert [ibis.literal(v).type() for v in res] == [expected] * len(res)
 
 
 @pytest.mark.parametrize(
@@ -89,15 +94,15 @@ def test_cast_timestamp_column(t, df, column, to, expected):
     ('to', 'expected'),
     [
         ('string', str),
-        ('int64', lambda x: x.value),
+        ('int64', lambda x: pd.Timestamp(x).value // int(1e9)),
         param(
             'double',
             float,
-            marks=pytest.mark.xfail(raises=NotImplementedError),
+            marks=pytest.mark.xfail(raises=OperationNotDefinedError),
         ),
         (
             dt.Timestamp('America/Los_Angeles'),
-            lambda x: x.tz_localize('America/Los_Angeles'),
+            lambda x: x.astimezone(tz=pytz.timezone('America/Los_Angeles')),
         ),
     ],
 )
@@ -113,15 +118,15 @@ def test_cast_timestamp_scalar_naive(to, expected):
     ('to', 'expected'),
     [
         ('string', str),
-        ('int64', lambda x: x.value),
+        ('int64', lambda x: pd.Timestamp(x).value // int(1e9)),
         param(
             'double',
             float,
-            marks=pytest.mark.xfail(raises=NotImplementedError),
+            marks=pytest.mark.xfail(raises=OperationNotDefinedError),
         ),
         (
             dt.Timestamp('America/Los_Angeles'),
-            lambda x: x.tz_convert('America/Los_Angeles'),
+            lambda x: x.astimezone(tz=pytz.timezone('America/Los_Angeles')),
         ),
     ],
 )
@@ -147,7 +152,7 @@ def test_timestamp_with_timezone_is_inferred_correctly(t, df):
 def test_cast_date(t, df, column):
     expr = t[column].cast('date')
     result = expr.execute()
-    expected = df[column].dt.normalize()
+    expected = df[column].dt.normalize().dt.tz_localize(None)
     tm.assert_series_equal(result, expected)
 
 
@@ -171,12 +176,3 @@ def test_cast_to_decimal(t, df, type):
         1 <= len(element.as_tuple().digits) <= type.precision
         for element in result.values
     )
-
-
-@pytest.mark.parametrize(
-    'column',
-    ['plain_int64', 'dup_strings', 'dup_ints', 'strings_with_nulls'],
-)
-def test_cast_to_category(t, df, column):
-    test = t[column].cast('category').execute()
-    tm.assert_series_equal(test, df[column].astype('category'))

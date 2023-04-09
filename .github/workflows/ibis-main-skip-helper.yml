@@ -7,6 +7,7 @@ on:
     paths:
       - "docs/**"
       - "mkdocs.yml"
+      - "**/*.md"
     branches:
       - master
       - "*.x.x"
@@ -14,11 +15,21 @@ on:
     paths:
       - "docs/**"
       - "mkdocs.yml"
+      - "**/*.md"
     branches:
       - master
       - "*.x.x"
+  merge_group:
 jobs:
-  nix-lint:
+  test_core:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "No build required"
+  test_shapely_duckdb_import:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "No build required"
+  test_doctests:
     runs-on: ubuntu-latest
     steps:
       - run: echo "No build required"
