@@ -320,7 +320,6 @@ operation_registry.update(
                 "",
             )
         ),
-        # snowflake typeof only accepts VARIANT
         ops.ArrayIndex: fixed_arity(sa.func.get, 2),
         ops.ArrayLength: fixed_arity(sa.func.array_size, 1),
         ops.ArrayConcat: fixed_arity(sa.func.array_cat, 2),
@@ -333,7 +332,23 @@ operation_registry.update(
                 sa.func.ifnull(arg, sa.func.parse_json("null")), type_=ARRAY
             )
         ),
+        ops.ArrayContains: fixed_arity(
+            lambda arr, el: sa.func.array_contains(sa.func.to_variant(el), arr), 2
+        ),
+        ops.ArrayPosition: fixed_arity(
+            # snowflake is zero-based here, so we don't need to substract 1 from the result
+            lambda lst, el: sa.func.coalesce(
+                sa.func.array_position(sa.func.to_variant(el), lst), -1
+            ),
+            2,
+        ),
+        ops.ArrayDistinct: fixed_arity(sa.func.array_distinct, 1),
+        ops.ArrayUnion: fixed_arity(
+            lambda left, right: sa.func.array_distinct(sa.func.array_cat(left, right)),
+            2,
+        ),
         ops.StringSplit: fixed_arity(sa.func.split, 2),
+        # snowflake typeof only accepts VARIANT, so we cast
         ops.TypeOf: unary(lambda arg: sa.func.typeof(sa.func.to_variant(arg))),
         ops.All: reduction(sa.func.booland_agg),
         ops.NotAll: reduction(lambda arg: ~sa.func.booland_agg(arg)),
@@ -383,7 +398,9 @@ _invalid_operations = {
     ops.CumulativeOp,
     ops.NTile,
     # ibis.expr.operations.array
+    ops.ArrayRemove,
     ops.ArrayRepeat,
+    ops.ArraySort,
     # ibis.expr.operations.reductions
     ops.MultiQuantile,
     # ibis.expr.operations.strings

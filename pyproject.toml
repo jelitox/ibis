@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "ibis-framework"
-version = "5.0.0"
+version = "5.1.0"
 packages = [{ include = "ibis" }]
 include = [
   "ibis/examples/*.json",
@@ -174,7 +174,7 @@ bigquery = [
   "google-cloud-bigquery-storage",
   "pydata-google-auth",
 ]
-clickhouse = ["clickhouse-driver", "clickhouse-cityhash", "lz4"]
+clickhouse = ["clickhouse-driver", "clickhouse-cityhash", "lz4", "sqlalchemy"]
 dask = ["dask", "pyarrow", "regex"]
 datafusion = ["datafusion"]
 druid = ["pydruid", "sqlalchemy"]
@@ -299,7 +299,7 @@ filterwarnings = [
   "ignore:Class ST_.+ will not make use of SQL compilation caching:",
   "ignore:UserDefinedType Geometry:",
   # google
-  "ignore:Deprecated call to `pkg_resources\\.declare_namespace\\('google.*'\\):DeprecationWarning",
+  "ignore:Deprecated call to `pkg_resources\\.declare_namespace\\('.*'\\):DeprecationWarning",
   # pyspark on python 3.11
   "ignore:typing\\.io is deprecated:DeprecationWarning",
   # warnings from google's use of the cgi module
