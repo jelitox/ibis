@@ -78,9 +78,9 @@ def _timestamp_from_unix(t, op):
     arg, unit = op.args
     arg = t.translate(arg)
 
-    if unit == "ms":
+    if unit.short == "ms":
         return sa.func.epoch_ms(arg)
-    elif unit == "s":
+    elif unit.short == "s":
         return sa.func.to_timestamp(arg)
     else:
         raise UnsupportedOperationError(f"{unit!r} unit is not supported!")
@@ -267,8 +267,20 @@ def _map_keys(t, op):
     )
 
 
+def _is_map_literal(op):
+    return isinstance(op, ops.Literal) or (
+        isinstance(op, ops.Map)
+        and isinstance(op.keys, ops.Literal)
+        and isinstance(op.values, ops.Literal)
+    )
+
+
 def _map_values(t, op):
-    m_json = sa.func.to_json(t.translate(op.arg))
+    if not _is_map_literal(arg := op.arg):
+        raise UnsupportedOperationError(
+            "Extracting values of non-literal maps is not yet supported by DuckDB"
+        )
+    m_json = sa.func.to_json(t.translate(arg))
     return sa.cast(
         sa.func.json_extract_string(m_json, sa.func.json_keys(m_json)),
         t.get_sqla_type(op.output_dtype),
@@ -276,6 +288,10 @@ def _map_values(t, op):
 
 
 def _map_merge(t, op):
+    if not (_is_map_literal(op.left) and _is_map_literal(op.right)):
+        raise UnsupportedOperationError(
+            "Merging non-literal maps is not yet supported by DuckDB"
+        )
     left = sa.func.to_json(t.translate(op.left))
     right = sa.func.to_json(t.translate(op.right))
     pairs = sa.func.json_merge_patch(left, right)

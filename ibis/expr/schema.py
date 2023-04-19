@@ -7,11 +7,11 @@ from multipledispatch import Dispatcher
 
 import ibis.expr.datatypes as dt
 from ibis.common.annotations import attribute
-from ibis.common.collections import MapSet
+from ibis.common.collections import FrozenDict, MapSet
 from ibis.common.exceptions import IntegrityError
 from ibis.common.grounds import Concrete
-from ibis.common.validators import Coercible, frozendict_of, instance_of, validator
-from ibis.util import deprecated, indent
+from ibis.common.validators import Coercible
+from ibis.util import indent
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -39,15 +39,10 @@ result : pd.Series
 )
 
 
-@validator
-def datatype(arg, **kwargs):
-    return dt.dtype(arg)
-
-
 class Schema(Concrete, Coercible, MapSet):
     """An object for holding table schema information."""
 
-    fields = frozendict_of(instance_of(str), datatype)
+    fields: FrozenDict[str, dt.DataType]
     """A mapping of [`str`][str] to [`DataType`][ibis.expr.datatypes.DataType] objects
     representing the type of each column."""
 
@@ -156,39 +151,6 @@ class Schema(Concrete, Coercible, MapSet):
 
     def as_struct(self) -> dt.Struct:
         return dt.Struct(self)
-
-    @deprecated(as_of="5.0", removed_in="6.0", instead="use union operator instead")
-    def merge(self, other: Schema) -> Schema:
-        """Merge `other` to `self`.
-
-        Raise an `IntegrityError` if there are duplicate column names.
-
-        Parameters
-        ----------
-        other
-            Schema instance to append to `self`.
-
-        Returns
-        -------
-        Schema
-            A new schema appended with `schema`.
-
-        Examples
-        --------
-        >>> import ibis
-        >>> first = ibis.Schema({"a": "int", "b": "string"})
-        >>> second = ibis.Schema({"c": "float", "d": "int16"})
-        >>> first.merge(second)  # doctest: +SKIP
-        ibis.Schema {
-          a  int64
-          b  string
-          c  float64
-          d  int16
-        }
-        """
-        if duplicates := self.keys() & other.keys():
-            raise IntegrityError(f'Duplicate column name(s): {duplicates}')
-        return self.__class__({**self, **other})
 
     def name_at_position(self, i: int) -> str:
         """Return the name of a schema column at position `i`.

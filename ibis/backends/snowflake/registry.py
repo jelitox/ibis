@@ -351,9 +351,9 @@ operation_registry.update(
         # snowflake typeof only accepts VARIANT, so we cast
         ops.TypeOf: unary(lambda arg: sa.func.typeof(sa.func.to_variant(arg))),
         ops.All: reduction(sa.func.booland_agg),
-        ops.NotAll: reduction(lambda arg: ~sa.func.booland_agg(arg)),
         ops.Any: reduction(sa.func.boolor_agg),
-        ops.NotAny: reduction(lambda arg: ~sa.func.boolor_agg(arg)),
+        ops.NotAll: reduction(lambda arg: sa.func.boolor_agg(~arg)),
+        ops.NotAny: reduction(lambda arg: sa.func.booland_agg(~arg)),
         ops.BitAnd: reduction(sa.func.bitand_agg),
         ops.BitOr: reduction(sa.func.bitor_agg),
         ops.BitXor: reduction(sa.func.bitxor_agg),
@@ -370,7 +370,7 @@ operation_registry.update(
         ),
         ops.TimestampFromYMDHMS: fixed_arity(sa.func.timestamp_from_parts, 6),
         ops.TimestampFromUNIX: lambda t, op: sa.func.to_timestamp(
-            t.translate(op.arg), _TIMESTAMP_UNITS_TO_SCALE[op.unit]
+            t.translate(op.arg), _TIMESTAMP_UNITS_TO_SCALE[op.unit.short]
         ),
         ops.StructField: lambda t, op: sa.cast(
             sa.func.get(t.translate(op.arg), op.field), t.get_sqla_type(op.output_dtype)

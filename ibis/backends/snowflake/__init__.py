@@ -3,6 +3,8 @@ from __future__ import annotations
 import contextlib
 import itertools
 import json
+import os
+import tempfile
 import warnings
 import weakref
 from typing import TYPE_CHECKING, Any, Iterable, Mapping
@@ -12,12 +14,12 @@ import sqlalchemy as sa
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
+from ibis import util
 from ibis.backends.base.sql.alchemy import (
     AlchemyCompiler,
     AlchemyExprTranslator,
     BaseAlchemyBackend,
 )
-from ibis.backends.base.sql.alchemy.query_builder import _AlchemyTableSetFormatter
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -59,9 +61,6 @@ with _handle_pyarrow_warning(action="ignore"):
     from snowflake.connector.converter import (
         SnowflakeConverter as _BaseSnowflakeConverter,
     )
-    from snowflake.connector.pandas_tools import (
-        write_pandas,
-    )
     from snowflake.sqlalchemy import ARRAY, OBJECT, URL
 
 from ibis.backends.snowflake.datatypes import parse  # noqa: E402
@@ -84,30 +83,9 @@ class SnowflakeExprTranslator(AlchemyExprTranslator):
     supports_unnest_in_select = False
 
 
-class SnowflakeTableSetFormatter(_AlchemyTableSetFormatter):
-    def _format_in_memory_table(self, op, ref_op, translator):
-        if _NATIVE_ARROW:
-            return super()._format_in_memory_table(op, ref_op, translator)
-
-        import ibis
-
-        schema = ref_op.schema
-        selects = (
-            sa.select(
-                *(
-                    translator.translate(ibis.literal(col, typ).op()).label(name)
-                    for col, (name, typ) in zip(row, schema.items())
-                )
-            )
-            for row in ref_op.data.to_frame().itertuples(index=False)
-        )
-        return sa.union_all(*selects)
-
-
 class SnowflakeCompiler(AlchemyCompiler):
-    cheap_in_memory_tables = _NATIVE_ARROW
+    cheap_in_memory_tables = True
     translator_class = SnowflakeExprTranslator
-    table_set_formatter_class = SnowflakeTableSetFormatter
 
 
 class _SnowFlakeConverter(_BaseSnowflakeConverter):
@@ -136,22 +114,10 @@ _SNOWFLAKE_MAP_UDFS = {
 }
 
 
-def _make_udf(name, defn, *, quote) -> str:
-    signature = ", ".join(
-        f'{quote(argname)} {sa.types.to_instance(typ)}'
-        for argname, typ in defn["inputs"].items()
-    )
-    return f"""\
-CREATE FUNCTION IF NOT EXISTS {name}({signature})
-RETURNS {sa.types.to_instance(defn["returns"])}
-LANGUAGE JAVASCRIPT
-AS
-$$ {defn["source"]} $$"""
-
-
 class Backend(BaseAlchemyBackend):
     name = "snowflake"
     compiler = SnowflakeCompiler
+    supports_create_or_replace = True
 
     @property
     def _current_schema(self) -> str:
@@ -165,7 +131,27 @@ class Backend(BaseAlchemyBackend):
     @property
     def version(self) -> str:
         with self.begin() as con:
-            return con.exec_driver_sql("SELECT CURRENT_VERSION()").scalar()
+            return con.execute(sa.select(sa.func.current_version())).scalar()
+
+    def _compile_sqla_type(self, typ) -> str:
+        return sa.types.to_instance(typ).compile(dialect=self.con.dialect)
+
+    def _make_udf(self, name: str, defn) -> str:
+        dialect = self.con.dialect
+        quote = dialect.preparer(dialect).quote_identifier
+        signature = ", ".join(
+            f"{quote(argname)} {self._compile_sqla_type(typ)}"
+            for argname, typ in defn["inputs"].items()
+        )
+        return_type = self._compile_sqla_type(defn["returns"])
+        return f"""\
+CREATE FUNCTION IF NOT EXISTS {name}({signature})
+RETURNS {return_type}
+LANGUAGE JAVASCRIPT
+RETURNS NULL ON NULL INPUT
+IMMUTABLE
+AS
+$$ {defn["source"]} $$"""
 
     def do_connect(
         self,
@@ -216,7 +202,7 @@ class Backend(BaseAlchemyBackend):
                 try:
                     cur.execute("CREATE DATABASE IF NOT EXISTS ibis_udfs")
                     for name, defn in _SNOWFLAKE_MAP_UDFS.items():
-                        cur.execute(_make_udf(name, defn, quote=quote))
+                        cur.execute(self._make_udf(name, defn))
                     cur.execute(f"USE SCHEMA {quote(database)}.{quote(schema)}")
                 except Exception as e:  # noqa: BLE001
                     warnings.warn(
@@ -375,15 +361,64 @@ class Backend(BaseAlchemyBackend):
         return self._filter_with_like(databases, like)
 
     def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
-        df = op.data.to_frame()
+        import pyarrow.parquet as pq
+
+        from ibis.backends.snowflake.datatypes import to_sqla_type
+
+        t = op.data.to_pyarrow(schema=op.schema)
+        dialect = self.con.dialect
+        quote = dialect.preparer(dialect).quote_identifier
+        table = quote(op.name)
+        stage = util.gen_name("stage")
+
         with self.begin() as con:
-            write_pandas(
-                conn=con.connection.connection,
-                df=df,
-                table_name=op.name,
-                table_type="temp",
-                auto_create_table=True,
-                quote_identifiers=True,
+            # 1. create a temporary stage for holding parquet files
+            con.exec_driver_sql(f"CREATE TEMP STAGE {stage}")
+
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+                path = os.path.join(tmpdir, f"{op.name}.parquet")
+                # optimize for bandwidth so use zstd which typically compresses
+                # better than the other options without much loss in speed
+                pq.write_table(t, path, compression="zstd")
+
+                # 2. copy the parquet file into the stage
+                #
+                # disable the automatic compression to gzip because we've
+                # already compressed the data with zstd
+                #
+                # 99 is the limit on the number of threads use to upload data,
+                # who knows why?
+                con.exec_driver_sql(
+                    f"""
+                    PUT 'file://{path}' @{stage}
+                    PARALLEL={min((os.cpu_count() or 2) // 2, 99)}
+                    AUTO_COMPRESS=FALSE
+                    """
+                )
+
+            # 3. create a temporary table
+            schema = ", ".join(
+                "{name} {typ}".format(
+                    name=quote(col),
+                    typ=sa.types.to_instance(to_sqla_type(dialect, typ)).compile(
+                        dialect=dialect
+                    ),
+                )
+                for col, typ in op.schema.items()
+            )
+            con.exec_driver_sql(f"CREATE TEMP TABLE {table} ({schema})")
+
+            # 4. copy the data into the table
+            columns = op.schema.names
+            column_names = ", ".join(map(quote, columns))
+            parquet_column_names = ", ".join(f"$1:{col}" for col in columns)
+            con.exec_driver_sql(
+                f"""
+                COPY INTO {table} ({column_names})
+                FROM (SELECT {parquet_column_names} FROM @{stage})
+                FILE_FORMAT=(TYPE=PARQUET COMPRESSION=AUTO)
+                PURGE=TRUE
+                """
             )
 
     def _get_temp_view_definition(

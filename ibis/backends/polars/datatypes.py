@@ -39,6 +39,11 @@ def to_polars_type(dtype):
         raise NotImplementedError(f"Unsupported type: {dtype!r}")
 
 
+@to_polars_type.register(dt.Decimal)
+def from_ibis_decimal(dtype):
+    return pl.Decimal(dtype.precision, dtype.scale)
+
+
 @to_polars_type.register(dt.Timestamp)
 def from_ibis_timestamp(dtype):
     return pl.Datetime("ns", dtype.timezone)
@@ -46,8 +51,8 @@ def from_ibis_timestamp(dtype):
 
 @to_polars_type.register(dt.Interval)
 def from_ibis_interval(dtype):
-    if dtype.unit in {'us', 'ns', 'ms'}:
-        return pl.Duration(dtype.unit)
+    if dtype.unit.short in {'us', 'ns', 'ms'}:
+        return pl.Duration(dtype.unit.short)
     else:
         raise ValueError(f"Unsupported polars duration unit: {dtype.unit}")
 
@@ -101,6 +106,11 @@ def from_polars_struct(typ):
     return dt.Struct.from_tuples(
         [(field.name, to_ibis_dtype(field.dtype)) for field in typ.fields]
     )
+
+
+@to_ibis_dtype.register(pl.Decimal)
+def from_polars_decimal(typ: pl.Decimal):
+    return dt.Decimal(precision=typ.precision, scale=typ.scale)
 
 
 @sch.infer.register(pl.LazyFrame)

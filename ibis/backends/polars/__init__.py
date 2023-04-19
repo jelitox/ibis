@@ -14,7 +14,7 @@ import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis.backends.base import BaseBackend
 from ibis.backends.polars.compiler import translate
-from ibis.util import deprecated, gen_name, normalize_filename
+from ibis.util import gen_name, normalize_filename
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -211,13 +211,6 @@ class Backend(BaseBackend):
     def database(self, name=None):
         return self.database_class(name, self)
 
-    @deprecated(
-        as_of="5.0", removed_in="6.0", instead="Use create_table(overwrite=True)"
-    )
-    def load_data(self, table_name, obj, **kwargs):
-        # kwargs is a catch all for any options required by other backends.
-        self._tables[table_name] = obj
-
     def create_table(
         self,
         name: str,
@@ -343,13 +336,9 @@ class Backend(BaseBackend):
             df = lf.collect()
 
         table = df.to_arrow()
-        if isinstance(expr, ir.Table):
-            schema = expr.schema().to_pyarrow()
-            return table.cast(schema)
-        elif isinstance(expr, ir.Value):
-            schema = sch.schema({expr.get_name(): expr.type().to_pyarrow()})
-            schema = schema.to_pyarrow()
-            return table.cast(schema)
+        if isinstance(expr, (ir.Table, ir.Value)):
+            schema = expr.as_table().schema().to_pyarrow()
+            return table.rename_columns(schema.names).cast(schema)
         else:
             raise com.IbisError(f"Cannot execute expression of type: {type(expr)}")
 

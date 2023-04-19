@@ -49,6 +49,7 @@ def _format_kwargs(kwargs: Mapping[str, Any]):
 class Backend(BaseAlchemyBackend):
     name = "duckdb"
     compiler = DuckDBSQLCompiler
+    supports_create_or_replace = True
 
     def current_database(self) -> str:
         return "main"
@@ -73,7 +74,6 @@ class Backend(BaseAlchemyBackend):
     def do_connect(
         self,
         database: str | Path = ":memory:",
-        path: str | Path = None,
         read_only: bool = False,
         temp_directory: Path | str | None = None,
         **config: Any,
@@ -84,8 +84,6 @@ class Backend(BaseAlchemyBackend):
         ----------
         database
             Path to a duckdb database.
-        path
-            Deprecated, use `database` instead.
         read_only
             Whether the database is read-only.
         temp_directory
@@ -102,12 +100,6 @@ class Backend(BaseAlchemyBackend):
         >>> ibis.duckdb.connect("database.ddb", threads=4, memory_limit="1GB")
         <ibis.backends.duckdb.Backend object at ...>
         """
-        if path is not None:
-            warnings.warn(
-                "The `path` argument is deprecated in 4.0. Use `database=...` "
-                "instead."
-            )
-            database = path
         if database != ":memory:":
             database = Path(database).absolute()
         elif temp_directory is None:
@@ -497,6 +489,7 @@ class Backend(BaseAlchemyBackend):
         if table_name is None:
             raise ValueError("`table_name` is required when registering a sqlite table")
         self._load_extensions(["sqlite"])
+
         source = sa.select(sa.literal_column("*")).select_from(
             sa.func.sqlite_scan(str(path), table_name)
         )
@@ -505,6 +498,40 @@ class Backend(BaseAlchemyBackend):
             con.exec_driver_sql(view)
 
         return self.table(table_name)
+
+    def attach_sqlite(
+        self, path: str | Path, overwrite: bool = False, all_varchar: bool = False
+    ) -> None:
+        """Attach a SQLite database to the current DuckDB session.
+
+        Parameters
+        ----------
+        path
+            The path to the SQLite database.
+        overwrite
+            Allow overwriting any tables or views that already exist in your current
+            session with the contents of the SQLite database.
+        all_varchar
+            Set all SQLite columns to type `VARCHAR` to avoid type errors on ingestion.
+
+        Returns
+        -------
+        None
+
+        Examples
+        --------
+        >>> import ibis
+        >>> con = ibis.connect("duckdb://")
+        >>> con.attach_sqlite("ci/ibis-testing-data/ibis_testing.db")
+        >>> con.list_tables()
+        ['functional_alltypes', 'awards_players', 'batting', 'diamonds']
+        """
+        self._load_extensions(["sqlite"])
+        with self.begin() as con:
+            con.execute(sa.text(f"SET GLOBAL sqlite_all_varchar={all_varchar}"))
+            con.execute(
+                sa.text(f"CALL sqlite_attach('{str(path)}', overwrite={overwrite})")
+            )
 
     def to_pyarrow_batches(
         self,

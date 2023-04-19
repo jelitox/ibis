@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import contextlib
 import os
 import platform
 import re
@@ -18,7 +21,8 @@ import ibis
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-from ibis.util import guid
+from ibis.backends.base import BaseBackend
+from ibis.util import gen_name, guid
 
 
 @pytest.fixture
@@ -120,7 +124,7 @@ backend_type_mapping = {
 }
 
 
-@mark.notimpl(["clickhouse", "datafusion", "polars", "druid"])
+@mark.notimpl(["datafusion", "polars", "druid"])
 def test_create_table_from_schema(con, new_schema, temp_table):
     new_table = con.create_table(temp_table, schema=new_schema)
     backend_mapping = backend_type_mapping.get(con.name, dict())
@@ -199,7 +203,7 @@ def test_rename_table(con, temp_table, new_schema):
         con.drop_table(temp_table, force=True)
 
 
-@mark.notimpl(["bigquery", "clickhouse", "datafusion", "polars", "druid"])
+@mark.notimpl(["bigquery", "datafusion", "polars", "druid"])
 @mark.never(["impala", "pyspark"], reason="No non-nullable datatypes")
 @mark.notyet(
     ["trino"], reason="trino doesn't support NOT NULL in its in-memory catalog"
@@ -672,12 +676,6 @@ def test_invalid_connect(tmp_path):
         ibis.connect(url)
 
 
-@pytest.mark.parametrize("backend_name", ["sqlite", "duckdb"])
-def test_deprecated_path_argument(backend_name, tmp_path):
-    with pytest.warns(UserWarning, match="The `path` argument is deprecated"):
-        getattr(ibis, backend_name).connect(path=str(tmp_path / "test.db"))
-
-
 @pytest.mark.parametrize(
     ("expr", "expected"),
     [
@@ -753,7 +751,7 @@ def test_agg_memory_table(con):
         param(pd.DataFrame([("a", 1.0)], columns=["a", "b"]), id="pandas"),
     ],
 )
-@pytest.mark.notimpl(["clickhouse", "dask", "datafusion", "pandas", "polars", "druid"])
+@pytest.mark.notimpl(["dask", "datafusion", "pandas", "polars", "druid"])
 def test_create_from_in_memory_table(backend, con, t):
     if backend.name() == "snowflake":
         pytest.skip("snowflake is unreliable here")
@@ -896,8 +894,7 @@ def test_interactive_repr_max_columns(alltypes, is_jupyter, monkeypatch):
     cols = {f"c_{i}": ibis._.id + i for i in range(50)}
     expr = alltypes.mutate(**cols).select(*cols)
 
-    console = rich.console.Console(force_jupyter=is_jupyter)
-    console.options.max_width = 80
+    console = rich.console.Console(force_jupyter=is_jupyter, width=80)
     options = console.options.copy()
 
     # max_columns = 0
@@ -1208,3 +1205,40 @@ def test_persist_expression_release(con, alltypes):
 
     with pytest.raises(Exception, match=cached_table.op().name):
         cached_table.execute()
+
+
+@contextlib.contextmanager
+def gen_test_name(con: BaseBackend) -> str:
+    name = gen_name("test_table")
+    try:
+        yield name
+    finally:
+        con.drop_table(name, force=True)
+
+
+@mark.notimpl(
+    ["bigquery", "datafusion", "polars"],
+    raises=NotImplementedError,
+    reason="overwriting not implemented in ibis for this backend",
+)
+@mark.broken(
+    ["druid"], raises=sa.exc.ProgrammingError, reason="generated SQL fails to parse"
+)
+@mark.notimpl(["impala"], reason="impala doesn't support memtable")
+@mark.notimpl(["pyspark"])
+def test_overwrite(ddl_con):
+    t0 = ibis.memtable({"a": [1, 2, 3]})
+
+    with gen_test_name(ddl_con) as x, gen_test_name(ddl_con) as y:
+        t1 = ddl_con.create_table(x, t0)
+
+        t2 = t1.filter(t1.a < 3)
+        expected_count = 2
+
+        assert t2.count().execute() == expected_count
+        assert ddl_con.create_table(y, t2).count().execute() == expected_count
+        assert (
+            ddl_con.create_table(x, t2, overwrite=True).count().execute()
+            == expected_count
+        )
+        assert t2.count().execute() == expected_count

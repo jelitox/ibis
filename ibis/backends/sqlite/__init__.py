@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import datetime
 import sqlite3
-import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 
@@ -24,6 +23,7 @@ import sqlalchemy as sa
 import toolz
 from sqlalchemy.dialects.sqlite import DATETIME, TIMESTAMP
 
+import ibis.expr.datatypes as dt
 import ibis.expr.schema as sch
 from ibis import util
 from ibis.backends.base import Database
@@ -31,10 +31,8 @@ from ibis.backends.base.sql.alchemy import BaseAlchemyBackend, to_sqla_type
 from ibis.backends.sqlite import udf
 from ibis.backends.sqlite.compiler import SQLiteCompiler
 from ibis.backends.sqlite.datatypes import parse
-from ibis.expr.schema import datatype
 
 if TYPE_CHECKING:
-    import ibis.expr.datatypes as dt
     import ibis.expr.types as ir
 
 
@@ -77,6 +75,7 @@ class Backend(BaseAlchemyBackend):
     # if there is technical debt that makes this required
     database_class = Database
     compiler = SQLiteCompiler
+    supports_create_or_replace = False
 
     def __getstate__(self) -> dict:
         r = super().__getstate__()
@@ -93,7 +92,6 @@ class Backend(BaseAlchemyBackend):
     def do_connect(
         self,
         database: str | Path | None = None,
-        path: str | Path | None = None,
         type_map: dict[str, str | dt.DataType] | None = None,
     ) -> None:
         """Create an Ibis client connected to a SQLite database.
@@ -106,8 +104,6 @@ class Backend(BaseAlchemyBackend):
             File path to the SQLite database file. If `None`, creates an
             in-memory transient database and you can use attach() to add more
             files
-        path
-            Deprecated, use `database`
         type_map
             An optional mapping from a string name of a SQLite "type" to the
             corresponding ibis DataType that it represents. This can be used
@@ -119,12 +115,6 @@ class Backend(BaseAlchemyBackend):
         >>> ibis.sqlite.connect("path/to/my/sqlite.db")
         """
         import pandas as pd
-
-        if path is not None:
-            warnings.warn(
-                "The `path` argument is deprecated in 4.0. Use `database=...`"
-            )
-            database = path
 
         self.database_name = "main"
 
@@ -140,7 +130,7 @@ class Backend(BaseAlchemyBackend):
             # easier than subclassing the builtin SQLite dialect, and achieves
             # the same desired behavior.
             def _to_ischema_val(t):
-                sa_type = to_sqla_type(engine.dialect, datatype(t))
+                sa_type = to_sqla_type(engine.dialect, dt.dtype(t))
                 if isinstance(sa_type, sa.types.TypeEngine):
                     # SQLAlchemy expects a callable here, rather than an
                     # instance. Use a lambda to work around this.

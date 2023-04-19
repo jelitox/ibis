@@ -100,7 +100,7 @@ _truncate_precisions = {
 def _timestamp_truncate(t, op):
     sa_arg = t.translate(op.arg)
     try:
-        precision = _truncate_precisions[op.unit]
+        precision = _truncate_precisions[op.unit.short]
     except KeyError:
         raise com.UnsupportedOperationError(f'Unsupported truncate unit {op.unit!r}')
     return sa.func.date_trunc(precision, sa_arg)
@@ -110,17 +110,18 @@ def _timestamp_from_unix(t, op):
     arg, unit = op.args
     arg = t.translate(arg)
 
-    if unit == "ms":
+    unit_short = unit.short
+    if unit_short == "ms":
         try:
             arg //= 1_000
         except TypeError:
             arg = sa.func.floor(arg / 1_000)
         res = sa.func.from_unixtime(arg)
-    elif unit == "s":
+    elif unit_short == "s":
         res = sa.func.from_unixtime(arg)
-    elif unit == "us":
+    elif unit_short == "us":
         res = sa.func.from_unixtime_nanos((arg - arg % 1_000_000) * 1_000)
-    elif unit == "ns":
+    elif unit_short == "ns":
         res = sa.func.from_unixtime_nanos(arg - arg % 1_000_000_000)
     else:
         raise com.UnsupportedOperationError(f"{unit!r} unit is not supported")
@@ -234,8 +235,8 @@ operation_registry.update(
         # boolean reductions
         ops.Any: reduction(sa.func.bool_or),
         ops.All: reduction(sa.func.bool_and),
-        ops.NotAny: reduction(lambda x: sa.not_(sa.func.bool_or(x))),
-        ops.NotAll: reduction(lambda x: sa.not_(sa.func.bool_and(x))),
+        ops.NotAny: reduction(lambda x: sa.func.bool_and(~x)),
+        ops.NotAll: reduction(lambda x: sa.func.bool_or(~x)),
         ops.ArgMin: reduction(sa.func.min_by),
         ops.ArgMax: reduction(sa.func.max_by),
         # array ops

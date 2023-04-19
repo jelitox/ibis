@@ -710,6 +710,13 @@ def test_integer_to_interval_timestamp(
     raises=com.UnsupportedOperationError,
     reason="Interval from integer column is unsupported for the PySpark backend.",
 )
+@pytest.mark.notimpl(
+    [
+        "sqlite",
+    ],
+    raises=(com.UnsupportedOperationError, com.OperationNotDefinedError),
+    reason="Handling unsupported op error for DateAdd with weeks",
+)
 def test_integer_to_interval_date(backend, con, alltypes, df, unit):
     interval = alltypes.int_col.to_interval(unit=unit)
     array = alltypes.date_string_col.split('/')
@@ -752,6 +759,10 @@ timestamp_value = pd.Timestamp('2018-01-01 18:18:18')
                     raises=com.UnsupportedOperationError,
                 ),
                 pytest.mark.notimpl(
+                    ["sqlite"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.notimpl(
                     ["druid"],
                     raises=com.IbisTypeError,
                     reason="Given argument with datatype interval('D') is not implicitly castable to string",
@@ -774,6 +785,7 @@ timestamp_value = pd.Timestamp('2018-01-01 18:18:18')
                         "pandas",
                         "postgres",
                         "snowflake",
+                        "sqlite",
                     ],
                     raises=com.OperationNotDefinedError,
                 ),
@@ -800,6 +812,10 @@ timestamp_value = pd.Timestamp('2018-01-01 18:18:18')
                     ["druid"],
                     raises=TypeError,
                     reason="unsupported operand type(s) for -: 'StringColumn' and 'IntervalScalar'",
+                ),
+                pytest.mark.notimpl(
+                    ["sqlite"],
+                    raises=com.OperationNotDefinedError,
                 ),
             ],
         ),
@@ -837,7 +853,7 @@ timestamp_value = pd.Timestamp('2018-01-01 18:18:18')
             id='timestamp-subtract-timestamp',
             marks=[
                 pytest.mark.notimpl(
-                    ["bigquery", "snowflake"],
+                    ["bigquery", "snowflake", "sqlite"],
                     raises=com.OperationNotDefinedError,
                 ),
                 pytest.mark.notimpl(
@@ -868,7 +884,7 @@ timestamp_value = pd.Timestamp('2018-01-01 18:18:18')
     ],
 )
 @pytest.mark.notimpl(
-    ["datafusion", "sqlite", "mssql", "trino"],
+    ["datafusion", "mssql", "trino"],
     raises=com.OperationNotDefinedError,
 )
 def test_temporal_binop(backend, con, alltypes, df, expr_fn, expected_fn):
@@ -2206,10 +2222,7 @@ def test_integer_cast_to_timestamp_scalar(alltypes, df):
     reason="No literal value renderer is available for literal value \"datetime.datetime(2419, 10, 11, 10, 10, 25)\" with datatype DATETIME",
     raises=sa.exc.CompileError,
 )
-@pytest.mark.notimpl(
-    ["datafusion"],
-    raises=IndexError,
-)
+@pytest.mark.notimpl(["datafusion"], raises=ArrowInvalid)
 @pytest.mark.notimpl(
     ["polars"],
     raises=(AssertionError, PolarsComputeError),
@@ -2306,10 +2319,7 @@ def test_timestamp_date_comparison(backend, alltypes, df, left_fn, right_fn):
     reason='No literal value renderer is available for literal value "datetime.datetime(4567, 1, 1, 0, 0)" with datatype DATETIME',
 )
 @pytest.mark.notimpl(["pyspark"], raises=pd.errors.OutOfBoundsDatetime)
-@pytest.mark.notimpl(
-    ["datafusion"],
-    raises=IndexError,
-)
+@pytest.mark.notimpl(["datafusion"], raises=ArrowInvalid)
 @pytest.mark.notimpl(
     ["polars"],
     raises=PolarsPanicException,

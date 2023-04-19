@@ -426,13 +426,6 @@ def test_limit(table):
     assert limited.op().offset == 5
 
 
-def test_sort_by_deprecated(table):
-    with pytest.warns(FutureWarning):
-        x = table.sort_by("f")
-    y = table.order_by("f")
-    assert x.equals(y)
-
-
 def test_order_by(table):
     result = table.order_by(['f']).op()
 
@@ -632,68 +625,6 @@ def test_aggregate_keywords(table):
     assert_equal(expr2, expected)
 
 
-def test_groupby_alias(table):
-    expected = table.group_by('g').size()
-    with pytest.warns(FutureWarning, match="deprecated"):
-        result = table.groupby('g').size()
-    assert_equal(result, expected)
-
-
-def test_summary_expand_list(table):
-    with pytest.warns(FutureWarning, match="is deprecated"):
-        summ = table.f.summary()
-
-    metric = table.g.group_concat().name('bar')
-    result = table.aggregate([metric, summ])
-    expected = table.aggregate([metric] + summ)
-    assert_equal(result, expected)
-
-
-def test_summary_prefix_suffix(table):
-    def get_names(exprs):
-        return [e.get_name() for e in exprs]
-
-    with pytest.warns(FutureWarning, match="is deprecated"):
-        assert get_names(table.g.summary(prefix="string_")) == [
-            'string_count',
-            'string_nulls',
-            'string_uniques',
-        ]
-    with pytest.warns(FutureWarning, match="is deprecated"):
-        assert get_names(table.g.summary(suffix="_string")) == [
-            'count_string',
-            'nulls_string',
-            'uniques_string',
-        ]
-    with pytest.warns(FutureWarning, match="is deprecated"):
-        assert get_names(table.g.summary(prefix="pre_", suffix="_post")) == [
-            'pre_count_post',
-            'pre_nulls_post',
-            'pre_uniques_post',
-        ]
-
-    with pytest.warns(FutureWarning, match="is deprecated"):
-        assert get_names(table.f.summary(prefix="float_")) == [
-            "float_count",
-            "float_nulls",
-            "float_min",
-            "float_max",
-            "float_sum",
-            "float_mean",
-            "float_approx_nunique",
-        ]
-    with pytest.warns(FutureWarning, match="is deprecated"):
-        assert get_names(table.f.summary(suffix="_numeric")) == [
-            "count_numeric",
-            "nulls_numeric",
-            "min_numeric",
-            "max_numeric",
-            "sum_numeric",
-            "mean_numeric",
-            "approx_nunique_numeric",
-        ]
-
-
 def test_filter_aggregate_pushdown_predicate(table):
     # In the case where we want to add a predicate to an aggregate
     # expression after the fact, rather than having to backpedal and add it
@@ -863,9 +794,9 @@ def test_asof_join():
     joined = api.asof_join(left, right, 'time')
 
     assert joined.columns == [
-        "time_x",
+        "time",
         "value",
-        "time_y",
+        "time_right",
         "value2",
     ]
     pred = joined.op().table.predicates[0]
@@ -877,11 +808,11 @@ def test_asof_join_with_by():
     right = ibis.table([('time', 'int32'), ('key', 'int32'), ('value2', 'double')])
     joined = api.asof_join(left, right, 'time', by='key')
     assert joined.columns == [
-        "time_x",
-        "key_x",
+        "time",
+        "key",
         "value",
-        "time_y",
-        "key_y",
+        "time_right",
+        "key_right",
         "value2",
     ]
     by = joined.op().table.by[0]
@@ -1000,8 +931,8 @@ def test_self_join_no_view_convenience(table):
     # column names to join on rather than referentially-valid expressions
 
     result = table.join(table, [('g', 'g')])
-    expected_cols = [f"{c}_x" if c != 'g' else 'g' for c in table.columns]
-    expected_cols.extend(f"{c}_y" for c in table.columns if c != 'g')
+    expected_cols = list(table.columns)
+    expected_cols.extend(f"{c}_right" for c in table.columns if c != 'g')
     assert result.columns == expected_cols
 
 
@@ -1065,8 +996,7 @@ def test_cross_join(table):
 
     joined = table.cross_join(scalar_aggs)
     agg_schema = api.Schema({'sum_a': 'int64', 'mean_b': 'double'})
-    with pytest.warns(FutureWarning):
-        ex_schema = table.schema().merge(agg_schema)
+    ex_schema = table.schema() | agg_schema
     assert_equal(joined.schema(), ex_schema)
 
 
@@ -1097,7 +1027,7 @@ def test_inner_join_overlapping_column_names():
     joined = t1.join(t2, 'foo')
     expected = t1.join(t2, t1.foo == t2.foo)
     assert_equal(joined, expected)
-    assert joined.columns == ["foo", "bar_x", "value1", "bar_y", "value2"]
+    assert joined.columns == ["foo", "bar", "value1", "bar_right", "value2"]
 
     joined = t1.join(t2, ['foo', 'bar'])
     expected = t1.join(t2, [t1.foo == t2.foo, t1.bar == t2.bar])
@@ -1106,11 +1036,25 @@ def test_inner_join_overlapping_column_names():
 
     # Equality predicates don't have same name, need to rename
     joined = t1.join(t2, t1.foo == t2.bar)
-    assert joined.columns == ["foo_x", "bar_x", "value1", "foo_y", "bar_y", "value2"]
+    assert joined.columns == [
+        "foo",
+        "bar",
+        "value1",
+        "foo_right",
+        "bar_right",
+        "value2",
+    ]
 
     # Not all predicates are equality, still need to rename
     joined = t1.join(t2, ["foo", t1.value1 < t2.value2])
-    assert joined.columns == ["foo_x", "bar_x", "value1", "foo_y", "bar_y", "value2"]
+    assert joined.columns == [
+        "foo",
+        "bar",
+        "value1",
+        "foo_right",
+        "bar_right",
+        "value2",
+    ]
 
 
 def test_join_key_alternatives(con):
@@ -1459,17 +1403,6 @@ def test_groupby_projection(table):
     assert_equal(expr, expected)
 
 
-def test_set_column(table):
-    def g(x):
-        return x.f * 2
-
-    with pytest.warns(FutureWarning, match=r"5\.1"):
-        result = table.set_column('f', g)
-    with pytest.warns(FutureWarning, match=r"6\.0"):
-        expected = table.set_column('f', table.f * 2)
-    assert_equal(result, expected)
-
-
 def test_pickle_table_expr():
     schema = [('time', 'timestamp'), ('key', 'string'), ('value', 'double')]
     t0 = ibis.table(schema, name='t0')
@@ -1612,10 +1545,10 @@ def test_merge_as_of_allows_overlapping_columns():
     merged = ibis.api.asof_join(signal_one, signal_two, 'timestamp_received')
     assert merged.columns == [
         'current',
-        'timestamp_received_x',
+        'timestamp_received',
         'signal_one',
         'voltage',
-        'timestamp_received_y',
+        'timestamp_received_right',
         'signal_two',
     ]
 
@@ -1642,13 +1575,22 @@ def test_filter_applied_to_join():
 
 
 @pytest.mark.parametrize("how", ["inner", "left", "outer", "right"])
-def test_join_suffixes(how):
+def test_join_lname_rname(how):
     left = ibis.table([("id", "int64"), ("first_name", "string")])
     right = ibis.table([("id", "int64"), ("last_name", "string")])
-
     method = getattr(left, f"{how}_join")
-    expr = method(right, suffixes=("_left", "_right"))
-    assert expr.columns == ["id_left", "first_name", "id_right", "last_name"]
+
+    expr = method(right)
+    assert expr.columns == ["id", "first_name", "id_right", "last_name"]
+
+    expr = method(right, rname="right_{name}")
+    assert expr.columns == ["id", "first_name", "right_id", "last_name"]
+
+    expr = method(right, lname="left_{name}", rname="")
+    assert expr.columns == ["left_id", "first_name", "id", "last_name"]
+
+    expr = method(right, rname="right_{name}", lname="left_{name}")
+    assert expr.columns == ["left_id", "first_name", "right_id", "last_name"]
 
 
 def test_drop():

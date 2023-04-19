@@ -99,7 +99,6 @@ aggregate_test_params = [
                 "impala",
                 "mysql",
                 "pyspark",
-                "sqlite",
                 "mssql",
                 "trino",
                 "druid",
@@ -286,8 +285,8 @@ def test_aggregate_multikey_group_reduction_udf(backend, alltypes, df):
             ),
         ),
         param(
-            lambda t, _: t.bool_col.any(),
-            lambda t, _: t.bool_col.any(),
+            lambda t, where: t.bool_col.any(where=where),
+            lambda t, where: t.bool_col[where].any(),
             id='any',
             marks=[
                 pytest.mark.notimpl(
@@ -302,17 +301,13 @@ def test_aggregate_multikey_group_reduction_udf(backend, alltypes, df):
             ],
         ),
         param(
-            lambda t, _: t.bool_col.notany(),
-            lambda t, _: ~t.bool_col.any(),
+            lambda t, where: t.bool_col.notany(where=where),
+            lambda t, where: ~t.bool_col[where].any(),
             id='notany',
             marks=[
                 pytest.mark.notimpl(
                     ["polars", "datafusion"],
                     raises=com.OperationNotDefinedError,
-                ),
-                pytest.mark.notimpl(
-                    ['mssql'],
-                    raises=sa.exc.ProgrammingError,
                 ),
                 pytest.mark.broken(
                     ["druid"],
@@ -322,18 +317,13 @@ def test_aggregate_multikey_group_reduction_udf(backend, alltypes, df):
             ],
         ),
         param(
-            lambda t, _: -t.bool_col.any(),
-            lambda t, _: ~t.bool_col.any(),
+            lambda t, where: -t.bool_col.any(where=where),
+            lambda t, where: ~t.bool_col[where].any(),
             id='any_negate',
             marks=[
                 pytest.mark.notimpl(
                     ["polars", "datafusion"],
                     raises=com.OperationNotDefinedError,
-                ),
-                pytest.mark.broken(
-                    ['mssql'],
-                    raises=sa.exc.ProgrammingError,
-                    reason="Incorrect syntax near '='",
                 ),
                 pytest.mark.broken(
                     ["druid"],
@@ -343,8 +333,8 @@ def test_aggregate_multikey_group_reduction_udf(backend, alltypes, df):
             ],
         ),
         param(
-            lambda t, _: t.bool_col.all(),
-            lambda t, _: t.bool_col.all(),
+            lambda t, where: t.bool_col.all(where=where),
+            lambda t, where: t.bool_col[where].all(),
             id='all',
             marks=[
                 pytest.mark.notimpl(
@@ -359,8 +349,8 @@ def test_aggregate_multikey_group_reduction_udf(backend, alltypes, df):
             ],
         ),
         param(
-            lambda t, _: t.bool_col.notall(),
-            lambda t, _: ~t.bool_col.all(),
+            lambda t, where: t.bool_col.notall(where=where),
+            lambda t, where: ~t.bool_col[where].all(),
             id='notall',
             marks=[
                 pytest.mark.notimpl(
@@ -372,26 +362,16 @@ def test_aggregate_multikey_group_reduction_udf(backend, alltypes, df):
                     raises=AttributeError,
                     reason="'IntegerColumn' object has no attribute 'notall'",
                 ),
-                pytest.mark.broken(
-                    ['mssql'],
-                    raises=sa.exc.ProgrammingError,
-                    reason="Incorrect syntax near '='",
-                ),
             ],
         ),
         param(
-            lambda t, _: -t.bool_col.all(),
-            lambda t, _: ~t.bool_col.all(),
+            lambda t, where: -t.bool_col.all(where=where),
+            lambda t, where: ~t.bool_col[where].all(),
             id='all_negate',
             marks=[
                 pytest.mark.notimpl(
                     ["polars", "datafusion"],
                     raises=com.OperationNotDefinedError,
-                ),
-                pytest.mark.broken(
-                    ['mssql'],
-                    raises=sa.exc.ProgrammingError,
-                    reason="Incorrect syntax near '='",
                 ),
                 pytest.mark.broken(
                     ["druid"],
@@ -448,7 +428,6 @@ def test_aggregate_multikey_group_reduction_udf(backend, alltypes, df):
                     "impala",
                     "mysql",
                     "pyspark",
-                    "sqlite",
                     "mssql",
                     "trino",
                     "druid",
@@ -1321,23 +1300,6 @@ def test_filter(backend, alltypes, df):
         .reset_index()
     )
     backend.assert_frame_equal(result, expected, check_like=True)
-
-
-@pytest.mark.notimpl(["polars", "datafusion"], raises=com.OperationNotDefinedError)
-@pytest.mark.notimpl(
-    ["pyspark"],
-    raises=PysparkAnalysisException,
-    reason=(
-        "cannot resolve 'sum((functional_alltypes.bool_col IS NULL))' due to data type mismatch: "
-        "function sum requires numeric or interval types, not boolean;"
-    ),
-)
-def test_column_summary(alltypes):
-    with pytest.warns(FutureWarning, match="is deprecated"):
-        bool_col_summary = alltypes.bool_col.summary()
-    expr = alltypes.aggregate(bool_col_summary)
-    result = expr.execute()
-    assert result.shape == (1, 7)
 
 
 def test_agg_name_in_output_column(alltypes):

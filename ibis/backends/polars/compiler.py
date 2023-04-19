@@ -78,7 +78,11 @@ def literal(op):
     if dtype.is_array():
         value = pl.Series("", value)
         typ = to_polars_type(dtype)
-        return pl.lit(value, dtype=typ).list()
+        val = pl.lit(value, dtype=typ)
+        try:
+            return val.implode()
+        except AttributeError:  # pragma: no cover
+            return val.list()  # pragma: no cover
     elif dtype.is_struct():
         values = [
             pl.lit(v, dtype=to_polars_type(dtype[k])).alias(k) for k, v in value.items()
@@ -697,7 +701,7 @@ def date(op):
 @translate.register(ops.TimestampTruncate)
 def temporal_truncate(op):
     arg = translate(op.arg)
-    unit = "mo" if op.unit == "M" else op.unit
+    unit = "mo" if op.unit.short == "M" else op.unit.short
     unit = f"1{unit.lower()}"
     return arg.dt.truncate(unit, "-1w")
 
@@ -740,7 +744,7 @@ def timestamp_from_ymdhms(op):
 @translate.register(ops.TimestampFromUNIX)
 def timestamp_from_unix(op):
     arg = translate(op.arg)
-    unit = op.unit
+    unit = op.unit.short
     if unit == "s":
         arg = arg.cast(pl.Int64) * 1_000
         unit = "ms"
@@ -809,7 +813,10 @@ def array_collect(op):
     arg = translate(op.arg)
     if (where := op.where) is not None:
         arg = arg.filter(translate(where))
-    return arg.list()
+    try:
+        return arg.implode()
+    except AttributeError:  # pragma: no cover
+        return arg.list()  # pragma: no cover
 
 
 @translate.register(ops.Unnest)

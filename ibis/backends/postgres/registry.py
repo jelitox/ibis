@@ -60,7 +60,7 @@ _truncate_precisions = {
 def _timestamp_truncate(t, op):
     sa_arg = t.translate(op.arg)
     try:
-        precision = _truncate_precisions[op.unit]
+        precision = _truncate_precisions[op.unit.short]
     except KeyError:
         raise com.UnsupportedOperationError(f'Unsupported truncate unit {op.unit!r}')
     return sa.func.date_trunc(precision, sa_arg)
@@ -561,8 +561,8 @@ operation_registry.update(
         # boolean reductions
         ops.Any: reduction(sa.func.bool_or),
         ops.All: reduction(sa.func.bool_and),
-        ops.NotAny: reduction(lambda x: sa.not_(sa.func.bool_or(x))),
-        ops.NotAll: reduction(lambda x: sa.not_(sa.func.bool_and(x))),
+        ops.NotAny: reduction(lambda x: sa.func.bool_and(~x)),
+        ops.NotAll: reduction(lambda x: sa.func.bool_or(~x)),
         # strings
         ops.GroupConcat: _string_agg,
         ops.Capitalize: unary(sa.func.initcap),
