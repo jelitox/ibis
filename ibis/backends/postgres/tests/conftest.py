@@ -15,13 +15,13 @@ from __future__ import annotations
 # limitations under the License.
 import os
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any
 
 import pytest
 import sqlalchemy as sa
 
 import ibis
-from ibis.backends.conftest import TEST_TABLES, _random_identifier, init_database
+from ibis.backends.conftest import TEST_TABLES, init_database
 from ibis.backends.tests.base import BackendTest, RoundHalfToEven
 
 PG_USER = os.environ.get(
@@ -88,7 +88,7 @@ class TestConf(BackendTest, RoundHalfToEven):
                 # `data_iter` argument would have to be turned back into a CSV
                 # before being passed to `copy_expert`.
                 sql = f"COPY {table} FROM STDIN WITH (FORMAT CSV, HEADER TRUE, DELIMITER ',')"
-                with data_dir.joinpath(f'{table}.csv').open('r') as file:
+                with data_dir.joinpath("csv", f'{table}.csv').open('r') as file:
                     cur.copy_expert(sql=sql, file=file)
 
     @staticmethod
@@ -152,24 +152,4 @@ def translate():
     from ibis.backends.postgres import Backend
 
     context = Backend.compiler.make_context()
-    return lambda expr: (Backend.compiler.translator_class(expr, context).get_result())
-
-
-@pytest.fixture
-def temp_table(con) -> Generator[str, None, None]:
-    """Return a temporary table name.
-
-    Parameters
-    ----------
-    con : ibis.postgres.PostgreSQLClient
-
-    Yields
-    ------
-    name : string
-        Random table name for a temporary usage.
-    """
-    name = _random_identifier('table')
-    try:
-        yield name
-    finally:
-        con.drop_table(name, force=True)
+    return lambda expr: Backend.compiler.translator_class(expr, context).get_result()

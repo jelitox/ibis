@@ -42,7 +42,6 @@ def test_cast_string_col(alltypes, translate, to_type, snapshot):
 @pytest.mark.parametrize(
     'column',
     [
-        'index',
         'id',
         'bool_col',
         'tinyint_col',
@@ -461,4 +460,9 @@ def test_count_distinct_with_filter(alltypes):
 def test_group_concat(alltypes, sep, where_case, translate, snapshot):
     where = None if where_case is None else alltypes.bool_col == where_case
     expr = alltypes.string_col.group_concat(sep, where)
+    snapshot.assert_match(translate(expr.op()), "out.sql")
+
+
+def test_hash(alltypes, translate, snapshot):
+    expr = alltypes.string_col.hash()
     snapshot.assert_match(translate(expr.op()), "out.sql")

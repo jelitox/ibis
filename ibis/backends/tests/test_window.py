@@ -654,11 +654,8 @@ def test_simple_ungrouped_unbound_following_window(
             id='unordered-lag',
             marks=[
                 pytest.mark.broken(
-                    ["bigquery", "trino"],
-                    reason=(
-                        "this isn't actually broken: the trino backend "
-                        "result is equal up to ordering"
-                    ),
+                    ["trino"],
+                    reason="this isn't actually broken: the backend result is equal up to ordering",
                     raises=AssertionError,
                 ),
                 pytest.mark.notimpl(["dask"], raises=com.OperationNotDefinedError),
@@ -910,7 +907,7 @@ def test_grouped_ordered_window_coalesce(backend, alltypes, df):
         return df
 
     expected = (
-        df.groupby("month")
+        df.groupby("month", group_keys=False)
         .apply(agg)
         .sort_values(["id"])
         .reset_index(drop=True)

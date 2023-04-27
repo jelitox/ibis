@@ -190,7 +190,17 @@ class BaseAlchemyBackend(BaseSQLBackend):
     def fetch_from_cursor(self, cursor, schema: sch.Schema) -> pd.DataFrame:
         import pandas as pd
 
-        df = pd.DataFrame.from_records(cursor, columns=schema.names, coerce_float=True)
+        try:
+            df = pd.DataFrame.from_records(
+                cursor, columns=schema.names, coerce_float=True
+            )
+        except Exception:
+            # clean up the cursor if we fail to create the DataFrame
+            #
+            # in the sqlite case failing to close the cursor results in
+            # artificially locked tables
+            cursor.close()
+            raise
         df = schema.apply_to(df)
         if not df.empty and geospatial_supported:
             return self._to_geodataframe(df, schema)
@@ -467,8 +477,15 @@ class BaseAlchemyBackend(BaseSQLBackend):
         """Handle cases where SQLAlchemy cannot infer the column types of `table`."""
 
         self.inspector.reflect_table(table, table.columns)
+
         dialect = self.con.dialect
-        quoted_name = dialect.identifier_preparer.quote(table.name)
+
+        quoted_name = ".".join(
+            map(
+                dialect.identifier_preparer.quote,
+                filter(None, [table.schema, table.name]),
+            )
+        )
 
         for colname, type in self._metadata(quoted_name):
             if colname in nulltype_cols:

@@ -17,12 +17,12 @@ from ibis.backends.conftest import LINUX, SANDBOXED
 
 
 def test_read_csv(data_directory):
-    t = ibis.read_csv(data_directory / "functional_alltypes.csv")
+    t = ibis.read_csv(data_directory / "csv" / "functional_alltypes.csv")
     assert t.count().execute()
 
 
 def test_read_parquet(data_directory):
-    t = ibis.read_parquet(data_directory / "functional_alltypes.parquet")
+    t = ibis.read_parquet(data_directory / "parquet" / "functional_alltypes.parquet")
     assert t.count().execute()
 
 
@@ -30,7 +30,7 @@ def test_read_parquet(data_directory):
     duckdb=["duckdb<0.7.0"], reason="read_json_auto doesn't exist", raises=exc.IbisError
 )
 def test_read_json(data_directory, tmp_path):
-    pqt = ibis.read_parquet(data_directory / "functional_alltypes.parquet")
+    pqt = ibis.read_parquet(data_directory / "parquet" / "functional_alltypes.parquet")
 
     path = tmp_path.joinpath("ft.json")
     path.write_text(pqt.execute().to_json(orient="records", lines=True))
@@ -92,6 +92,11 @@ def test_read_postgres(con, pgurl):  # pragma: no cover
     assert table.count().execute()
 
 
+@pytest.mark.xfail(
+    LINUX and SANDBOXED,
+    reason="nix on linux cannot download duckdb extensions or data due to sandboxing",
+    raises=duckdb.IOException,
+)
 def test_read_sqlite(con, tmp_path):
     path = tmp_path / "test.db"
 
@@ -116,6 +121,11 @@ def test_read_sqlite_no_table_name(con, tmp_path):
         con.read_sqlite(path)
 
 
+@pytest.mark.xfail(
+    LINUX and SANDBOXED,
+    reason="nix on linux cannot download duckdb extensions or data due to sandboxing",
+    raises=duckdb.IOException,
+)
 def test_register_sqlite(con, tmp_path):
     path = tmp_path / "test.db"
 
@@ -132,15 +142,22 @@ def test_register_sqlite(con, tmp_path):
     reason="nix on linux cannot download duckdb extensions or data due to sandboxing",
     raises=duckdb.IOException,
 )
-def test_attach_sqlite(data_directory):
+def test_attach_sqlite(data_directory, tmp_path):
+    import sqlite3
+
+    test_db_path = tmp_path / "test.db"
+    with sqlite3.connect(test_db_path) as scon:
+        for line in (
+            Path(data_directory.parent / "schema" / "sqlite.sql").read_text().split(";")
+        ):
+            scon.execute(line)
+
     # Create a new connection here because we already have the `ibis_testing`
     # tables loaded in to the `con` fixture.
     con = ibis.duckdb.connect()
 
-    sqlite_db = data_directory / "ibis_testing.db"
-
-    con.attach_sqlite(sqlite_db)
-    assert set(con.list_tables()) == {
+    con.attach_sqlite(test_db_path)
+    assert set(con.list_tables()) >= {
         "functional_alltypes",
         "awards_players",
         "batting",
@@ -151,8 +168,8 @@ def test_attach_sqlite(data_directory):
     assert len(set(fa.schema().types)) > 1
 
     # overwrite existing sqlite_db and force schema to all strings
-    con.attach_sqlite(sqlite_db, overwrite=True, all_varchar=True)
-    assert set(con.list_tables()) == {
+    con.attach_sqlite(test_db_path, overwrite=True, all_varchar=True)
+    assert set(con.list_tables()) >= {
         "functional_alltypes",
         "awards_players",
         "batting",

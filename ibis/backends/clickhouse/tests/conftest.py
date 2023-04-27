@@ -38,15 +38,18 @@ class TestConf(UnorderedComparator, ServiceBackendTest, RoundHalfToEven):
 
     @classmethod
     def service_spec(cls, data_dir: Path) -> ServiceSpec:
-        files = [data_dir.joinpath("functional_alltypes.parquet")]
-        files.extend(
-            data_dir.joinpath("parquet", name, f"{name}.parquet")
-            for name in ("diamonds", "batting", "awards_players")
-        )
         return ServiceSpec(
             name=cls.name(),
             data_volume="/var/lib/clickhouse/user_files/ibis",
-            files=files,
+            files=[
+                data_dir.joinpath("parquet", f"{name}.parquet")
+                for name in (
+                    "diamonds",
+                    "batting",
+                    "awards_players",
+                    "functional_alltypes",
+                )
+            ],
         )
 
     @staticmethod
@@ -77,9 +80,6 @@ class TestConf(UnorderedComparator, ServiceBackendTest, RoundHalfToEven):
 
         with contextlib.suppress(clickhouse_driver.errors.ServerException):
             client.execute(f"CREATE DATABASE {database} ENGINE = Atomic")
-
-        client.execute("DROP DATABASE IF EXISTS tmptables")
-        client.execute("CREATE DATABASE tmptables ENGINE = Atomic")
 
         client.execute(f"USE {database}")
         client.execute("SET allow_experimental_object_type = 1")

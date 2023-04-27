@@ -4,6 +4,7 @@ from operator import invert, methodcaller, neg
 
 import numpy as np
 import pandas as pd
+import pandas.testing as tm
 import pytest
 import sqlalchemy as sa
 import toolz
@@ -508,11 +509,6 @@ def test_select_sort_sort(alltypes):
         param(_.id, {"by": "id"}),
         param(lambda _: _.id, {"by": "id"}),
         param(
-            ("id", False),
-            {"by": "id", "ascending": False},
-            marks=pytest.mark.notimpl(["dask"]),
-        ),
-        param(
             ibis.desc("id"),
             {"by": "id", "ascending": False},
             marks=pytest.mark.notimpl(["dask"]),
@@ -523,7 +519,7 @@ def test_select_sort_sort(alltypes):
             marks=pytest.mark.notimpl(["dask"]),
         ),
         param(
-            ["id", ("int_col", False)],
+            ["id", ibis.desc("int_col")],
             {"by": ["id", "int_col"], "ascending": [True, False]},
             marks=pytest.mark.notimpl(["dask"]),
         ),
@@ -760,19 +756,16 @@ def test_between(backend, alltypes, df):
 
 
 @pytest.mark.notimpl(["druid"])
-def test_interactive(alltypes):
+def test_interactive(alltypes, monkeypatch):
+    monkeypatch.setattr(ibis.options, "interactive", True)
+
     expr = alltypes.mutate(
         str_col=_.string_col.replace("1", "").nullif("2"),
         date_col=_.timestamp_col.date(),
         delta_col=lambda t: ibis.now() - t.timestamp_col,
     )
 
-    orig = ibis.options.interactive
-    ibis.options.interactive = True
-    try:
-        repr(expr)
-    finally:
-        ibis.options.interactive = orig
+    repr(expr)
 
 
 def test_correlated_subquery(alltypes):
@@ -1167,3 +1160,26 @@ def test_distinct_on_keep_is_none(backend, on):
         .reset_index(drop=True)
     )
     assert len(result) == len(expected)
+
+
+@pytest.mark.notimpl(
+    [
+        "dask",
+        "pandas",
+        "postgres",
+    ]
+)
+@pytest.mark.notyet(
+    [
+        "sqlite",
+        "datafusion",
+        "druid",  # ???
+        "mysql",  # CHECKSUM TABLE but not column
+        "trino",  # checksum returns varbinary
+    ]
+)
+def test_hash_consistent(backend, alltypes):
+    h1 = alltypes.string_col.hash().execute(limit=10)
+    h2 = alltypes.string_col.hash().execute(limit=10)
+    tm.assert_series_equal(h1, h2)
+    assert h1.dtype in ("i8", "uint64")  # polars likes returning uint64 for this

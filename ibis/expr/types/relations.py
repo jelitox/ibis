@@ -901,8 +901,8 @@ class Table(Expr, _FixedTextJupyterMixin):
         agg = ops.Aggregation(
             self,
             metrics=list(metrics),
-            by=util.promote_list(by),
-            having=util.promote_list(having),
+            by=bind_expr(self, util.promote_list(by)),
+            having=bind_expr(self, util.promote_list(having)),
         )
         agg = an.simplify_aggregation(agg)
 
@@ -1231,13 +1231,33 @@ class Table(Expr, _FixedTextJupyterMixin):
         │     1 │ c      │     4 │
         └───────┴────────┴───────┘
         """
+        used_tuple_syntax = False
         if isinstance(by, tuple):
             by = [by]
-        elif by is None:
-            by = []
-        else:
-            by = util.promote_list(by)
-        return self.op().order_by(by).to_expr()
+            used_tuple_syntax = True
+
+        sort_keys = []
+        for item in util.promote_list(by):
+            if isinstance(item, tuple):
+                if len(item) != 2:
+                    raise ValueError(
+                        "Tuple must be of length 2, got {}".format(len(item))
+                    )
+                item = (bind_expr(self, item[0]), item[1])
+                used_tuple_syntax = True
+            else:
+                item = bind_expr(self, item)
+            sort_keys.append(item)
+
+        if used_tuple_syntax:
+            util.warn_deprecated(
+                "table.order_by((key, True)) and table.order_by((key, False)) syntax",
+                as_of="6.0",
+                removed_in="7.0",
+                instead="Use ibis.desc(key) or ibis.asc(key) instead",
+            )
+
+        return self.op().order_by(sort_keys).to_expr()
 
     def union(self, *tables: Table, distinct: bool = False) -> Table:
         """Compute the set union of multiple table expressions.
@@ -2103,7 +2123,7 @@ class Table(Expr, _FixedTextJupyterMixin):
         344
         """
         if subset is not None:
-            subset = util.promote_list(subset)
+            subset = bind_expr(self, util.promote_list(subset))
         return ops.DropNa(self, how, subset).to_expr()
 
     def fillna(
@@ -2545,6 +2565,8 @@ class Table(Expr, _FixedTextJupyterMixin):
         >>> from ibis import _
         >>> ibis.options.interactive = True
         >>> t = ibis.examples.penguins.fetch()
+        >>> t.count()
+        344
         >>> agg = t.drop("year").agg(s.across(s.numeric(), _.mean()))
         >>> expr = t.cross_join(agg)
         >>> expr
@@ -2579,8 +2601,6 @@ class Table(Expr, _FixedTextJupyterMixin):
          'flipper_length_mm_right',
          'body_mass_g_right']
         >>> expr.count()
-        344
-        >>> t.count()
         344
         """
         op = ops.CrossJoin(

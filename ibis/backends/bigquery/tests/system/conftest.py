@@ -60,30 +60,34 @@ def credentials(default_credentials):
 
 
 @pytest.fixture(scope="session")
-def client(credentials, project_id, dataset_id):
+def con(credentials, project_id, dataset_id):
     con = ibis.bigquery.connect(
         project_id=project_id, dataset_id=dataset_id, credentials=credentials
     )
     try:
-        return con.sql("SELECT 1")
+        con.sql("SELECT 1")
     except gexc.Forbidden:
         pytest.skip("Cannot access BigQuery")
+    else:
+        return con
 
 
 @pytest.fixture(scope="session")
-def client2(credentials, project_id, dataset_id):
+def con2(credentials, project_id, dataset_id):
     con = ibis.bigquery.connect(
         project_id=project_id, dataset_id=dataset_id, credentials=credentials
     )
     try:
-        return con.sql("SELECT 1")
+        con.sql("SELECT 1")
     except gexc.Forbidden:
         pytest.skip("Cannot access BigQuery")
+    else:
+        return con
 
 
 @pytest.fixture(scope="session")
-def alltypes(client):
-    return client.table("functional_alltypes")
+def alltypes(con):
+    return con.table("functional_alltypes")
 
 
 @pytest.fixture(scope="session")
@@ -92,18 +96,18 @@ def df(alltypes):
 
 
 @pytest.fixture(scope="session")
-def parted_alltypes(client):
-    return client.table("functional_alltypes_parted")
+def parted_alltypes(con):
+    return con.table("functional_alltypes_parted")
 
 
 @pytest.fixture(scope="session")
-def struct_table(client):
-    return client.table("struct_table")
+def struct_table(con):
+    return con.table("struct_table")
 
 
 @pytest.fixture(scope="session")
-def numeric_table(client):
-    return client.table("numeric_table")
+def numeric_table(con):
+    return con.table("numeric_table")
 
 
 @pytest.fixture(scope="session")

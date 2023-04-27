@@ -7,7 +7,7 @@ import io
 import os
 import pathlib
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 import google.api_core.exceptions as gexc
 import google.auth
@@ -16,11 +16,15 @@ from google.cloud import bigquery as bq
 
 import ibis
 import ibis.expr.datatypes as dt
+import ibis.selectors as s
 from ibis.backends.bigquery import EXTERNAL_DATA_SCOPES, Backend
 from ibis.backends.bigquery.datatypes import ibis_type_to_bigquery_type
 from ibis.backends.conftest import TEST_TABLES
 from ibis.backends.tests.base import BackendTest, RoundAwayFromZero, UnorderedComparator
 from ibis.backends.tests.data import json_types, non_null_array_types, struct_types, win
+
+if TYPE_CHECKING:
+    import ibis.expr.types as ir
 
 DATASET_ID = "ibis_gbq_testing"
 DEFAULT_PROJECT_ID = "ibis-gbq"
@@ -182,30 +186,13 @@ class TestConf(UnorderedComparator, BackendTest, RoundAwayFromZero):
                 e.submit(
                     make_job,
                     client.load_table_from_file,
-                    io.BytesIO(data_dir.joinpath("struct_table.avro").read_bytes()),
+                    io.BytesIO(
+                        data_dir.joinpath("avro", "struct_table.avro").read_bytes()
+                    ),
                     bq.TableReference(testing_dataset, "struct_table"),
                     job_config=bq.LoadJobConfig(
                         write_disposition=write_disposition,
                         source_format=bq.SourceFormat.AVRO,
-                    ),
-                )
-            )
-
-            futures.append(
-                e.submit(
-                    make_job,
-                    client.load_table_from_file,
-                    io.BytesIO(
-                        data_dir.joinpath("functional_alltypes.csv").read_bytes()
-                    ),
-                    functional_alltypes_parted,
-                    job_config=bq.LoadJobConfig(
-                        schema=ibis_schema_to_bq_schema(
-                            TEST_TABLES["functional_alltypes"]
-                        ),
-                        write_disposition=write_disposition,
-                        source_format=bq.SourceFormat.CSV,
-                        skip_leading_rows=1,
                     ),
                 )
             )
@@ -264,24 +251,30 @@ class TestConf(UnorderedComparator, BackendTest, RoundAwayFromZero):
                 )
             )
 
-            for table, schema in TEST_TABLES.items():
-                futures.append(
-                    e.submit(
-                        make_job,
-                        client.load_table_from_file,
-                        io.BytesIO(data_dir.joinpath(f"{table}.csv").read_bytes()),
-                        bq.TableReference(testing_dataset, table),
-                        job_config=bq.LoadJobConfig(
-                            schema=ibis_schema_to_bq_schema(schema),
-                            write_disposition=bq.WriteDisposition.WRITE_TRUNCATE,
-                            source_format=bq.SourceFormat.CSV,
-                            skip_leading_rows=1,
-                        ),
-                    )
+            futures.extend(
+                e.submit(
+                    make_job,
+                    client.load_table_from_file,
+                    io.BytesIO(
+                        data_dir.joinpath("parquet", f"{table}.parquet").read_bytes()
+                    ),
+                    bq.TableReference(testing_dataset, table),
+                    job_config=bq.LoadJobConfig(
+                        schema=ibis_schema_to_bq_schema(schema),
+                        write_disposition=write_disposition,
+                        source_format=bq.SourceFormat.PARQUET,
+                    ),
                 )
+                for table, schema in TEST_TABLES.items()
+            )
 
             for fut in concurrent.futures.as_completed(futures):
                 fut.result()
+
+    @property
+    def functional_alltypes(self) -> ir.Table:
+        t = super().functional_alltypes
+        return t.select(~s.c("index", "Unnamed_0"))
 
     @staticmethod
     def connect(data_directory: pathlib.Path) -> Backend:
