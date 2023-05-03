@@ -7,6 +7,7 @@ import sqlalchemy as sa
 import sqlglot
 from pytest import mark, param
 
+import ibis
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 from ibis import _
@@ -23,6 +24,12 @@ try:
     from google.api_core.exceptions import BadRequest as GoogleBadRequest
 except ImportError:
     GoogleBadRequest = None
+
+
+try:
+    from polars.exceptions import ComputeError
+except ImportError:
+    ComputeError = None
 
 
 @reduction(input_type=[dt.double], output_type=dt.double)
@@ -101,8 +108,8 @@ aggregate_test_params = [
                 "datafusion",
                 "impala",
                 "mysql",
-                "pyspark",
                 "mssql",
+                "pyspark",
                 "trino",
                 "druid",
             ],
@@ -430,20 +437,25 @@ def test_aggregate_multikey_group_reduction_udf(backend, alltypes, df):
             lambda t, where: (t.int_col % 3).mode(where=where),
             lambda t, where: (t.int_col % 3)[where].mode().iloc[0],
             id='mode',
-            marks=pytest.mark.notyet(
-                [
-                    "bigquery",
-                    "clickhouse",
-                    "datafusion",
-                    "impala",
-                    "mysql",
-                    "pyspark",
-                    "mssql",
-                    "trino",
-                    "druid",
-                ],
-                raises=com.OperationNotDefinedError,
-            ),
+            marks=[
+                pytest.mark.notyet(
+                    [
+                        "bigquery",
+                        "clickhouse",
+                        "datafusion",
+                        "impala",
+                        "mysql",
+                        "pyspark",
+                        "mssql",
+                        "trino",
+                        "druid",
+                    ],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.xfail_version(
+                    pyspark=["pyspark<3.4.0"], raises=AttributeError
+                ),
+            ],
         ),
         param(
             lambda t, where: t.double_col.argmin(t.int_col, where=where),
@@ -679,6 +691,14 @@ def test_aggregate_multikey_group_reduction_udf(backend, alltypes, df):
             lambda t, where: t.count(where=where),
             lambda t, where: len(t[where]),
             id='count_star',
+            marks=[
+                pytest.mark.broken(
+                    ["polars"],
+                    raises=ComputeError,
+                    reason="polars seems broken for named ungrouped scalar reductions with no filter",
+                    strict=False,
+                )
+            ],
         ),
         param(
             lambda t, where: t.string_col.collect(where=where),
@@ -1014,14 +1034,29 @@ def test_corr_cov(
     raises=com.OperationNotDefinedError,
 )
 @pytest.mark.broken(
-    ["dask", "pandas"],
+    ["dask"],
     raises=AttributeError,
-    reason="'Series' object has no attribute 'approxmedian'",
+    reason="'Series' object has no attribute 'approx_median'",
 )
 def test_approx_median(alltypes):
     expr = alltypes.double_col.approx_median()
     result = expr.execute()
     assert isinstance(result, float)
+
+
+@pytest.mark.notimpl(
+    ["bigquery", "datafusion", "druid", "sqlite"], raises=com.OperationNotDefinedError
+)
+@pytest.mark.notyet(
+    ["impala", "mysql", "mssql", "druid", "pyspark", "trino"],
+    raises=com.OperationNotDefinedError,
+)
+@pytest.mark.notyet(["dask"], raises=NotImplementedError)
+def test_median(alltypes, df):
+    expr = alltypes.double_col.median()
+    result = expr.execute()
+    expected = df.double_col.median()
+    assert result == expected
 
 
 @mark.parametrize(
@@ -1333,3 +1368,15 @@ def test_agg_name_in_output_column(alltypes):
     df = query.execute()
     assert "min" in df.columns[0].lower()
     assert "max" in df.columns[1].lower()
+
+
+@pytest.mark.notimpl(["datafusion"], raises=com.OperationNotDefinedError)
+def test_grouped_case(backend, con):
+    table = ibis.memtable({"key": [1, 1, 2, 2], "value": [10, 30, 20, 40]})
+
+    case_expr = ibis.case().when(table.value < 25, table.value).else_(ibis.null()).end()
+
+    expr = table.group_by("key").aggregate(mx=case_expr.max()).order_by("key")
+    result = con.execute(expr)
+    expected = pd.DataFrame({"key": [1, 2], "mx": [10, 20]})
+    backend.assert_frame_equal(result, expected)
