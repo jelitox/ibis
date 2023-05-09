@@ -539,21 +539,7 @@ def compile_any(t, op, *, aggcontext=None, **kwargs):
 
 @compiles(ops.NotAny)
 def compile_notany(t, op, *args, aggcontext=None, **kwargs):
-    # The code here is a little ugly because the translation are different
-    # with different context.
-    # When translating col.notany() (context is None), we returns the dataframe
-    # so we need to negate the aggregator, i.e., df.select(~F.max(col))
-    # When traslating col.notany().over(w), we need to negate the result
-    # after the window translation, i.e., ~(F.max(col).over(w))
-
-    if aggcontext is None:
-
-        def fn(col):
-            return ~(F.max(col))
-
-        return compile_aggregator(t, op, *args, fn=fn, aggcontext=aggcontext, **kwargs)
-    else:
-        return ~compile_any(t, op, *args, aggcontext=aggcontext, **kwargs)
+    return ~compile_any(t, op, *args, aggcontext=aggcontext, **kwargs)
 
 
 @compiles(ops.All)
@@ -563,15 +549,7 @@ def compile_all(t, op, *args, **kwargs):
 
 @compiles(ops.NotAll)
 def compile_notall(t, op, *, aggcontext=None, **kwargs):
-    # See comments for opts.NotAny for reasoning for the if/else
-    if aggcontext is None:
-
-        def fn(col):
-            return ~(F.min(col))
-
-        return compile_aggregator(t, op, fn=fn, aggcontext=aggcontext, **kwargs)
-    else:
-        return ~compile_all(t, op, aggcontext=aggcontext, **kwargs)
+    return ~compile_all(t, op, aggcontext=aggcontext, **kwargs)
 
 
 @compiles(ops.Count)
@@ -708,6 +686,18 @@ def compile_arbitrary(t, op, **kwargs):
             f"PySpark backend does not support how={how!r}"
         )
 
+    return compile_aggregator(t, op, fn=fn, **kwargs)
+
+
+@compiles(ops.First)
+def compile_first(t, op, **kwargs):
+    fn = functools.partial(F.first, ignorenulls=True)
+    return compile_aggregator(t, op, fn=fn, **kwargs)
+
+
+@compiles(ops.Last)
+def compile_last(t, op, **kwargs):
+    fn = functools.partial(F.last, ignorenulls=True)
     return compile_aggregator(t, op, fn=fn, **kwargs)
 
 
@@ -1198,7 +1188,8 @@ def compile_window_function(t, op, **kwargs):
 
     # If the operand is a shift op (e.g. lead, lag), Spark will set the window
     # bounds. Only set window bounds here if not a shift operation.
-    if not isinstance(op.func, ops.ShiftBase):
+    func = op.func.__window_op__
+    if not isinstance(func, ops.ShiftBase):
         if op.frame.start is None:
             win_start = Window.unboundedPreceding
         else:
@@ -1213,17 +1204,19 @@ def compile_window_function(t, op, **kwargs):
         else:
             pyspark_window = pyspark_window.rowsBetween(win_start, win_end)
 
-    func = op.func
-    if isinstance(func, (ops.NotAll, ops.NotAny)):
+    orig_func = func
+    if isinstance(orig_func, (ops.NotAll, ops.NotAny)):
         # For NotAll and NotAny, negation must be applied after .over(window)
         # Here we rewrite node to be its negation, and negate it back after
         # translation and window operation
         func = func.negate()
+    else:
+        func = orig_func
     result = t.translate(func, **kwargs, aggcontext=aggcontext).over(pyspark_window)
 
-    if isinstance(op.func, (ops.NotAll, ops.NotAny)):
+    if isinstance(orig_func, (ops.NotAll, ops.NotAny)):
         return ~result
-    elif isinstance(op.func, ops.RankBase):
+    elif isinstance(func, ops.RankBase):
         # result must be cast to long type for Rank / RowNumber
         return result.astype('long') - 1
     else:

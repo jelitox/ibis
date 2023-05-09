@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import time
 import traceback
 from typing import TYPE_CHECKING
 
@@ -158,31 +157,8 @@ class ImpalaCursor:
 
     def _wait_synchronous(self):
         # Wait to finish, but cancel if KeyboardInterrupt
-        from impala.hiveserver2 import OperationalError
-
-        loop_start = time.time()
-
-        def _sleep_interval(start_time):
-            elapsed = time.time() - start_time
-            if elapsed < 0.05:
-                return 0.01
-            elif elapsed < 1.0:
-                return 0.05
-            elif elapsed < 10.0:
-                return 0.1
-            elif elapsed < 60.0:
-                return 0.5
-            return 1.0
-
-        cur = self._cursor
         try:
-            while True:
-                state = cur.status()
-                if self._cursor._op_state_is_error(state):
-                    raise OperationalError("Operation is in ERROR_STATE")
-                if not cur._op_state_is_executing(state):
-                    break
-                time.sleep(_sleep_interval(loop_start))
+            self._cursor._wait_to_finish()
         except KeyboardInterrupt:
             util.log('Canceling query')
             self.cancel()
@@ -329,7 +305,8 @@ class ImpalaTable(ir.Table):
                 partition_schema=partition_schema,
                 overwrite=overwrite,
             )
-            return self._client.raw_sql(statement.compile())
+            self._client._safe_exec_sql(statement.compile())
+            return self
 
     def load_data(self, path, overwrite=False, partition=None):
         """Load data into an Impala table.
@@ -357,7 +334,8 @@ class ImpalaTable(ir.Table):
             overwrite=overwrite,
         )
 
-        return self._client.raw_sql(stmt.compile())
+        self._client._safe_exec_sql(stmt.compile())
+        return self
 
     @property
     def name(self):
@@ -372,7 +350,7 @@ class ImpalaTable(ir.Table):
         if not m and database is None:
             database = self._database
         statement = RenameTable(self._qualified_name, new_name, new_database=database)
-        self._client.raw_sql(statement)
+        self._client._safe_exec_sql(statement)
 
         op = self.op().copy(name=statement.new_qualified_name)
         return type(self)(op)
@@ -409,7 +387,8 @@ class ImpalaTable(ir.Table):
         stmt = ddl.AddPartition(
             self._qualified_name, spec, part_schema, location=location
         )
-        return self._client.raw_sql(stmt)
+        self._client._safe_exec_sql(stmt)
+        return self
 
     def alter(
         self,
@@ -434,7 +413,8 @@ class ImpalaTable(ir.Table):
 
         def _run_ddl(**kwds):
             stmt = AlterTable(self._qualified_name, **kwds)
-            return self._client.raw_sql(stmt)
+            self._client._safe_exec_sql(stmt)
+            return self
 
         return self._alter_table_helper(
             _run_ddl,
@@ -475,7 +455,8 @@ class ImpalaTable(ir.Table):
 
         def _run_ddl(**kwds):
             stmt = ddl.AlterPartition(self._qualified_name, spec, part_schema, **kwds)
-            return self._client.raw_sql(stmt)
+            self._client._safe_exec_sql(stmt)
+            return self
 
         return self._alter_table_helper(
             _run_ddl,
@@ -498,7 +479,8 @@ class ImpalaTable(ir.Table):
         """Drop an existing table partition."""
         part_schema = self.partition_schema()
         stmt = ddl.DropPartition(self._qualified_name, spec, part_schema)
-        return self._client.raw_sql(stmt)
+        self._client._safe_exec_sql(stmt)
+        return self
 
     def partitions(self):
         """Return information about the table's partitions.

@@ -21,8 +21,8 @@ import pytest
 import sqlalchemy as sa
 
 import ibis
-from ibis.backends.conftest import TEST_TABLES, init_database
-from ibis.backends.tests.base import BackendTest, RoundHalfToEven
+from ibis.backends.conftest import init_database
+from ibis.backends.tests.base import RoundHalfToEven, ServiceBackendTest, ServiceSpec
 
 PG_USER = os.environ.get(
     'IBIS_TEST_POSTGRES_USER', os.environ.get('PGUSER', 'postgres')
@@ -39,12 +39,20 @@ IBIS_TEST_POSTGRES_DB = os.environ.get(
 )
 
 
-class TestConf(BackendTest, RoundHalfToEven):
+class TestConf(ServiceBackendTest, RoundHalfToEven):
     # postgres rounds half to even for double precision and half away from zero
     # for numeric and decimal
 
     returned_timestamp_unit = 's'
     supports_structs = False
+
+    @classmethod
+    def service_spec(cls, data_dir: Path) -> ServiceSpec:
+        return ServiceSpec(
+            name=cls.name(),
+            data_volume="/data",
+            files=data_dir.joinpath("csv").glob("*.csv"),
+        )
 
     @staticmethod
     def _load_data(
@@ -67,29 +75,15 @@ class TestConf(BackendTest, RoundHalfToEven):
             Location of scripts defining schemas
         """
         with open(script_dir / 'schema' / 'postgresql.sql') as schema:
-            engine = init_database(
+            init_database(
                 url=sa.engine.make_url(
                     f"postgresql://{user}:{password}@{host}:{port:d}/{database}"
                 ),
                 database=database,
                 schema=schema,
-                isolation_level='AUTOCOMMIT',
+                isolation_level="AUTOCOMMIT",
                 recreate=False,
             )
-
-        tables = list(TEST_TABLES) + ['geo']
-        with engine.begin() as con, con.connection.cursor() as cur:
-            for table in tables:
-                # Here we insert rows using COPY table FROM STDIN, using
-                # psycopg2's `copy_expert` API.
-                #
-                # We could use DataFrame.to_sql(method=callable), but that
-                # incurs an unnecessary round trip and requires more code: the
-                # `data_iter` argument would have to be turned back into a CSV
-                # before being passed to `copy_expert`.
-                sql = f"COPY {table} FROM STDIN WITH (FORMAT CSV, HEADER TRUE, DELIMITER ',')"
-                with data_dir.joinpath("csv", f'{table}.csv').open('r') as file:
-                    cur.copy_expert(sql=sql, file=file)
 
     @staticmethod
     def connect(data_directory: Path):

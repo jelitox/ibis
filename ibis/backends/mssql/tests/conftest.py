@@ -30,19 +30,11 @@ class TestConf(ServiceBackendTest, RoundHalfToEven):
     supports_json = False
 
     @classmethod
-    def service_spec(cls, data_dir: Path):
+    def service_spec(cls, data_dir: Path) -> ServiceSpec:
         return ServiceSpec(
             name=cls.name(),
             data_volume="/data",
-            files=[
-                data_dir.joinpath("csv", f"{name}.csv")
-                for name in (
-                    "diamonds",
-                    "batting",
-                    "awards_players",
-                    "functional_alltypes",
-                )
-            ],
+            files=data_dir.joinpath("csv").glob("*.csv"),
         )
 
     @staticmethod

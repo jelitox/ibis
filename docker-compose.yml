@@ -1,7 +1,7 @@
 version: "3.4"
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:23.4.1.1943-alpine
+    image: clickhouse/clickhouse-server:23.4.2.11-alpine
     ports:
       - 9000:9000
     healthcheck:
@@ -116,6 +116,8 @@ services:
       - 3306:3306
     networks:
       - mysql
+    volumes:
+      - mysql:/data
   postgres:
     user: postgres
     environment:
@@ -135,6 +137,8 @@ services:
       - 5432:5432
     networks:
       - postgres
+    volumes:
+      - postgres:/data
   mssql:
     image: mcr.microsoft.com/mssql/server:2022-latest
     environment:
@@ -172,6 +176,8 @@ services:
       - 5433:5432
     networks:
       - trino
+    volumes:
+      - trino-postgres:/data
   trino:
     depends_on:
       - trino-postgres
@@ -182,7 +188,7 @@ services:
         - CMD-SHELL
         - trino --execute 'SELECT 1 AS one'
       timeout: 30s
-    image: trinodb/trino:415
+    image: trinodb/trino:416
     ports:
       - 8080:8080
     networks:
@@ -195,8 +201,6 @@ services:
   druid-postgres:
     image: postgres:15.2-alpine
     container_name: druid-postgres
-    volumes:
-      - metadata_data:/var/lib/postgresql/data
     environment:
       - POSTGRES_PASSWORD=FoolishPassword
       - POSTGRES_USER=druid
@@ -310,6 +314,7 @@ services:
     volumes:
       - druid:/opt/shared
       - middle_var:/opt/druid/var
+      - druid-data:/data
     depends_on:
       - druid-zookeeper
       - druid-postgres
@@ -357,6 +362,28 @@ services:
     networks:
       - druid
 
+  oracle:
+    image: gvenzl/oracle-free:23
+    environment:
+      ORACLE_PASSWORD: ibis
+      ORACLE_DATABASE: IBIS_TESTING
+      APP_USER: ibis
+      APP_USER_PASSWORD: ibis
+    ports:
+      - 1521:1521
+    healthcheck:
+      interval: 5s
+      retries: 10
+      test:
+        - CMD-SHELL
+        - ./healthcheck.sh
+      timeout: 30s
+    restart: on-failure
+    networks:
+      - oracle
+    volumes:
+      - oracle:/opt/oracle/data
+
 networks:
   impala:
   mysql:
@@ -365,14 +392,20 @@ networks:
   postgres:
   trino:
   druid:
+  oracle:
 
 volumes:
-  metadata_data:
-  middle_var:
-  historical_var:
   broker_var:
   coordinator_var:
-  router_var:
-  clickhouse:
   druid:
+  historical_var:
+  middle_var:
+  router_var:
+  # test data volumes
+  clickhouse:
+  druid-data:
   mssql:
+  mysql:
+  oracle:
+  postgres:
+  trino-postgres:

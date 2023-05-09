@@ -13,7 +13,11 @@ import pytest
 from requests import Session
 
 import ibis
-from ibis.backends.tests.base import RoundHalfToEven, ServiceBackendTest, ServiceSpec
+from ibis.backends.tests.base import (
+    RoundHalfToEven,
+    ServiceBackendTest,
+    ServiceSpec,
+)
 
 DRUID_URL = os.environ.get(
     "DRUID_URL", "druid://localhost:8082/druid/v2/sql?header=true"
@@ -98,13 +102,11 @@ class TestConf(ServiceBackendTest, RoundHalfToEven):
     supports_json = False  # it does, but we haven't implemented it
 
     @classmethod
-    def service_spec(cls, data_dir: Path):
-        files = [
-            data_dir.joinpath("parquet", f"{name}.parquet")
-            for name in ("diamonds", "batting", "awards_players", "functional_alltypes")
-        ]
+    def service_spec(cls, data_dir: Path) -> ServiceSpec:
         return ServiceSpec(
-            name="druid-coordinator", data_volume="/opt/shared", files=files
+            name="druid-middlemanager",
+            data_volume="/data",
+            files=data_dir.joinpath("parquet").glob("*.parquet"),
         )
 
     @staticmethod

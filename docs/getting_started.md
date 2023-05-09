@@ -67,7 +67,7 @@ AlchemyTable: penguins
 
 Ibis is lazily evaluated, so instead of seeing the data, we see the schema of
 the table, instead. To peek at the data, we can call `head` and then `execute`
-to get the first few rows of the table as a Pandas DataFrame.
+to get the first few rows of the table as a pandas DataFrame.
 
 ```python
 >>> penguins.head().execute()
@@ -79,9 +79,9 @@ to get the first few rows of the table as a Pandas DataFrame.
 4  Adelie  Torgersen            36.7           19.3              193.0       3450.0  female  2007
 ```
 
-`execute` takes the existing lazy expression and evaluates it. If we leave it
-off, you'll see the Ibis representation of the expression that `execute` will
-evaluate (when you're ready!).
+`execute` takes the existing lazy table expression and evaluates it. If we
+leave it off, you'll see the Ibis representation of the table expression that
+`execute` will evaluate (when you're ready!).
 
 ```python
 >>> penguins.head()
@@ -98,9 +98,9 @@ r0 := AlchemyTable: penguins
 Limit[r0, n=5]
 ```
 
-!!! note "Results in Pandas DataFrame"
+!!! note "Results in pandas DataFrame"
 
-    Ibis returns results as a Pandas DataFrame by default. It isn't using Pandas to
+    Ibis returns results as a pandas DataFrame by default. It isn't using pandas to
     perform any of the computation. The query is executed by the backend (DuckDB in
     this case). Only when the query is executed does Ibis then pull back the results
     and convert them into a DataFrame.
@@ -110,7 +110,8 @@ Limit[r0, n=5]
 For the rest of this intro, we'll turn on interactive mode, which partially
 executes queries to give users a preview of the results. There is a small
 difference in the way the output is formatted, but otherwise this is the same
-as calling `execute()` on the expression with a limit of 10 results returned.
+as calling `execute()` on the table expression with a limit of 10 result rows
+returned.
 
 ```python
 >>> ibis.options.interactive = True

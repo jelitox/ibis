@@ -38,11 +38,11 @@ numpy = ">=1,<2"
 pandas = ">=1.2.5,<3"
 parsy = ">=2,<3"
 pooch = { version = ">=1.6.0,<2", extras = ["progress", "xxhash"] }
-pyarrow = ">=2,<12"
+pyarrow = ">=2,<13"
 python-dateutil = ">=2.8.2,<3"
 pytz = ">=2022.7"
 rich = ">=12.4.4,<14"
-sqlglot = ">=10.4.3,<12"
+sqlglot = ">=10.4.3,<13"
 toolz = ">=0.11,<1"
 typing-extensions = ">=4.3.0,<5"
 black = { version = ">=22.1.0,<24", optional = true }
@@ -64,6 +64,7 @@ google-cloud-bigquery = { version = ">=3,<4", optional = true }
 google-cloud-bigquery-storage = { version = ">=2,<3", optional = true }
 graphviz = { version = ">=0.16,<1", optional = true }
 impyla = { version = ">=0.17,<1", optional = true }
+oracledb = { version = ">=1.3.1,<2", optional = true }
 packaging = { version = ">=21.3,<24", optional = true }
 polars = { version = ">=0.14.18,<1", optional = true }
 psycopg2 = { version = ">=2.8.4,<3", optional = true }
@@ -117,14 +118,14 @@ sqlalchemy = ">=1.4,<3"
 [tool.poetry.group.docs.dependencies]
 griffe = ">=0.25.3,<1"
 ipykernel = ">=6,<7"
-mkdocs = ">=1.2.3,<1.4.3"
+mkdocs = ">=1.2.3,<1.4.4"
 mkdocs-exclude = ">=1.0.2,<2"
 mkdocs-gen-files = ">=0.3.4,<0.6.0"
 mkdocs-git-revision-date-localized-plugin = ">=1.1.0,<2"
 mkdocs-jupyter = ">=0.24.1,<1"
 mkdocs-literate-nav = ">=0.4.1,<1"
 mkdocs-macros-plugin = ">=0.6.3,<1"
-mkdocs-material = ">=8.2.1,<9.1.9"
+mkdocs-material = ">=8.2.1,<9.1.10"
 mkdocstrings = ">=0.19.1,<1"
 mkdocstrings-python = ">=0.8.3,<1"
 requests = ">=2,<3"
@@ -146,6 +147,7 @@ all = [
   "google-cloud-bigquery-storage",
   "graphviz",
   "impyla",
+  "oracledb",
   "packaging",
   "polars",
   "psycopg2",
@@ -184,6 +186,7 @@ geospatial = ["geoalchemy2", "geopandas", "shapely"]
 impala = ["fsspec", "impyla", "requests", "sqlalchemy"]
 mssql = ["sqlalchemy", "pymssql", "sqlalchemy-views"]
 mysql = ["sqlalchemy", "pymysql", "sqlalchemy-views"]
+oracle = ["sqlalchemy", "oracledb", "packaging", "sqlalchemy-views"]
 pandas = ["regex"]
 polars = ["polars"]
 postgres = ["psycopg2", "sqlalchemy", "sqlalchemy-views"]
@@ -209,6 +212,7 @@ duckdb = "ibis.backends.duckdb"
 impala = "ibis.backends.impala"
 mysql = "ibis.backends.mysql"
 mssql = "ibis.backends.mssql"
+oracle = "ibis.backends.oracle"
 pandas = "ibis.backends.pandas"
 polars = "ibis.backends.polars"
 postgres = "ibis.backends.postgres"
@@ -328,6 +332,7 @@ markers = [
   "impala: Apache Impala tests",
   "mysql: MySQL tests",
   "mssql: MS SQL Server tests",
+  "oracle: Oracle tests",
   "pandas: Pandas tests",
   "polars: Polars tests",
   "postgres: PostgreSQL tests",

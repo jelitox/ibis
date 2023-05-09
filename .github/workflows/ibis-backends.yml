@@ -144,6 +144,13 @@ jobs:
               - druid
             services:
               - druid
+          - name: oracle
+            title: Oracle
+            serial: true
+            extras:
+              - oracle
+            services:
+              - oracle
         exclude:
           - os: windows-latest
             backend:
@@ -230,6 +237,15 @@ jobs:
                 - druid
               services:
                 - druid
+          - os: windows-latest
+            backend:
+              name: oracle
+              title: Oracle
+              serial: true
+              extras:
+                - oracle
+              services:
+                - oracle
     steps:
       - name: update and install system dependencies
         if: matrix.os == 'ubuntu-latest' && matrix.backend.sys-deps != null
@@ -612,6 +628,13 @@ jobs:
             title: DuckDB
             extras:
               - duckdb
+          - name: oracle
+            title: Oracle
+            serial: true
+            extras:
+              - oracle
+            services:
+              - oracle
     steps:
       - name: checkout
         uses: actions/checkout@v3

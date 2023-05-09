@@ -118,6 +118,18 @@ def reduction_to_aggregation(node):
     return agg
 
 
+def find_physical_tables(node):
+    """Find every first occurrence of a `ir.PhysicalTable` object in `node`."""
+
+    def finder(node):
+        if isinstance(node, ops.PhysicalTable):
+            return g.halt, node
+        else:
+            return g.proceed, None
+
+    return list(toolz.unique(g.traverse(finder, node)))
+
+
 def find_immediate_parent_tables(input_node, keep_input=True):
     """Find every first occurrence of a `ir.Table` object in `input_node`.
 
@@ -438,6 +450,15 @@ def windowize_function(expr, frame):
     return _windowize(expr.op(), frame).to_expr()
 
 
+def contains_first_or_last_agg(exprs):
+    def fn(node: ops.Node) -> tuple[bool, bool | None]:
+        if not isinstance(node, ops.Value):
+            return g.halt, None
+        return g.proceed, isinstance(node, (ops.First, ops.Last))
+
+    return any(g.traverse(fn, exprs))
+
+
 def simplify_aggregation(agg):
     def _pushdown(nodes):
         subbed = []
@@ -452,7 +473,15 @@ def simplify_aggregation(agg):
 
         return valid, subbed
 
-    if isinstance(agg.table, ops.Selection) and not agg.table.selections:
+    table = agg.table
+    if (
+        isinstance(table, ops.Selection)
+        and not table.selections
+        # more aggressive than necessary, a better solution would be to check
+        # whether the selections have any order sensitive aggregates that
+        # *depend on* the sort_keys
+        and not (table.sort_keys or contains_first_or_last_agg(table.selections))
+    ):
         metrics_valid, lowered_metrics = _pushdown(agg.metrics)
         by_valid, lowered_by = _pushdown(agg.by)
         having_valid, lowered_having = _pushdown(agg.having)
@@ -460,7 +489,7 @@ def simplify_aggregation(agg):
         if metrics_valid and by_valid and having_valid:
             valid_lowered_sort_keys = frozenset(lowered_metrics).union(lowered_by)
             return ops.Aggregation(
-                agg.table.table,
+                table.table,
                 lowered_metrics,
                 by=lowered_by,
                 having=lowered_having,
