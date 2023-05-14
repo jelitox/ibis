@@ -427,8 +427,10 @@ def _interval_from_integer(op, **kw):
 def _literal(op, **kw):
     value = op.value
     dtype = op.output_dtype
-    if value is None and op.output_dtype.nullable:
-        return _null_literal(op)
+    if value is None and dtype.nullable:
+        if dtype.is_null():
+            return "Null"
+        return f"CAST(Null AS {serialize(dtype)})"
     if dtype.is_boolean():
         return str(int(bool(value)))
     elif dtype.is_inet():
@@ -488,9 +490,6 @@ def _literal(op, **kw):
     elif isinstance(op.output_dtype, dt.Map):
         values = ", ".join(_map_literal_values(op))
         return f"map({values})"
-    elif isinstance(op.output_dtype, dt.Set):
-        args = ", ".join(map(repr, value))
-        return f"({args})"
     elif isinstance(op.output_dtype, dt.Struct):
         fields = ", ".join(f"{value} as `{key}`" for key, value in op.value.items())
         return f"tuple({fields})"

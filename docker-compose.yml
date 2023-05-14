@@ -3,13 +3,14 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:23.4.2.11-alpine
     ports:
+      - 8123:8123
       - 9000:9000
     healthcheck:
       interval: 1s
       retries: 10
       test:
         - CMD-SHELL
-        - nc -z 127.0.0.1 9000
+        - nc -z 127.0.0.1 8123 && nc -z 127.0.0.1 9000
       timeout: 10s
     volumes:
       - clickhouse:/var/lib/clickhouse/user_files/ibis
@@ -56,7 +57,7 @@ services:
         - CMD
         - pg_isready
       timeout: 5s
-    image: postgres:13.9-alpine
+    image: postgres:13.11-alpine
     networks:
       - impala
   kudu:
@@ -111,7 +112,7 @@ services:
         - mysqladmin
         - ping
       timeout: 5s
-    image: mariadb:10.11.2
+    image: mariadb:10.11.3
     ports:
       - 3306:3306
     networks:
@@ -188,7 +189,7 @@ services:
         - CMD-SHELL
         - trino --execute 'SELECT 1 AS one'
       timeout: 30s
-    image: trinodb/trino:416
+    image: trinodb/trino:417
     ports:
       - 8080:8080
     networks:
@@ -199,7 +200,7 @@ services:
       - $PWD/docker/trino/jvm.config:/etc/trino/jvm.config:ro
 
   druid-postgres:
-    image: postgres:15.2-alpine
+    image: postgres:15.3-alpine
     container_name: druid-postgres
     environment:
       - POSTGRES_PASSWORD=FoolishPassword

@@ -25,9 +25,9 @@ except ImportError:
     DuckDBConversionException = None
 
 try:
-    import clickhouse_driver
+    import clickhouse_connect as cc
 
-    ClickhouseDriverOperationalError = clickhouse_driver.dbapi.errors.OperationalError
+    ClickhouseDriverOperationalError = cc.driver.ProgrammingError
 except ImportError:
     ClickhouseDriverOperationalError = None
 
@@ -769,6 +769,7 @@ def test_interactive(alltypes, monkeypatch):
     repr(expr)
 
 
+@pytest.mark.notyet(["pyspark"], reason="no native support for correlated subqueries")
 def test_correlated_subquery(alltypes):
     expr = alltypes[_.double_col > _.view().double_col]
     assert expr.compile() is not None

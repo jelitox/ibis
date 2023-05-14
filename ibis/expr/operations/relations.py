@@ -99,6 +99,15 @@ class TableProxy(Immutable):
     def to_pyarrow(self, schema: sch.Schema) -> pa.Table:  # pragma: no cover
         """Convert this input to a PyArrow Table."""
 
+    def to_pyarrow_bytes(self, schema: sch.Schema) -> bytes:
+        import pyarrow as pa
+
+        data = self.to_pyarrow(schema=schema)
+        out = pa.BufferOutputStream()
+        with pa.RecordBatchFileWriter(out, data.schema) as writer:
+            writer.write(data)
+        return out.getvalue()
+
 
 @public
 class InMemoryTable(PhysicalTable):
@@ -316,6 +325,10 @@ class Limit(TableNode):
 @public
 class SelfReference(TableNode):
     table = rlz.table
+
+    @property
+    def name(self) -> str:
+        return f"{self.table.name}_ref"
 
     @property
     def schema(self):

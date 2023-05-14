@@ -12,6 +12,7 @@ import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis import util
 from ibis.common.annotations import attribute, optional
+from ibis.common.enums import IntervalUnit
 from ibis.common.validators import (
     bool_,
     callable_with,  # noqa: F401
@@ -296,7 +297,6 @@ strict_numeric = one_of([integer, floating, decimal])
 soft_numeric = one_of([integer, floating, decimal, boolean])
 numeric = soft_numeric
 
-set_ = value(dt.Set)
 array = value(dt.Array)
 struct = value(dt.Struct)
 mapping = value(dt.Map)
@@ -432,6 +432,14 @@ def numeric_like(name, op):
     return output_dtype
 
 
+def _promote_interval_resolution(units: list[IntervalUnit]) -> IntervalUnit:
+    # Find the smallest unit present in units
+    for unit in reversed(IntervalUnit):
+        if unit in units:
+            return unit
+    raise AssertionError('unreachable')
+
+
 # TODO(kszucs): it could be as simple as rlz.instance_of(ops.TableNode)
 # we have a single test case testing the schema superset condition, not
 # used anywhere else
@@ -559,7 +567,6 @@ public(
     point=point,
     polygon=polygon,
     ref=ref,
-    set_=set_,
     soft_numeric=soft_numeric,
     str_=str_,
     strict_numeric=strict_numeric,

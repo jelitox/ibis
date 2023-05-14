@@ -4,6 +4,7 @@ import collections
 import enum
 import functools
 import operator
+from functools import partial, reduce
 
 import pyspark
 import pyspark.sql.functions as F
@@ -97,7 +98,7 @@ compiles = PySparkExprTranslator.compiles
 @compiles(PySparkDatabaseTable)
 def compile_datasource(t, op, *, timecontext, **kwargs):
     df = op.source._session.table(op.name)
-    return filter_by_time_context(df, timecontext)
+    return filter_by_time_context(df, timecontext).alias(op.name)
 
 
 @compiles(ops.SQLQueryResult)
@@ -226,8 +227,15 @@ def compile_nan_as_null(compile_func):
 @compiles(ops.TableColumn)
 @compile_nan_as_null
 def compile_column(t, op, **kwargs):
-    table = t.translate(op.table, **kwargs)
-    return table[op.name]
+    name = op.name
+    table = op.table
+    try:
+        name = f"`{table.name}`.`{name}`"
+    except AttributeError:
+        spark_df = t.translate(table, **kwargs)
+        return spark_df[name]
+    else:
+        return F.col(name)
 
 
 @compiles(ops.StructField)
@@ -248,7 +256,7 @@ def compile_struct_column(t, op, **kwargs):
 
 @compiles(ops.SelfReference)
 def compile_self_reference(t, op, **kwargs):
-    return t.translate(op.table, **kwargs)
+    return t.translate(op.table, **kwargs).alias(op.name)
 
 
 @compiles(ops.Cast)
@@ -396,7 +404,7 @@ def compile_aggregation(t, op, **kwargs):
         )
 
     if op.predicates:
-        predicate = functools.reduce(ops.And, op.predicates)
+        predicate = reduce(ops.And, op.predicates)
         src_table = src_table.filter(t.translate(predicate, **kwargs))
 
     if op.by:
@@ -1121,14 +1129,9 @@ def compile_join(t, op, how, **kwargs):
     left_df = t.translate(op.left, **kwargs)
     right_df = t.translate(op.right, **kwargs)
 
-    pred_columns = []
-    for pred in op.predicates:
-        if not isinstance(pred, ops.Equals):
-            raise NotImplementedError(
-                f"Only equality predicate is supported, but got {type(pred)}"
-            )
-        pred_columns.append(pred.left.name)
-
+    pred_columns = reduce(
+        operator.and_, map(partial(t.translate, **kwargs), op.predicates)
+    )
     return left_df.join(right_df, pred_columns, how)
 
 
@@ -1805,7 +1808,7 @@ def compile_view(t, op, **kwargs):
         raise ValueError(f"table or non-temporary view `{name}` already exists")
     result = t.translate(child, **kwargs)
     result.createOrReplaceTempView(name)
-    return result
+    return result.alias(name)
 
 
 @compiles(ops.SQLStringView)
@@ -1813,8 +1816,9 @@ def compile_sql_view(t, op, **kwargs):
     # TODO(kszucs): avoid converting to expr
     backend = op.child.to_expr()._find_backend()
     result = backend._session.sql(op.query)
-    result.createOrReplaceTempView(op.name)
-    return result
+    name = op.name
+    result.createOrReplaceTempView(name)
+    return result.alias(name)
 
 
 @compiles(ops.StringContains)
@@ -1901,7 +1905,9 @@ def compile_in_memory_table(t, op, session, **kwargs):
         for name, dtype in op.schema.items()
     ]
     schema = pt.StructType(fields)
-    return session.createDataFrame(data=op.data.to_frame(), schema=schema)
+    return session.createDataFrame(data=op.data.to_frame(), schema=schema).alias(
+        op.name
+    )
 
 
 @compiles(ops.BitwiseAnd)

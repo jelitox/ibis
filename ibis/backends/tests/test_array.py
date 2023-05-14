@@ -186,7 +186,7 @@ unnest = toolz.compose(
 
 @builtin_array
 @pytest.mark.never(
-    ["clickhouse", "duckdb", "pandas", "pyspark", "snowflake", "polars"],
+    ["clickhouse", "duckdb", "pandas", "pyspark", "snowflake", "polars", "trino"],
     reason="backend does not flatten array types",
     raises=AssertionError,
 )
@@ -253,11 +253,6 @@ def test_array_discovery_clickhouse(backend):
 @pytest.mark.notyet(
     ["clickhouse", "postgres"],
     reason="backend does not support nullable nested types",
-    raises=AssertionError,
-)
-@pytest.mark.notimpl(
-    ["trino"],
-    reason="trino supports nested arrays, but not with the postgres connector",
     raises=AssertionError,
 )
 @pytest.mark.never(
@@ -327,11 +322,11 @@ def test_unnest_simple(backend):
         array_types.execute()
         .x.explode()
         .reset_index(drop=True)
-        .astype("float64")
+        .astype("Float64")
         .rename("tmp")
     )
     expr = array_types.x.cast("!array<float64>").unnest()
-    result = expr.execute().rename("tmp")
+    result = expr.execute().astype("Float64").rename("tmp")
     tm.assert_series_equal(result, expected)
 
 
