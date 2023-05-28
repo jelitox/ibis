@@ -7,7 +7,6 @@ import parsy
 from public import public
 
 import ibis.expr.datatypes.core as dt
-from ibis.common.exceptions import IbisTypeError
 from ibis.common.parsing import (
     COLON,
     COMMA,
@@ -142,16 +141,12 @@ def parse(
         .combine_dict(dt.Timestamp)
     )
 
-    ty = parsy.forward_declaration()
-
-    angle_type = LANGLE.then(ty).skip(RANGLE)
-
     interval = spaceless_string("interval").then(
-        parsy.seq(
-            value_type=angle_type.optional(dt.int32), unit=parened_string.optional("s")
-        ).combine_dict(dt.Interval)
+        parsy.seq(unit=parened_string.optional("s")).combine_dict(dt.Interval)
     )
 
+    ty = parsy.forward_declaration()
+    angle_type = LANGLE.then(ty).skip(RANGLE)
     array = spaceless_string("array").then(angle_type).map(dt.Array)
 
     map = (
@@ -190,11 +185,3 @@ def parse(
     )
 
     return ty.parse(text)
-
-
-@dt.dtype.register(str)
-def from_string(value: str) -> dt.DataType:
-    try:
-        return parse(value)
-    except SyntaxError:
-        raise IbisTypeError(f'{value!r} cannot be parsed as a datatype')

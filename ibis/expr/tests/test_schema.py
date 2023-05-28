@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from typing import Dict, List, NamedTuple, Tuple
 
-import pandas as pd
+import numpy as np
 import pandas.testing as tm
+import pyarrow as pa
 import pytest
 
 import ibis.expr.datatypes as dt
@@ -12,6 +14,18 @@ import ibis.expr.rules as rlz
 import ibis.expr.schema as sch
 from ibis.common.exceptions import IntegrityError
 from ibis.common.grounds import Annotable
+
+has_pandas = False
+with contextlib.suppress(ImportError):
+    import pandas as pd
+
+    has_pandas = True
+
+has_dask = False
+with contextlib.suppress(ImportError):
+    import dask.dataframe as dd  # noqa: F401
+
+    has_dask = True
 
 
 def test_whole_schema():
@@ -102,15 +116,24 @@ def test_whole_schema():
     assert sch.schema(schema) == sch.schema(expected)
 
 
-def test_schema_names_and_types_length_must_match():
+def test_schema_from_tuples():
+    schema = sch.Schema.from_tuples(
+        [
+            ('a', 'int64'),
+            ('b', 'string'),
+            ('c', 'double'),
+            ('d', 'boolean'),
+        ]
+    )
+    expected = sch.Schema(
+        {'a': dt.int64, 'b': dt.string, 'c': dt.double, 'd': dt.boolean}
+    )
+
+    assert schema == expected
+
+    # test that duplicate field names are prohibited
     with pytest.raises(IntegrityError):
-        sch.schema(["a", "b"], ["int", "str", "float"])
-
-    schema = sch.schema(["a", "b"], ["int", "str"])
-
-    assert isinstance(schema, sch.Schema)
-    assert schema.names == ("a", "b")
-    assert schema.types == (dt.int64, dt.string)
+        sch.Schema.from_tuples([('a', 'int64'), ('a', 'string')])
 
 
 def test_schema_subset():
@@ -126,12 +149,11 @@ def test_schema_subset():
 
 def test_empty_schema():
     s1 = sch.Schema({})
-    s2 = sch.schema()
-    s3 = sch.schema([])
+    s2 = sch.schema([])
 
-    assert s1 == s2 == s3
+    assert s1 == s2
 
-    for s in [s1, s2, s3]:
+    for s in [s1, s2]:
         assert len(s.items()) == 0
         assert repr(s) == "ibis.Schema {\n}"
 
@@ -153,20 +175,19 @@ def test_nullable_output():
     assert 'baz  !boolean' not in sch_str
 
 
-# perhaps move it arounds
 @pytest.fixture
 def df():
     return pd.DataFrame({"A": pd.Series([1], dtype="int8"), "b": ["x"]})
 
 
 def test_apply_to_column_rename(df):
-    schema = sch.schema([("a", "int8"), ("B", "string")])
+    schema = sch.Schema({"a": "int8", "B": "string"})
     expected = df.rename({"A": "a", "b": "B"}, axis=1)
     tm.assert_frame_equal(schema.apply_to(df.copy()), expected)
 
 
 def test_apply_to_column_order(df):
-    schema = sch.schema([("a", "int8"), ("b", "string")])
+    schema = sch.Schema({"a": "int8", "b": "string"})
     expected = df.rename({"A": "a"}, axis=1)
     new_df = schema.apply_to(df.copy())
     tm.assert_frame_equal(new_df, expected)
@@ -176,11 +197,6 @@ def test_api_accepts_schema_objects():
     s1 = sch.schema(dict(a="int", b="str"))
     s2 = sch.schema(s1)
     assert s1 == s2
-
-
-def test_names_types():
-    s = sch.schema(["a"], ["array<float64>"])
-    assert s == sch.schema(dict(a="array<float64>"))
 
 
 def test_schema_mapping_api():
@@ -325,11 +341,6 @@ def test_schema_is_coercible():
     assert o.schema == s
 
 
-def test_schema_shorthand_supports_kwargs():
-    s = sch.schema(a=dt.int64, b=dt.Array(dt.int64))
-    assert s == sch.Schema({'a': dt.int64, 'b': dt.Array(dt.int64)})
-
-
 def test_schema_set_operations():
     a = sch.Schema({'a': dt.string, 'b': dt.int64, 'c': dt.float64})
     b = sch.Schema({'a': dt.string, 'c': dt.float64, 'd': dt.boolean, 'e': dt.date})
@@ -359,3 +370,96 @@ def test_schema_set_operations():
     assert c < d
     assert d >= c
     assert d > c
+
+
+def test_schema_infer_pyarrow_table():
+    table = pa.Table.from_arrays(
+        [
+            pa.array([1, 2, 3]),
+            pa.array(['a', 'b', 'c']),
+            pa.array([True, False, True]),
+        ],
+        ['a', 'b', 'c'],
+    )
+    s = sch.infer(table)
+    assert s == sch.Schema({'a': dt.int64, 'b': dt.string, 'c': dt.boolean})
+
+
+def test_schema_from_to_pyarrow_schema():
+    pyarrow_schema = pa.schema(
+        [
+            pa.field('a', pa.int64()),
+            pa.field('b', pa.string()),
+            pa.field('c', pa.bool_()),
+        ]
+    )
+    ibis_schema = sch.schema(pyarrow_schema)
+    restored_schema = ibis_schema.to_pyarrow()
+
+    assert ibis_schema == sch.Schema({'a': dt.int64, 'b': dt.string, 'c': dt.boolean})
+    assert restored_schema == pyarrow_schema
+
+
+def test_schema_from_to_numpy_dtypes():
+    numpy_dtypes = [
+        ('a', np.dtype('int64')),
+        ('b', np.dtype('str')),
+        ('c', np.dtype('bool')),
+    ]
+    ibis_schema = sch.Schema.from_numpy(numpy_dtypes)
+    assert ibis_schema == sch.Schema({'a': dt.int64, 'b': dt.string, 'c': dt.boolean})
+
+    restored_dtypes = ibis_schema.to_numpy()
+    expected_dtypes = [
+        ('a', np.dtype('int64')),
+        ('b', np.dtype('object')),
+        ('c', np.dtype('bool')),
+    ]
+    assert restored_dtypes == expected_dtypes
+
+
+@pytest.mark.parametrize(
+    ('from_method', 'to_method'),
+    [
+        pytest.param(
+            'from_dask',
+            'to_dask',
+            marks=pytest.mark.skipif(not has_dask, reason='dask not installed'),
+        ),
+        pytest.param(
+            'from_pandas',
+            'to_pandas',
+            marks=pytest.mark.skipif(not has_pandas, reason='pandas not installed'),
+        ),
+    ],
+)
+def test_schema_from_to_pandas_dask_dtypes(from_method, to_method):
+    pandas_schema = pd.Series(
+        [
+            ('a', np.dtype('int64')),
+            ('b', np.dtype('str')),
+            ('c', pd.CategoricalDtype(['a', 'b', 'c'])),
+            ('d', pd.DatetimeTZDtype(tz='US/Eastern', unit='ns')),
+        ]
+    )
+    ibis_schema = getattr(sch.Schema, from_method)(pandas_schema)
+    assert ibis_schema == sch.schema(pandas_schema)
+
+    expected = sch.Schema(
+        {
+            'a': dt.int64,
+            'b': dt.string,
+            'c': dt.string,
+            'd': dt.Timestamp(timezone='US/Eastern'),
+        }
+    )
+    assert ibis_schema == expected
+
+    restored_dtypes = getattr(ibis_schema, to_method)()
+    expected_dtypes = [
+        ('a', np.dtype('int64')),
+        ('b', np.dtype('object')),
+        ('c', np.dtype('object')),
+        ('d', pd.DatetimeTZDtype(tz='US/Eastern', unit='ns')),
+    ]
+    assert restored_dtypes == expected_dtypes

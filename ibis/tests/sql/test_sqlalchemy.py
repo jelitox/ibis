@@ -19,16 +19,11 @@ import pytest
 import sqlglot as sg
 from pytest import param
 from sqlalchemy import types as sat
-from sqlalchemy.engine.default import DefaultDialect
 
 import ibis
 import ibis.expr.datatypes as dt
-from ibis.backends.base.sql.alchemy import (
-    AlchemyCompiler,
-    schema_from_table,
-    to_sqla_type,
-)
-from ibis.backends.base.sql.alchemy.datatypes import ArrayType
+from ibis.backends.base.sql.alchemy import AlchemyCompiler, BaseAlchemyBackend
+from ibis.backends.base.sql.alchemy.datatypes import ArrayType, dtype_to_sqlalchemy
 from ibis.tests.expr.mocks import MockAlchemyBackend
 from ibis.tests.util import assert_decompile_roundtrip, assert_equal
 
@@ -40,9 +35,8 @@ L = sa.literal
 
 def to_sql(expr, *args, **kwargs) -> str:
     compiled = AlchemyCompiler.to_sql(expr, *args, **kwargs)
-    return sg.parse_one(
-        str(compiled.compile(compile_kwargs=dict(literal_binds=True)))
-    ).sql(pretty=True, dialect="duckdb")
+    sqlstring = str(compiled.compile(compile_kwargs=dict(literal_binds=True)))
+    return sg.parse_one(sqlstring).sql(pretty=True, dialect="duckdb")
 
 
 @pytest.fixture(scope="module")
@@ -68,13 +62,18 @@ def alltypes(con):
 def test_sqla_schema_conversion():
     typespec = [
         # name, type, nullable
-        ('smallint', sat.SmallInteger, False, dt.int16),
-        ('int', sat.Integer, True, dt.int32),
-        ('integer', sat.INTEGER(), True, dt.int32),
-        ('bigint', sat.BigInteger, False, dt.int64),
+        ('smallint', sat.SMALLINT, False, dt.int16),
+        ('smallint_', sat.SmallInteger, False, dt.int16),
+        ('int', sat.INTEGER, True, dt.int32),
+        ('integer', sat.INTEGER, True, dt.int32),
+        ('integer_', sat.Integer, True, dt.int32),
+        ('bigint', sat.BIGINT, False, dt.int64),
+        ('bigint_', sat.BigInteger, False, dt.int64),
         ('real', sat.REAL, True, dt.float32),
-        ('bool', sat.Boolean, True, dt.bool),
-        ('timestamp', sat.DateTime, True, dt.timestamp),
+        ('bool', sat.BOOLEAN, True, dt.bool),
+        ('bool_', sat.Boolean, True, dt.bool),
+        ('timestamp', sat.DATETIME, True, dt.timestamp),
+        ('timestamp_', sat.DateTime, True, dt.timestamp),
     ]
 
     sqla_types = []
@@ -85,7 +84,7 @@ def test_sqla_schema_conversion():
 
     table = sa.Table('tname', sa.MetaData(), *sqla_types)
 
-    schema = schema_from_table(table)
+    schema = BaseAlchemyBackend._schema_from_sqla_table(table)
     expected = ibis.schema(ibis_types)
 
     assert_equal(schema, expected)
@@ -554,12 +553,11 @@ def test_tpc_h11(snapshot):
 
 
 def test_to_sqla_type_array_of_non_primitive():
-    result = to_sqla_type(DefaultDialect(), dt.Array(dt.Struct(dict(a="int"))))
+    result = dtype_to_sqlalchemy(dt.Array(dt.Struct(dict(a="int"))))
     [(result_name, result_type)] = result.value_type.fields.items()
     expected_name = "a"
-    expected_type = sa.BigInteger()
     assert result_name == expected_name
-    assert type(result_type) == type(expected_type)
+    assert type(result_type) == sat.BigInteger
     assert isinstance(result, ArrayType)
 
 

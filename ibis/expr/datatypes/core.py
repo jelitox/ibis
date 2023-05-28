@@ -9,67 +9,49 @@ from collections.abc import Iterator, Mapping, Sequence
 from numbers import Integral, Real
 from typing import Any, Iterable, Literal, NamedTuple, Optional
 
-import numpy as np
 import toolz
-from multipledispatch import Dispatcher
 from public import public
-from typing_extensions import get_args, get_origin, get_type_hints
+from typing_extensions import Self, get_args, get_origin, get_type_hints
 
 from ibis.common.annotations import attribute
 from ibis.common.collections import FrozenDict, MapSet
-from ibis.common.enums import IntervalUnit
+from ibis.common.dispatch import lazy_singledispatch
 from ibis.common.grounds import Concrete, Singleton
+from ibis.common.temporal import IntervalUnit, TimestampUnit
 from ibis.common.validators import Coercible
 
-# TODO(kszucs): we don't support union types yet
 
-dtype = Dispatcher('dtype')
-
-
-@dtype.register(object)
-def dtype_from_object(value, **kwargs) -> DataType:
-    # TODO(kszucs): implement this in a @dtype.register(type) overload once dtype
-    # turned into a singledispatched function because that overload doesn't work
-    # with multipledispatch
-
-    # TODO(kszucs): support Tuple[int, str] and Tuple[int, ...] typehints
-    # in order to support more kinds of typehints follow the implementation of
-    # Validator.from_annotation
-    origin_type = get_origin(value)
-    if origin_type is None:
-        if isinstance(value, type):
-            if issubclass(value, DataType):
-                return value()
-            elif result := _python_dtypes.get(value):
-                return result
-            elif annots := get_type_hints(value):
-                return Struct(toolz.valmap(dtype, annots))
-            elif issubclass(value, bytes):
-                return bytes
-            elif issubclass(value, str):
-                return string
-            elif issubclass(value, Integral):
-                return int64
-            elif issubclass(value, Real):
-                return float64
-            elif value is type(None):
-                return null
-            else:
-                raise TypeError(
-                    f"Cannot construct an ibis datatype from python type `{value!r}`"
-                )
-        else:
-            raise TypeError(
-                f"Cannot construct an ibis datatype from python value `{value!r}`"
-            )
-    elif issubclass(origin_type, Sequence):
-        (value_type,) = map(dtype, get_args(value))
-        return Array(value_type)
-    elif issubclass(origin_type, Mapping):
-        key_type, value_type = map(dtype, get_args(value))
-        return Map(key_type, value_type)
+@lazy_singledispatch
+def dtype(value, nullable=True) -> DataType:
+    """Construct an ibis datatype from a python type."""
+    if isinstance(value, DataType):
+        return value
     else:
-        raise TypeError(f'Value {value!r} is not a valid datatype')
+        return DataType.from_typehint(value)
+
+
+@dtype.register(str)
+def from_string(value):
+    return DataType.from_string(value)
+
+
+@dtype.register("numpy.dtype")
+def from_numpy_dtype(value, nullable=True):
+    return DataType.from_numpy(value, nullable)
+
+
+@dtype.register("pandas.core.dtypes.base.ExtensionDtype")
+def from_pandas_extension_dtype(value, nullable=True):
+    return DataType.from_pandas(value, nullable)
+
+
+@dtype.register("pyarrow.lib.DataType")
+def from_pyarrow(value, nullable=True):
+    return DataType.from_pyarrow(value, nullable)
+
+
+# lock the dispatcher to prevent new types from being registered
+del dtype.register
 
 
 @public
@@ -122,17 +104,116 @@ class DataType(Concrete, Coercible):
 
         return castable(self, other, **kwargs)
 
+    @classmethod
+    def from_string(cls, value) -> Self:
+        from ibis.expr.datatypes.parse import parse
+
+        try:
+            return parse(value)
+        except SyntaxError:
+            raise TypeError(f'{value!r} cannot be parsed as a datatype')
+
+    @classmethod
+    def from_typehint(cls, typ, nullable=True) -> Self:
+        origin_type = get_origin(typ)
+        if origin_type is None:
+            if isinstance(typ, type):
+                if issubclass(typ, DataType):
+                    return typ(nullable=nullable)
+                elif typ is type(None):
+                    return null
+                elif issubclass(typ, bool):
+                    return Boolean(nullable=nullable)
+                elif issubclass(typ, bytes):
+                    return Binary(nullable=nullable)
+                elif issubclass(typ, str):
+                    return String(nullable=nullable)
+                elif issubclass(typ, Integral):
+                    return Int64(nullable=nullable)
+                elif issubclass(typ, Real):
+                    return Float64(nullable=nullable)
+                elif issubclass(typ, pydecimal.Decimal):
+                    return Decimal(nullable=nullable)
+                elif issubclass(typ, pydatetime.datetime):
+                    return Timestamp(nullable=nullable)
+                elif issubclass(typ, pydatetime.date):
+                    return Date(nullable=nullable)
+                elif issubclass(typ, pydatetime.time):
+                    return Time(nullable=nullable)
+                elif issubclass(typ, pydatetime.timedelta):
+                    return Interval(nullable=nullable)
+                elif issubclass(typ, pyuuid.UUID):
+                    return UUID(nullable=nullable)
+                elif annots := get_type_hints(typ):
+                    return Struct(toolz.valmap(dtype, annots), nullable=nullable)
+                else:
+                    raise TypeError(
+                        f"Cannot construct an ibis datatype from python type `{typ!r}`"
+                    )
+            else:
+                raise TypeError(
+                    f"Cannot construct an ibis datatype from python value `{typ!r}`"
+                )
+        elif issubclass(origin_type, (Sequence, Array)):
+            (value_type,) = map(dtype, get_args(typ))
+            return Array(value_type)
+        elif issubclass(origin_type, (Mapping, Map)):
+            key_type, value_type = map(dtype, get_args(typ))
+            return Map(key_type, value_type)
+        else:
+            raise TypeError(f'Value {typ!r} is not a valid datatype')
+
+    @classmethod
+    def from_numpy(cls, numpy_type, nullable=True) -> Self:
+        """Return the equivalent ibis datatype."""
+        from ibis.formats.numpy import dtype_from_numpy
+
+        return dtype_from_numpy(numpy_type, nullable=nullable)
+
+    @classmethod
+    def from_pandas(cls, pandas_type, nullable=True) -> Self:
+        """Return the equivalent ibis datatype."""
+        from ibis.formats.pandas import dtype_from_pandas
+
+        return dtype_from_pandas(pandas_type, nullable=nullable)
+
+    @classmethod
+    def from_pyarrow(cls, arrow_type, nullable=True) -> Self:
+        """Return the equivalent ibis datatype."""
+        from ibis.formats.pyarrow import dtype_to_pyarrow
+
+        return dtype_to_pyarrow(arrow_type, nullable=nullable)
+
+    @classmethod
+    def from_dask(cls, dask_type, nullable=True) -> Self:
+        """Return the equivalent ibis datatype."""
+        from ibis.formats.dask import dtype_from_dask
+
+        return dtype_from_dask(dask_type, nullable=nullable)
+
+    def to_numpy(self):
+        """Return the equivalent numpy datatype."""
+        from ibis.formats.numpy import dtype_to_numpy
+
+        return dtype_to_numpy(self)
+
     def to_pandas(self):
         """Return the equivalent pandas datatype."""
-        from ibis.backends.pandas.client import ibis_dtype_to_pandas
+        from ibis.formats.pandas import dtype_to_pandas
 
-        return ibis_dtype_to_pandas(self)
+        return dtype_to_pandas(self)
 
     def to_pyarrow(self):
         """Return the equivalent pyarrow datatype."""
-        from ibis.backends.pyarrow.datatypes import to_pyarrow_type
+        from ibis.formats.pyarrow import dtype_to_pyarrow
 
-        return to_pyarrow_type(self)
+        return dtype_to_pyarrow(self)
+
+    def to_dask(self):
+        """Return the equivalent dask datatype."""
+        from ibis.formats.dask import dtype_to_dask
+
+        return dtype_to_dask(self)
 
     def is_array(self) -> bool:
         return isinstance(self, Array)
@@ -270,11 +351,6 @@ class DataType(Concrete, Coercible):
         return isinstance(self, Variadic)
 
 
-@dtype.register(DataType)
-def from_ibis_dtype(value: DataType) -> DataType:
-    return value
-
-
 @public
 class Unknown(DataType, Singleton):
     """An unknown type."""
@@ -409,6 +485,36 @@ class Timestamp(Temporal, Parametric):
 
     scalar = "TimestampScalar"
     column = "TimestampColumn"
+
+    @classmethod
+    def from_unit(cls, unit, timezone=None, nullable=True):
+        """Return a timestamp type with the given unit and timezone."""
+        unit = TimestampUnit(unit)
+        if unit == TimestampUnit.SECOND:
+            scale = 0
+        elif unit == TimestampUnit.MILLISECOND:
+            scale = 3
+        elif unit == TimestampUnit.MICROSECOND:
+            scale = 6
+        elif unit == TimestampUnit.NANOSECOND:
+            scale = 9
+        else:
+            raise ValueError(f"Invalid unit {unit}")
+        return cls(scale=scale, timezone=timezone, nullable=nullable)
+
+    @property
+    def unit(self) -> str:
+        """Return the unit of the timestamp."""
+        if self.scale is None or self.scale == 0:
+            return TimestampUnit.SECOND
+        elif 1 <= self.scale <= 3:
+            return TimestampUnit.MILLISECOND
+        elif 4 <= self.scale <= 6:
+            return TimestampUnit.MICROSECOND
+        elif 7 <= self.scale <= 9:
+            return TimestampUnit.NANOSECOND
+        else:
+            raise ValueError(f"Invalid scale {self.scale}")
 
     @property
     def _pretty_piece(self) -> str:
@@ -616,18 +722,8 @@ class Interval(Parametric):
     unit: IntervalUnit = 's'
     """The time unit of the interval."""
 
-    value_type: Integer = Int32()
-    """The underlying type of the stored values."""
-
     scalar = "IntervalScalar"
     column = "IntervalColumn"
-
-    # TODO(kszucs): assert that the nullability if the value_type is equal
-    # to the interval's nullability
-
-    @property
-    def bounds(self):
-        return self.value_type.bounds
 
     @property
     def resolution(self):
@@ -875,69 +971,6 @@ decimal = Decimal()
 unknown = Unknown()
 
 Enum = String
-
-
-_python_dtypes = {
-    bool: boolean,
-    int: int64,
-    float: float64,
-    str: string,
-    bytes: binary,
-    pydatetime.date: date,
-    pydatetime.time: time,
-    pydatetime.datetime: timestamp,
-    pydatetime.timedelta: interval,
-    pydecimal.Decimal: decimal,
-    pyuuid.UUID: uuid,
-}
-
-_numpy_dtypes = {
-    np.dtype("bool"): boolean,
-    np.dtype("int8"): int8,
-    np.dtype("int16"): int16,
-    np.dtype("int32"): int32,
-    np.dtype("int64"): int64,
-    np.dtype("uint8"): uint8,
-    np.dtype("uint16"): uint16,
-    np.dtype("uint32"): uint32,
-    np.dtype("uint64"): uint64,
-    np.dtype("float16"): float16,
-    np.dtype("float32"): float32,
-    np.dtype("float64"): float64,
-    np.dtype("double"): float64,
-    np.dtype("unicode"): string,
-    np.dtype("str"): string,
-    np.dtype("datetime64"): timestamp,
-    np.dtype("datetime64[Y]"): timestamp,
-    np.dtype("datetime64[M]"): timestamp,
-    np.dtype("datetime64[W]"): timestamp,
-    np.dtype("datetime64[D]"): timestamp,
-    np.dtype("datetime64[h]"): timestamp,
-    np.dtype("datetime64[m]"): timestamp,
-    np.dtype("datetime64[s]"): timestamp,
-    np.dtype("datetime64[ms]"): timestamp,
-    np.dtype("datetime64[us]"): timestamp,
-    np.dtype("datetime64[ns]"): timestamp,
-    np.dtype("timedelta64"): interval,
-    np.dtype("timedelta64[Y]"): Interval("Y"),
-    np.dtype("timedelta64[M]"): Interval("M"),
-    np.dtype("timedelta64[W]"): Interval("W"),
-    np.dtype("timedelta64[D]"): Interval("D"),
-    np.dtype("timedelta64[h]"): Interval("h"),
-    np.dtype("timedelta64[m]"): Interval("m"),
-    np.dtype("timedelta64[s]"): Interval("s"),
-    np.dtype("timedelta64[ms]"): Interval("ms"),
-    np.dtype("timedelta64[us]"): Interval("us"),
-    np.dtype("timedelta64[ns]"): Interval("ns"),
-}
-
-
-@dtype.register(np.dtype)
-def from_numpy_dtype(value):
-    try:
-        return _numpy_dtypes[value]
-    except KeyError:
-        raise TypeError(f"numpy dtype {value!r} is not supported")
 
 
 public(

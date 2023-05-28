@@ -14,6 +14,7 @@ import duckdb
 import pyarrow as pa
 import sqlalchemy as sa
 import toolz
+from packaging.version import parse as vparse
 
 import ibis.common.exceptions as exc
 import ibis.expr.datatypes as dt
@@ -22,8 +23,8 @@ import ibis.expr.types as ir
 from ibis import util
 from ibis.backends.base.sql.alchemy import BaseAlchemyBackend
 from ibis.backends.duckdb.compiler import DuckDBSQLCompiler
-from ibis.backends.duckdb.datatypes import parse
-from ibis.backends.pandas.client import DataFrameProxy
+from ibis.backends.duckdb.datatypes import dtype_to_duckdb, parse
+from ibis.expr.operations.relations import PandasDataFrameProxy
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -78,6 +79,45 @@ class Backend(BaseAlchemyBackend):
 
         return importlib.metadata.version("duckdb")
 
+    @staticmethod
+    def _new_sa_metadata():
+        meta = sa.MetaData()
+
+        # _new_sa_metadata is invoked whenever `_get_sqla_table` is called, so
+        # it's safe to store columns as keys, that is, columns from different
+        # tables with the same name won't collide
+        complex_type_info_cache = {}
+
+        @sa.event.listens_for(meta, "column_reflect")
+        def column_reflect(inspector, table, column_info):
+            import duckdb_engine.datatypes as ddt
+
+            # duckdb_engine as of 0.7.2 doesn't expose the inner types of any
+            # complex types so we have to extract it from duckdb directly
+            ddt_struct_type = getattr(ddt, "Struct", sa.types.NullType)
+            ddt_map_type = getattr(ddt, "Map", sa.types.NullType)
+            if isinstance(
+                column_info["type"], (sa.ARRAY, ddt_struct_type, ddt_map_type)
+            ):
+                engine = inspector.engine
+                colname = column_info["name"]
+                if (coltype := complex_type_info_cache.get(colname)) is None:
+                    quote = engine.dialect.identifier_preparer.quote_identifier
+                    quoted_colname = quote(colname)
+                    quoted_tablename = quote(table.name)
+                    with engine.connect() as con:
+                        # The .connection property is used to avoid creating a
+                        # nested transaction
+                        con.connection.execute(
+                            f"DESCRIBE SELECT {quoted_colname} FROM {quoted_tablename}"
+                        )
+                        _, typ, *_ = con.connection.fetchone()
+                    complex_type_info_cache[colname] = coltype = parse(typ)
+
+                column_info["type"] = dtype_to_duckdb(coltype)
+
+        return meta
+
     def do_connect(
         self,
         database: str | Path = ":memory:",
@@ -129,8 +169,10 @@ class Backend(BaseAlchemyBackend):
         @sa.event.listens_for(engine, "connect")
         def configure_connection(dbapi_connection, connection_record):
             dbapi_connection.execute("SET TimeZone = 'UTC'")
-            # the progress bar causes kernel crashes in jupyterlab ¯\_(ツ)_/¯
-            dbapi_connection.execute("SET enable_progress_bar = false")
+            # the progress bar in duckdb <0.8.0 causes kernel crashes in
+            # jupyterlab, fixed in https://github.com/duckdb/duckdb/pull/6831
+            if vparse(duckdb.__version__) < vparse("0.8.0"):
+                dbapi_connection.execute("SET enable_progress_bar = false")
 
         self._record_batch_readers_consumed = {}
         super().do_connect(engine)
@@ -258,8 +300,6 @@ class Backend(BaseAlchemyBackend):
         Table
             An ibis table expression
         """
-        from packaging.version import parse as vparse
-
         if (version := vparse(self.version)) < vparse("0.7.0"):
             raise exc.IbisError(
                 f"`read_json` requires duckdb >= 0.7.0, duckdb {version} is installed"
@@ -546,7 +586,7 @@ class Backend(BaseAlchemyBackend):
         with self.begin() as con:
             con.execute(sa.text(f"SET GLOBAL sqlite_all_varchar={all_varchar}"))
             con.execute(
-                sa.text(f"CALL sqlite_attach('{str(path)}', overwrite={overwrite})")
+                sa.text(f"CALL sqlite_attach('{path!s}', overwrite={overwrite})")
             )
 
     def _run_pre_execute_hooks(self, expr: ir.Expr) -> None:
@@ -600,9 +640,16 @@ class Backend(BaseAlchemyBackend):
         query_ast = self.compiler.to_ast_ensure_limit(expr, limit, params=params)
         sql = query_ast.compile()
 
+        # handle the argument name change in duckdb 0.8.0
+        fetch_record_batch = (
+            (lambda cur: cur.fetch_record_batch(rows_per_batch=chunk_size))
+            if vparse(duckdb.__version__) >= vparse("0.8.0")
+            else (lambda cur: cur.fetch_record_batch(chunk_size=chunk_size))
+        )
+
         def batch_producer(con):
             with con.begin() as c, contextlib.closing(c.execute(sql)) as cur:
-                yield from cur.cursor.fetch_record_batch(chunk_size=chunk_size)
+                yield from fetch_record_batch(cur.cursor)
 
         # batch_producer keeps the `self.con` member alive long enough to
         # exhaust the record batch reader, even if the backend or connection
@@ -742,7 +789,13 @@ class Backend(BaseAlchemyBackend):
             {
                 name: (
                     col.to_pylist()
-                    if pat.is_nested(col.type)
+                    if (
+                        pat.is_nested(col.type)
+                        or
+                        # pyarrow / duckdb type null literals columns as int32?
+                        # but calling `to_pylist()` will render it as None
+                        col.null_count
+                    )
                     else col.to_pandas(timestamp_as_object=True)
                 )
                 for name, col in zip(table.column_names, table.columns)
@@ -774,7 +827,7 @@ class Backend(BaseAlchemyBackend):
 
         # only register if we haven't already done so
         if (name := op.name) not in self.list_tables():
-            if isinstance(data := op.data, DataFrameProxy):
+            if isinstance(data := op.data, PandasDataFrameProxy):
                 table = data.to_frame()
 
                 # convert to object string dtypes because duckdb is either

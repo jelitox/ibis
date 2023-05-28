@@ -12,7 +12,6 @@ from pydruid.db.sqlalchemy import DruidDialect
 
 import ibis.backends.druid.datatypes as ddt
 import ibis.expr.datatypes as dt
-import ibis.expr.schema as sch
 from ibis.backends.base.sql.alchemy import BaseAlchemyBackend
 from ibis.backends.druid.compiler import DruidCompiler
 
@@ -74,16 +73,13 @@ class Backend(BaseAlchemyBackend):
             result = con.exec_driver_sql(query).scalar()
 
         (plan,) = json.loads(result)
-        return sch.Schema(
-            {
-                column["name"]: (
-                    dt.timestamp
-                    if column["name"] == "__time"
-                    else ddt.parse(column["type"])
-                )
-                for column in plan["signature"]
-            }
-        )
+        for column in plan["signature"]:
+            name, typ = column["name"], column["type"]
+            if name == "__time":
+                dtype = dt.timestamp
+            else:
+                dtype = ddt.parse(typ)
+            yield name, dtype
 
     def _get_temp_view_definition(
         self, name: str, definition: sa.sql.compiler.Compiled
@@ -106,7 +102,7 @@ WHERE TABLE_NAME = :table_name"""
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
-                message="|".join(
+                message="|".join(  # noqa: FLY002
                     (
                         "Did not recognize type",
                         "Dialect druid:rest will not make use of SQL compilation caching",

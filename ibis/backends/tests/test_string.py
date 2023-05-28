@@ -10,6 +10,11 @@ import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 from ibis.common.exceptions import OperationNotDefinedError
 
+try:
+    from google.api_core.exceptions import BadRequest
+except ImportError:
+    BadRequest = None
+
 
 @pytest.mark.parametrize(
     ("text_value", "expected_types"),
@@ -206,12 +211,24 @@ def test_string_col_is_unicode(alltypes, df):
             ],
         ),
         param(
-            lambda t: t.string_col.re_extract(r'(\d+)', 1),
+            lambda t: ("xyz" + t.string_col + "abcd").re_extract(r'(\d+)', 0),
             lambda t: t.string_col.str.extract(r'(\d+)', expand=False),
             id='re_extract',
             marks=[
                 pytest.mark.notimpl(
-                    ["mysql", "mssql", "druid", "oracle"],
+                    ["mssql", "druid", "oracle"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.broken(["impala"], raises=AssertionError),
+            ],
+        ),
+        param(
+            lambda t: ("xyz" + t.string_col + "abcd").re_extract(r'(\d+)abc', 1),
+            lambda t: t.string_col.str.extract(r'(\d+)', expand=False),
+            id='re_extract_group',
+            marks=[
+                pytest.mark.notimpl(
+                    ["mssql", "druid", "oracle"],
                     raises=com.OperationNotDefinedError,
                 ),
                 pytest.mark.broken(["impala"], raises=AssertionError),
@@ -223,7 +240,7 @@ def test_string_col_is_unicode(alltypes, df):
             id='re_extract_posix',
             marks=[
                 pytest.mark.notimpl(
-                    ["mysql", "mssql", "druid", "oracle"],
+                    ["mssql", "druid", "oracle"],
                     raises=com.OperationNotDefinedError,
                 ),
                 pytest.mark.broken(["pyspark"], raises=AssertionError),
@@ -235,21 +252,76 @@ def test_string_col_is_unicode(alltypes, df):
             id='re_extract_whole_group',
             marks=[
                 pytest.mark.notimpl(
-                    ["mysql", "mssql", "druid", "oracle"],
+                    ["mssql", "druid", "oracle"],
                     raises=com.OperationNotDefinedError,
                 ),
+                pytest.mark.broken(["impala"], raises=AssertionError),
+            ],
+        ),
+        param(
+            lambda t: t.date_string_col.re_extract(r'(\d+)\D(\d+)\D(\d+)', 1),
+            lambda t: t.date_string_col.str.extract(
+                r'(\d+)\D(\d+)\D(\d+)', expand=False
+            ).iloc[:, 0],
+            id='re_extract_group_1',
+            marks=[
                 pytest.mark.notimpl(
-                    ["snowflake"],
-                    raises=sa.exc.ProgrammingError,
-                    reason=(
-                        '(snowflake.connector.errors.ProgrammingError) 100050 (22023): '
-                        'Invalid parameter value: 0. Reason: Position must be positive'
-                    ),
+                    ["mssql", "druid", "oracle"],
+                    raises=com.OperationNotDefinedError,
                 ),
-                pytest.mark.broken(
-                    ["impala"],
-                    raises=AssertionError,
+                pytest.mark.broken(["impala"], raises=AssertionError),
+            ],
+        ),
+        param(
+            lambda t: t.date_string_col.re_extract(r'(\d+)\D(\d+)\D(\d+)', 2),
+            lambda t: t.date_string_col.str.extract(
+                r'(\d+)\D(\d+)\D(\d+)', expand=False
+            ).iloc[:, 1],
+            id='re_extract_group_2',
+            marks=[
+                pytest.mark.notimpl(
+                    ["mssql", "druid", "oracle"],
+                    raises=com.OperationNotDefinedError,
                 ),
+                pytest.mark.broken(["impala"], raises=AssertionError),
+            ],
+        ),
+        param(
+            lambda t: t.date_string_col.re_extract(r'(\d+)\D(\d+)\D(\d+)', 3),
+            lambda t: t.date_string_col.str.extract(
+                r'(\d+)\D(\d+)\D(\d+)', expand=False
+            ).iloc[:, 2],
+            id='re_extract_group_3',
+            marks=[
+                pytest.mark.notimpl(
+                    ["mssql", "druid", "oracle"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.broken(["impala"], raises=AssertionError),
+            ],
+        ),
+        param(
+            lambda t: t.date_string_col.re_extract(r'^(\d+)', 1),
+            lambda t: t.date_string_col.str.extract(r'^(\d+)', expand=False),
+            id='re_extract_group_at_beginning',
+            marks=[
+                pytest.mark.notimpl(
+                    ["mssql", "druid", "oracle"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.broken(["impala"], raises=AssertionError),
+            ],
+        ),
+        param(
+            lambda t: t.date_string_col.re_extract(r'(\d+)$', 1),
+            lambda t: t.date_string_col.str.extract(r'(\d+)$', expand=False),
+            id='re_extract_group_at_end',
+            marks=[
+                pytest.mark.notimpl(
+                    ["mssql", "druid", "oracle"],
+                    raises=com.OperationNotDefinedError,
+                ),
+                pytest.mark.broken(["impala"], raises=AssertionError),
             ],
         ),
         param(
@@ -258,7 +330,7 @@ def test_string_col_is_unicode(alltypes, df):
             id='re_replace_posix',
             marks=[
                 pytest.mark.notimpl(
-                    ['datafusion', "mysql", "mssql", "druid", "oracle"],
+                    ["mysql", "mssql", "druid", "oracle"],
                     raises=com.OperationNotDefinedError,
                 ),
                 pytest.mark.broken(
@@ -273,7 +345,7 @@ def test_string_col_is_unicode(alltypes, df):
             id='re_replace',
             marks=[
                 pytest.mark.notimpl(
-                    ["datafusion", "mysql", "mssql", "druid", "oracle"],
+                    ["mysql", "mssql", "druid", "oracle"],
                     raises=com.OperationNotDefinedError,
                 ),
                 pytest.mark.broken(
@@ -335,9 +407,16 @@ def test_string_col_is_unicode(alltypes, df):
             lambda t: t.string_col.find('a'),
             lambda t: t.string_col.str.find('a'),
             id='find',
-            marks=pytest.mark.notimpl(
-                ["datafusion", "polars"], raises=com.OperationNotDefinedError
-            ),
+            marks=pytest.mark.notimpl(["polars"], raises=com.OperationNotDefinedError),
+        ),
+        param(
+            lambda t: t.date_string_col.find('13', 3),
+            lambda t: t.date_string_col.str.find('13', 3),
+            id='find_start',
+            marks=[
+                pytest.mark.notimpl(["polars"], raises=com.OperationNotDefinedError),
+                pytest.mark.notyet(["bigquery"], raises=NotImplementedError),
+            ],
         ),
         param(
             lambda t: t.string_col.lpad(10, 'a'),
@@ -748,9 +827,6 @@ def test_string_col_is_unicode(alltypes, df):
             lambda t: t.string_col.replace("1", "42"),
             lambda t: t.string_col.str.replace("1", "42"),
             id="replace",
-            marks=pytest.mark.notimpl(
-                ["datafusion"], raises=com.OperationNotDefinedError
-            ),
         ),
     ],
 )
@@ -763,7 +839,7 @@ def test_string(backend, alltypes, df, result_func, expected_func):
 
 
 @pytest.mark.notimpl(
-    ["datafusion", "mysql", "mssql", "druid", "oracle"],
+    ["mysql", "mssql", "druid", "oracle"],
     raises=com.OperationNotDefinedError,
 )
 def test_re_replace_global(con):

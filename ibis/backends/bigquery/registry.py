@@ -21,8 +21,8 @@ from ibis.backends.base.sql.registry import (
     reduction,
     unary,
 )
-from ibis.backends.bigquery.datatypes import ibis_type_to_bigquery_type
-from ibis.common.enums import DateUnit, IntervalUnit, TimeUnit
+from ibis.backends.bigquery.datatypes import dtype_to_bigquery
+from ibis.common.temporal import DateUnit, IntervalUnit, TimeUnit
 
 
 def _extract_field(sql_attr):
@@ -65,7 +65,7 @@ def bigquery_cast_floating_to_integer(compiled_arg, from_, to):
 @bigquery_cast.register(str, dt.DataType, dt.DataType)
 def bigquery_cast_generate(compiled_arg, from_, to):
     """Cast to desired type."""
-    sql_type = ibis_type_to_bigquery_type(to)
+    sql_type = dtype_to_bigquery(to)
     return f"CAST({compiled_arg} AS {sql_type})"
 
 
@@ -163,8 +163,15 @@ def _regex_extract(translator, op):
     regex = _translate_pattern(translator, op.pattern)
     index = translator.translate(op.index)
     matches = f"REGEXP_CONTAINS({arg}, {regex})"
-    extract = f"REGEXP_EXTRACT_ALL({arg}, {regex})[SAFE_ORDINAL({index})]"
-    return f"IF({matches}, IF(COALESCE({index}, 0) = 0, {arg}, {extract}), NULL)"
+    # non-greedily match the regex's prefix so the regex can match as much as possible
+    nonzero_index_replace = fr"REGEXP_REPLACE({arg}, CONCAT('.*?', {regex}, '.*'), CONCAT('\\', CAST({index} AS STRING)))"
+    # zero index replacement means capture everything matched by the regex, so
+    # we wrap the regex in an outer group
+    zero_index_replace = (
+        fr"REGEXP_REPLACE({arg}, CONCAT('.*?', CONCAT('(', {regex}, ')'), '.*'), '\\1')"
+    )
+    extract = f"IF({index} = 0, {zero_index_replace}, {nonzero_index_replace})"
+    return f"IF({matches}, {extract}, NULL)"
 
 
 def _regex_replace(translator, op):
@@ -244,7 +251,7 @@ def _literal(translator, op):
             prefix = "-" * value.is_signed()
             return f"CAST('{prefix}inf' AS FLOAT64)"
         else:
-            return f"{ibis_type_to_bigquery_type(dtype)} '{value}'"
+            return f"{dtype_to_bigquery(dtype)} '{value}'"
     elif dtype.is_uuid():
         return translator.translate(ops.Literal(str(value), dtype=dt.str))
 
@@ -341,14 +348,16 @@ def _timestamp_op(func, units):
     def _formatter(translator, op):
         arg, offset = op.args
 
+        formatted_arg = translator.translate(arg)
+        formatted_offset = translator.translate(offset)
+
         unit = offset.output_dtype.unit
         if unit not in units:
             raise com.UnsupportedOperationError(
                 "BigQuery does not allow binary operation "
                 f"{func} with INTERVAL offset {unit}"
             )
-        formatted_arg = translator.translate(arg)
-        formatted_offset = translator.translate(offset)
+
         result = f"{func}({formatted_arg}, {formatted_offset})"
         return result
 
@@ -435,7 +444,7 @@ def compiles_string_to_timestamp(translator, op):
 
 
 def compiles_floor(t, op):
-    bigquery_type = ibis_type_to_bigquery_type(op.output_dtype)
+    bigquery_type = dtype_to_bigquery(op.output_dtype)
     arg = op.arg
     return f"CAST(FLOOR({t.translate(arg)}) AS {bigquery_type})"
 

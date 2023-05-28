@@ -336,7 +336,7 @@ def execute_until_in_scope(
 
     # if we're unable to find data then raise an exception
     if not scopes and computable_args:
-        raise com.UnboundExpressionError(f'Unable to find data for node:\n{repr(node)}')
+        raise com.UnboundExpressionError(f'Unable to find data for node:\n{node!r}')
 
     # there should be exactly one dictionary per computable argument
     assert len(computable_args) == len(scopes)
@@ -561,6 +561,11 @@ def get_node_arguments_default(node):
 @get_node_arguments.register(ops.ScalarParameter)
 def get_node_arguments_parameter(node):
     return ()
+
+
+@get_node_arguments.register(ops.DatabaseTable)
+def get_node_arguments_table(node):
+    return (node.source,)
 
 
 @get_node_arguments.register(ops.DropNa)

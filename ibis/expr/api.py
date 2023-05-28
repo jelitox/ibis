@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import datetime
 import functools
+import numbers
 import operator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, NamedTuple, Sequence, TypeVar
 
-import dateutil.parser
 import numpy as np
 
 import ibis.expr.builders as bl
@@ -20,6 +20,7 @@ from ibis import selectors, util
 from ibis.backends.base import BaseBackend, connect
 from ibis.common.dispatch import lazy_singledispatch
 from ibis.common.exceptions import IbisInputError
+from ibis.common.temporal import normalize_datetime, normalize_timezone
 from ibis.expr.decompile import decompile
 from ibis.expr.deferred import Deferred
 from ibis.expr.schema import Schema
@@ -27,8 +28,6 @@ from ibis.expr.sql import parse_sql, show_sql, to_sql
 from ibis.expr.types import (
     DateValue,
     Expr,
-    IntegerColumn,
-    StringValue,
     Table,
     TimeValue,
     array,
@@ -254,8 +253,12 @@ def schema(
     """
     if pairs is not None:
         return sch.schema(pairs)
-    else:
-        return sch.schema(names, types)
+
+    # validate lengths of names and types are the same
+    if len(names) != len(types):
+        raise ValueError('Schema names and types must have the same length')
+
+    return sch.Schema.from_tuples(zip(names, types))
 
 
 def table(
@@ -346,7 +349,7 @@ def memtable(
     >>> t
     InMemoryTable
       data:
-        DataFrameProxy:
+        PandasDataFrameProxy:
              a
           0  1
           1  2
@@ -355,7 +358,7 @@ def memtable(
     >>> t
     InMemoryTable
       data:
-        DataFrameProxy:
+        PandasDataFrameProxy:
              a    b
           0  1  foo
           1  2  baz
@@ -367,7 +370,7 @@ def memtable(
     >>> t
     InMemoryTable
       data:
-        DataFrameProxy:
+        PandasDataFrameProxy:
              a    b
           0  1  foo
           1  2  baz
@@ -379,7 +382,7 @@ def memtable(
     >>> t
     InMemoryTable
       data:
-        DataFrameProxy:
+        PandasDataFrameProxy:
              col0 col1
           0     1  foo
           1     2  baz
@@ -400,7 +403,7 @@ def _memtable_from_pyarrow_table(
     schema: SupportsSchema | None = None,
     columns: Iterable[str] | None = None,
 ):
-    from ibis.backends.pyarrow import PyArrowTableProxy
+    from ibis.expr.operations.relations import PyArrowTableProxy
 
     if columns is not None:
         assert schema is None, "if `columns` is not `None` then `schema` must be `None`"
@@ -422,7 +425,7 @@ def _memtable_from_dataframe(
 ) -> Table:
     import pandas as pd
 
-    from ibis.backends.pandas.client import DataFrameProxy
+    from ibis.expr.operations.relations import PandasDataFrameProxy
 
     df = pd.DataFrame(data, columns=columns)
     if df.columns.inferred_type != "string":
@@ -436,7 +439,7 @@ def _memtable_from_dataframe(
     op = ops.InMemoryTable(
         name=name if name is not None else util.gen_name("pandas_memtable"),
         schema=sch.infer(df) if schema is None else schema,
-        data=DataFrameProxy(df),
+        data=PandasDataFrameProxy(df),
     )
     return op.to_expr()
 
@@ -581,137 +584,107 @@ def random() -> ir.FloatingScalar:
     return ops.RandomScalar().to_expr()
 
 
-@functools.singledispatch
-def timestamp(
-    value,
-    *args,
-    timezone: str | None = None,
-) -> ir.TimestampScalar:
-    """Construct a timestamp literal if `value` is coercible to a timestamp.
+def timestamp(value, *args, timezone: str | None = None) -> ir.TimestampScalar:
+    """Return a timestamp literal if `value` is coercible to a timestamp.
 
     Parameters
     ----------
     value
-        The value to use for constructing the timestamp
+        Timestamp string, datetime object or numeric value
     args
-        Additional arguments used when constructing a timestamp
+        Additional arguments if `value` is numeric
     timezone
-        The timezone of the timestamp
+        Timezone name
 
     Returns
     -------
     TimestampScalar
         A timestamp expression
+
+    Examples
+    --------
+    >>> import ibis
+    >>> ibis.options.interactive = True
+    >>> ibis.timestamp("2021-01-01 00:00:00")
+    Timestamp('2021-01-01 00:00:00')
     """
-    raise NotImplementedError(f'cannot convert {type(value)} to timestamp')
+    if isinstance(value, (numbers.Real, ir.IntegerValue)):
+        if timezone:
+            raise NotImplementedError('timestamp timezone not implemented')
+        if not args:
+            raise TypeError(f"Use ibis.literal({value}).to_timestamp() instead")
+        return ops.TimestampFromYMDHMS(value, *args).to_expr()
+    elif isinstance(value, (Deferred, ir.Expr)):
+        # TODO(kszucs): could call .cast(dt.timestamp) for certain value expressions
+        raise NotImplementedError(
+            "`ibis.timestamp` isn't implemented for expression inputs"
+        )
+    else:
+        value = normalize_datetime(value)
+        tzinfo = normalize_timezone(timezone or value.tzinfo)
+        timezone = tzinfo.tzname(value) if tzinfo is not None else None
+        return literal(value, type=dt.Timestamp(timezone=timezone))
 
 
-@timestamp.register(np.integer)
-@timestamp.register(np.floating)
-@timestamp.register(int)
-@timestamp.register(float)
-@timestamp.register(ir.IntegerValue)
-def _timestamp_from_ymdhms(
-    value, *args, timezone: str | None = None
-) -> ir.TimestampScalar:
-    if timezone:
-        raise NotImplementedError('timestamp timezone not implemented')
-
-    if not args:  # only one value
-        raise TypeError(f"Use ibis.literal({value}).to_timestamp")
-
-    # pass through to datetime constructor
-    return ops.TimestampFromYMDHMS(value, *args).to_expr()
-
-
-@timestamp.register(datetime.datetime)
-def _timestamp_from_datetime(value, timezone: str | None = None) -> ir.TimestampScalar:
-    return literal(value, type=dt.Timestamp(timezone=timezone))
-
-
-@timestamp.register(str)
-def _timestamp_from_str(value: str, timezone: str | None = None) -> ir.TimestampScalar:
-    import pandas as pd
-
-    try:
-        value = pd.Timestamp(value, tz=timezone)
-    except pd.errors.OutOfBoundsDatetime:
-        value = dateutil.parser.parse(value)
-    dtype = dt.Timestamp(timezone=timezone if timezone is not None else value.tzname())
-    return literal(value, type=dtype)
-
-
-@functools.singledispatch
-def date(value) -> DateValue:
+def date(value, *args) -> DateValue:
     """Return a date literal if `value` is coercible to a date.
 
     Parameters
     ----------
     value
-        Date string
+        Date string, datetime object or numeric value
+    args
+        Month and day if `value` is a year
 
     Returns
     -------
     DateScalar
         A date expression
     """
-    raise NotImplementedError()
+    if isinstance(value, (numbers.Real, ir.IntegerValue)):
+        year, month, day = value, *args
+        return ops.DateFromYMD(year, month, day).to_expr()
+    elif isinstance(value, ir.StringValue):
+        return value.cast(dt.date)
+    elif isinstance(value, Deferred):
+        return value.date()
+    else:
+        return literal(value, type=dt.date)
 
 
-@date.register(str)
-def _date_from_str(value: str) -> ir.DateScalar:
-    import pandas as pd
+def time(value, *args) -> TimeValue:
+    """Return a time literal if `value` is coercible to a time.
 
-    return literal(pd.to_datetime(value).date(), type=dt.date)
+    Parameters
+    ----------
+    value
+        Time string
+    args
+        Minutes, seconds if `value` is an hour
 
+    Returns
+    -------
+    TimeScalar
+        A time expression
 
-@date.register(datetime.datetime)
-def _date_from_timestamp(value) -> ir.DateScalar:
-    return literal(value, type=dt.date)
-
-
-@date.register(IntegerColumn)
-@date.register(int)
-def _date_from_int(year, month, day) -> ir.DateScalar:
-    return ops.DateFromYMD(year, month, day).to_expr()
-
-
-@date.register(StringValue)
-def _date_from_string(value: StringValue) -> DateValue:
-    return value.cast(dt.date)
-
-
-@date.register(Deferred)
-def _date_from_deferred(value: Deferred) -> Deferred:
-    return value.date()
-
-
-@functools.singledispatch
-def time(value) -> TimeValue:
-    return literal(value, type=dt.time)
-
-
-@time.register(str)
-def _time_from_str(value: str) -> ir.TimeScalar:
-    import pandas as pd
-
-    return literal(pd.to_datetime(value).time(), type=dt.time)
-
-
-@time.register(IntegerColumn)
-@time.register(int)
-def _time_from_int(hours, mins, secs) -> ir.TimeScalar:
-    return ops.TimeFromHMS(hours, mins, secs).to_expr()
-
-
-@time.register(StringValue)
-def _time_from_string(value: StringValue) -> TimeValue:
-    return value.cast(dt.time)
-
-
-@time.register(Deferred)
-def _time_from_deferred(value: Deferred) -> Deferred:
-    return value.time()
+    Examples
+    --------
+    >>> import ibis
+    >>> ibis.options.interactive = True
+    >>> ibis.time("00:00:00")
+    datetime.time(0, 0)
+    >>> ibis.time(12, 15, 30)
+    datetime.time(12, 15, 30)
+    """
+    if isinstance(value, (numbers.Real, ir.IntegerValue)):
+        hours, mins, secs = value, *args
+        return ops.TimeFromHMS(hours, mins, secs).to_expr()
+    elif isinstance(value, ir.StringValue):
+        return value.cast(dt.time)
+    elif isinstance(value, Deferred):
+        return value.time()
+    else:
+        return literal(value, type=dt.time)
 
 
 def interval(
@@ -801,10 +774,7 @@ def interval(
     if not components:
         components.append((0, "s"))
 
-    intervals = [
-        literal(v, type=dt.Interval(u, value_type=literal(v).type()))
-        for v, u in components
-    ]
+    intervals = [literal(v, type=dt.Interval(u)) for v, u in components]
     return functools.reduce(operator.add, intervals)
 
 
@@ -877,26 +847,7 @@ def read_csv(sources: str | Path | Sequence[str | Path], **kwargs: Any) -> ir.Ta
     Examples
     --------
     >>> import ibis
-    >>> ibis.options.interactive = True
-    >>> t = ibis.examples.Batting_raw.fetch()
-    >>> t
-    ┏━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━┓
-    ┃ playerID  ┃ yearID ┃ stint ┃ teamID ┃ lgID   ┃ G     ┃ AB    ┃ R     ┃ … ┃
-    ┡━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━┩
-    │ string    │ int64  │ int64 │ string │ string │ int64 │ int64 │ int64 │ … │
-    ├───────────┼────────┼───────┼────────┼────────┼───────┼───────┼───────┼───┤
-    │ abercda01 │   1871 │     1 │ TRO    │ NA     │     1 │     4 │     0 │ … │
-    │ addybo01  │   1871 │     1 │ RC1    │ NA     │    25 │   118 │    30 │ … │
-    │ allisar01 │   1871 │     1 │ CL1    │ NA     │    29 │   137 │    28 │ … │
-    │ allisdo01 │   1871 │     1 │ WS3    │ NA     │    27 │   133 │    28 │ … │
-    │ ansonca01 │   1871 │     1 │ RC1    │ NA     │    25 │   120 │    29 │ … │
-    │ armstbo01 │   1871 │     1 │ FW1    │ NA     │    12 │    49 │     9 │ … │
-    │ barkeal01 │   1871 │     1 │ RC1    │ NA     │     1 │     4 │     0 │ … │
-    │ barnero01 │   1871 │     1 │ BS1    │ NA     │    31 │   157 │    66 │ … │
-    │ barrebi01 │   1871 │     1 │ FW1    │ NA     │     1 │     5 │     1 │ … │
-    │ barrofr01 │   1871 │     1 │ BS1    │ NA     │    18 │    86 │    13 │ … │
-    │ …         │      … │     … │ …      │ …      │     … │     … │     … │ … │
-    └───────────┴────────┴───────┴────────┴────────┴───────┴───────┴───────┴───┘
+    >>> t = ibis.read_csv("path/to/data.csv")  # doctest: +SKIP
     """
     from ibis.config import _default_backend
 
@@ -937,15 +888,15 @@ def read_json(sources: str | Path | Sequence[str | Path], **kwargs: Any) -> ir.T
     ...     _ = f.write(lines)
     >>> t = ibis.read_json("/tmp/lines.json")
     >>> t
-    ┏━━━━━━━━┳━━━━━━━━┓
-    ┃ a      ┃ b      ┃
-    ┡━━━━━━━━╇━━━━━━━━┩
-    │ uint64 │ string │
-    ├────────┼────────┤
-    │      1 │ d      │
-    │      2 │ NULL   │
-    │   NULL │ f      │
-    └────────┴────────┘
+    ┏━━━━━━━┳━━━━━━━━┓
+    ┃ a     ┃ b      ┃
+    ┡━━━━━━━╇━━━━━━━━┩
+    │ int64 │ string │
+    ├───────┼────────┤
+    │     1 │ d      │
+    │     2 │ NULL   │
+    │  NULL │ f      │
+    └───────┴────────┘
     """
     from ibis.config import _default_backend
 
@@ -977,26 +928,7 @@ def read_parquet(sources: str | Path | Sequence[str | Path], **kwargs: Any) -> i
     Examples
     --------
     >>> import ibis
-    >>> ibis.options.interactive = True
-    >>> t = ibis.examples.Batting_raw.fetch()
-    >>> t
-    ┏━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━━━━━┳━━━┓
-    ┃ playerID  ┃ yearID ┃ stint ┃ teamID ┃ lgID   ┃ G     ┃ AB    ┃ R     ┃ … ┃
-    ┡━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━━━━━╇━━━┩
-    │ string    │ int64  │ int64 │ string │ string │ int64 │ int64 │ int64 │ … │
-    ├───────────┼────────┼───────┼────────┼────────┼───────┼───────┼───────┼───┤
-    │ abercda01 │   1871 │     1 │ TRO    │ NA     │     1 │     4 │     0 │ … │
-    │ addybo01  │   1871 │     1 │ RC1    │ NA     │    25 │   118 │    30 │ … │
-    │ allisar01 │   1871 │     1 │ CL1    │ NA     │    29 │   137 │    28 │ … │
-    │ allisdo01 │   1871 │     1 │ WS3    │ NA     │    27 │   133 │    28 │ … │
-    │ ansonca01 │   1871 │     1 │ RC1    │ NA     │    25 │   120 │    29 │ … │
-    │ armstbo01 │   1871 │     1 │ FW1    │ NA     │    12 │    49 │     9 │ … │
-    │ barkeal01 │   1871 │     1 │ RC1    │ NA     │     1 │     4 │     0 │ … │
-    │ barnero01 │   1871 │     1 │ BS1    │ NA     │    31 │   157 │    66 │ … │
-    │ barrebi01 │   1871 │     1 │ FW1    │ NA     │     1 │     5 │     1 │ … │
-    │ barrofr01 │   1871 │     1 │ BS1    │ NA     │    18 │    86 │    13 │ … │
-    │ …         │      … │     … │ …      │ …      │     … │     … │     … │ … │
-    └───────────┴────────┴───────┴────────┴────────┴───────┴───────┴───────┴───┘
+    >>> t = ibis.read_parquet("path/to/data.parquet")  # doctest: +SKIP
     """
     from ibis.config import _default_backend
 

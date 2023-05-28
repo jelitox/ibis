@@ -702,3 +702,31 @@ def test_unnest_struct(con):
     result = con.execute(expr)
     expected = pd.DataFrame(data).explode("value").iloc[:, 0].reset_index(drop=True)
     tm.assert_series_equal(result, expected)
+
+
+@pytest.mark.never(
+    ["impala", "mssql", "mysql", "sqlite"],
+    raises=com.OperationNotDefinedError,
+    reason="no array support",
+)
+@pytest.mark.notyet(["bigquery"], raises=com.OperationNotDefinedError)
+@pytest.mark.notimpl(
+    ["dask", "datafusion", "druid", "oracle", "pandas", "polars", "postgres"],
+    raises=com.OperationNotDefinedError,
+)
+def test_zip(backend):
+    t = backend.array_types
+
+    x = t.x.execute()
+    res = t.x.zip(t.x)
+    assert res.type().value_type.names == ("f1", "f2")
+    s = res.execute()
+    assert len(s[0][0]) == len(res.type().value_type)
+    assert len(x[0]) == len(s[0])
+
+    x = t.x.execute()
+    res = t.x.zip(t.x, t.x, t.x, t.x, t.x)
+    assert res.type().value_type.names == ("f1", "f2", "f3", "f4", "f5", "f6")
+    s = res.execute()
+    assert len(s[0][0]) == len(res.type().value_type)
+    assert len(x[0]) == len(s[0])

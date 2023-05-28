@@ -18,7 +18,7 @@ import ibis
 import ibis.expr.datatypes as dt
 import ibis.selectors as s
 from ibis.backends.bigquery import EXTERNAL_DATA_SCOPES, Backend
-from ibis.backends.bigquery.datatypes import ibis_type_to_bigquery_type
+from ibis.backends.bigquery.datatypes import dtype_to_bigquery
 from ibis.backends.conftest import TEST_TABLES
 from ibis.backends.tests.base import BackendTest, RoundAwayFromZero, UnorderedComparator
 from ibis.backends.tests.data import json_types, non_null_array_types, struct_types, win
@@ -38,13 +38,13 @@ def ibis_type_to_bq_field(typ: dt.DataType) -> Mapping[str, Any]:
 
 @ibis_type_to_bq_field.register(dt.DataType)
 def _(typ: dt.DataType) -> Mapping[str, Any]:
-    return {"field_type": ibis_type_to_bigquery_type(typ)}
+    return {"field_type": dtype_to_bigquery(typ)}
 
 
 @ibis_type_to_bq_field.register(dt.Array)
 def _(typ: dt.Array) -> Mapping[str, Any]:
     return {
-        "field_type": ibis_type_to_bigquery_type(typ.value_type),
+        "field_type": dtype_to_bigquery(typ.value_type),
         "mode": "REPEATED",
     }
 
@@ -202,7 +202,7 @@ class TestConf(UnorderedComparator, BackendTest, RoundAwayFromZero):
                     make_job,
                     client.load_table_from_file,
                     io.StringIO(
-                        "\n".join(
+                        "\n".join(  # noqa: FLY002
                             [
                                 """{"string_col": "1st value", "numeric_col": 0.999999999}""",
                                 """{"string_col": "2nd value", "numeric_col": 0.000000002}""",

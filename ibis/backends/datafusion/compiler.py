@@ -12,7 +12,7 @@ import pyarrow.compute as pc
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-from ibis.backends.datafusion.datatypes import to_pyarrow_type
+from ibis.formats.pyarrow import dtype_to_pyarrow
 
 
 @functools.singledispatch
@@ -27,8 +27,7 @@ def operation(op):
 
 @translate.register(ops.DatabaseTable)
 def table(op):
-    name, _, client = op.args
-    return client._context.table(name)
+    return op.source._context.table(op.name)
 
 
 @translate.register(ops.Alias)
@@ -44,7 +43,7 @@ def literal(op):
     else:
         value = op.value
 
-    arrow_type = to_pyarrow_type(op.dtype)
+    arrow_type = dtype_to_pyarrow(op.dtype)
     arrow_scalar = pa.scalar(value, type=arrow_type)
 
     return df.literal(arrow_scalar)
@@ -53,7 +52,7 @@ def literal(op):
 @translate.register(ops.Cast)
 def cast(op):
     arg = translate(op.arg)
-    typ = to_pyarrow_type(op.to)
+    typ = dtype_to_pyarrow(op.to)
     return arg.cast(to=typ)
 
 
@@ -459,8 +458,8 @@ def e(_):
 def elementwise_udf(op):
     udf = df.udf(
         op.func,
-        input_types=list(map(to_pyarrow_type, op.input_type)),
-        return_type=to_pyarrow_type(op.return_type),
+        input_types=list(map(dtype_to_pyarrow, op.input_type)),
+        return_type=dtype_to_pyarrow(op.return_type),
         volatility="volatile",
     )
     args = map(translate, op.func_args)
@@ -505,9 +504,45 @@ def regex_extract(op):
         )
     string_array_get = df.udf(
         lambda arr, index=index: pc.list_element(arr, index),
-        input_types=[to_pyarrow_type(dt.Array(dt.string))],
-        return_type=to_pyarrow_type(dt.string),
+        input_types=[dtype_to_pyarrow(dt.Array(dt.string))],
+        return_type=dtype_to_pyarrow(dt.string),
         volatility="immutable",
         name="string_array_get",
     )
     return string_array_get(df.functions.regexp_match(arg, pattern))
+
+
+@translate.register(ops.StringReplace)
+def string_replace(op):
+    arg = translate(op.arg)
+    pattern = translate(op.pattern)
+    replacement = translate(op.replacement)
+    return df.functions.replace(arg, pattern, replacement)
+
+
+@translate.register(ops.RegexReplace)
+def regex_replace(op):
+    arg = translate(op.arg)
+    pattern = translate(op.pattern)
+    replacement = translate(op.replacement)
+    return df.functions.regexp_replace(arg, pattern, replacement, df.lit("g"))
+
+
+@translate.register(ops.StringFind)
+def string_find(op):
+    if op.end is not None:
+        raise NotImplementedError("`end` not yet implemented")
+
+    arg = translate(op.arg)
+    pattern = translate(op.substr)
+
+    if (op_start := op.start) is not None:
+        sub_string = ops.Substring(op.arg, op_start)
+        arg = translate(sub_string)
+        pos = df.functions.strpos(arg, pattern)
+        start = translate(op_start)
+        return df.functions.coalesce(
+            df.functions.nullif(pos + start, start), df.lit(0)
+        ) - df.lit(1)
+
+    return df.functions.strpos(arg, pattern) - df.lit(1)

@@ -8,7 +8,7 @@ import hypothesis.strategies as st
 import ibis
 import ibis.expr.datatypes as dt
 import ibis.expr.schema as sch
-from ibis.common.enums import IntervalUnit
+from ibis.common.temporal import IntervalUnit
 
 # pyarrow also has hypothesis strategies various pyarrow objects
 
@@ -54,9 +54,7 @@ timestamp_dtype = st.builds(
     dt.Timestamp, timezone=st.none() | tzst.timezones().map(str), nullable=nullable
 )
 interval_unit = st.sampled_from(list(IntervalUnit))
-interval_dtype = st.builds(
-    dt.Interval, unit=interval_unit, value_type=integer_dtypes, nullable=nullable
-)
+interval_dtype = st.builds(dt.Interval, unit=interval_unit, nullable=nullable)
 temporal_dtypes = st.one_of(
     date_dtype,
     time_dtype,

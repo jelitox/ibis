@@ -814,14 +814,9 @@ timestamp_value = pd.Timestamp('2018-01-01 18:18:18')
                         "postgres",
                         "snowflake",
                         "sqlite",
-                    ],
-                    raises=com.OperationNotDefinedError,
-                ),
-                pytest.mark.notimpl(
-                    [
                         "bigquery",
                     ],
-                    raises=com.UnsupportedOperationError,
+                    raises=com.OperationNotDefinedError,
                 ),
                 pytest.mark.notimpl(
                     ["druid"],
@@ -846,14 +841,9 @@ timestamp_value = pd.Timestamp('2018-01-01 18:18:18')
                         "mysql",
                         "impala",
                         "snowflake",
-                    ],
-                    raises=com.OperationNotDefinedError,
-                ),
-                pytest.mark.notimpl(
-                    [
                         "bigquery",
                     ],
-                    raises=com.UnsupportedOperationError,
+                    raises=com.OperationNotDefinedError,
                 ),
                 pytest.mark.notimpl(
                     ["druid"],
@@ -925,6 +915,11 @@ timestamp_value = pd.Timestamp('2018-01-01 18:18:18')
                     ["druid"],
                     raises=TypeError,
                     reason="unsupported operand type(s) for -: 'StringColumn' and 'TimestampScalar'",
+                ),
+                pytest.mark.xfail_version(
+                    duckdb=["duckdb>=0.8.0"],
+                    raises=AssertionError,
+                    reason="duckdb 0.8.0 returns DateOffset columns",
                 ),
             ],
         ),
@@ -1759,7 +1754,6 @@ def test_now(con):
     assert result_strftime == expected_strftime
 
 
-@pytest.mark.notimpl(["dask"], reason="Limit #2553", raises=AssertionError)
 @pytest.mark.notimpl(["polars"], reason="assert 1 == 5", raises=AssertionError)
 @pytest.mark.notimpl(
     ["datafusion", "druid", "oracle"], raises=com.OperationNotDefinedError
@@ -1911,7 +1905,7 @@ def test_timestamp_literal(con, backend):
 @pytest.mark.notimpl(
     ['bigquery'],
     "BigQuery does not support timestamps with timezones other than 'UTC'",
-    raises=com.UnsupportedOperationError,
+    raises=TypeError,
 )
 @pytest.mark.notimpl(
     ["druid"],
@@ -2071,7 +2065,7 @@ INTERVAL_BACKEND_TYPES = {
     raises=(NotImplementedError, AttributeError),
 )
 @pytest.mark.broken(
-    ['bigquery'], "Could not convert object to NumPy timedelta", raises=ValueError
+    ['bigquery'], reason="BigQuery returns DateOffset arrays", raises=AssertionError
 )
 @pytest.mark.notimpl(
     ["datafusion"],
@@ -2082,6 +2076,11 @@ INTERVAL_BACKEND_TYPES = {
     ['clickhouse'],
     reason="Driver doesn't know how to handle intervals",
     raises=ClickhouseOperationalError,
+)
+@pytest.mark.xfail_version(
+    duckdb=["duckdb>=0.8.0"],
+    raises=AssertionError,
+    reason="duckdb 0.8.0 returns DateOffset columns",
 )
 def test_interval_literal(con, backend):
     expr = ibis.interval(1, unit="s")

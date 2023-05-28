@@ -1,4 +1,4 @@
-SELECT count(1) AS `count`
+SELECT count(1) AS `CountStar()`
 FROM (
   SELECT t2.*, t1.`r_name` AS `region`
   FROM tpch_region t1

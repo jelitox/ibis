@@ -6,7 +6,7 @@ WITH t0 AS (
 ),
 t1 AS (
   SELECT t2.*, t3.`value2`
-  FROM `first` t2
+  FROM first t2
     INNER JOIN second t3
       ON t2.`key1` = t3.`key1`
 )

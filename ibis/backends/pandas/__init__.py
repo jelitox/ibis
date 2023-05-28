@@ -12,11 +12,7 @@ import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis.backends.base import BaseBackend
-from ibis.backends.pandas.client import (
-    PandasDatabase,
-    PandasTable,
-    ibis_schema_to_pandas,
-)
+from ibis.formats.pandas import schema_from_pandas_dataframe, schema_to_pandas
 
 if TYPE_CHECKING:
     import pyarrow as pa
@@ -98,18 +94,18 @@ class BasePandasBackend(BaseBackend):
 
     def table(self, name: str, schema: sch.Schema = None):
         df = self.dictionary[name]
-        schema = sch.infer(df, schema=schema or self.schemas.get(name, None))
-        return self.table_class(name, schema, self).to_expr()
-
-    def database(self, name=None):
-        return self.database_class(name, self)
+        schema = schema or self.schemas.get(name, None)
+        schema = schema_from_pandas_dataframe(df, schema=schema)
+        return ops.DatabaseTable(name, schema, self).to_expr()
 
     def get_schema(self, table_name, database=None):
         schemas = self.schemas
         try:
             schema = schemas[table_name]
         except KeyError:
-            schemas[table_name] = schema = sch.infer(self.dictionary[table_name])
+            schemas[table_name] = schema = schema_from_pandas_dataframe(
+                self.dictionary[table_name]
+            )
         return schema
 
     def compile(self, expr, *args, **kwargs):
@@ -147,8 +143,7 @@ class BasePandasBackend(BaseBackend):
                 )
             df = self._convert_object(obj)
         else:
-            pandas_schema = self._convert_schema(schema)
-            dtypes = dict(pandas_schema)
+            dtypes = dict(schema_to_pandas(schema))
             df = self._from_pandas(pd.DataFrame(columns=dtypes.keys()).astype(dtypes))
 
         if name in self.dictionary and not overwrite:
@@ -184,11 +179,9 @@ class BasePandasBackend(BaseBackend):
 
     @classmethod
     def _supports_conversion(cls, obj: Any) -> bool:
+        if isinstance(obj, ir.Table):
+            return isinstance(obj.op(), ops.InMemoryTable)
         return True
-
-    @staticmethod
-    def _convert_schema(schema: sch.Schema):
-        return ibis_schema_to_pandas(schema)
 
     @staticmethod
     def _from_pandas(df: pd.DataFrame) -> pd.DataFrame:
@@ -196,6 +189,10 @@ class BasePandasBackend(BaseBackend):
 
     @classmethod
     def _convert_object(cls, obj: Any) -> Any:
+        if isinstance(obj, ir.Table):
+            # Support memtables
+            assert isinstance(obj.op(), ops.InMemoryTable)
+            return obj.op().data.to_frame()
         return cls.backend_table_type(obj)
 
     @classmethod
@@ -236,8 +233,6 @@ class BasePandasBackend(BaseBackend):
 
 class Backend(BasePandasBackend):
     name = 'pandas'
-    database_class = PandasDatabase
-    table_class = PandasTable
 
     def to_pyarrow(
         self,

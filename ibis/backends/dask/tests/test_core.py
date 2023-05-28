@@ -1,4 +1,5 @@
 import pytest
+from dask.dataframe.utils import tm
 
 import ibis
 import ibis.common.exceptions as com
@@ -7,10 +8,8 @@ from ibis.backends.base.df.scope import Scope
 from ibis.backends.pandas.dispatch import execute_node as pandas_execute_node
 
 dd = pytest.importorskip("dask.dataframe")
+import pandas as pd  # noqa: E402
 
-from dask.dataframe.utils import tm  # noqa: E402
-
-from ibis.backends.dask import Backend  # noqa: E402
 from ibis.backends.dask.core import execute  # noqa: E402
 from ibis.backends.dask.dispatch import (  # noqa: E402
     execute_node,
@@ -18,8 +17,10 @@ from ibis.backends.dask.dispatch import (  # noqa: E402
     pre_execute,
 )
 
+dd = pytest.importorskip("dask.dataframe")
 
-def test_from_dataframe(dataframe, ibis_table, core_client):
+
+def test_table_from_dataframe(dataframe, ibis_table, core_client):
     t = core_client.from_dataframe(dataframe)
     result = t.execute()
     expected = ibis_table.execute()
@@ -33,6 +34,15 @@ def test_from_dataframe(dataframe, ibis_table, core_client):
     t = core_client.from_dataframe(dataframe, name='foo', client=client)
     expected = ibis_table.execute()
     tm.assert_frame_equal(result, expected)
+
+
+def test_array_literal_from_series(core_client):
+    values = [1, 2, 3, 4]
+    s = dd.from_pandas(pd.Series(values), npartitions=1)
+    expr = ibis.array(s)
+
+    assert expr.equals(ibis.array(values))
+    assert core_client.execute(expr) == pytest.approx([1, 2, 3, 4])
 
 
 def test_pre_execute_basic():
@@ -64,22 +74,6 @@ def test_missing_data_sources():
     expr = t.a.length()
     with pytest.raises(com.UnboundExpressionError):
         execute(expr.op())
-
-
-def test_missing_data_on_custom_client():
-    class MyBackend(Backend):
-        def table(self, name):
-            return ops.DatabaseTable(
-                name, ibis.schema([('a', 'int64')]), self
-            ).to_expr()
-
-    con = MyBackend()
-    t = con.table('t')
-    with pytest.raises(
-        com.OperationNotDefinedError,
-        match="Operation 'DatabaseTable' is not implemented for this backend",
-    ):
-        con.execute(t)
 
 
 def test_post_execute_called_on_joins(dataframe, core_client, ibis_table):

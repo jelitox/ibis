@@ -45,7 +45,7 @@ NULL_BACKEND_TYPES = {
 }
 
 
-@pytest.mark.broken(["duckdb", "impala", "bigquery"], 'assert nan is None')
+@pytest.mark.broken(["impala", "bigquery"], 'assert nan is None')
 def test_null_literal(con, backend):
     expr = ibis.null()
     result = con.execute(expr)
@@ -775,7 +775,7 @@ def test_correlated_subquery(alltypes):
     assert expr.compile() is not None
 
 
-@pytest.mark.notimpl(["dask", "polars", "pyspark", "datafusion"])
+@pytest.mark.notimpl(["polars", "pyspark", "datafusion"])
 def test_uncorrelated_subquery(backend, batting, batting_df):
     subset_batting = batting[batting.yearID <= 2000]
     expr = batting[_.yearID == subset_batting.yearID.max()]['playerID', 'yearID']

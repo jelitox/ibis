@@ -29,6 +29,13 @@ class ImpalaExprTranslator(ExprTranslator):
         ops.FirstValue,
         ops.LastValue,
     )
+    _unsupported_reductions = (
+        ops.ApproxMedian,
+        ops.ApproxCountDistinct,
+        ops.GroupConcat,
+    )
+    _dialect_name = "hive"
+    _quote_identifiers = True
 
 
 rewrites = ImpalaExprTranslator.rewrites

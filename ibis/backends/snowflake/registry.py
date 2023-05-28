@@ -14,6 +14,8 @@ from ibis import util
 from ibis.backends.base.sql.alchemy.registry import (
     fixed_arity,
     geospatial_functions,
+    get_col,
+    get_sqla_table,
     reduction,
     unary,
 )
@@ -49,8 +51,8 @@ def _literal(t, op):
             value.second,
             value.microsecond * 1_000,
         )
-        if (tz := value.tzinfo) is not None:
-            return sa.func.timestamp_tz_from_parts(*args, str(tz))
+        if value.tzinfo is not None:
+            return sa.func.timestamp_tz_from_parts(*args, dtype.timezone)
         else:
             return sa.func.timestamp_from_parts(*args)
     elif dtype.is_date():
@@ -64,6 +66,26 @@ def _literal(t, op):
     elif dtype.is_uuid():
         return sa.literal(str(value))
     return _postgres_literal(t, op)
+
+
+def _table_column(t, op):
+    ctx = t.context
+    table = op.table
+
+    sa_table = get_sqla_table(ctx, table)
+    out_expr = get_col(sa_table, op)
+
+    if (dtype := op.output_dtype).is_timestamp() and (
+        timezone := dtype.timezone
+    ) is not None:
+        out_expr = sa.func.convert_timezone(timezone, out_expr).label(op.name)
+
+    # If the column does not originate from the table set in the current SELECT
+    # context, we should format as a subquery
+    if t.permit_subquery and ctx.is_foreign_expr(table):
+        return sa.select(out_expr)
+
+    return out_expr
 
 
 def _string_find(t, op):
@@ -194,6 +216,23 @@ def _group_concat(t, op):
     )
 
 
+def _array_zip(t, op):
+    return sa.type_coerce(
+        sa.func.ibis_udfs.public.array_zip(
+            sa.func.array_construct(*map(t.translate, op.arg))
+        ),
+        t.get_sqla_type(op.output_dtype),
+    )
+
+
+def _regex_extract(t, op):
+    arg = t.translate(op.arg)
+    pattern = t.translate(op.pattern)
+    index = t.translate(op.index)
+    # https://docs.snowflake.com/en/sql-reference/functions/regexp_substr
+    return sa.func.regexp_substr(arg, pattern, 1, 1, 'ce', index)
+
+
 _TIMESTAMP_UNITS_TO_SCALE = {"s": 0, "ms": 3, "us": 6, "ns": 9}
 
 _SF_POS_INF = sa.func.to_double("Inf")
@@ -204,6 +243,7 @@ operation_registry.update(
     {
         ops.JSONGetItem: fixed_arity(sa.func.get, 2),
         ops.StringFind: _string_find,
+        ops.ArrayZip: _array_zip,
         ops.Map: fixed_arity(
             lambda keys, values: sa.func.iff(
                 sa.func.is_array(keys) & sa.func.is_array(values),
@@ -351,7 +391,7 @@ operation_registry.update(
         ops.BitXor: reduction(sa.func.bitxor_agg),
         ops.DateFromYMD: fixed_arity(sa.func.date_from_parts, 3),
         ops.StringToTimestamp: fixed_arity(sa.func.to_timestamp_tz, 2),
-        ops.RegexExtract: fixed_arity(sa.func.regexp_substr, 3),
+        ops.RegexExtract: _regex_extract,
         ops.RegexSearch: fixed_arity(sa.sql.operators.custom_op("REGEXP"), 2),
         ops.RegexReplace: fixed_arity(sa.func.regexp_replace, 3),
         ops.ExtractMillisecond: fixed_arity(
@@ -389,6 +429,7 @@ operation_registry.update(
         ops.Hash: unary(sa.func.hash),
         ops.ApproxMedian: reduction(lambda x: sa.func.approx_percentile(x, 0.5)),
         ops.Median: reduction(sa.func.median),
+        ops.TableColumn: _table_column,
     }
 )
 

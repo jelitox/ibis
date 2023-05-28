@@ -114,7 +114,6 @@ argidx_not_grouped_marks = [
     "datafusion",
     "impala",
     "mysql",
-    "polars",
     "mssql",
     "druid",
     "oracle",
@@ -279,7 +278,7 @@ def test_aggregate_multikey_group_reduction_udf(backend, alltypes, df):
             id='any',
             marks=[
                 pytest.mark.notimpl(
-                    ["polars", "datafusion"],
+                    ["datafusion"],
                     raises=com.OperationNotDefinedError,
                 ),
                 pytest.mark.broken(
@@ -295,7 +294,7 @@ def test_aggregate_multikey_group_reduction_udf(backend, alltypes, df):
             id='notany',
             marks=[
                 pytest.mark.notimpl(
-                    ["polars", "datafusion"],
+                    ["datafusion"],
                     raises=com.OperationNotDefinedError,
                 ),
                 pytest.mark.broken(
@@ -316,7 +315,7 @@ def test_aggregate_multikey_group_reduction_udf(backend, alltypes, df):
             id='any_negate',
             marks=[
                 pytest.mark.notimpl(
-                    ["polars", "datafusion"],
+                    ["datafusion"],
                     raises=com.OperationNotDefinedError,
                 ),
                 pytest.mark.broken(
@@ -337,7 +336,7 @@ def test_aggregate_multikey_group_reduction_udf(backend, alltypes, df):
             id='all',
             marks=[
                 pytest.mark.notimpl(
-                    ["polars", "datafusion"],
+                    ["datafusion"],
                     raises=com.OperationNotDefinedError,
                 ),
                 pytest.mark.broken(
@@ -353,7 +352,7 @@ def test_aggregate_multikey_group_reduction_udf(backend, alltypes, df):
             id='notall',
             marks=[
                 pytest.mark.notimpl(
-                    ["polars", "datafusion"],
+                    ["datafusion"],
                     raises=com.OperationNotDefinedError,
                 ),
                 pytest.mark.broken(
@@ -374,7 +373,7 @@ def test_aggregate_multikey_group_reduction_udf(backend, alltypes, df):
             id='all_negate',
             marks=[
                 pytest.mark.notimpl(
-                    ["polars", "datafusion"],
+                    ["datafusion"],
                     raises=com.OperationNotDefinedError,
                 ),
                 pytest.mark.broken(
@@ -459,7 +458,6 @@ def test_aggregate_multikey_group_reduction_udf(backend, alltypes, df):
                     [
                         "impala",
                         "mysql",
-                        "polars",
                         "datafusion",
                         "mssql",
                         "druid",
@@ -484,7 +482,6 @@ def test_aggregate_multikey_group_reduction_udf(backend, alltypes, df):
                     [
                         "impala",
                         "mysql",
-                        "polars",
                         "datafusion",
                         "mssql",
                         "druid",
@@ -805,6 +802,7 @@ def test_reduction_ops(
     expr = alltypes.agg(tmp=result_fn(alltypes, ibis_cond(alltypes))).tmp
     result = expr.execute().squeeze()
     expected = expected_fn(df, pandas_cond(df))
+
     try:
         np.testing.assert_allclose(result, expected, rtol=backend.reduction_tolerance)
     except TypeError:  # assert_allclose only handles numerics
@@ -834,10 +832,10 @@ def test_reduction_ops(
                     ],
                     raises=com.OperationNotDefinedError,
                 ),
-                mark.broken(
+                mark.never(
                     ["dask"],
+                    reason="backend implements approximate quantiles",
                     raises=AssertionError,
-                    reason="assert 50.5 ± 5.1e-05 == 45.45",
                 ),
                 mark.never(
                     ["trino"],
@@ -961,7 +959,7 @@ def test_quantile(
             id='corr_pop',
             marks=[
                 pytest.mark.notimpl(
-                    ["dask", "datafusion", "pandas", "polars", "druid"],
+                    ["dask", "datafusion", "pandas", "druid"],
                     raises=com.OperationNotDefinedError,
                 ),
                 pytest.mark.notyet(
@@ -986,11 +984,11 @@ def test_quantile(
             id='corr_samp',
             marks=[
                 pytest.mark.notimpl(
-                    ["dask", "datafusion", "pandas", "polars", "druid"],
+                    ["dask", "datafusion", "pandas", "druid"],
                     raises=com.OperationNotDefinedError,
                 ),
                 pytest.mark.notyet(
-                    ["impala", "mysql", "sqlite", "polars"],
+                    ["impala", "mysql", "sqlite"],
                     raises=com.OperationNotDefinedError,
                 ),
                 pytest.mark.notyet(
@@ -1038,7 +1036,7 @@ def test_quantile(
             id='corr_pop_bool',
             marks=[
                 pytest.mark.notimpl(
-                    ["dask", "datafusion", "pandas", "polars", "druid"],
+                    ["dask", "datafusion", "pandas", "druid"],
                     raises=com.OperationNotDefinedError,
                 ),
                 pytest.mark.notyet(
@@ -1457,4 +1455,36 @@ def test_grouped_case(backend, con):
     expr = table.group_by("key").aggregate(mx=case_expr.max()).order_by("key")
     result = con.execute(expr)
     expected = pd.DataFrame({"key": [1, 2], "mx": [10, 20]})
+    backend.assert_frame_equal(result, expected)
+
+
+@pytest.mark.notimpl(
+    ["datafusion", "mssql", "polars"], raises=com.OperationNotDefinedError
+)
+@pytest.mark.broken(
+    ["dask", "pandas"],
+    reason="Dask and Pandas do not windowize this operation correctly",
+    raises=AssertionError,
+)
+@pytest.mark.notyet(["clickhouse", "impala"], raises=com.UnsupportedOperationError)
+@pytest.mark.notyet(["druid", "trino", "snowflake"], raises=sa.exc.ProgrammingError)
+@pytest.mark.notyet("mysql", raises=sa.exc.NotSupportedError)
+@pytest.mark.notyet("oracle", raises=sa.exc.DatabaseError)
+@pytest.mark.notyet("pyspark", raises=PysparkAnalysisException)
+def test_group_concat_over_window(backend, con):
+    input_df = pd.DataFrame(
+        {
+            "s": ["a|b|c", "b|a|c", "b|b|b|c|a"],
+            "token": ["a", "b", "c"],
+            "pk": [1, 1, 2],
+        }
+    )
+    expected = input_df.assign(test=["a|b|c|b|a|c", "b|a|c", "b|b|b|c|a"])
+
+    table = ibis.memtable(input_df)
+    w = ibis.window(group_by="pk", preceding=0, following=None)
+    expr = table.mutate(test=table.s.group_concat(sep="|").over(w)).order_by("pk")
+
+    result = con.execute(expr)
+
     backend.assert_frame_equal(result, expected)

@@ -759,6 +759,62 @@ class ArrayValue(Value):
         """
         return ops.ArrayUnion(self, other).to_expr()
 
+    def zip(self, other: ir.Array, *others: ir.Array) -> ir.Array:
+        """Zip two or more arrays together.
+
+        Parameters
+        ----------
+        other
+            Another array to zip with `self`
+        others
+            Additional arrays to zip with `self`
+
+        Returns
+        -------
+        Array
+            Array of structs where each struct field is an element of each input
+            array.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable({"numbers": [[3, 2], [], None], "strings": [["a", "c"], None, ["e"]]})
+        >>> t
+        ┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ numbers              ┃ strings              ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<int64>         │ array<string>        │
+        ├──────────────────────┼──────────────────────┤
+        │ [3, 2]               │ ['a', 'c']           │
+        │ []                   │ NULL                 │
+        │ NULL                 │ ['e']                │
+        └──────────────────────┴──────────────────────┘
+        >>> expr = t.numbers.zip(t.strings)
+        >>> expr
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayZip()                           ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<struct<f1: int64, f2: string>> │
+        ├──────────────────────────────────────┤
+        │ [{...}, {...}]                       │
+        │ []                                   │
+        │ [{...}]                              │
+        └──────────────────────────────────────┘
+        >>> expr.unnest()
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayZip()                    ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ struct<f1: int64, f2: string> │
+        ├───────────────────────────────┤
+        │ {'f1': 3, 'f2': 'a'}          │
+        │ {'f1': 2, 'f2': 'c'}          │
+        │ {'f1': None, 'f2': 'e'}       │
+        └───────────────────────────────┘
+        """
+
+        return ops.ArrayZip((self, other, *others)).to_expr()
+
 
 @public
 class ArrayScalar(Scalar, ArrayValue):

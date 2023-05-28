@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import collections
 import functools
-from typing import Any, Iterator
+from typing import Iterator
 
 from multipledispatch import Dispatcher
 from public import public
@@ -129,7 +128,7 @@ def can_cast_decimals(source: dt.Decimal, target: dt.Decimal, **kwargs) -> bool:
 
 @castable.register(dt.Interval, dt.Interval)
 def can_cast_intervals(source: dt.Interval, target: dt.Interval, **kwargs) -> bool:
-    return source.unit == target.unit and castable(source.value_type, target.value_type)
+    return source.unit == target.unit
 
 
 @castable.register(dt.Integer, dt.Boolean)
@@ -143,7 +142,7 @@ def can_cast_integer_to_boolean(
 def can_cast_integer_to_interval(
     source: dt.Integer, target: dt.Interval, **kwargs
 ) -> bool:
-    return castable(source, target.value_type)
+    return True
 
 
 @castable.register(dt.String, (dt.Date, dt.Time, dt.Timestamp))
@@ -199,13 +198,6 @@ def can_cast_geospatial(source, target, **kwargs):
 @castable.register(dt.INET, dt.INET)
 def can_cast_special_string(source, target, **kwargs):
     return True
-
-
-@dt.dtype.register((list, collections.abc.Set))
-def from_list(values: list[Any]) -> dt.Array:
-    if not values:
-        return dt.Array(dt.null)
-    return dt.Array(highest_precedence(map(dt.dtype, values)))
 
 
 public(castable=castable)

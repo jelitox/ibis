@@ -42,7 +42,7 @@ pyarrow = ">=2,<13"
 python-dateutil = ">=2.8.2,<3"
 pytz = ">=2022.7"
 rich = ">=12.4.4,<14"
-sqlglot = ">=10.4.3,<13"
+sqlglot = ">=10.4.3,<15"
 toolz = ">=0.11,<1"
 typing-extensions = ">=4.3.0,<5"
 black = { version = ">=22.1.0,<24", optional = true }
@@ -55,7 +55,7 @@ dask = { version = ">=2022.9.1", optional = true, extras = [
   "array",
   "dataframe",
 ] }
-datafusion = { version = ">=0.6,<24", optional = true }
+datafusion = { version = ">=0.6,<25", optional = true }
 db-dtypes = { version = ">=0.3,<2", optional = true }
 duckdb = { version = ">=0.3.3,<1", optional = true }
 duckdb-engine = { version = ">=0.1.8,<1", optional = true }
@@ -78,7 +78,7 @@ pyspark = { version = ">=3,<4", optional = true }
 # used to support posix regexen in the pandas, dask and sqlite backends
 regex = { version = ">=2021.7.6", optional = true }
 requests = { version = ">=2,<3", optional = true }
-shapely = { version = ">=1.6,<1.8|>=1.9,<3", optional = true }
+shapely = { version = ">=1.9,<3", optional = true }
 # include an explicit dependency on `snowflake-connector-python` because the
 # lack of lower bound on this dependency as specified in `snowflake-sqlalchemy`
 # appears to cause poetry's solver to get stuck
@@ -88,7 +88,7 @@ snowflake-connector-python = { version = ">=2.7.10,<4", optional = true }
 snowflake-sqlalchemy = { version = ">=1.4.1,<2", optional = true }
 sqlalchemy = { version = ">=1.4,<3", optional = true }
 sqlalchemy-views = { version = ">=0.3.1,<1", optional = true }
-trino = { version = ">=0.319,<1", optional = true, extras = ["sqlalchemy"] }
+trino = { version = ">=0.321,<1", optional = true, extras = ["sqlalchemy"] }
 
 [tool.poetry.group.dev.dependencies]
 black = ">=22.1.0,<24"
@@ -97,6 +97,7 @@ ipython = ">=8.7.0,<9"
 poetry-dynamic-versioning = ">=0.18.0,<1"
 pre-commit = ">=3.1,<4"
 ruff = ">=0.0.205,<1"
+pydeps = ">=1.12.7,<2"
 
 [tool.poetry.group.test.dependencies]
 black = ">=22.1.0,<24"
@@ -126,8 +127,8 @@ mkdocs-gen-files = ">=0.3.4,<0.6.0"
 mkdocs-git-revision-date-localized-plugin = ">=1.1.0,<2"
 mkdocs-jupyter = ">=0.24.1,<1"
 mkdocs-literate-nav = ">=0.4.1,<1"
-mkdocs-macros-plugin = ">=0.6.3,<1"
-mkdocs-material = ">=8.2.1,<9.1.12"
+mkdocs-macros-plugin = ">=0.6.3,<2"
+mkdocs-material = ">=8.2.1,<9.1.15"
 mkdocstrings = ">=0.19.1,<1"
 mkdocstrings-python = ">=0.8.3,<2"
 requests = ">=2,<3"
@@ -308,6 +309,8 @@ filterwarnings = [
   # this has no effect on ibis's output because we convert types after
   # execution
   "ignore:Datatype BOOL does not support CAST on MySQL/MariaDB; the cast will be skipped:sqlalchemy.exc.SAWarning",
+  # snowflake vendors an older version requests
+  "ignore:'urllib3\\.contrib\\.pyopenssl' module is deprecated and will be removed in a future release of urllib3:DeprecationWarning",
 ]
 empty_parameter_set_mark = "fail_at_collect"
 markers = [
@@ -344,6 +347,14 @@ markers = [
   "trino: Trino tests",
 ]
 
+[tool.pydeps]
+exclude = ["__future__", "collections", "os", "re", "sys"]
+verbose = 0
+pylib = false
+show_dot = false
+no_dot = true
+show_deps = true
+
 [tool.ruff]
 line-length = 88
 select = [
@@ -353,14 +364,13 @@ select = [
   "D",   # pydocstyle
   "E",   # pycodestyle
   "F",   # pyflakes
+  "FLY", # flynt (format string conversion)
   "I",   # isort
   "ICN", # flake8-import-conventions
+  "INP", # flake8-no-pep420 (implicit namespace packages)
   "ISC", # flake8-implicit-str-concat
   "PGH", # pygrep-hooks
-  "PLC", # pylint
-  "PLE", # pylint
-  "PLR", # pylint import style
-  "PLW", # pylint
+  "PL",  # pylint
   "RET", # flake8-return
   "RUF", # ruff-specific rules
   "SIM", # flake8-simplify
@@ -429,6 +439,8 @@ unfixable = [
 "*test*.py" = [
   "D", # ignore all docstring lints in tests
 ]
+"ci/*.py" = ["INP001"]
+"docs/*.py" = ["INP001"]
 "ci/release/verify_release.py" = ["T201"] # CLI tool that prints stuff
 "ibis/selectors.py" = ["UP007"]
 

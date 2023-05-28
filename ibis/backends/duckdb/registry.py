@@ -4,8 +4,10 @@ import operator
 from functools import partial
 from typing import Any, Mapping
 
+import duckdb
 import numpy as np
 import sqlalchemy as sa
+from packaging.version import parse as vparse
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.functions import GenericFunction
 from toolz.curried import flip
@@ -36,6 +38,8 @@ operation_registry = {
     op: operation_registry[op]
     for op in operation_registry.keys() - geospatial_functions.keys()
 }
+
+_SUPPORTS_MAPS = vparse(duckdb.__version__) >= vparse("0.8.0")
 
 
 def _round(t, op):
@@ -153,20 +157,13 @@ def _neg_idx_to_pos(array, idx):
 
 
 def _regex_extract(string, pattern, index):
-    result = sa.case(
-        (
-            sa.func.regexp_matches(string, pattern),
-            sa.func.regexp_extract(
-                string,
-                pattern,
-                # DuckDB requires the index to be a constant so we compile
-                # the value and inline it using sa.text
-                sa.text(str(index.compile(compile_kwargs=dict(literal_binds=True)))),
-            ),
-        ),
-        else_="",
+    return sa.func.regexp_extract(
+        string,
+        pattern,
+        # DuckDB requires the index to be a constant, so we compile
+        # the value and inline it by using sa.text
+        sa.text(str(index.compile(compile_kwargs=dict(literal_binds=True)))),
     )
-    return result
 
 
 def _json_get_item(left, path):
@@ -302,6 +299,24 @@ def _map_merge(t, op):
     )
 
 
+def _array_zip(t, op):
+    args = tuple(map(t.translate, op.arg))
+
+    i = sa.literal_column("i", type_=sa.INTEGER)
+    dtype = op.output_dtype
+    return array_map(
+        sa.func.range(1, sa.func.greatest(*map(sa.func.array_length, args)) + 1),
+        i,
+        struct_pack(
+            {
+                name: sa.func.list_extract(arg, i)
+                for name, arg in zip(dtype.value_type.names, args)
+            },
+            type=t.get_sqla_type(dtype),
+        ),
+    )
+
+
 operation_registry.update(
     {
         ops.ArrayColumn: (
@@ -342,6 +357,7 @@ operation_registry.update(
         ops.ArrayUnion: fixed_arity(
             lambda left, right: sa.func.list_distinct(sa.func.list_cat(left, right)), 2
         ),
+        ops.ArrayZip: _array_zip,
         ops.DayOfWeekName: unary(sa.func.dayname),
         ops.Literal: _literal,
         ops.Log2: unary(sa.func.log2),
@@ -414,9 +430,11 @@ operation_registry.update(
             lambda arg, key: sa.func.array_length(sa.func.element_at(arg, key)) != 0, 2
         ),
         ops.MapLength: unary(sa.func.cardinality),
-        ops.MapKeys: _map_keys,
-        ops.MapValues: _map_values,
-        ops.MapMerge: _map_merge,
+        ops.MapKeys: unary(sa.func.map_keys) if _SUPPORTS_MAPS else _map_keys,
+        ops.MapValues: unary(sa.func.map_values) if _SUPPORTS_MAPS else _map_values,
+        ops.MapMerge: (
+            fixed_arity(sa.func.map_concat, 2) if _SUPPORTS_MAPS else _map_merge
+        ),
         ops.Hash: unary(sa.func.hash),
         ops.Median: reduction(sa.func.median),
         ops.First: reduction(sa.func.first),

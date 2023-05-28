@@ -1,10 +1,12 @@
 import pandas as pd
 import pytest
 import sqlalchemy as sa
+from packaging.version import parse as vparse
 from pytest import param
 
 import ibis
 import ibis.expr.datatypes as dt
+from ibis import util
 
 pa = pytest.importorskip("pyarrow")
 
@@ -50,6 +52,7 @@ def test_table_to_pyarrow_batches(limit, awards_players):
     assert isinstance(batch, pa.RecordBatch)
     if limit is not None:
         assert len(batch) == limit
+    util.consume(batch_reader)
 
 
 @pytest.mark.notyet(
@@ -63,6 +66,7 @@ def test_column_to_pyarrow_batches(limit, awards_players):
     assert isinstance(batch, pa.RecordBatch)
     if limit is not None:
         assert len(batch) == limit
+    util.consume(batch_reader)
 
 
 @pytest.mark.parametrize("limit", limit_no_limit)
@@ -91,7 +95,6 @@ def test_empty_column_to_pyarrow(limit, awards_players):
     assert len(array) == 0
 
 
-@pytest.mark.notyet(["datafusion"], reason="DataFusion backend doesn't support sum")
 @pytest.mark.parametrize("limit", no_limit)
 def test_empty_scalar_to_pyarrow(limit, awards_players):
     expr = awards_players.filter(awards_players.awardID == "DEADBEEF").yearID.sum()
@@ -99,7 +102,6 @@ def test_empty_scalar_to_pyarrow(limit, awards_players):
     assert isinstance(array, pa.Scalar)
 
 
-@pytest.mark.notyet(["datafusion"], reason="DataFusion backend doesn't support sum")
 @pytest.mark.parametrize("limit", no_limit)
 def test_scalar_to_pyarrow_scalar(limit, awards_players):
     scalar = awards_players.yearID.sum().to_pyarrow(limit=limit)
@@ -107,10 +109,26 @@ def test_scalar_to_pyarrow_scalar(limit, awards_players):
 
 
 @pytest.mark.notimpl(["dask", "impala", "pyspark", "druid"])
-def test_table_to_pyarrow_table_schema(awards_players):
+def test_table_to_pyarrow_table_schema(con, awards_players):
     table = awards_players.to_pyarrow()
     assert isinstance(table, pa.Table)
-    assert table.schema == awards_players.schema().to_pyarrow()
+
+    string = (
+        pa.large_string()
+        if con.name == "duckdb" and vparse(con.version) >= vparse("0.8.0")
+        else pa.string()
+    )
+    expected_schema = pa.schema(
+        [
+            pa.field("playerID", string),
+            pa.field("awardID", string),
+            pa.field("yearID", pa.int64()),
+            pa.field("lgID", string),
+            pa.field("tie", string),
+            pa.field("notes", string),
+        ]
+    )
+    assert table.schema == expected_schema
 
 
 @pytest.mark.notimpl(["dask", "impala", "pyspark"])
@@ -118,7 +136,7 @@ def test_column_to_pyarrow_table_schema(awards_players):
     expr = awards_players.awardID
     array = expr.to_pyarrow()
     assert isinstance(array, (pa.ChunkedArray, pa.Array))
-    assert array.type == expr.type().to_pyarrow()
+    assert array.type == pa.string() or array.type == pa.large_string()
 
 
 @pytest.mark.notimpl(["pandas", "dask", "impala", "pyspark", "datafusion", "druid"])
@@ -133,6 +151,7 @@ def test_table_pyarrow_batch_chunk_size(awards_players):
     batch = batch_reader.read_next_batch()
     assert isinstance(batch, pa.RecordBatch)
     assert len(batch) <= 2048
+    util.consume(batch_reader)
 
 
 @pytest.mark.notimpl(["pandas", "dask", "impala", "pyspark", "datafusion"])
@@ -149,6 +168,7 @@ def test_column_pyarrow_batch_chunk_size(awards_players):
     batch = batch_reader.read_next_batch()
     assert isinstance(batch, pa.RecordBatch)
     assert len(batch) <= 2048
+    util.consume(batch_reader)
 
 
 @pytest.mark.notimpl(["pandas", "dask", "impala", "pyspark", "datafusion", "druid"])
@@ -165,6 +185,7 @@ def test_to_pyarrow_batches_borked_types(batting):
     batch = batch_reader.read_next_batch()
     assert isinstance(batch, pa.RecordBatch)
     assert len(batch) == 42
+    util.consume(batch_reader)
 
 
 @pytest.mark.notimpl(["dask", "datafusion", "impala", "pyspark"])
@@ -228,7 +249,8 @@ def test_roundtrip_partitioned_parquet(tmp_path, con, backend, awards_players):
     # Reingest and compare schema
     reingest = con.read_parquet(outparquet / "*" / "*")
 
-    assert reingest.schema() == awards_players.schema()
+    # avoid type comparison to appease duckdb: as of 0.8.0 it returns large_string
+    assert reingest.schema().names == awards_players.schema().names
 
     backend.assert_frame_equal(awards_players.execute(), awards_players.execute())
 

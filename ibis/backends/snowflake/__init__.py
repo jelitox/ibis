@@ -62,7 +62,11 @@ with _handle_pyarrow_warning(action="ignore"):
     )
     from snowflake.sqlalchemy import ARRAY, OBJECT, URL
 
-from ibis.backends.snowflake.datatypes import parse  # noqa: E402
+from ibis.backends.snowflake.datatypes import (  # noqa: E402
+    dtype_from_snowflake,
+    dtype_to_snowflake,
+    parse,
+)
 from ibis.backends.snowflake.registry import operation_registry  # noqa: E402
 
 
@@ -80,6 +84,9 @@ class SnowflakeExprTranslator(AlchemyExprTranslator):
     _quote_column_names = True
     _quote_table_names = True
     supports_unnest_in_select = False
+
+    get_sqla_type = staticmethod(dtype_to_snowflake)
+    get_ibis_type = staticmethod(dtype_from_snowflake)
 
 
 class SnowflakeCompiler(AlchemyCompiler):
@@ -109,6 +116,16 @@ _SNOWFLAKE_MAP_UDFS = {
         "inputs": {"ks": ARRAY, "vs": ARRAY},
         "returns": OBJECT,
         "source": "return Object.assign(...ks.map((k, i) => ({[k]: vs[i]})))",
+    },
+    "ibis_udfs.public.array_zip": {
+        "inputs": {"arrays": ARRAY},
+        "returns": ARRAY,
+        "source": """\
+const longest = arrays.reduce((a, b) => a.length > b.length ? a : b, []);
+const keys = Array.from(Array(arrays.length).keys()).map(key => `f${key + 1}`);
+return longest.map((_, i) => {
+    return Object.assign(...keys.map((key, j) => ({[key]: arrays[j][i]})));
+})""",
     },
 }
 
@@ -144,7 +161,7 @@ class Backend(BaseAlchemyBackend):
         )
         return_type = self._compile_sqla_type(defn["returns"])
         return f"""\
-CREATE FUNCTION IF NOT EXISTS {name}({signature})
+CREATE OR REPLACE FUNCTION {name}({signature})
 RETURNS {return_type}
 LANGUAGE JAVASCRIPT
 RETURNS NULL ON NULL INPUT
@@ -161,6 +178,28 @@ $$ {defn["source"]} $$"""
         connect_args: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ):
+        """Connect to Snowflake.
+
+        Parameters
+        ----------
+        user
+            Username
+        password
+            Password
+        account
+            A Snowflake organization ID and a Snowflake user ID, separated by a hyphen.
+            Note that a Snowflake user ID is a separate identifier from a username.
+            See https://ibis-project.org/backends/Snowflake/ for details
+        database
+            A Snowflake database and a Snowflake schema, separated by a `/`.
+            See https://ibis-project.org/backends/Snowflake/ for details
+        connect_args
+            Additional arguments passed to the SQLAlchemy engine creation call.
+        kwargs:
+            Additiional arguments passed to the SQLAlchemy URL constructor.
+            See https://docs.snowflake.com/en/developer-guide/python-connector/sqlalchemy#additional-connection-parameters
+            for more details
+        """
         dbparams = dict(zip(("database", "schema"), database.split("/", 1)))
         if dbparams.get("schema") is None:
             raise ValueError(
@@ -325,9 +364,12 @@ $$ {defn["source"]} $$"""
         if ident:
             with self.begin() as con:
                 con.exec_driver_sql(f"USE {ident}")
-        result = super()._get_sqla_table(
-            name, schema=schema, autoload=autoload, database=db, **kwargs
-        )
+        try:
+            result = super()._get_sqla_table(
+                name, schema=schema, autoload=autoload, database=db, **kwargs
+            )
+        except sa.exc.NoSuchTableError:
+            raise sa.exc.NoSuchTableError(name)
 
         with self.begin() as con:
             con.exec_driver_sql(f"USE {default_db}.{default_schema}")
@@ -355,7 +397,7 @@ $$ {defn["source"]} $$"""
     def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
         import pyarrow.parquet as pq
 
-        from ibis.backends.snowflake.datatypes import to_sqla_type
+        from ibis.backends.snowflake.datatypes import dtype_to_snowflake
 
         dialect = self.con.dialect
         quote = dialect.preparer(dialect).quote_identifier
@@ -394,7 +436,7 @@ $$ {defn["source"]} $$"""
                 schema = ", ".join(
                     "{name} {typ}".format(
                         name=quote(col),
-                        typ=sa.types.to_instance(to_sqla_type(dialect, typ)).compile(
+                        typ=sa.types.to_instance(dtype_to_snowflake(typ)).compile(
                             dialect=dialect
                         ),
                     )

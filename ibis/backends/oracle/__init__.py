@@ -25,13 +25,17 @@ from typing import TYPE_CHECKING, Any, Iterable  # noqa: E402
 
 import sqlalchemy as sa  # noqa: E402
 
-import ibis.backends.oracle.datatypes as odt  # noqa: E402
 import ibis.expr.datatypes as dt  # noqa: E402
 import ibis.expr.operations as ops  # noqa: E402
 from ibis.backends.base.sql.alchemy import (  # noqa: E402
     AlchemyCompiler,
     AlchemyExprTranslator,
     BaseAlchemyBackend,
+)
+from ibis.backends.oracle.datatypes import (  # noqa: E402
+    dtype_from_oracle,
+    dtype_to_oracle,
+    parse,
 )
 from ibis.backends.oracle.registry import operation_registry  # noqa: E402
 
@@ -59,6 +63,9 @@ class OracleExprTranslator(AlchemyExprTranslator):
 
     _quote_column_names = True
     _quote_table_names = True
+
+    get_sqla_type = staticmethod(dtype_to_oracle)
+    get_ibis_type = staticmethod(dtype_from_oracle)
 
 
 class OracleCompiler(AlchemyCompiler):
@@ -168,7 +175,7 @@ class Backend(BaseAlchemyBackend):
                 # TODO: how to disambiguate between int and float here without inspecting the value?
                 typ = dt.float
             else:
-                typ = odt.parse(type_code).copy(nullable=is_nullable)
+                typ = parse(type_code).copy(nullable=is_nullable)
             yield name, typ
 
     def _table_from_schema(
@@ -186,7 +193,8 @@ class Backend(BaseAlchemyBackend):
             atexit.register(self._clean_up_tmp_table, t)
         return t
 
-    def _clean_up_tmp_table(self, tmptable: sa.Table) -> None:
+    def _clean_up_tmp_table(self, name: str) -> None:
+        tmptable = self._get_sqla_table(name, autoload=False)
         with self.begin() as bind:
             # global temporary tables cannot be dropped without first truncating them
             #
@@ -200,4 +208,4 @@ class Backend(BaseAlchemyBackend):
                 tmptable.drop(bind=bind)
 
     def _clean_up_cached_table(self, op):
-        self._clean_up_tmp_table(op.sqla_table)
+        self._clean_up_tmp_table(op.name)

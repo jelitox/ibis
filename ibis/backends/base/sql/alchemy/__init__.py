@@ -15,13 +15,12 @@ from sqlalchemy.sql.expression import ClauseElement, Executable
 
 import ibis
 import ibis.common.exceptions as com
+import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis import util
 from ibis.backends.base.sql import BaseSQLBackend
-from ibis.backends.base.sql.alchemy.database import AlchemyDatabase, AlchemyTable
-from ibis.backends.base.sql.alchemy.datatypes import schema_from_table, to_sqla_type
 from ibis.backends.base.sql.alchemy.geospatial import geospatial_supported
 from ibis.backends.base.sql.alchemy.query_builder import AlchemyCompiler
 from ibis.backends.base.sql.alchemy.registry import (
@@ -42,16 +41,12 @@ from ibis.backends.base.sql.alchemy.translator import (
 if TYPE_CHECKING:
     import pandas as pd
 
-    import ibis.expr.datatypes as dt
 
 __all__ = (
     'BaseAlchemyBackend',
     'AlchemyExprTranslator',
     'AlchemyContext',
     'AlchemyCompiler',
-    'AlchemyTable',
-    'AlchemyDatabase',
-    'AlchemyContext',
     'sqlalchemy_operation_registry',
     'sqlalchemy_window_functions_registry',
     'reduction',
@@ -60,7 +55,6 @@ __all__ = (
     'unary',
     'infix_op',
     'get_sqla_table',
-    'to_sqla_type',
     'schema_from_table',
     'varargs',
 )
@@ -101,8 +95,6 @@ def _create_table_as(element, compiler, **kw):
 class BaseAlchemyBackend(BaseSQLBackend):
     """Backend class for backends that compile to SQLAlchemy expressions."""
 
-    database_class = AlchemyDatabase
-    table_class = AlchemyTable
     compiler = AlchemyCompiler
     supports_temporary_tables = True
     _temporary_prefix = "TEMPORARY"
@@ -127,12 +119,14 @@ class BaseAlchemyBackend(BaseSQLBackend):
 
     def do_connect(self, con: sa.engine.Engine) -> None:
         self.con = con
-        self._inspector = sa.inspect(self.con)
+        self._inspector = None
         self._schemas: dict[str, sch.Schema] = {}
         self._temp_views: set[str] = set()
 
     @property
     def version(self):
+        if self._inspector is None:
+            self._inspector = sa.inspect(self.con)
         return '.'.join(map(str, self.con.dialect.server_version_info))
 
     def list_tables(self, like=None, database=None):
@@ -147,7 +141,10 @@ class BaseAlchemyBackend(BaseSQLBackend):
 
     @property
     def inspector(self):
-        self._inspector.info_cache.clear()
+        if self._inspector is None:
+            self._inspector = sa.inspect(self.con)
+        else:
+            self._inspector.info_cache.clear()
         return self._inspector
 
     def _to_sql(self, expr: ir.Expr, **kwargs) -> str:
@@ -358,11 +355,10 @@ class BaseAlchemyBackend(BaseSQLBackend):
         return methodcaller("from_select", list(expr.columns), compiled)
 
     def _columns_from_schema(self, name: str, schema: sch.Schema) -> list[sa.Column]:
-        dialect = self.con.dialect
         return [
             sa.Column(
                 colname,
-                to_sqla_type(dialect, dtype),
+                self.compiler.translator_class.get_sqla_type(dtype),
                 nullable=dtype.nullable,
                 quote=self.compiler.translator_class._quote_column_names,
             )
@@ -460,8 +456,6 @@ class BaseAlchemyBackend(BaseSQLBackend):
     def _get_sqla_table(
         self, name: str, schema: str | None = None, autoload: bool = True, **_: Any
     ) -> sa.Table:
-        # If the underlying table (or more likely, view) has changed, remove it
-        # to ensure a correct reflection
         meta = self._new_sa_metadata()
         with warnings.catch_warnings():
             warnings.filterwarnings(
@@ -481,6 +475,42 @@ class BaseAlchemyBackend(BaseSQLBackend):
             if not nulltype_cols:
                 return table
             return self._handle_failed_column_type_inference(table, nulltype_cols)
+
+    # TODO(kszucs): remove the schema parameter
+    @classmethod
+    def _schema_from_sqla_table(
+        cls,
+        table: sa.sql.TableClause,
+        schema: sch.Schema | None = None,
+    ) -> sch.Schema:
+        """Retrieve an ibis schema from a SQLAlchemy `Table`.
+
+        Parameters
+        ----------
+        table
+            Table whose schema to infer
+        schema
+            Predefined ibis schema to pull types from
+        dialect
+            Optional sqlalchemy dialect
+
+        Returns
+        -------
+        schema
+            An ibis schema corresponding to the types of the columns in `table`.
+        """
+        schema = schema if schema is not None else {}
+        pairs = []
+        for column in table.columns:
+            name = column.name
+            if name in schema:
+                dtype = schema[name]
+            else:
+                dtype = cls.compiler.translator_class.get_ibis_type(
+                    column.type, nullable=column.nullable
+                )
+            pairs.append((name, dtype))
+        return sch.schema(pairs)
 
     def _handle_failed_column_type_inference(
         self, table: sa.Table, nulltype_cols: Iterable[str]
@@ -505,23 +535,13 @@ class BaseAlchemyBackend(BaseSQLBackend):
                 table.append_column(
                     sa.Column(
                         colname,
-                        to_sqla_type(dialect, type),
+                        self.compiler.translator_class.get_sqla_type(type),
                         nullable=type.nullable,
                         quote=self.compiler.translator_class._quote_column_names,
                     ),
                     replace_existing=True,
                 )
         return table
-
-    def _sqla_table_to_expr(self, table: sa.Table) -> ir.Table:
-        schema = self._schemas.get(table.name)
-        node = self.table_class(
-            source=self,
-            sqla_table=table,
-            name=table.name,
-            schema=schema,
-        )
-        return self.table_expr_class(node)
 
     def raw_sql(self, query) -> None:
         """Execute a query string.
@@ -564,6 +584,7 @@ class BaseAlchemyBackend(BaseSQLBackend):
         Table
             Table expression
         """
+        namespace = schema
         if database is not None:
             if not isinstance(database, str):
                 raise com.IbisTypeError(
@@ -571,8 +592,16 @@ class BaseAlchemyBackend(BaseSQLBackend):
                 )
             if database != self.current_database:
                 return self.database(name=database).table(name=name, schema=schema)
-        sqla_table = self._get_sqla_table(name, database=database, schema=schema)
-        return self._sqla_table_to_expr(sqla_table)
+
+        sqla_table = self._get_sqla_table(name, schema=schema)
+
+        schema = self._schema_from_sqla_table(
+            sqla_table, schema=self._schemas.get(name)
+        )
+        node = ops.DatabaseTable(
+            name=name, schema=schema, source=self, namespace=namespace
+        )
+        return node.to_expr()
 
     def _insert_dataframe(
         self, table_name: str, df: pd.DataFrame, overwrite: bool

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import calendar
+import contextlib
 import functools
 from functools import partial
 from operator import add, mul, sub
@@ -280,15 +281,16 @@ def _substring(op, **kw):
 
 @translate_val.register(ops.StringFind)
 def _string_find(op, **kw):
-    if op.start is not None:
-        raise com.UnsupportedOperationError(
-            "String find doesn't support start argument"
-        )
     if op.end is not None:
         raise com.UnsupportedOperationError("String find doesn't support end argument")
 
     arg = translate_val(op.arg, **kw)
     substr = translate_val(op.substr, **kw)
+
+    if op.start is not None:
+        op_start = translate_val(op.start)
+        return f"locate({arg}, {substr}, {op_start}) - 1"
+
     return f"locate({arg}, {substr}) - 1"
 
 
@@ -302,26 +304,18 @@ def _regex_search(op, **kw):
 @translate_val.register(ops.RegexExtract)
 def _regex_extract(op, **kw):
     arg = translate_val(op.arg, **kw)
-    pattern = translate_val(op.pattern, **kw)
-    index = "Null" if op.index is None else translate_val(op.index, **kw)
-
-    # arg can be Nullable, which is not allowed in extractAll, so cast to non
-    # nullable type
     arg = f"CAST({arg} AS String)"
 
-    # extract all matches in pattern
-    extracted = f"CAST(extractAll({arg}, {pattern}) AS Array(Nullable(String)))"
+    wrapped_op_pattern = op.pattern.copy(value="(" + op.pattern.value + ")")
+    pattern = translate_val(wrapped_op_pattern, **kw)
 
-    # if there's a match
-    #   if the index IS zero or null
-    #     return the full string
-    #   else
-    #     return the Nth match group
-    # else
-    #   return null
-    does_match = f"multiMatchAny({arg}, [{pattern}])"
-    idx = f"CAST(nullIf({index}, 0) AS Nullable(Int64))"
-    then = f"if({idx} IS NULL, {arg}, {extracted}[{idx}])"
+    then = f"extractGroups({arg}, {pattern})[1]"
+    if op.index is not None:
+        index = translate_val(op.index, **kw)
+        then = f"extractGroups({arg}, {pattern})[{index} + 1]"
+
+    does_match = f"notEmpty({then})"
+
     return f"if({does_match}, {then}, NULL)"
 
 
@@ -454,7 +448,7 @@ def _literal(op, **kw):
             type_name = 'Decimal128'
         else:
             type_name = 'Decimal256'
-        return f"to{type_name}({str(value)}, {dtype.scale})"
+        return f"to{type_name}({value!s}, {dtype.scale})"
     elif dtype.is_numeric():
         return repr(value)
     elif dtype.is_interval():
@@ -475,41 +469,36 @@ def _literal(op, **kw):
         elif micros // 1000:
             args.append(3)
 
-        if (timezone := op.output_dtype.timezone) is not None:
+        if (timezone := dtype.timezone) is not None:
             args.append(timezone)
 
         joined_args = ", ".join(map(repr, args))
         return f"{func}({joined_args})"
 
-    elif isinstance(op.output_dtype, dt.Date):
+    elif dtype.is_date():
         formatted = value.strftime('%Y-%m-%d')
         return f"toDate('{formatted}')"
-    elif isinstance(op.output_dtype, dt.Array):
-        values = ", ".join(_array_literal_values(op))
+    elif dtype.is_array():
+        value_type = dtype.value_type
+        values = ", ".join(
+            _literal(ops.Literal(v, dtype=value_type), **kw) for v in value
+        )
         return f"[{values}]"
-    elif isinstance(op.output_dtype, dt.Map):
-        values = ", ".join(_map_literal_values(op))
+    elif dtype.is_map():
+        value_type = dtype.value_type
+        values = ", ".join(
+            f"{k!r}, {_literal(ops.Literal(v, dtype=value_type), **kw)}"
+            for k, v in value.items()
+        )
         return f"map({values})"
-    elif isinstance(op.output_dtype, dt.Struct):
-        fields = ", ".join(f"{value} as `{key}`" for key, value in op.value.items())
+    elif dtype.is_struct():
+        fields = ", ".join(
+            _literal(ops.Literal(v, dtype=subdtype), **kw)
+            for subdtype, v in zip(dtype.types, value.values())
+        )
         return f"tuple({fields})"
     else:
         raise NotImplementedError(f'Unsupported type: {dtype!r}')
-
-
-def _array_literal_values(op):
-    value_type = op.output_dtype.value_type
-    for v in op.value:
-        value = ops.Literal(v, dtype=value_type)
-        yield _literal(value)
-
-
-def _map_literal_values(op):
-    value_type = op.output_dtype.value_type
-    for k, v in op.value.items():
-        value = ops.Literal(v, dtype=value_type)
-        yield repr(k)
-        yield _literal(value)
 
 
 def _sql(obj, dialect="clickhouse"):
@@ -763,7 +752,7 @@ def _clip(op, **kw):
 def _struct_field(op, **kw):
     arg = op.arg
     arg_dtype = arg.output_dtype
-    arg = translate_val(op.arg, **kw)
+    arg = translate_val(op.arg, render_aliases=False, **kw)
     idx = arg_dtype.names.index(op.field)
     typ = arg_dtype.types[idx]
     return f"CAST({arg}.{idx + 1} AS {serialize(typ)})"
@@ -1301,39 +1290,39 @@ def _rank(_, **kw):
 
 @translate_val.register(ops.ExtractProtocol)
 def _extract_protocol(op, **kw):
-    arg = translate_val(op.arg, **kw)
+    arg = translate_val(op.arg, render_aliases=False, **kw)
     return f"nullIf(protocol({arg}), '')"
 
 
 @translate_val.register(ops.ExtractAuthority)
 def _extract_authority(op, **kw):
-    arg = translate_val(op.arg, **kw)
+    arg = translate_val(op.arg, render_aliases=False, **kw)
     return f"nullIf(netloc({arg}), '')"
 
 
 @translate_val.register(ops.ExtractHost)
 def _extract_host(op, **kw):
-    arg = translate_val(op.arg, **kw)
+    arg = translate_val(op.arg, render_aliases=False, **kw)
     return f"nullIf(domain({arg}), '')"
 
 
 @translate_val.register(ops.ExtractFile)
 def _extract_file(op, **kw):
-    arg = translate_val(op.arg, **kw)
+    arg = translate_val(op.arg, render_aliases=False, **kw)
     return f"nullIf(cutFragment(pathFull({arg})), '')"
 
 
 @translate_val.register(ops.ExtractPath)
 def _extract_path(op, **kw):
-    arg = translate_val(op.arg, **kw)
+    arg = translate_val(op.arg, render_aliases=False, **kw)
     return f"nullIf(path({arg}), '')"
 
 
 @translate_val.register(ops.ExtractQuery)
 def _extract_query(op, **kw):
-    arg = translate_val(op.arg, **kw)
+    arg = translate_val(op.arg, render_aliases=False, **kw)
     if (key := op.key) is not None:
-        key = translate_val(key, **kw)
+        key = translate_val(key, render_aliases=False, **kw)
         return f"nullIf(extractURLParameter({arg}, {key}), '')"
     else:
         return f"nullIf(queryString({arg}), '')"
@@ -1341,7 +1330,7 @@ def _extract_query(op, **kw):
 
 @translate_val.register(ops.ExtractFragment)
 def _extract_fragment(op, **kw):
-    arg = translate_val(op.arg, **kw)
+    arg = translate_val(op.arg, render_aliases=False, **kw)
     return f"nullIf(fragment({arg}), '')"
 
 
@@ -1386,3 +1375,14 @@ def _array_remove(op, **kw):
 @translate_val.register(ops.ArrayUnion)
 def _array_union(op, **kw):
     return translate_val(ops.ArrayDistinct(ops.ArrayConcat(op.left, op.right)), **kw)
+
+
+@translate_val.register(ops.ArrayZip)
+def _array_zip(op: ops.ArrayZip, **kw: Any) -> str:
+    arglist = []
+    for arg in op.arg:
+        sql_arg = translate_val(arg, **kw)
+        with contextlib.suppress(AttributeError):
+            sql_arg = sql_arg.sql(dialect="clickhouse")
+        arglist.append(sql_arg)
+    return f"arrayZip({', '.join(arglist)})"

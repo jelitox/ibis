@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 
 import pyspark
 import sqlalchemy as sa
+import sqlglot as sg
 from pyspark import SparkConf
 from pyspark.sql import DataFrame, SparkSession
 
@@ -25,8 +26,9 @@ from ibis.backends.base.sql.ddl import (
     is_fully_qualified,
 )
 from ibis.backends.pyspark import ddl
-from ibis.backends.pyspark.client import PySparkTable, spark_dataframe_schema
-from ibis.backends.pyspark.compiler import PySparkDatabaseTable, PySparkExprTranslator
+from ibis.backends.pyspark.client import PySparkTable
+from ibis.backends.pyspark.compiler import PySparkExprTranslator
+from ibis.backends.pyspark.datatypes import dtype_from_pyspark
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -107,8 +109,6 @@ class PySparkCompiler(Compiler):
 class Backend(BaseSQLBackend):
     compiler = PySparkCompiler
     name = 'pyspark'
-    table_class = PySparkDatabaseTable
-    table_expr_class = PySparkTable
 
     class Options(ibis.config.Config):
         """PySpark options.
@@ -226,13 +226,11 @@ class Backend(BaseSQLBackend):
         else:
             raise com.IbisError(f"Cannot execute expression of type: {type(expr)}")
 
-    @staticmethod
-    def _fully_qualified_name(name, database):
+    def _fully_qualified_name(self, name, database):
         if is_fully_qualified(name):
             return name
-        if database:
-            return f'{database}.`{name}`'
-        return name
+
+        return sg.table(name, db=database, quoted=True).sql(dialect="spark")
 
     def close(self):
         """Close Spark connection and drop any temporary objects."""
@@ -247,16 +245,19 @@ class Backend(BaseSQLBackend):
         return _PySparkCursor(query)
 
     def _get_schema_using_query(self, query):
-        cur = self.raw_sql(f"SELECT * FROM ({query}) t0 LIMIT 0")
-        return spark_dataframe_schema(cur.query)
+        cursor = self.raw_sql(f"SELECT * FROM ({query}) t0 LIMIT 0")
+        struct = dtype_from_pyspark(cursor.query.schema)
+        return sch.Schema(struct)
 
     def _get_jtable(self, name, database=None):
+        get_table = self._catalog._jcatalog.getTable
         try:
-            jtable = self._catalog._jcatalog.getTable(
-                self._fully_qualified_name(name, database)
-            )
-        except pyspark.sql.utils.AnalysisException as e:
-            raise com.IbisInputError(str(e)) from e
+            jtable = get_table(self._fully_qualified_name(name, database))
+        except pyspark.sql.utils.AnalysisException as e1:
+            try:
+                jtable = get_table(self._fully_qualified_name(name, database=None))
+            except pyspark.sql.utils.AnalysisException as e2:
+                raise com.IbisInputError(str(e2)) from e1
         return jtable
 
     def table(self, name: str, database: str | None = None) -> ir.Table:
@@ -280,8 +281,8 @@ class Backend(BaseSQLBackend):
         qualified_name = self._fully_qualified_name(name, database)
 
         schema = self.get_schema(qualified_name)
-        node = self.table_class(qualified_name, schema, self)
-        return self.table_expr_class(node)
+        node = ops.DatabaseTable(name, schema, self, namespace=database)
+        return PySparkTable(node)
 
     def create_database(
         self,
@@ -343,8 +344,8 @@ class Backend(BaseSQLBackend):
             )
 
         df = self._session.table(table_name)
-
-        return sch.infer(df)
+        struct = dtype_from_pyspark(df.schema)
+        return sch.Schema(struct)
 
     def create_table(
         self,

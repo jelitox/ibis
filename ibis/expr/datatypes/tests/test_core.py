@@ -10,6 +10,7 @@ from typing import Dict, List, NamedTuple, Tuple
 import pytest
 
 import ibis.expr.datatypes as dt
+from ibis.common.temporal import TimestampUnit
 
 
 def test_validate_type():
@@ -26,8 +27,6 @@ def test_validate_type():
             'map<int64, array<map<string, int8>>>',
             dt.Map(dt.int64, dt.Array(dt.Map(dt.string, dt.int8))),
         ),
-        ([dt.uint8], dt.Array(dt.uint8)),
-        ([dt.float32, dt.float64], dt.Array(dt.float64)),
     ]
     + [
         (f"{cls.__name__.lower()}{suffix}", expected)
@@ -97,7 +96,6 @@ class FooStruct:
     ob: dt.Timestamp('UTC', 6)
     p: dt.interval
     pa: dt.Interval('s')
-    pb: dt.Interval('s', dt.int16)
     q: dt.decimal
     qa: dt.Decimal(12, 2)
     r: dt.Array(dt.int16)
@@ -124,7 +122,6 @@ class BarStruct:
     ob: dt.Timestamp['UTC', 6]  # noqa: F821
     p: dt.Interval
     pa: dt.Interval['s']
-    pb: dt.Interval['s', dt.Int16]
     q: dt.Decimal
     qa: dt.Decimal[12, 2]
     r: dt.Array[dt.Int16]
@@ -152,7 +149,6 @@ baz_struct = dt.Struct(
         'ob': dt.Timestamp('UTC', 6),
         'p': dt.interval,
         'pa': dt.Interval('s'),
-        'pb': dt.Interval('s', dt.int16),
         'q': dt.decimal,
         'qa': dt.Decimal(12, 2),
         'r': dt.Array(dt.int16),
@@ -287,7 +283,6 @@ class FooDataClass:
         (dt.Timestamp['UTC'], dt.Timestamp(timezone='UTC')),
         (dt.Timestamp['UTC', 6], dt.Timestamp(timezone='UTC', scale=6)),
         (dt.Interval['s'], dt.Interval('s')),
-        (dt.Interval['s', dt.Int16], dt.Interval('s', dt.Int16())),
         (dt.Decimal[12, 2], dt.Decimal(12, 2)),
         (
             dt.Struct['a' : dt.Int16, 'b' : dt.Int32],
@@ -499,6 +494,30 @@ def test_timestamp_with_scale(scale, tz):
 @pytest.mark.parametrize("scale", range(10))
 def test_timestamp_with_scale_no_tz(scale):
     assert dt.parse(f"timestamp({scale:d})") == dt.Timestamp(scale=scale)
+
+
+def test_timestamp_unit():
+    assert dt.Timestamp().unit == TimestampUnit.SECOND
+    assert dt.Timestamp(scale=0).unit == TimestampUnit.SECOND
+    for scale in range(1, 3):
+        assert dt.Timestamp(scale=scale).unit == TimestampUnit.MILLISECOND
+    for scale in range(4, 7):
+        assert dt.Timestamp(scale=scale).unit == TimestampUnit.MICROSECOND
+    for scale in range(7, 10):
+        assert dt.Timestamp(scale=scale).unit == TimestampUnit.NANOSECOND
+
+
+def test_timestamp_from_unit():
+    assert dt.Timestamp.from_unit('s') == dt.Timestamp(scale=0)
+    assert dt.Timestamp.from_unit('ms', timezone='UTC') == dt.Timestamp(
+        scale=3, timezone='UTC'
+    )
+    assert dt.Timestamp.from_unit('us', nullable=True) == dt.Timestamp(
+        scale=6, nullable=True
+    )
+    assert dt.Timestamp.from_unit('ns', timezone='UTC', nullable=False) == dt.Timestamp(
+        scale=9, timezone='UTC', nullable=False
+    )
 
 
 def get_leaf_classes(op):

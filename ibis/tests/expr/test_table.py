@@ -545,9 +545,7 @@ def test_slice(table):
 def test_table_count(table):
     result = table.count()
     assert isinstance(result, ir.IntegerScalar)
-    assert isinstance(result.op(), ops.Alias)
-    assert isinstance(result.op().arg, ops.CountStar)
-    assert result.get_name() == 'count'
+    assert isinstance(result.op(), ops.CountStar)
 
 
 def test_len_raises_expression_error(table):
@@ -857,9 +855,9 @@ def test_equijoin_schema_merge():
     pred = table1['key1'] == table2['key2']
     join_types = ['inner_join', 'left_join', 'outer_join']
 
-    ex_schema = sch.schema(
-        ['key1', 'value1', 'key2', 'stuff'],
-        ['string', 'double', 'string', 'int32'],
+    ex_schema = ibis.schema(
+        names=['key1', 'value1', 'key2', 'stuff'],
+        types=['string', 'double', 'string', 'int32'],
     )
 
     for fname in join_types:
@@ -1449,6 +1447,13 @@ def test_group_by_key_function():
     assert expr.columns == ['new_key', 'foo']
 
 
+def test_group_by_no_keys():
+    t = ibis.table([('a', 'timestamp'), ('b', 'string'), ('c', 'double')])
+
+    with pytest.raises(com.IbisInputError):
+        t.group_by(s.startswith("x")).aggregate(foo=t.c.mean())
+
+
 def test_unbound_table_name():
     t = ibis.table([('a', 'timestamp')])
     name = t.op().name
@@ -1590,6 +1595,18 @@ def test_join_lname_rname(how):
 
     expr = method(right, rname="right_{name}", lname="left_{name}")
     assert expr.columns == ["left_id", "first_name", "right_id", "last_name"]
+
+
+def test_join_lname_rname_still_collide():
+    t1 = ibis.table({"id": "int64", "col1": "int64", "col2": "int64"})
+    t2 = ibis.table({"id": "int64", "col1": "int64", "col2": "int64"})
+    t3 = ibis.table({"id": "int64", "col1": "int64", "col2": "int64"})
+
+    with pytest.raises(com.IntegrityError) as rec:
+        t1.left_join(t2, "id").left_join(t3, "id")
+
+    assert "`['col1_right', 'col2_right', 'id_right']`" in str(rec.value)
+    assert "`lname='', rname='{name}_right'`" in str(rec.value)
 
 
 def test_drop():
@@ -1802,3 +1819,9 @@ def test_invalid_keep_distinct():
     t = ibis.table(dict(a="int", b="string"), name="t")
     with pytest.raises(com.IbisError, match="Invalid value for `keep`:"):
         t.distinct(on="a", keep="invalid")
+
+
+def test_invalid_distinct_empty_key():
+    t = ibis.table(dict(a="int", b="string"), name="t")
+    with pytest.raises(com.IbisInputError):
+        t.distinct(on="c", keep="first")

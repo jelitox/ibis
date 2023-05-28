@@ -14,8 +14,7 @@ from packaging.version import parse as vparse
 import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-import ibis.expr.schema as sch
-from ibis.backends.polars.datatypes import to_polars_type
+from ibis.backends.polars.datatypes import dtype_to_polars, schema_from_polars
 
 
 def _assert_literal(op):
@@ -45,12 +44,13 @@ def table(op):
 @translate.register(ops.InMemoryTable)
 def pandas_in_memory_table(op):
     lf = pl.from_pandas(op.data.to_frame()).lazy()
+    schema = schema_from_polars(lf.schema)
 
     columns = []
-    for name, current_dtype in sch.infer(lf).items():
+    for name, current_dtype in schema.items():
         desired_dtype = op.schema[name]
         if current_dtype != desired_dtype:
-            typ = to_polars_type(desired_dtype)
+            typ = dtype_to_polars(desired_dtype)
             columns.append(pl.col(name).cast(typ))
 
     if columns:
@@ -77,7 +77,7 @@ def literal(op):
 
     if dtype.is_array():
         value = pl.Series("", value)
-        typ = to_polars_type(dtype)
+        typ = dtype_to_polars(dtype)
         val = pl.lit(value, dtype=typ)
         try:
             return val.implode()
@@ -85,7 +85,8 @@ def literal(op):
             return val.list()  # pragma: no cover
     elif dtype.is_struct():
         values = [
-            pl.lit(v, dtype=to_polars_type(dtype[k])).alias(k) for k, v in value.items()
+            pl.lit(v, dtype=dtype_to_polars(dtype[k])).alias(k)
+            for k, v in value.items()
         ]
         return pl.struct(values)
     elif dtype.is_interval():
@@ -95,7 +96,7 @@ def literal(op):
     elif dtype.is_binary():
         raise NotImplementedError(f"Unsupported type: {dtype!r}")
     else:
-        typ = to_polars_type(dtype)
+        typ = dtype_to_polars(dtype)
         return pl.lit(op.value, dtype=typ)
 
 
@@ -141,7 +142,7 @@ def cast(op):
                 return arg.dt.truncate("1s")
             return arg
 
-    typ = to_polars_type(to)
+    typ = dtype_to_polars(to)
     return arg.cast(typ)
 
 
@@ -416,7 +417,7 @@ _string_unary = {
 @translate.register(ops.StringLength)
 def string_length(op):
     arg = translate(op.arg)
-    typ = to_polars_type(op.output_dtype)
+    typ = dtype_to_polars(op.output_dtype)
     return arg.str.lengths().cast(typ)
 
 
@@ -553,7 +554,7 @@ def str_right(op):
 @translate.register(ops.Round)
 def round(op):
     arg = translate(op.arg)
-    typ = to_polars_type(op.output_dtype)
+    typ = dtype_to_polars(op.output_dtype)
     if op.digits is not None:
         _assert_literal(op.digits)
         digits = op.digits.value
@@ -609,7 +610,7 @@ def repeat(op):
 @translate.register(ops.Sign)
 def sign(op):
     arg = translate(op.arg)
-    typ = to_polars_type(op.output_dtype)
+    typ = dtype_to_polars(op.output_dtype)
     return arg.sign().cast(typ)
 
 
@@ -645,6 +646,8 @@ _reductions = {
     ops.Median: 'median',
     ops.First: 'first',
     ops.Last: 'last',
+    ops.All: 'all',
+    ops.Any: 'any',
 }
 
 for reduction in _reductions.keys():
@@ -665,6 +668,23 @@ def mode(op):
     if (where := op.where) is not None:
         arg = arg.filter(translate(where))
     return arg.mode().min()
+
+
+@translate.register(ops.Correlation)
+def correlation(op):
+    x = op.left
+    if (x_type := x.output_dtype).is_boolean():
+        x = ops.Cast(x, dt.Int32(nullable=x_type.nullable))
+
+    y = op.right
+    if (y_type := y.output_dtype).is_boolean():
+        y = ops.Cast(y, dt.Int32(nullable=y_type.nullable))
+
+    if (where := op.where) is not None:
+        x = ops.Where(where, x, None)
+        y = ops.Where(where, y, None)
+
+    return pl.corr(translate(x), translate(y))
 
 
 @translate.register(ops.Distinct)
@@ -962,7 +982,7 @@ def bitwise_binops(op):
     else:
         result = pl.map([left, right], lambda cols: ufunc(cols[0], cols[1]))
 
-    return result.cast(to_polars_type(op.output_dtype))
+    return result.cast(dtype_to_polars(op.output_dtype))
 
 
 @translate.register(ops.BitwiseNot)
@@ -998,7 +1018,7 @@ def binop(op):
 @translate.register(ops.ElementWiseVectorizedUDF)
 def elementwise_udf(op):
     func_args = list(map(translate, op.func_args))
-    return_type = to_polars_type(op.return_type)
+    return_type = dtype_to_polars(op.return_type)
 
     return pl.map(func_args, lambda args: op.func(*args), return_dtype=return_type)
 
@@ -1032,3 +1052,48 @@ def execute_union(op, **kwargs):
 @translate.register(ops.Hash)
 def execute_hash(op, **kwargs):
     return translate(op.arg).hash()
+
+
+@translate.register(ops.NotAll)
+def execute_not_all(op, **kwargs):
+    arg = op.arg
+    if (op_where := op.where) is not None:
+        arg = ops.Where(op_where, arg, None)
+
+    return translate(arg).all().is_not()
+
+
+@translate.register(ops.NotAny)
+def execute_not_any(op, **kwargs):
+    arg = op.arg
+    if (op_where := op.where) is not None:
+        arg = ops.Where(op_where, arg, None)
+
+    return translate(arg).any().is_not()
+
+
+def _arg_min_max(op, func, **kwargs):
+    key = op.key
+    arg = op.arg
+
+    if (op_where := op.where) is not None:
+        key = ops.Where(op_where, key, None)
+        arg = ops.Where(op_where, arg, None)
+
+    translate_arg = translate(arg)
+    translate_key = translate(key)
+
+    not_null_mask = translate_arg.is_not_null() & translate_key.is_not_null()
+    return translate_arg.filter(not_null_mask).take(
+        func(translate_key.filter(not_null_mask))
+    )
+
+
+@translate.register(ops.ArgMax)
+def execute_arg_max(op, **kwargs):
+    return _arg_min_max(op, pl.Expr.arg_max, **kwargs)
+
+
+@translate.register(ops.ArgMin)
+def execute_arg_min(op, **kwargs):
+    return _arg_min_max(op, pl.Expr.arg_min, **kwargs)

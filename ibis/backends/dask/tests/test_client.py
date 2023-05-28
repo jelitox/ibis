@@ -8,7 +8,7 @@ from dask.dataframe.utils import tm
 from pytest import param
 
 import ibis
-from ibis.backends.dask.client import DaskTable
+import ibis.expr.operations as ops
 
 
 def make_dask_data_frame(npartitions):
@@ -43,12 +43,7 @@ def test_connect_no_args():
 
 
 def test_client_table(table):
-    assert isinstance(table.op(), ibis.expr.operations.DatabaseTable)
-    assert isinstance(table.op(), DaskTable)
-
-
-def test_client_table_repr(table):
-    assert 'DaskTable' in repr(table)
+    assert isinstance(table.op(), ops.DatabaseTable)
 
 
 def test_create_table(client, npartitions):
