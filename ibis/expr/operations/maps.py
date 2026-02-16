@@ -1,3 +1,5 @@
+"""Operations for working with maps."""
+
 from __future__ import annotations
 
 from public import public
@@ -6,79 +8,93 @@ import ibis.expr.datatypes as dt
 import ibis.expr.rules as rlz
 from ibis.common.annotations import attribute
 from ibis.expr.operations.core import Unary, Value
-from ibis.expr.types.generic import null
 
 
 @public
 class Map(Value):
-    keys = rlz.array
-    values = rlz.array
+    """Construct a map."""
 
-    output_shape = rlz.shape_like("args")
+    keys: Value[dt.Array]
+    values: Value[dt.Array]
 
-    @attribute.default
-    def output_dtype(self):
+    shape = rlz.shape_like("args")
+
+    @attribute
+    def dtype(self):
         return dt.Map(
-            self.keys.output_dtype.value_type,
-            self.values.output_dtype.value_type,
+            self.keys.dtype.value_type,
+            self.values.dtype.value_type,
         )
 
 
 @public
 class MapLength(Unary):
-    arg = rlz.mapping
-    output_dtype = dt.int64
+    """Compute the number of unique keys in a map."""
+
+    arg: Value[dt.Map]
+    dtype = dt.int64
 
 
 @public
 class MapGet(Value):
-    arg = rlz.mapping
-    key = rlz.one_of([rlz.string, rlz.integer])
-    default = rlz.optional(rlz.any, default=null())
+    """Get a value from a map by key."""
 
-    output_shape = rlz.shape_like("args")
+    arg: Value[dt.Map]
+    key: Value
+    default: Value = None
 
-    @attribute.default
-    def output_dtype(self):
-        return dt.higher_precedence(
-            self.default.output_dtype, self.arg.output_dtype.value_type
-        )
+    shape = rlz.shape_like("args")
+
+    @attribute
+    def dtype(self):
+        return dt.higher_precedence(self.default.dtype, self.arg.dtype.value_type)
 
 
 @public
 class MapContains(Value):
-    arg = rlz.mapping
-    key = rlz.one_of([rlz.string, rlz.integer])
+    """Check if a map contains a key."""
 
-    output_shape = rlz.shape_like("args")
-    output_dtype = dt.bool
+    arg: Value[dt.Map]
+    key: Value
+
+    shape = rlz.shape_like("args")
+    dtype = dt.bool
 
 
 @public
 class MapKeys(Unary):
-    arg = rlz.mapping
+    """Get the keys of a map as an array."""
 
-    @attribute.default
-    def output_dtype(self):
-        return dt.Array(self.arg.output_dtype.key_type)
+    arg: Value[dt.Map]
+
+    @attribute
+    def dtype(self):
+        return dt.Array(self.arg.dtype.key_type)
 
 
 @public
 class MapValues(Unary):
-    arg = rlz.mapping
+    """Get the values of a map as an array."""
 
-    @attribute.default
-    def output_dtype(self):
-        return dt.Array(self.arg.output_dtype.value_type)
+    arg: Value[dt.Map]
+
+    @attribute
+    def dtype(self):
+        return dt.Array(self.arg.dtype.value_type)
 
 
 @public
 class MapMerge(Value):
-    left = rlz.mapping
-    right = rlz.mapping
+    """Combine two maps into one.
 
-    output_shape = rlz.shape_like("args")
-    output_dtype = rlz.dtype_like("args")
+    If a key is present in both maps, the value from the first is kept.
+    """
+
+    left: Value[dt.Map]
+    right: Value[dt.Map]
+
+    shape = rlz.shape_like("args")
+    dtype = rlz.dtype_like("args")
 
 
 public(MapValueForKey=MapGet, MapValueOrDefaultForKey=MapGet, MapConcat=MapMerge)

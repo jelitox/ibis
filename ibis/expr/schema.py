@@ -1,58 +1,43 @@
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping
-from typing import TYPE_CHECKING, Any
-
-from multipledispatch import Dispatcher
+from typing import TYPE_CHECKING, Any, Union
 
 import ibis.expr.datatypes as dt
 from ibis.common.annotations import attribute
-from ibis.common.collections import FrozenDict, MapSet
+from ibis.common.collections import FrozenOrderedDict, MapSet
 from ibis.common.dispatch import lazy_singledispatch
 from ibis.common.exceptions import InputTypeError, IntegrityError
 from ibis.common.grounds import Concrete
-from ibis.common.validators import Coercible
-from ibis.util import indent
+from ibis.common.patterns import Coercible
+from ibis.util import deprecated, indent
 
 if TYPE_CHECKING:
-    import pandas as pd
+    from typing import TypeAlias
 
-convert = Dispatcher(
-    'convert',
-    doc="""\
-Convert `column` to the pandas dtype corresponding to `out_dtype`, where the
-dtype of `column` is `in_dtype`.
-
-Parameters
-----------
-in_dtype : Union[np.dtype, pandas_dtype]
-    The dtype of `column`, used for dispatching
-out_dtype : ibis.expr.datatypes.DataType
-    The requested ibis type of the output
-column : pd.Series
-    The column to convert
-
-Returns
--------
-result : pd.Series
-    The converted column
-""",
-)
+    import numpy as np
+    import pyarrow as pa
+    import sqlglot as sg
+    import sqlglot.expressions as sge
+    from pandas.api.extensions import ExtensionDtype
+    from typing_extensions import Self
 
 
-class Schema(Concrete, Coercible, MapSet):
-    """An object for holding table schema information."""
+class Schema(Concrete, Coercible, MapSet[str, dt.DataType]):
+    """An ordered mapping of str -> [datatype](./datatypes.qmd), used to hold a [Table](./expression-tables.qmd#ibis.expr.tables.Table)'s schema."""
 
-    fields: FrozenDict[str, dt.DataType]
-    """A mapping of [`str`][str] to [`DataType`][ibis.expr.datatypes.DataType] objects
-    representing the type of each column."""
+    fields: FrozenOrderedDict[str, dt.DataType]
+    """A mapping of [](`str`) to
+    [`DataType`](./datatypes.qmd#ibis.expr.datatypes.DataType)
+    objects representing the type of each column."""
 
     def __repr__(self) -> str:
         space = 2 + max(map(len, self.names), default=0)
         return "ibis.Schema {{{}\n}}".format(
             indent(
-                ''.join(
-                    f'\n{name.ljust(space)}{type!s}' for name, type in self.items()
+                "".join(
+                    f"\n{name.ljust(space)}{type!s}" for name, type in self.items()
                 ),
                 2,
             )
@@ -73,22 +58,34 @@ class Schema(Concrete, Coercible, MapSet):
 
     @classmethod
     def __coerce__(cls, value) -> Schema:
+        if isinstance(value, cls):
+            return value
         return schema(value)
 
-    @attribute.default
+    @attribute
     def names(self):
         return tuple(self.keys())
 
-    @attribute.default
+    @attribute
     def types(self):
         return tuple(self.values())
 
-    @attribute.default
+    @attribute
+    def geospatial(self) -> tuple[str, ...]:
+        return tuple(name for name, typ in self.fields.items() if typ.is_geospatial())
+
+    @attribute
+    def null_fields(self) -> tuple[str, ...]:
+        return tuple(name for name, typ in self.fields.items() if typ.is_null())
+
+    @attribute
     def _name_locs(self) -> dict[str, int]:
         return {v: i for i, v in enumerate(self.names)}
 
     def equals(self, other: Schema) -> bool:
         """Return whether `other` is equal to `self`.
+
+        The order of fields in the schema is taken into account when computing equality.
 
         Parameters
         ----------
@@ -98,23 +95,25 @@ class Schema(Concrete, Coercible, MapSet):
         Examples
         --------
         >>> import ibis
-        >>> first = ibis.schema({"a": "int"})
-        >>> second = ibis.schema({"a": "int"})
-        >>> assert first.equals(second)
-        >>> third = ibis.schema({"a": "array<int>"})
-        >>> assert not first.equals(third)
+        >>> xy = ibis.schema({"x": int, "y": str})
+        >>> xy2 = ibis.schema({"x": int, "y": str})
+        >>> yx = ibis.schema({"y": str, "x": int})
+        >>> xy_float = ibis.schema({"x": float, "y": str})
+        >>> assert xy.equals(xy2)
+        >>> assert not xy.equals(yx)
+        >>> assert not xy.equals(xy_float)
         """
         if not isinstance(other, Schema):
             raise TypeError(
                 f"invalid equality comparison between Schema and {type(other)}"
             )
-        return self.__cached_equals__(other)
+        return self == other
 
     @classmethod
     def from_tuples(
         cls,
         values: Iterable[tuple[str, str | dt.DataType]],
-    ) -> Schema:
+    ) -> Self:
         """Construct a `Schema` from an iterable of pairs.
 
         Parameters
@@ -135,75 +134,175 @@ class Schema(Concrete, Coercible, MapSet):
           a  int64
           b  string
         }
+
         """
+
         pairs = list(values)
-        if len(pairs) == 0:
+        if not pairs:
             return cls({})
 
         names, types = zip(*pairs)
 
         # validate unique field names
-        name_locs = {v: i for i, v in enumerate(names)}
-        if len(name_locs) < len(names):
-            duplicate_names = list(names)
-            for v in name_locs:
-                duplicate_names.remove(v)
-            raise IntegrityError(f'Duplicate column name(s): {duplicate_names}')
+        name_counts = Counter(names)
+        [(_, most_common_count)] = name_counts.most_common(1)
+
+        if most_common_count > 1:
+            duplicate_names = [name for name, count in name_counts.items() if count > 1]
+            raise IntegrityError(f"Duplicate column name(s): {duplicate_names}")
 
         # construct the schema
         return cls(dict(zip(names, types)))
 
     @classmethod
-    def from_numpy(self, numpy_schema):
+    def from_numpy(cls, numpy_schema) -> Self:
         """Return the equivalent ibis schema."""
-        from ibis.formats.numpy import schema_from_numpy
+        from ibis.formats.numpy import NumpySchema
 
-        return schema_from_numpy(numpy_schema)
+        return NumpySchema.to_ibis(numpy_schema)
 
     @classmethod
-    def from_pandas(self, pandas_schema):
+    def from_pandas(cls, pandas_schema) -> Self:
         """Return the equivalent ibis schema."""
-        from ibis.formats.pandas import schema_from_pandas
+        from ibis.formats.pandas import PandasSchema
 
-        return schema_from_pandas(pandas_schema)
+        return PandasSchema.to_ibis(pandas_schema)
 
     @classmethod
-    def from_pyarrow(self, pyarrow_schema):
+    def from_pyarrow(cls, pyarrow_schema) -> Self:
         """Return the equivalent ibis schema."""
-        from ibis.formats.pyarrow import schema_from_pyarrow
+        from ibis.formats.pyarrow import PyArrowSchema
 
-        return schema_from_pyarrow(pyarrow_schema)
+        return PyArrowSchema.to_ibis(pyarrow_schema)
 
     @classmethod
-    def from_dask(self, dask_schema):
+    def from_polars(cls, polars_schema) -> Self:
         """Return the equivalent ibis schema."""
-        from ibis.formats.dask import schema_from_dask
+        from ibis.formats.polars import PolarsSchema
 
-        return schema_from_dask(dask_schema)
+        return PolarsSchema.to_ibis(polars_schema)
 
-    def to_numpy(self):
+    @classmethod
+    def from_sqlglot(
+        cls, schema: sge.Schema, dialect: str | sg.Dialect | None = None
+    ) -> Self:
+        """Construct an Ibis Schema from a SQLGlot Schema.
+
+        Parameters
+        ----------
+        schema
+            A SQLGlot Schema containing column definitions.
+        dialect
+            Optional dialect to use for type conversion.
+
+        Returns
+        -------
+        Schema
+            An Ibis Schema.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> import sqlglot as sg
+        >>> import sqlglot.expressions as sge
+        >>> columns = [
+        ...     sge.ColumnDef(
+        ...         this=sg.to_identifier("a", quoted=True),
+        ...         kind=sge.DataType(this=sge.DataType.Type.BIGINT),
+        ...     ),
+        ...     sge.ColumnDef(
+        ...         this=sg.to_identifier("b", quoted=True),
+        ...         kind=sge.DataType(this=sge.DataType.Type.VARCHAR),
+        ...         constraints=[sge.ColumnConstraint(kind=sge.NotNullColumnConstraint())],
+        ...     ),
+        ... ]
+        >>> schema_expr = sge.Schema(expressions=columns)
+        >>> sch = ibis.Schema.from_sqlglot(schema_expr)
+        >>> sch
+        ibis.Schema {
+          a  int64
+          b  !string
+        }
+
+        Different source dialects are supported using the `dialect` keyword argument.
+
+        >>> columns = [
+        ...     sge.ColumnDef(
+        ...         this=sg.to_identifier("a", quoted=True),
+        ...         kind=sge.DataType(
+        ...             this=sge.DataType.Type.ARRAY,
+        ...             expressions=[sge.DataType(this=sge.DataType.Type.BIGINT, nested=False)],
+        ...             nested=True,
+        ...         ),
+        ...     )
+        ... ]
+        >>> schema_expr = sge.Schema(expressions=columns)
+        >>> snowflake_schema = ibis.Schema.from_sqlglot(schema_expr, dialect="snowflake")
+        >>> snowflake_schema
+        ibis.Schema {
+          a  array<json>
+        }
+        >>> bigquery_schema = ibis.Schema.from_sqlglot(schema_expr, dialect="bigquery")
+        >>> bigquery_schema
+        ibis.Schema {
+          a  array<int64>
+        }
+        """
+        import sqlglot.expressions as sge
+
+        from ibis.backends.sql.datatypes import SqlglotType, get_type_mapper
+
+        expressions = schema.expressions
+        if not expressions:
+            return cls({})
+
+        type_mapper_class = SqlglotType if dialect is None else get_type_mapper(dialect)
+        type_mapper = type_mapper_class()
+        fields = {}
+
+        for column in expressions:
+            name = column.this.this
+
+            nullable = not any(
+                isinstance(constraint.kind, sge.NotNullColumnConstraint)
+                for constraint in (column.constraints or [])
+            )
+
+            if column.kind:
+                ibis_dtype = type_mapper.to_ibis(column.kind, nullable=nullable)
+            else:
+                ibis_dtype = dt.String(nullable=nullable)
+
+            fields[name] = ibis_dtype
+
+        return cls(fields)
+
+    def to_numpy(self) -> list[tuple[str, np.dtype]]:
         """Return the equivalent numpy dtypes."""
-        from ibis.formats.numpy import schema_to_numpy
+        from ibis.formats.numpy import NumpySchema
 
-        return schema_to_numpy(self)
+        return NumpySchema.from_ibis(self)
 
-    def to_pandas(self):
+    def to_pandas(self) -> list[tuple[str, np.dtype | ExtensionDtype]]:
         """Return the equivalent pandas datatypes."""
-        from ibis.formats.pandas import schema_to_pandas
+        from ibis.formats.pandas import PandasSchema
 
-        return schema_to_pandas(self)
+        return PandasSchema.from_ibis(self)
 
-    def to_pyarrow(self):
+    def to_pyarrow(self) -> pa.Schema:
         """Return the equivalent pyarrow schema."""
-        from ibis.formats.pyarrow import schema_to_pyarrow
+        from ibis.formats.pyarrow import PyArrowSchema
 
-        return schema_to_pyarrow(self)
+        return PyArrowSchema.from_ibis(self)
 
-    def to_dask(self):
-        """Return the equivalent dask dtypes."""
-        from ibis.formats.dask import schema_to_dask
+    def __arrow_c_schema__(self):
+        return self.to_pyarrow().__arrow_c_schema__()
 
-        return schema_to_dask(self)
+    def to_polars(self):
+        """Return the equivalent polars schema."""
+        from ibis.formats.polars import PolarsSchema
+
+        return PolarsSchema.from_ibis(self)
 
     def as_struct(self) -> dt.Struct:
         return dt.Struct(self)
@@ -229,177 +328,188 @@ class Schema(Concrete, Coercible, MapSet):
         'a'
         >>> sch.name_at_position(1)
         'b'
+
         """
         return self.names[i]
 
-    def apply_to(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Apply the schema `self` to a pandas `DataFrame`.
-
-        This method mutates the input `DataFrame`.
+    def to_sqlglot_column_defs(self, dialect: str | sg.Dialect) -> list[sge.ColumnDef]:
+        """Convert the schema to a list of SQL column definitions.
 
         Parameters
         ----------
-        df
-            Input DataFrame
+        dialect
+            The SQL dialect to use.
 
         Returns
         -------
-        DataFrame
-            Type-converted DataFrame
+        list[sqlglot.expressions.ColumnDef]
+            A list of SQL column definitions.
 
         Examples
         --------
-        Import the necessary modules
-
-        >>> import numpy as np
-        >>> import pandas as pd
         >>> import ibis
-        >>> import ibis.expr.datatypes as dt
-
-        Construct a DataFrame with string timestamps and an `int8` column that
-        we're going to upcast.
-
-        >>> data = dict(
-        ...     times=[
-        ...         "2022-01-01 12:00:00",
-        ...         "2022-01-01 13:00:01",
-        ...         "2022-01-01 14:00:02",
-        ...     ],
-        ...     x=np.array([-1, 0, 1], dtype="int8")
-        ... )
-        >>> df = pd.DataFrame(data)
-        >>> df
-                         times  x
-        0  2022-01-01 12:00:00 -1
-        1  2022-01-01 13:00:01  0
-        2  2022-01-01 14:00:02  1
-        >>> df.dtypes
-        times    object
-        x          int8
-        dtype: object
-
-        Construct an ibis Schema that we want to cast to.
-
-        >>> sch = ibis.schema({"times": dt.timestamp, "x": "int16"})
+        >>> sch = ibis.schema({"a": "int", "b": "!string"})
         >>> sch
         ibis.Schema {
-          times  timestamp
-          x      int16
+          a  int64
+          b  !string
         }
+        >>> columns = sch.to_sqlglot_column_defs(dialect="duckdb")
+        >>> columns
+        [ColumnDef(
+          this=Identifier(this='a', quoted=True),
+          kind=DataType(this=Type.BIGINT)), ColumnDef(
+          this=Identifier(this='b', quoted=True),
+          kind=DataType(this=Type.VARCHAR),
+          constraints=[
+            ColumnConstraint(
+              kind=NotNullColumnConstraint())])]
 
-        Apply the schema
+        One use case for this method is to embed its output into a SQLGlot
+        `CREATE TABLE` expression.
 
-        >>> sch.apply_to(df)
-                        times  x
-        0 2022-01-01 12:00:00 -1
-        1 2022-01-01 13:00:01  0
-        2 2022-01-01 14:00:02  1
-        >>> df.dtypes  # `df` is mutated by the method
-        times    datetime64[ns]
-        x                 int16
-        dtype: object
+        >>> import sqlglot as sg
+        >>> import sqlglot.expressions as sge
+        >>> table = sg.table("t", quoted=True)
+        >>> ct = sge.Create(
+        ...     kind="TABLE",
+        ...     this=sge.Schema(
+        ...         this=table,
+        ...         expressions=columns,
+        ...     ),
+        ... )
+        >>> ct.sql(dialect="duckdb")
+        'CREATE TABLE "t" ("a" BIGINT, "b" TEXT NOT NULL)'
         """
-        schema_names = self.names
-        data_columns = df.columns
+        import sqlglot as sg
+        import sqlglot.expressions as sge
 
-        assert len(schema_names) == len(
-            data_columns
-        ), "schema column count does not match input data column count"
+        from ibis.backends.sql.datatypes import get_type_mapper
 
-        for column, dtype in zip(data_columns, self.types):
-            pandas_dtype = dtype.to_pandas()
+        type_mapper = get_type_mapper(dialect)
+        return [
+            sge.ColumnDef(
+                this=sg.to_identifier(name, quoted=True),
+                kind=type_mapper.from_ibis(dtype),
+                constraints=(
+                    None
+                    if dtype.nullable
+                    else [sge.ColumnConstraint(kind=sge.NotNullColumnConstraint())]
+                ),
+            )
+            for name, dtype in self.items()
+        ]
 
-            col = df[column]
-            col_dtype = col.dtype
+    @deprecated(
+        instead="use Schema.to_sqlglot_column_defs() instead. In a future release, to_sqlglot() will return a sqlglot.schema.Schema object"
+    )
+    def to_sqlglot(self, dialect: str | sg.Dialect) -> list[sge.ColumnDef]:
+        """DEPRECATED: use `to_sqlglot_column_defs()` instead."""
+        return self.to_sqlglot_column_defs(dialect)
 
-            try:
-                not_equal = pandas_dtype != col_dtype
-            except TypeError:
-                # ugh, we can't compare dtypes coming from pandas,
-                # assume not equal
-                not_equal = True
 
-            if not_equal or not dtype.is_primitive():
-                new_col = convert(col_dtype, dtype, col)
-            else:
-                new_col = col
-            df[column] = new_col
+IntoSchema: TypeAlias = Union[
+    Schema,
+    Mapping[str, dt.IntoDtype],
+    Iterable[tuple[str, dt.IntoDtype]],
+]
+"""Something that can be converted into a `Schema`."""
+SchemaLike = IntoSchema
+"""Deprecated, use `IntoSchema` instead."""
 
-        # return data with the schema's columns which may be different than the
-        # input columns
-        df.columns = schema_names
-        return df
+
+def schema(value: IntoSchema, /) -> Schema:
+    """Construct ibis schema from schema-like python objects.
+
+    Parameters
+    ----------
+    value
+        One of the following:
+        - An existing `Schema` object
+        - A mapping of column names to data types
+        - An iterable of (column name, data type) pairs
+
+    Returns
+    -------
+    Schema
+        An ibis `Schema` object
+    """
+    return _schema(value)
+
+
+def infer(value: Any, /) -> Schema:
+    """Infer the corresponding ibis schema for a python object."""
+    return _infer(value)
 
 
 @lazy_singledispatch
-def schema(value: Any) -> Schema:
+def _schema(value: IntoSchema, /) -> Schema:
     """Construct ibis schema from schema-like python objects."""
     raise InputTypeError(value)
 
 
 @lazy_singledispatch
-def infer(value: Any, schema=None) -> Schema:
+def _infer(value: Any, /) -> Schema:
     """Infer the corresponding ibis schema for a python object."""
     raise InputTypeError(value)
 
 
-@schema.register(Schema)
+@_schema.register(Schema)
 def from_schema(s):
     return s
 
 
-@schema.register(Mapping)
+@_schema.register(Mapping)
 def from_mapping(d):
     return Schema(d)
 
 
-@schema.register(Iterable)
+@_schema.register(Iterable)
 def from_pairs(lst):
     return Schema.from_tuples(lst)
 
 
-@schema.register(type)
+@_schema.register(type)
 def from_class(cls):
     return Schema(dt.dtype(cls))
 
 
-@schema.register("pandas.Series")
+@_schema.register("pandas.Series")
 def from_pandas_series(s):
-    from ibis.formats.pandas import schema_from_pandas
+    from ibis.formats.pandas import PandasSchema
 
-    return schema_from_pandas(s)
+    return PandasSchema.to_ibis(s)
 
 
-@schema.register("pyarrow.Schema")
+@_schema.register("pyarrow.Schema")
 def from_pyarrow_schema(schema):
-    from ibis.formats.pyarrow import schema_from_pyarrow
+    from ibis.formats.pyarrow import PyArrowSchema
 
-    return schema_from_pyarrow(schema)
-
-
-@infer.register("pandas.DataFrame")
-def infer_pandas_dataframe(df, schema=None):
-    from ibis.formats.pandas import schema_from_pandas_dataframe
-
-    return schema_from_pandas_dataframe(df, schema)
+    return PyArrowSchema.to_ibis(schema)
 
 
-@infer.register("dask.dataframe.DataFrame")
-def infer_dask_dataframe(df, schema=None):
-    from ibis.formats.dask import schema_from_dask_dataframe
+@_infer.register("pandas.DataFrame")
+def infer_pandas_dataframe(df):
+    from ibis.formats.pandas import PandasData
 
-    return schema_from_dask_dataframe(df, schema)
+    return PandasData.infer_table(df)
 
 
-# TODO(kszucs): do we really need the schema kwarg?
-@infer.register("pyarrow.Table")
-def infer_pyarrow_table(table, schema=None):
-    from ibis.formats.pyarrow import schema_from_pyarrow
+@_infer.register("pyarrow.Table")
+def infer_pyarrow_table(table):
+    from ibis.formats.pyarrow import PyArrowSchema
 
-    schema = schema if schema is not None else table.schema
-    return schema_from_pyarrow(schema)
+    return PyArrowSchema.to_ibis(table.schema)
+
+
+@_infer.register("polars.DataFrame")
+@_infer.register("polars.LazyFrame")
+def infer_polars_dataframe(df):
+    from ibis.formats.polars import PolarsSchema
+
+    return PolarsSchema.to_ibis(df.collect_schema())
 
 
 # lock the dispatchers to avoid adding new implementations
-del infer.register
-del schema.register
+del _infer.register
+del _schema.register

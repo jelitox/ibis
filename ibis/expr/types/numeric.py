@@ -1,29 +1,29 @@
 from __future__ import annotations
 
-import collections
-import functools
-from typing import TYPE_CHECKING, Iterable, Literal, Sequence
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Literal
 
 from public import public
 
+import ibis
 import ibis.expr.operations as ops
-from ibis import util
 from ibis.common.exceptions import IbisTypeError
-from ibis.expr.types.core import _binop
-from ibis.expr.types.generic import Column, Scalar, Value
+from ibis.expr.types.generic import Column, Scalar, Value, _binop
 
 if TYPE_CHECKING:
+    from decimal import Decimal
+    from typing import Union
+
+    from typing_extensions import Self
+
     import ibis.expr.types as ir
+
+    Number = Union[int, float, Decimal]
 
 
 @public
 class NumericValue(Value):
-    @staticmethod
-    def __negate_op__():
-        # TODO(kszucs): do we need this?
-        return ops.Negate
-
-    def negate(self) -> NumericValue:
+    def negate(self) -> Self:
         """Negate a numeric expression.
 
         Returns
@@ -47,16 +47,9 @@ class NumericValue(Value):
         │             -1 │
         └────────────────┘
         """
-        op = self.op()
-        try:
-            result = op.negate()
-        except AttributeError:
-            op_class = self.__negate_op__()
-            result = op_class(self)
+        return ops.Negate(self).to_expr()
 
-        return result.to_expr()
-
-    def __neg__(self) -> NumericValue:
+    def __neg__(self) -> Self:
         """Negate `self`.
 
         Returns
@@ -66,7 +59,7 @@ class NumericValue(Value):
         """
         return self.negate()
 
-    def round(self, digits: int | IntegerValue | None = None) -> NumericValue:
+    def round(self, digits: int | IntegerValue = 0, /) -> NumericValue:
         """Round values to an indicated number of decimal places.
 
         Parameters
@@ -77,12 +70,10 @@ class NumericValue(Value):
             Here's how the `digits` parameter affects the expression output
             type:
 
-            |   `digits`    | `self.type()` |  Output   |
-            | :-----------: | :-----------: | :-------: |
-            | `None` or `0` |   `decimal`   | `decimal` |
-            |    Nonzero    |   `decimal`   | `decimal` |
-            | `None` or `0` |   Floating    |  `int64`  |
-            |    Nonzero    |   Floating    | `float64` |
+            - `digits` is `False`-y; `self.type()` is `decimal` → `decimal`
+            -   `digits` is nonzero; `self.type()` is `decimal` → `decimal`
+            - `digits` is `False`-y; `self.type()` is Floating  → `int64`
+            -   `digits` is nonzero; `self.type()` is Floating  → `float64`
 
         Returns
         -------
@@ -106,17 +97,17 @@ class NumericValue(Value):
         │    2.54 │
         └─────────┘
         >>> t.values.round()
-        ┏━━━━━━━━━━━━━━━┓
-        ┃ Round(values) ┃
-        ┡━━━━━━━━━━━━━━━┩
-        │ int64         │
-        ├───────────────┤
-        │             1 │
-        │             2 │
-        │             2 │
-        │             3 │
-        └───────────────┘
-        >>> t.values.round(digits=1)
+        ┏━━━━━━━━━━━━━━━━━━┓
+        ┃ Round(values, 0) ┃
+        ┡━━━━━━━━━━━━━━━━━━┩
+        │ int64            │
+        ├──────────────────┤
+        │                1 │
+        │                2 │
+        │                2 │
+        │                3 │
+        └──────────────────┘
+        >>> t.values.round(1)
         ┏━━━━━━━━━━━━━━━━━━┓
         ┃ Round(values, 1) ┃
         ┡━━━━━━━━━━━━━━━━━━┩
@@ -130,8 +121,8 @@ class NumericValue(Value):
         """
         return ops.Round(self, digits).to_expr()
 
-    def log(self, base: NumericValue | None = None) -> NumericValue:
-        """Return the logarithm using a specified base.
+    def log(self, base: NumericValue | None = None, /) -> NumericValue:
+        r"""Compute $\log_{\texttt{base}}\left(\texttt{self}\right)$.
 
         Parameters
         ----------
@@ -164,7 +155,7 @@ class NumericValue(Value):
         >>> import ibis
         >>> ibis.options.interactive = True
         >>> t = ibis.memtable({"values": [10, 100, 1000]})
-        >>> t.values.log(base=10)
+        >>> t.values.log(10)
         ┏━━━━━━━━━━━━━━━━━┓
         ┃ Log(values, 10) ┃
         ┡━━━━━━━━━━━━━━━━━┩
@@ -179,10 +170,12 @@ class NumericValue(Value):
 
     def clip(
         self,
-        lower: NumericValue | None = None,
-        upper: NumericValue | None = None,
-    ) -> NumericValue:
+        lower: Number | NumericValue | ibis.Deferred | None = None,
+        upper: Number | NumericValue | ibis.Deferred | None = None,
+    ) -> Self:
         """Trim values outside of `lower` and `upper` bounds.
+
+        `NULL` values are preserved and are not replaced with bounds.
 
         Parameters
         ----------
@@ -200,20 +193,23 @@ class NumericValue(Value):
         --------
         >>> import ibis
         >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({"values": range(8)})
+        >>> t = ibis.memtable(
+        ...     {"values": [None, 2, 3, None, 5, None, None, 8]},
+        ...     schema=dict(values="int"),
+        ... )
         >>> t.values.clip(lower=3, upper=6)
         ┏━━━━━━━━━━━━━━━━━━━━┓
         ┃ Clip(values, 3, 6) ┃
         ┡━━━━━━━━━━━━━━━━━━━━┩
         │ int64              │
         ├────────────────────┤
+        │               NULL │
         │                  3 │
         │                  3 │
-        │                  3 │
-        │                  3 │
-        │                  4 │
+        │               NULL │
         │                  5 │
-        │                  6 │
+        │               NULL │
+        │               NULL │
         │                  6 │
         └────────────────────┘
         """
@@ -222,7 +218,7 @@ class NumericValue(Value):
 
         return ops.Clip(self, lower, upper).to_expr()
 
-    def abs(self) -> NumericValue:
+    def abs(self) -> Self:
         """Return the absolute value of `self`.
 
         Examples
@@ -477,14 +473,6 @@ class NumericValue(Value):
         """
         return ops.Sqrt(self).to_expr()
 
-    def nullifzero(self) -> NumericValue:
-        """Return `NULL` if an expression is zero."""
-        return ops.NullIfZero(self).to_expr()
-
-    def zeroifnull(self) -> NumericValue:
-        """Return zero if an expression is `NULL`."""
-        return ops.ZeroIfNull(self).to_expr()
-
     def acos(self) -> NumericValue:
         """Compute the arc cosine of `self`.
 
@@ -549,7 +537,7 @@ class NumericValue(Value):
         """
         return ops.Atan(self).to_expr()
 
-    def atan2(self, other: NumericValue) -> NumericValue:
+    def atan2(self, other: Number | NumericValue | ibis.Deferred, /) -> NumericValue:
         """Compute the two-argument version of arc tangent.
 
         Examples
@@ -598,7 +586,7 @@ class NumericValue(Value):
         --------
         >>> import ibis
         >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({"values": [-1, 0, 1]})
+        >>> t = ibis.memtable({"values": [-1, -2, 3]})
         >>> t.values.cot()
         ┏━━━━━━━━━━━━━┓
         ┃ Cot(values) ┃
@@ -606,8 +594,8 @@ class NumericValue(Value):
         │ float64     │
         ├─────────────┤
         │   -0.642093 │
-        │         inf │
-        │    0.642093 │
+        │    0.457658 │
+        │   -7.015253 │
         └─────────────┘
         """
         return ops.Cot(self).to_expr()
@@ -654,86 +642,90 @@ class NumericValue(Value):
         """
         return ops.Tan(self).to_expr()
 
-    def __add__(self, other: NumericValue) -> NumericValue | NotImplemented:
+    def __add__(self, other: Number | NumericValue | ibis.Deferred) -> NumericValue:
         """Add `self` with `other`."""
         return _binop(ops.Add, self, other)
 
     add = radd = __radd__ = __add__
 
-    def __sub__(self, other: NumericValue) -> NumericValue | NotImplemented:
-        """Substract `other` from `self`."""
+    def __sub__(self, other: Number | NumericValue | ibis.Deferred) -> NumericValue:
+        """Subtract `other` from `self`."""
         return _binop(ops.Subtract, self, other)
 
     sub = __sub__
 
-    def __rsub__(self, other: NumericValue) -> NumericValue | NotImplemented:
-        """Substract `self` from `other`."""
+    def __rsub__(self, other: Number | NumericValue | ibis.Deferred) -> NumericValue:
+        """Subtract `self` from `other`."""
         return _binop(ops.Subtract, other, self)
 
     rsub = __rsub__
 
-    def __mul__(self, other: NumericValue) -> NumericValue | NotImplemented:
+    def __mul__(self, other: Number | NumericValue | ibis.Deferred) -> NumericValue:
         """Multiply `self` and `other`."""
         return _binop(ops.Multiply, self, other)
 
     mul = rmul = __rmul__ = __mul__
 
-    def __truediv__(self, other):
+    def __truediv__(self, other: Number | NumericValue | ibis.Deferred) -> NumericValue:
         """Divide `self` by `other`."""
         return _binop(ops.Divide, self, other)
 
     div = __div__ = __truediv__
 
-    def __rtruediv__(self, other: NumericValue) -> NumericValue | NotImplemented:
-        """Divide `other` by `self`."""
+    def __rtruediv__(
+        self, other: Number | NumericValue | ibis.Deferred
+    ) -> NumericValue:
+        """Perform `other` / `self`."""
         return _binop(ops.Divide, other, self)
 
     rdiv = __rdiv__ = __rtruediv__
 
     def __floordiv__(
         self,
-        other: NumericValue,
-    ) -> NumericValue | NotImplemented:
-        """Floor divide `self` by `other`."""
+        other: Number | NumericValue | ibis.Deferred,
+    ) -> IntegerValue:
+        """Perform `self` // `other`."""
         return _binop(ops.FloorDivide, self, other)
 
     floordiv = __floordiv__
 
     def __rfloordiv__(
         self,
-        other: NumericValue,
-    ) -> NumericValue | NotImplemented:
-        """Floor divide `other` by `self`."""
+        other: Number | NumericValue | ibis.Deferred,
+    ) -> IntegerValue:
+        """Perform `other` // `self`."""
         return _binop(ops.FloorDivide, other, self)
 
     rfloordiv = __rfloordiv__
 
-    def __pow__(self, other: NumericValue) -> NumericValue | NotImplemented:
+    def __pow__(self, other: Number | NumericValue | ibis.Deferred) -> NumericValue:
         """Raise `self` to the `other`th power."""
         return _binop(ops.Power, self, other)
 
     pow = __pow__
 
-    def __rpow__(self, other: NumericValue) -> NumericValue | NotImplemented:
+    def __rpow__(self, other: Number | NumericValue | ibis.Deferred) -> NumericValue:
         """Raise `other` to the `self`th power."""
         return _binop(ops.Power, other, self)
 
     rpow = __rpow__
 
-    def __mod__(self, other: NumericValue) -> NumericValue | NotImplemented:
+    def __mod__(self, other: Number | NumericValue | ibis.Deferred) -> NumericValue:
         """Compute `self` modulo `other`."""
         return _binop(ops.Modulus, self, other)
 
     mod = __mod__
 
-    def __rmod__(self, other: NumericValue) -> NumericValue | NotImplemented:
+    def __rmod__(self, other: Number | NumericValue | ibis.Deferred) -> NumericValue:
         """Compute `other` modulo `self`."""
 
         return _binop(ops.Modulus, other, self)
 
     rmod = __rmod__
 
-    def point(self, right: int | float | NumericValue) -> ir.PointValue:
+    def point(
+        self, right: int | float | NumericValue | ibis.Deferred, /
+    ) -> ir.PointValue:
         """Return a point constructed from the coordinate values.
 
         Constant coordinates result in construction of a `POINT` literal or
@@ -748,6 +740,30 @@ class NumericValue(Value):
         -------
         PointValue
             Points
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.examples.zones.fetch()
+        >>> t.x_cent.point(t.y_cent)
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ GeoPoint(x_cent, y_cent)         ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ point:geometry                   │
+        ├──────────────────────────────────┤
+        │ <POINT (935996.821 191376.75)>   │
+        │ <POINT (1031085.719 164018.754)> │
+        │ <POINT (1026452.617 254265.479)> │
+        │ <POINT (990633.981 202959.782)>  │
+        │ <POINT (931871.37 140681.351)>   │
+        │ <POINT (964319.735 157998.936)>  │
+        │ <POINT (1006496.679 216719.218)> │
+        │ <POINT (1005551.571 222936.088)> │
+        │ <POINT (1043002.677 212969.849)> │
+        │ <POINT (1042223.605 186706.496)> │
+        │ …                                │
+        └──────────────────────────────────┘
         """
         return ops.GeoPoint(self, right).to_expr()
 
@@ -759,70 +775,59 @@ class NumericScalar(Scalar, NumericValue):
 
 @public
 class NumericColumn(Column, NumericValue):
-    def median(self, where: ir.BooleanValue | None = None) -> NumericScalar:
-        """Return the median of the column.
-
-        Parameters
-        ----------
-        where
-            Optional boolean expression. If given, only the values where
-            `where` evaluates to true will be considered for the median.
-
-        Returns
-        -------
-        NumericScalar
-            Median of the column
-        """
-        return ops.Median(self, where=where).to_expr()
-
-    def quantile(
+    def kurtosis(
         self,
-        quantile: Sequence[NumericValue | float],
-        interpolation: Literal[
-            "linear",
-            "lower",
-            "higher",
-            "midpoint",
-            "nearest",
-        ]
-        | None = None,
-        where: ir.BooleanValue | None = None,
+        *,
+        where: bool | ir.BooleanValue | ibis.Deferred | None = None,
+        how: Literal["sample", "pop"] = "sample",
     ) -> NumericScalar:
-        """Return value at the given quantile.
+        """Return the kurtosis of a numeric column.
 
         Parameters
         ----------
-        quantile
-            `0 <= quantile <= 1`, the quantile(s) to compute
-        interpolation
-            !!! warning "This parameter is backend dependent and may have no effect"
-
-            This parameter specifies the interpolation method to use, when the
-            desired quantile lies between two data points `i` and `j`:
-
-            * linear: `i + (j - i) * fraction`, where `fraction` is the
-              fractional part of the index surrounded by `i` and `j`.
-            * lower: `i`.
-            * higher: `j`.
-            * nearest: `i` or `j` whichever is nearest.
-            * midpoint: (`i` + `j`) / 2.
         where
-            Boolean filter for input values
+            Filter
+        how
+            Whether to include bias correction. `"sample"` includes the
+            correction while `"pop"` does not.
 
         Returns
         -------
         NumericScalar
-            Quantile of the input
+            Kurtosis of `arg`
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "keys": ["a", "a", "b", "b", "a", "a", "b", "b"],
+        ...         "values": [1, 2, 3, 3, 6, 4, 5, 7],
+        ...     }
+        ... )
+        >>> t.values.kurtosis()
+        ┌──────────┐
+        │ -0.88595 │
+        └──────────┘
+        >>> t.group_by("keys").agg(kurt=t.values.kurtosis()).order_by("keys")
+        ┏━━━━━━━━┳━━━━━━━━━━━┓
+        ┃ keys   ┃ kurt      ┃
+        ┡━━━━━━━━╇━━━━━━━━━━━┩
+        │ string │ float64   │
+        ├────────┼───────────┤
+        │ a      │ -1.699512 │
+        │ b      │ -1.289256 │
+        └────────┴───────────┘
         """
-        if isinstance(quantile, collections.abc.Sequence):
-            op = ops.MultiQuantile
-        else:
-            op = ops.Quantile
-        return op(self, quantile, interpolation, where=where).to_expr()
+        return ops.Kurtosis(
+            self, how=how, where=self._bind_to_parent_table(where)
+        ).to_expr()
 
     def std(
         self,
-        where: ir.BooleanValue | None = None,
+        *,
+        where: bool | ir.BooleanValue | ibis.Deferred | None = None,
         how: Literal["sample", "pop"] = "sample",
     ) -> NumericScalar:
         """Return the standard deviation of a numeric column.
@@ -838,11 +843,41 @@ class NumericColumn(Column, NumericValue):
         -------
         NumericScalar
             Standard deviation of `arg`
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "values": [1, 3, 3, 4, 5, 7],
+        ...     }
+        ... )
+        >>> t.values.std()
+        ┌──────────┐
+        │ 2.041241 │
+        └──────────┘
+        >>> t.mutate(std_col=t.values.std())
+        ┏━━━━━━━━┳━━━━━━━━━━┓
+        ┃ values ┃ std_col  ┃
+        ┡━━━━━━━━╇━━━━━━━━━━┩
+        │ int64  │ float64  │
+        ├────────┼──────────┤
+        │      1 │ 2.041241 │
+        │      3 │ 2.041241 │
+        │      3 │ 2.041241 │
+        │      4 │ 2.041241 │
+        │      5 │ 2.041241 │
+        │      7 │ 2.041241 │
+        └────────┴──────────┘
         """
-        return ops.StandardDev(self, how=how, where=where).to_expr()
+        return ops.StandardDev(
+            self, how=how, where=self._bind_to_parent_table(where)
+        ).to_expr()
 
     def var(
         self,
+        *,
         where: ir.BooleanValue | None = None,
         how: Literal["sample", "pop"] = "sample",
     ) -> NumericScalar:
@@ -859,15 +894,46 @@ class NumericColumn(Column, NumericValue):
         -------
         NumericScalar
             Standard deviation of `arg`
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "values": [1, 3, 3, 4, 5, 7],
+        ...     }
+        ... )
+        >>> t.values.var()
+        ┌──────────┐
+        │ 4.166667 │
+        └──────────┘
+        >>> t.mutate(var_col=t.values.var())
+        ┏━━━━━━━━┳━━━━━━━━━━┓
+        ┃ values ┃ var_col  ┃
+        ┡━━━━━━━━╇━━━━━━━━━━┩
+        │ int64  │ float64  │
+        ├────────┼──────────┤
+        │      1 │ 4.166667 │
+        │      3 │ 4.166667 │
+        │      3 │ 4.166667 │
+        │      4 │ 4.166667 │
+        │      5 │ 4.166667 │
+        │      7 │ 4.166667 │
+        └────────┴──────────┘
         """
-        return ops.Variance(self, how=how, where=where).to_expr()
+        return ops.Variance(
+            self, how=how, where=self._bind_to_parent_table(where)
+        ).to_expr()
 
     def corr(
         self,
         right: NumericColumn,
-        where: ir.BooleanValue | None = None,
-        how: Literal['sample', 'pop'] = 'sample',
-    ) -> NumericScalar:
+        /,
+        *,
+        where: bool | ir.BooleanValue | ibis.Deferred | None = None,
+        how: Literal["sample", "pop"] = "sample",
+    ) -> FloatingScalar:
         """Return the correlation of two numeric columns.
 
         Parameters
@@ -883,15 +949,50 @@ class NumericColumn(Column, NumericValue):
         -------
         NumericScalar
             The correlation of `left` and `right`
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "left": [1, 3, 3, 4, 5, 7],
+        ...         "right": [7, 5, 4, 3, 3, 1],
+        ...     }
+        ... )
+        >>> t.left.corr(t.right, how="pop")
+        ┌────────┐
+        │ -0.968 │
+        └────────┘
+        >>> t.mutate(corr_col=t.left.corr(t.right, how="pop"))
+        ┏━━━━━━━┳━━━━━━━┳━━━━━━━━━━┓
+        ┃ left  ┃ right ┃ corr_col ┃
+        ┡━━━━━━━╇━━━━━━━╇━━━━━━━━━━┩
+        │ int64 │ int64 │ float64  │
+        ├───────┼───────┼──────────┤
+        │     1 │     7 │   -0.968 │
+        │     3 │     5 │   -0.968 │
+        │     3 │     4 │   -0.968 │
+        │     4 │     3 │   -0.968 │
+        │     5 │     3 │   -0.968 │
+        │     7 │     1 │   -0.968 │
+        └───────┴───────┴──────────┘
         """
-        return ops.Correlation(self, right, how=how, where=where).to_expr()
+        return ops.Correlation(
+            self,
+            self._bind_to_parent_table(right),
+            how=how,
+            where=self._bind_to_parent_table(where),
+        ).to_expr()
 
     def cov(
         self,
         right: NumericColumn,
-        where: ir.BooleanValue | None = None,
-        how: Literal['sample', 'pop'] = 'sample',
-    ) -> NumericScalar:
+        /,
+        *,
+        where: bool | ir.BooleanValue | ibis.Deferred | None = None,
+        how: Literal["sample", "pop"] = "sample",
+    ) -> FloatingScalar:
         """Return the covariance of two numeric columns.
 
         Parameters
@@ -907,12 +1008,48 @@ class NumericColumn(Column, NumericValue):
         -------
         NumericScalar
             The covariance of `self` and `right`
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "left": [1, 3, 3, 4, 5, 7],
+        ...         "right": [7, 5, 4, 3, 3, 1],
+        ...     }
+        ... )
+        >>> t.left.cov(t.right)
+        ┌───────────┐
+        │ -4.033333 │
+        └───────────┘
+        >>> t.left.cov(t.right, how="pop")
+        ┌───────────┐
+        │ -3.361111 │
+        └───────────┘
+        >>> t.mutate(cov_col=t.left.cov(t.right, how="pop"))
+        ┏━━━━━━━┳━━━━━━━┳━━━━━━━━━━━┓
+        ┃ left  ┃ right ┃ cov_col   ┃
+        ┡━━━━━━━╇━━━━━━━╇━━━━━━━━━━━┩
+        │ int64 │ int64 │ float64   │
+        ├───────┼───────┼───────────┤
+        │     1 │     7 │ -3.361111 │
+        │     3 │     5 │ -3.361111 │
+        │     3 │     4 │ -3.361111 │
+        │     4 │     3 │ -3.361111 │
+        │     5 │     3 │ -3.361111 │
+        │     7 │     1 │ -3.361111 │
+        └───────┴───────┴───────────┘
         """
-        return ops.Covariance(self, right, how=how, where=where).to_expr()
+        return ops.Covariance(
+            self,
+            self._bind_to_parent_table(right),
+            how=how,
+            where=self._bind_to_parent_table(where),
+        ).to_expr()
 
     def mean(
-        self,
-        where: ir.BooleanValue | None = None,
+        self, *, where: bool | ir.BooleanValue | ibis.Deferred | None = None
     ) -> NumericScalar:
         """Return the mean of a numeric column.
 
@@ -925,18 +1062,106 @@ class NumericColumn(Column, NumericValue):
         -------
         NumericScalar
             The mean of the input expression
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "id": [1, 2, 3, 4, 5, 6],
+        ...         "grouper": ["a", "a", "a", "b", "b", "c"],
+        ...         "values": [3, 2, 1, 2, 3, 2],
+        ...     }
+        ... )
+        >>> t.mutate(mean_col=t.values.mean())
+        ┏━━━━━━━┳━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━┓
+        ┃ id    ┃ grouper ┃ values ┃ mean_col ┃
+        ┡━━━━━━━╇━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━┩
+        │ int64 │ string  │ int64  │ float64  │
+        ├───────┼─────────┼────────┼──────────┤
+        │     1 │ a       │      3 │ 2.166667 │
+        │     2 │ a       │      2 │ 2.166667 │
+        │     3 │ a       │      1 │ 2.166667 │
+        │     4 │ b       │      2 │ 2.166667 │
+        │     5 │ b       │      3 │ 2.166667 │
+        │     6 │ c       │      2 │ 2.166667 │
+        └───────┴─────────┴────────┴──────────┘
+
+        >>> t.mutate(mean_col=t.values.mean(where=t.grouper != "c"))
+        ┏━━━━━━━┳━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━┓
+        ┃ id    ┃ grouper ┃ values ┃ mean_col ┃
+        ┡━━━━━━━╇━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━┩
+        │ int64 │ string  │ int64  │ float64  │
+        ├───────┼─────────┼────────┼──────────┤
+        │     1 │ a       │      3 │      2.2 │
+        │     2 │ a       │      2 │      2.2 │
+        │     3 │ a       │      1 │      2.2 │
+        │     4 │ b       │      2 │      2.2 │
+        │     5 │ b       │      3 │      2.2 │
+        │     6 │ c       │      2 │      2.2 │
+        └───────┴─────────┴────────┴──────────┘
         """
         # TODO(kszucs): remove the alias from the reduction method in favor
         # of default name generated by ops.Value operations
-        return ops.Mean(self, where=where).to_expr()
+        return ops.Mean(self, where=self._bind_to_parent_table(where)).to_expr()
 
-    def cummean(self) -> NumericColumn:
-        """Return the cumulative mean of the input."""
-        return ops.CumulativeMean(self).to_expr()
+    def cummean(
+        self,
+        *,
+        where: bool | ir.BooleanValue | ibis.Deferred | None = None,
+        group_by=None,
+        order_by=None,
+    ) -> FloatingColumn:
+        """Return the cumulative mean of the input.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "id": [1, 2, 3, 4, 5, 6],
+        ...         "grouper": ["a", "a", "a", "b", "b", "c"],
+        ...         "values": [3, 2, 1, 2, 3, 2],
+        ...     }
+        ... )
+        >>> t.mutate(cummean=t.values.cummean()).order_by("id")
+        ┏━━━━━━━┳━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━┓
+        ┃ id    ┃ grouper ┃ values ┃ cummean  ┃
+        ┡━━━━━━━╇━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━┩
+        │ int64 │ string  │ int64  │ float64  │
+        ├───────┼─────────┼────────┼──────────┤
+        │     1 │ a       │      3 │ 3.000000 │
+        │     2 │ a       │      2 │ 2.500000 │
+        │     3 │ a       │      1 │ 2.000000 │
+        │     4 │ b       │      2 │ 2.000000 │
+        │     5 │ b       │      3 │ 2.200000 │
+        │     6 │ c       │      2 │ 2.166667 │
+        └───────┴─────────┴────────┴──────────┘
+
+        >>> t.mutate(cummean=t.values.cummean(where=t.grouper != "c", group_by="grouper")).order_by(
+        ...     "id"
+        ... )
+        ┏━━━━━━━┳━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━┓
+        ┃ id    ┃ grouper ┃ values ┃ cummean ┃
+        ┡━━━━━━━╇━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━┩
+        │ int64 │ string  │ int64  │ float64 │
+        ├───────┼─────────┼────────┼─────────┤
+        │     1 │ a       │      3 │     3.0 │
+        │     2 │ a       │      2 │     2.5 │
+        │     3 │ a       │      1 │     2.0 │
+        │     4 │ b       │      2 │     2.0 │
+        │     5 │ b       │      3 │     2.5 │
+        │     6 │ c       │      2 │    NULL │
+        └───────┴─────────┴────────┴─────────┘
+        """
+        return self.mean(where=where).over(
+            ibis.cumulative_window(group_by=group_by, order_by=order_by)
+        )
 
     def sum(
-        self,
-        where: ir.BooleanValue | None = None,
+        self, *, where: bool | ir.BooleanValue | ibis.Deferred | None = None
     ) -> NumericScalar:
         """Return the sum of a numeric column.
 
@@ -949,16 +1174,105 @@ class NumericColumn(Column, NumericValue):
         -------
         NumericScalar
             The sum of the input expression
-        """
-        return ops.Sum(self, where=where).to_expr()
 
-    def cumsum(self) -> NumericColumn:
-        """Return the cumulative sum of the input."""
-        return ops.CumulativeSum(self).to_expr()
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "id": [1, 2, 3, 4, 5, 6],
+        ...         "grouper": ["a", "a", "a", "b", "b", "c"],
+        ...         "values": [3, 2, 1, 2, 3, 2],
+        ...     }
+        ... )
+        >>> t.mutate(sum_col=t.values.sum())
+        ┏━━━━━━━┳━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━┓
+        ┃ id    ┃ grouper ┃ values ┃ sum_col ┃
+        ┡━━━━━━━╇━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━┩
+        │ int64 │ string  │ int64  │ int64   │
+        ├───────┼─────────┼────────┼─────────┤
+        │     1 │ a       │      3 │      13 │
+        │     2 │ a       │      2 │      13 │
+        │     3 │ a       │      1 │      13 │
+        │     4 │ b       │      2 │      13 │
+        │     5 │ b       │      3 │      13 │
+        │     6 │ c       │      2 │      13 │
+        └───────┴─────────┴────────┴─────────┘
+
+        >>> t.mutate(sum_col=t.values.sum(where=t.grouper != "c"))
+        ┏━━━━━━━┳━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━┓
+        ┃ id    ┃ grouper ┃ values ┃ sum_col ┃
+        ┡━━━━━━━╇━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━┩
+        │ int64 │ string  │ int64  │ int64   │
+        ├───────┼─────────┼────────┼─────────┤
+        │     1 │ a       │      3 │      11 │
+        │     2 │ a       │      2 │      11 │
+        │     3 │ a       │      1 │      11 │
+        │     4 │ b       │      2 │      11 │
+        │     5 │ b       │      3 │      11 │
+        │     6 │ c       │      2 │      11 │
+        └───────┴─────────┴────────┴─────────┘
+        """
+        return ops.Sum(self, where=self._bind_to_parent_table(where)).to_expr()
+
+    def cumsum(
+        self,
+        *,
+        where: bool | ir.BooleanValue | ibis.Deferred | None = None,
+        group_by=None,
+        order_by=None,
+    ) -> NumericColumn:
+        """Return the cumulative sum of the input.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "id": [1, 2, 3, 4, 5, 6],
+        ...         "grouper": ["a", "a", "a", "b", "b", "c"],
+        ...         "values": [3, 2, 1, 2, 3, 2],
+        ...     }
+        ... )
+        >>> t.mutate(cumsum=t.values.cumsum())
+        ┏━━━━━━━┳━━━━━━━━━┳━━━━━━━━┳━━━━━━━━┓
+        ┃ id    ┃ grouper ┃ values ┃ cumsum ┃
+        ┡━━━━━━━╇━━━━━━━━━╇━━━━━━━━╇━━━━━━━━┩
+        │ int64 │ string  │ int64  │ int64  │
+        ├───────┼─────────┼────────┼────────┤
+        │     1 │ a       │      3 │      3 │
+        │     2 │ a       │      2 │      5 │
+        │     3 │ a       │      1 │      6 │
+        │     4 │ b       │      2 │      8 │
+        │     5 │ b       │      3 │     11 │
+        │     6 │ c       │      2 │     13 │
+        └───────┴─────────┴────────┴────────┘
+
+        >>> t.mutate(cumsum=t.values.cumsum(where=t.grouper != "c"))
+        ┏━━━━━━━┳━━━━━━━━━┳━━━━━━━━┳━━━━━━━━┓
+        ┃ id    ┃ grouper ┃ values ┃ cumsum ┃
+        ┡━━━━━━━╇━━━━━━━━━╇━━━━━━━━╇━━━━━━━━┩
+        │ int64 │ string  │ int64  │ int64  │
+        ├───────┼─────────┼────────┼────────┤
+        │     1 │ a       │      3 │      3 │
+        │     2 │ a       │      2 │      5 │
+        │     3 │ a       │      1 │      6 │
+        │     4 │ b       │      2 │      8 │
+        │     5 │ b       │      3 │     11 │
+        │     6 │ c       │      2 │     11 │
+        └───────┴─────────┴────────┴────────┘
+        """
+        return self.sum(where=where).over(
+            ibis.cumulative_window(group_by=group_by, order_by=order_by)
+        )
 
     def bucket(
         self,
         buckets: Sequence[int],
+        /,
+        *,
         closed: Literal["left", "right"] = "left",
         close_extreme: bool = True,
         include_under: bool = False,
@@ -989,6 +1303,35 @@ class NumericColumn(Column, NumericValue):
         -------
         IntegerColumn
             A categorical column expression
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "values": [-1, 3, 5, 6, 8, 10, 11],
+        ...     }
+        ... )
+        >>> buckets = [0, 5, 10]
+        >>> t.mutate(
+        ...     bucket_closed_left=t.values.bucket(buckets),
+        ...     bucket_closed_right=t.values.bucket(buckets, closed="right"),
+        ...     bucket_over_under=t.values.bucket(buckets, include_over=True, include_under=True),
+        ... )
+        ┏━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┓
+        ┃ values ┃ bucket_closed_left ┃ bucket_closed_right ┃ bucket_over_under ┃
+        ┡━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━┩
+        │ int64  │ int8               │ int8                │ int8              │
+        ├────────┼────────────────────┼─────────────────────┼───────────────────┤
+        │     -1 │               NULL │                NULL │                 0 │
+        │      3 │                  0 │                   0 │                 1 │
+        │      5 │                  1 │                   0 │                 2 │
+        │      6 │                  1 │                   1 │                 2 │
+        │      8 │                  1 │                   1 │                 2 │
+        │     10 │                  1 │                   1 │                 2 │
+        │     11 │               NULL │                NULL │                 3 │
+        └────────┴────────────────────┴─────────────────────┴───────────────────┘
         """
         return ops.Bucket(
             self,
@@ -1001,11 +1344,12 @@ class NumericColumn(Column, NumericValue):
 
     def histogram(
         self,
+        *,
         nbins: int | None = None,
         binwidth: float | None = None,
         base: float | None = None,
         eps: float = 1e-13,
-    ):
+    ) -> IntegerColumn:
         """Compute a histogram with fixed width bins.
 
         Parameters
@@ -1024,6 +1368,53 @@ class NumericColumn(Column, NumericValue):
         -------
         Column
             Bucketed column
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "values": [-1, 3, 5, 6, 8, 10, 11, 23, 25],
+        ...     }
+        ... )
+
+        Compute a histogram with 5 bins.
+
+        >>> t.mutate(histogram=t.values.histogram(nbins=5))
+        ┏━━━━━━━━┳━━━━━━━━━━━┓
+        ┃ values ┃ histogram ┃
+        ┡━━━━━━━━╇━━━━━━━━━━━┩
+        │ int64  │ int64     │
+        ├────────┼───────────┤
+        │     -1 │         0 │
+        │      3 │         0 │
+        │      5 │         1 │
+        │      6 │         1 │
+        │      8 │         1 │
+        │     10 │         2 │
+        │     11 │         2 │
+        │     23 │         4 │
+        │     25 │         4 │
+        └────────┴───────────┘
+
+        Compute a histogram with a fixed bin width of 10.
+        >>> t.mutate(histogram=t.values.histogram(binwidth=10))
+        ┏━━━━━━━━┳━━━━━━━━━━━┓
+        ┃ values ┃ histogram ┃
+        ┡━━━━━━━━╇━━━━━━━━━━━┩
+        │ int64  │ int64     │
+        ├────────┼───────────┤
+        │     -1 │         0 │
+        │      3 │         0 │
+        │      5 │         0 │
+        │      6 │         0 │
+        │      8 │         0 │
+        │     10 │         1 │
+        │     11 │         1 │
+        │     23 │         2 │
+        │     25 │         2 │
+        └────────┴───────────┘
         """
 
         if nbins is not None and binwidth is not None:
@@ -1031,28 +1422,79 @@ class NumericColumn(Column, NumericValue):
                 f"Cannot pass both `nbins` (got {nbins}) and `binwidth` (got {binwidth})"
             )
 
-        if binwidth is None or base is None:
-            import ibis
+        if base is None:
+            base = self.min() - eps
 
+        if binwidth is None:
             if nbins is None:
                 raise ValueError("`nbins` is required if `binwidth` is not provided")
 
-            empty_window = ibis.window()
+            binwidth = (self.max() - base) / nbins
 
-            if base is None:
-                base = self.min().over(empty_window) - eps
+        if nbins is None:
+            nbins = ((self.max() - base) / binwidth).ceil()
 
-            binwidth = (self.max().over(empty_window) - base) / (nbins - 1)
+        return ((self - base) / binwidth).floor().clip(-1, nbins - 1)
 
-        return ((self - base) / binwidth).floor()
+    def approx_quantile(
+        self,
+        quantile: float | ir.NumericValue | Sequence[ir.NumericValue | float],
+        /,
+        *,
+        where: ir.BooleanValue | None = None,
+    ) -> NumericScalar:
+        """Compute one or more approximate quantiles of a column.
+
+        ::: {.callout-note}
+        ## The result may or may not be exact
+
+        Whether the result is an approximation depends on the backend.
+        :::
+
+        Parameters
+        ----------
+        quantile
+            `0 <= quantile <= 1`, or an array of such values
+            indicating the quantile or quantiles to compute
+        where
+            Boolean filter for input values
+
+        Returns
+        -------
+        Scalar
+            Quantile of the input
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.examples.penguins.fetch()
+
+        Compute the approximate 0.50 quantile of `bill_depth_mm`.
+
+        >>> t.bill_depth_mm.approx_quantile(0.50)
+        ┌────────┐
+        │ 17.318 │
+        └────────┘
+
+        Compute multiple approximate quantiles in one call - in this case the
+        result is an array.
+
+        >>> t.bill_depth_mm.approx_quantile([0.25, 0.75])
+        ┌────────────────────────┐
+        │ [15.565625, 18.671875] │
+        └────────────────────────┘
+        """
+        if isinstance(quantile, Sequence):
+            op = ops.ApproxMultiQuantile
+        else:
+            op = ops.ApproxQuantile
+        return op(self, quantile, where=self._bind_to_parent_table(where)).to_expr()
 
 
 @public
 class IntegerValue(NumericValue):
-    def to_timestamp(
-        self,
-        unit: Literal["s", "ms", "us"] = "s",
-    ) -> ir.TimestampValue:
+    def as_timestamp(self, unit: Literal["s", "ms", "us"], /) -> ir.TimestampValue:
         """Convert an integral UNIX timestamp to a timestamp expression.
 
         Parameters
@@ -1064,12 +1506,29 @@ class IntegerValue(NumericValue):
         -------
         TimestampValue
             `self` converted to a timestamp
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable({"int_col": [0, 1730501716, 2147483647]})
+        >>> t.int_col.as_timestamp("s")
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ TimestampFromUNIX(int_col, SECOND) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ timestamp                          │
+        ├────────────────────────────────────┤
+        │ 1970-01-01 00:00:00                │
+        │ 2024-11-01 22:55:16                │
+        │ 2038-01-19 03:14:07                │
+        └────────────────────────────────────┘
         """
         return ops.TimestampFromUNIX(self, unit).to_expr()
 
-    def to_interval(
+    def as_interval(
         self,
         unit: Literal["Y", "M", "W", "D", "h", "m", "s", "ms", "us", "ns"] = "s",
+        /,
     ) -> ir.IntervalValue:
         """Convert an integer to an interval.
 
@@ -1082,14 +1541,51 @@ class IntegerValue(NumericValue):
         -------
         IntervalValue
             An interval in units of `unit`
+
+        Examples
+        --------
+        >>> from datetime import datetime
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "timestamp_col": [
+        ...             datetime(2024, 1, 1, 0, 0, 0),
+        ...             datetime(2024, 1, 1, 0, 0, 0),
+        ...             datetime(2024, 1, 1, 0, 0, 0),
+        ...         ],
+        ...         "int_col": [1, 2, 3],
+        ...     }
+        ... )
+        >>> t.int_col.as_interval("h")
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ IntervalFromInteger(int_col, HOUR)                         ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ interval('h')                                              │
+        ├────────────────────────────────────────────────────────────┤
+        │ MonthDayNano(months=0, days=0, nanoseconds=3600000000000)  │
+        │ MonthDayNano(months=0, days=0, nanoseconds=7200000000000)  │
+        │ MonthDayNano(months=0, days=0, nanoseconds=10800000000000) │
+        └────────────────────────────────────────────────────────────┘
+
+        >>> t.mutate(timestamp_added_col=t.timestamp_col + t.int_col.as_interval("h"))
+        ┏━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ timestamp_col       ┃ int_col ┃ timestamp_added_col ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━┩
+        │ timestamp           │ int64   │ timestamp           │
+        ├─────────────────────┼─────────┼─────────────────────┤
+        │ 2024-01-01 00:00:00 │       1 │ 2024-01-01 01:00:00 │
+        │ 2024-01-01 00:00:00 │       2 │ 2024-01-01 02:00:00 │
+        │ 2024-01-01 00:00:00 │       3 │ 2024-01-01 03:00:00 │
+        └─────────────────────┴─────────┴─────────────────────┘
         """
         return ops.IntervalFromInteger(self, unit).to_expr()
 
     def convert_base(
         self,
-        from_base: IntegerValue,
-        to_base: IntegerValue,
-    ) -> IntegerValue:
+        from_base: int | IntegerValue,
+        to_base: int | IntegerValue,
+    ) -> ir.StringValue:
         """Convert an integer from one base to another.
 
         Parameters
@@ -1101,60 +1597,46 @@ class IntegerValue(NumericValue):
 
         Returns
         -------
-        IntegerValue
+        StringValue
             Converted expression
         """
         return ops.BaseConvert(self, from_base, to_base).to_expr()
 
-    def __and__(self, other: IntegerValue) -> IntegerValue | NotImplemented:
+    def __and__(self, other: int | IntegerValue | ibis.Deferred) -> IntegerValue:
         """Bitwise and `self` with `other`."""
-        from ibis.expr import operations as ops
-
         return _binop(ops.BitwiseAnd, self, other)
 
     __rand__ = __and__
 
-    def __or__(self, other: IntegerValue) -> IntegerValue | NotImplemented:
+    def __or__(self, other: int | IntegerValue | ibis.Deferred) -> IntegerValue:
         """Bitwise or `self` with `other`."""
-        from ibis.expr import operations as ops
-
         return _binop(ops.BitwiseOr, self, other)
 
     __ror__ = __or__
 
-    def __xor__(self, other: IntegerValue) -> IntegerValue | NotImplemented:
+    def __xor__(self, other: int | IntegerValue | ibis.Deferred) -> IntegerValue:
         """Bitwise xor `self` with `other`."""
-        from ibis.expr import operations as ops
-
         return _binop(ops.BitwiseXor, self, other)
 
     __rxor__ = __xor__
 
-    def __lshift__(self, other: IntegerValue) -> IntegerValue | NotImplemented:
+    def __lshift__(self, other: int | IntegerValue | ibis.Deferred) -> IntegerValue:
         """Bitwise left shift `self` with `other`."""
-        from ibis.expr import operations as ops
-
         return _binop(ops.BitwiseLeftShift, self, other)
 
-    def __rlshift__(self, other: IntegerValue) -> IntegerValue | NotImplemented:
+    def __rlshift__(self, other: int | IntegerValue | ibis.Deferred) -> IntegerValue:
         """Bitwise left shift `self` with `other`."""
-        from ibis.expr import operations as ops
-
         return _binop(ops.BitwiseLeftShift, other, self)
 
-    def __rshift__(self, other: IntegerValue) -> IntegerValue | NotImplemented:
+    def __rshift__(self, other: int | IntegerValue | ibis.Deferred) -> IntegerValue:
         """Bitwise right shift `self` with `other`."""
-        from ibis.expr import operations as ops
-
         return _binop(ops.BitwiseRightShift, self, other)
 
-    def __rrshift__(self, other: IntegerValue) -> IntegerValue | NotImplemented:
+    def __rrshift__(self, other: int | IntegerValue | ibis.Deferred) -> IntegerValue:
         """Bitwise right shift `self` with `other`."""
-        from ibis.expr import operations as ops
-
         return _binop(ops.BitwiseRightShift, other, self)
 
-    def __invert__(self) -> IntegerValue:
+    def __invert__(self) -> Self:
         """Bitwise not of `self`.
 
         Returns
@@ -1162,55 +1644,12 @@ class IntegerValue(NumericValue):
         IntegerValue
             Inverted bits of `self`.
         """
-        from ibis.expr import operations as ops
-
         try:
             node = ops.BitwiseNot(self)
         except (IbisTypeError, NotImplementedError):
             return NotImplemented
         else:
             return node.to_expr()
-
-    def label(self, labels: Iterable[str], nulls: str | None = None) -> ir.StringValue:
-        """Label a set of integer values with strings.
-
-        Parameters
-        ----------
-        labels
-            An iterable of string labels. Each integer value in `self` will be mapped to
-            a value in `labels`.
-        nulls
-            String label to use for `NULL` values
-
-        Returns
-        -------
-        StringValue
-            `self` labeled with `labels`
-
-        Examples
-        --------
-        >>> import ibis
-        >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({"a": [0, 1, 0, 2]})
-        >>> t.select(t.a, labeled=t.a.label(["a", "b", "c"]))
-        ┏━━━━━━━┳━━━━━━━━━┓
-        ┃ a     ┃ labeled ┃
-        ┡━━━━━━━╇━━━━━━━━━┩
-        │ int64 │ string  │
-        ├───────┼─────────┤
-        │     0 │ a       │
-        │     1 │ b       │
-        │     0 │ a       │
-        │     2 │ c       │
-        └───────┴─────────┘
-        """
-        return (
-            functools.reduce(
-                lambda stmt, inputs: stmt.when(*inputs), enumerate(labels), self.case()
-            )
-            .else_(nulls)
-            .end()
-        )
 
 
 @public
@@ -1220,27 +1659,136 @@ class IntegerScalar(NumericScalar, IntegerValue):
 
 @public
 class IntegerColumn(NumericColumn, IntegerValue):
-    def bit_and(self, where: ir.BooleanValue | None = None) -> IntegerScalar:
-        """Aggregate the column using the bitwise and operator."""
-        return ops.BitAnd(self, where).to_expr()
+    def bit_and(
+        self, *, where: bool | ir.BooleanValue | ibis.Deferred | None = None
+    ) -> IntegerScalar:
+        """Aggregate the column using the bitwise and operator.
 
-    def bit_or(self, where: ir.BooleanValue | None = None) -> IntegerScalar:
-        """Aggregate the column using the bitwise or operator."""
-        return ops.BitOr(self, where).to_expr()
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable({"x": [-1, 0, 1]})
+        >>> t.x.bit_and()
+        ┌───┐
+        │ 0 │
+        └───┘
+        >>> t.x.bit_and(where=t.x != 0)
+        ┌───┐
+        │ 1 │
+        └───┘
+        """
+        return ops.BitAnd(self, where=self._bind_to_parent_table(where)).to_expr()
 
-    def bit_xor(self, where: ir.BooleanValue | None = None) -> IntegerScalar:
-        """Aggregate the column using the bitwise exclusive or operator."""
-        return ops.BitXor(self, where).to_expr()
+    def bit_or(
+        self, *, where: bool | ir.BooleanValue | ibis.Deferred | None = None
+    ) -> IntegerScalar:
+        """Aggregate the column using the bitwise or operator.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable({"x": [-1, 0, 1]})
+        >>> t.x.bit_or()
+        ┌────┐
+        │ -1 │
+        └────┘
+        >>> t.x.bit_or(where=t.x >= 0)
+        ┌───┐
+        │ 1 │
+        └───┘
+        """
+        return ops.BitOr(self, where=self._bind_to_parent_table(where)).to_expr()
+
+    def bit_xor(
+        self, *, where: bool | ir.BooleanValue | ibis.Deferred | None = None
+    ) -> IntegerScalar:
+        """Aggregate the column using the bitwise exclusive or operator.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable({"x": [-1, 0, 1]})
+        >>> t.x.bit_xor()
+        ┌────┐
+        │ -2 │
+        └────┘
+        >>> t.x.bit_xor(where=t.x >= 0)
+        ┌───┐
+        │ 1 │
+        └───┘
+        """
+        return ops.BitXor(self, where=self._bind_to_parent_table(where)).to_expr()
 
 
 @public
 class FloatingValue(NumericValue):
     def isnan(self) -> ir.BooleanValue:
-        """Return whether the value is NaN."""
+        """Return whether the value is NaN. Does NOT detect `NULL` and `inf` values.
+
+        See Also
+        --------
+        [`Value.isnull()`](./expression-generic.qmd#ibis.expr.types.generic.Value.fill_null)
+        [`FloatingValue.isinf()`](./expression-numeric.qmd#ibis.expr.types.numeric.FloatingValue.isinf)
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable({"f": [None, "-inf", "3.0", "inf", "nan"]})
+        >>> t = t.mutate(f=ibis._.f.cast(float))
+        >>> t.mutate(
+        ...     isnull=t.f.isnull(),
+        ...     isnan=t.f.isnan(),
+        ...     isinf=t.f.isinf(),
+        ... )
+        ┏━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┓
+        ┃ f       ┃ isnull  ┃ isnan   ┃ isinf   ┃
+        ┡━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━┩
+        │ float64 │ boolean │ boolean │ boolean │
+        ├─────────┼─────────┼─────────┼─────────┤
+        │    NULL │ True    │ NULL    │ NULL    │
+        │    -inf │ False   │ False   │ True    │
+        │     3.0 │ False   │ False   │ False   │
+        │     inf │ False   │ False   │ True    │
+        │     nan │ False   │ True    │ False   │
+        └─────────┴─────────┴─────────┴─────────┘
+        """
         return ops.IsNan(self).to_expr()
 
     def isinf(self) -> ir.BooleanValue:
-        """Return whether the value is infinity."""
+        """Return whether the value is +/-inf. Does NOT detect `NULL` and `inf` values.
+
+        See Also
+        --------
+        [`Value.isnull()`](./expression-generic.qmd#ibis.expr.types.generic.Value.fill_null)
+        [`FloatingValue.isnan()`](./expression-numeric.qmd#ibis.expr.types.numeric.FloatingValue.isnan)
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable({"f": [None, "-inf", "3.0", "inf", "nan"]})
+        >>> t = t.mutate(f=ibis._.f.cast(float))
+        >>> t.mutate(
+        ...     isnull=t.f.isnull(),
+        ...     isnan=t.f.isnan(),
+        ...     isinf=t.f.isinf(),
+        ... )
+        ┏━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━┓
+        ┃ f       ┃ isnull  ┃ isnan   ┃ isinf   ┃
+        ┡━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━┩
+        │ float64 │ boolean │ boolean │ boolean │
+        ├─────────┼─────────┼─────────┼─────────┤
+        │    NULL │ True    │ NULL    │ NULL    │
+        │    -inf │ False   │ False   │ True    │
+        │     3.0 │ False   │ False   │ False   │
+        │     inf │ False   │ False   │ True    │
+        │     nan │ False   │ True    │ False   │
+        └─────────┴─────────┴─────────┴─────────┘
+        """
         return ops.IsInf(self).to_expr()
 
 

@@ -1,12 +1,18 @@
+from __future__ import annotations
+
 import datetime
 import decimal
 
-import pandas as pd
 import pytest
 
 import ibis
 import ibis.expr.datatypes as dt
-from ibis.expr.types.pretty import format_column
+
+pytest.importorskip("rich")
+
+from ibis.expr.types._rich import format_column, format_values
+
+pd = pytest.importorskip("pandas")
 
 null = "NULL"
 
@@ -113,7 +119,7 @@ def test_format_date_column(is_date):
 
 def test_format_interval_column():
     values = [datetime.timedelta(seconds=1)]
-    fmts, _, _ = format_column(dt.interval, values)
+    fmts, _, _ = format_column(dt.Interval("s"), values)
     strs = [str(f) for f in fmts]
     assert strs == [str(v) for v in values]
 
@@ -143,9 +149,18 @@ def test_format_short_string_column():
     assert max_len == 4
 
 
-def test_format_nested_column():
+def test_format_struct_column():
     dtype = dt.Struct({"x": "int", "y": "float"})
     values = [{"x": 1, "y": 2.5}, None]
+    fmts, min_len, max_len = format_column(dtype, values)
+    assert str(fmts[1]) == null
+    assert min_len == 20
+    assert max_len is None
+
+
+def test_format_map_column():
+    dtype = dt.Map(dt.String(), dt.Int32())
+    values = [[("x", 1), ("y", 2.5)], None]
     fmts, min_len, max_len = format_column(dtype, values)
     assert str(fmts[1]) == null
     assert min_len == 20
@@ -164,3 +179,34 @@ def test_all_empty_groups_repr():
     dtype = dt.float64
     fmts, *_ = format_column(dtype, values)
     assert list(map(str, fmts)) == ["nan", "nan"]
+
+
+def test_non_interactive_column_repr():
+    from rich.console import Console
+
+    t = ibis.table(dict(names="string", values="int"))
+    expr = t.names
+    console = Console()
+    with console.capture() as capture:
+        console.print(expr)
+
+    result = capture.get()
+    assert "Selection" not in result
+
+
+def test_format_link():
+    result = format_values(dt.string, ["https://ibis-project.org"])[0]
+    assert str(result) == "https://ibis-project.org"
+    assert result.spans[0].style == "link https://ibis-project.org"
+
+    # Check that long urls are truncated visually, but the link
+    # itself is still the full url.
+    long = "https://" + "x" * 1000
+    result = format_values(dt.string, [long])[0]
+    assert str(result).startswith("https://xxxxx")
+    assert len(str(result)) < 1000
+    assert result.spans[0].style == "link " + long
+
+    # not links
+    results = format_values(dt.string, ["https://", "https:", "https"])
+    assert all(not rendered.spans for rendered in results)

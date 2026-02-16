@@ -1,66 +1,3 @@
-CREATE OR REPLACE TABLE diamonds (
-    carat FLOAT,
-    cut TEXT,
-    color TEXT,
-    clarity TEXT,
-    depth FLOAT,
-    "table" FLOAT,
-    price BIGINT,
-    x FLOAT,
-    y FLOAT,
-    z FLOAT
-);
-
-CREATE OR REPLACE TABLE batting (
-    "playerID" TEXT,
-    "yearID" BIGINT,
-    stint BIGINT,
-    "teamID" TEXT,
-    "lgID" TEXT,
-    "G" BIGINT,
-    "AB" BIGINT,
-    "R" BIGINT,
-    "H" BIGINT,
-    "X2B" BIGINT,
-    "X3B" BIGINT,
-    "HR" BIGINT,
-    "RBI" BIGINT,
-    "SB" BIGINT,
-    "CS" BIGINT,
-    "BB" BIGINT,
-    "SO" BIGINT,
-    "IBB" BIGINT,
-    "HBP" BIGINT,
-    "SH" BIGINT,
-    "SF" BIGINT,
-    "GIDP" BIGINT
-);
-
-CREATE OR REPLACE TABLE awards_players (
-    "playerID" TEXT,
-    "awardID" TEXT,
-    "yearID" BIGINT,
-    "lgID" TEXT,
-    tie TEXT,
-    notes TEXT
-);
-
-CREATE OR REPLACE TABLE functional_alltypes (
-    id INTEGER,
-    bool_col BOOLEAN,
-    tinyint_col SMALLINT,
-    smallint_col SMALLINT,
-    int_col INTEGER,
-    bigint_col BIGINT,
-    float_col REAL,
-    double_col DOUBLE PRECISION,
-    date_string_col TEXT,
-    string_col TEXT,
-    timestamp_col TIMESTAMP WITHOUT TIME ZONE,
-    year INTEGER,
-    month INTEGER
-);
-
 CREATE OR REPLACE TABLE array_types (
     x BIGINT[],
     y TEXT[],
@@ -92,17 +29,25 @@ INSERT INTO struct VALUES
     (NULL),
     ({'a': 3.0, 'b': 'orange', 'c': NULL});
 
-CREATE OR REPLACE TABLE json_t (js JSON);
+CREATE OR REPLACE TABLE json_t (rowid BIGINT, js JSON);
 
 INSERT INTO json_t VALUES
-    ('{"a": [1,2,3,4], "b": 1}'),
-    ('{"a":null,"b":2}'),
-    ('{"a":"foo", "c":null}'),
-    ('null'),
-    ('[42,47,55]'),
-    ('[]');
+    (1, '{"a": [1,2,3,4], "b": 1}'),
+    (2, '{"a":null,"b":2}'),
+    (3, '{"a":"foo", "c":null}'),
+    (4, 'null'),
+    (5, '[42,47,55]'),
+    (6, '[]'),
+    (7, '"a"'),
+    (8, '""'),
+    (9, '"b"'),
+    (10, NULL),
+    (11, 'true'),
+    (12, 'false'),
+    (13, '42'),
+    (14, '37.37');
 
-CREATE OR REPLACE TABLE win (g TEXT, x BIGINT, y BIGINT);
+CREATE OR REPLACE TABLE win (g TEXT, x BIGINT NOT NULL, y BIGINT);
 INSERT INTO win VALUES
     ('a', 0, 3),
     ('a', 1, 2),
@@ -110,7 +55,15 @@ INSERT INTO win VALUES
     ('a', 3, 1),
     ('a', 4, 1);
 
-CREATE OR REPLACE TABLE map (kv MAP(STRING, BIGINT));
+CREATE OR REPLACE TABLE map (idx BIGINT, kv MAP(STRING, BIGINT));
 INSERT INTO map VALUES
-    (MAP(['a', 'b', 'c'], [1, 2, 3])),
-    (MAP(['d', 'e', 'f'], [4, 5, 6]));
+    (1, MAP(['a', 'b', 'c'], [1, 2, 3])),
+    (2, MAP(['d', 'e', 'f'], [4, 5, 6]));
+
+
+CREATE OR REPLACE TABLE topk (x BIGINT);
+INSERT INTO topk VALUES (1), (1), (NULL);
+
+CREATE SCHEMA shops;
+CREATE TABLE shops.ice_cream (flavor TEXT, quantity INT);
+INSERT INTO shops.ice_cream values ('vanilla', 2), ('chocolate', 3);

@@ -1,300 +1,390 @@
+"""String operations."""
+
 from __future__ import annotations
+
+from typing import Optional
 
 from public import public
 
 import ibis.expr.datatypes as dt
 import ibis.expr.rules as rlz
 from ibis.common.annotations import attribute
+from ibis.common.typing import VarTuple  # noqa: TC001
 from ibis.expr.operations.core import Unary, Value
 
 
 @public
 class StringUnary(Unary):
-    arg = rlz.string
-    output_dtype = dt.string
+    """Base class for string operations accepting one argument."""
+
+    arg: Value[dt.String]
+
+    dtype = dt.string
 
 
 @public
 class Uppercase(StringUnary):
-    pass
+    """Convert a string to uppercase."""
 
 
 @public
 class Lowercase(StringUnary):
-    pass
+    """Convert a string to lowercase."""
 
 
 @public
 class Reverse(StringUnary):
-    pass
+    """Reverse a string."""
 
 
 @public
 class Strip(StringUnary):
-    pass
+    """Strip leading and trailing whitespace."""
 
 
 @public
 class LStrip(StringUnary):
-    pass
+    """Strip leading whitespace."""
 
 
 @public
 class RStrip(StringUnary):
-    pass
+    """Strip trailing whitespace."""
 
 
 @public
 class Capitalize(StringUnary):
-    pass
+    """Capitalize the first letter of a string."""
 
 
 @public
 class Substring(Value):
-    arg = rlz.string
-    start = rlz.integer
-    length = rlz.optional(rlz.integer)
+    """Extract a substring from a string."""
 
-    output_dtype = dt.string
-    output_shape = rlz.shape_like('arg')
+    arg: Value[dt.String]
+    start: Value[dt.Integer]
+    length: Optional[Value[dt.Integer]] = None
+
+    dtype = dt.string
+    shape = rlz.shape_like("args")
+
+
+@public
+class StringSlice(Value):
+    """Extract a substring from a string."""
+
+    arg: Value[dt.String]
+    start: Optional[Value[dt.Integer]] = None
+    end: Optional[Value[dt.Integer]] = None
+
+    dtype = dt.string
+    shape = rlz.shape_like("args")
 
 
 @public
 class StrRight(Value):
-    arg = rlz.string
-    nchars = rlz.integer
-    output_shape = rlz.shape_like("arg")
-    output_dtype = dt.string
+    """Extract a substring starting from the right of a string."""
+
+    arg: Value[dt.String]
+    nchars: Value[dt.Integer]
+
+    shape = rlz.shape_like("args")
+    dtype = dt.string
 
 
 @public
 class Repeat(Value):
-    arg = rlz.string
-    times = rlz.integer
-    output_shape = rlz.shape_like("arg")
-    output_dtype = dt.string
+    """Repeat a string."""
+
+    arg: Value[dt.String]
+    times: Value[dt.Integer]
+
+    shape = rlz.shape_like("args")
+    dtype = dt.string
 
 
 @public
 class StringFind(Value):
-    arg = rlz.string
-    substr = rlz.string
-    start = rlz.optional(rlz.integer)
-    end = rlz.optional(rlz.integer)
+    """Find the position of a substring in a string."""
 
-    output_shape = rlz.shape_like("arg")
-    output_dtype = dt.int64
+    arg: Value[dt.String]
+    substr: Value[dt.String]
+    start: Optional[Value[dt.Integer]] = None
+    end: Optional[Value[dt.Integer]] = None
+
+    shape = rlz.shape_like("args")
+    dtype = dt.int64
 
 
 @public
 class Translate(Value):
-    arg = rlz.string
-    from_str = rlz.string
-    to_str = rlz.string
+    """Translate characters in a string."""
 
-    output_shape = rlz.shape_like("arg")
-    output_dtype = dt.string
+    arg: Value[dt.String]
+    from_str: Value[dt.String]
+    to_str: Value[dt.String]
+
+    shape = rlz.shape_like("args")
+    dtype = dt.string
 
 
 @public
 class LPad(Value):
-    arg = rlz.string
-    length = rlz.integer
-    pad = rlz.optional(rlz.string)
+    """Pad a string on the left."""
 
-    output_shape = rlz.shape_like("arg")
-    output_dtype = dt.string
+    arg: Value[dt.String]
+    length: Value[dt.Integer]
+    pad: Optional[Value[dt.String]] = None
+
+    shape = rlz.shape_like("args")
+    dtype = dt.string
 
 
 @public
 class RPad(Value):
-    arg = rlz.string
-    length = rlz.integer
-    pad = rlz.optional(rlz.string)
+    """Pad a string on the right."""
 
-    output_shape = rlz.shape_like("arg")
-    output_dtype = dt.string
+    arg: Value[dt.String]
+    length: Value[dt.Integer]
+    pad: Optional[Value[dt.String]] = None
+
+    shape = rlz.shape_like("args")
+    dtype = dt.string
 
 
 @public
 class FindInSet(Value):
-    needle = rlz.string
-    values = rlz.tuple_of(rlz.string, min_length=1)
+    """Find the position of a string in a list of comma-separated strings."""
 
-    output_shape = rlz.shape_like("needle")
-    output_dtype = dt.int64
+    needle: Value[dt.String]
+    values: VarTuple[Value[dt.String]]
+
+    shape = rlz.shape_like("needle")
+    dtype = dt.int64
 
 
 @public
 class StringJoin(Value):
-    sep = rlz.string
-    arg = rlz.tuple_of(rlz.string, min_length=1)
+    """Join strings with a separator."""
 
-    output_dtype = dt.string
+    arg: VarTuple[Value[dt.String]]
+    sep: Value[dt.String]
 
-    @attribute.default
-    def output_shape(self):
-        return rlz.highest_precedence_shape(self.arg)
+    dtype = dt.string
+
+    @attribute
+    def shape(self):
+        return rlz.highest_precedence_shape((self.sep, *self.arg))
 
 
 @public
 class ArrayStringJoin(Value):
-    sep = rlz.string
-    arg = rlz.value(dt.Array(dt.string))
+    """Join strings in an array with a separator."""
 
-    output_dtype = dt.string
-    output_shape = rlz.shape_like("args")
+    arg: Value[dt.Array[dt.String]]
+    sep: Value[dt.String]
+
+    dtype = dt.string
+    shape = rlz.shape_like("args")
 
 
 @public
 class StartsWith(Value):
-    arg = rlz.string
-    start = rlz.scalar(rlz.string)
-    output_dtype = dt.boolean
-    output_shape = rlz.shape_like("arg")
+    """Check if a string starts with another string."""
+
+    arg: Value[dt.String]
+    start: Value[dt.String]
+
+    dtype = dt.boolean
+    shape = rlz.shape_like("args")
 
 
 @public
 class EndsWith(Value):
-    arg = rlz.string
-    end = rlz.scalar(rlz.string)
-    output_dtype = dt.boolean
-    output_shape = rlz.shape_like("arg")
+    """Check if a string ends with another string."""
+
+    arg: Value[dt.String]
+    end: Value[dt.String]
+
+    dtype = dt.boolean
+    shape = rlz.shape_like("args")
 
 
 @public
 class FuzzySearch(Value):
-    arg = rlz.string
-    pattern = rlz.string
-    output_dtype = dt.boolean
-    output_shape = rlz.shape_like('arg')
+    arg: Value[dt.String]
+    pattern: Value[dt.String]
+
+    dtype = dt.boolean
+    shape = rlz.shape_like("args")
 
 
 @public
 class StringSQLLike(FuzzySearch):
-    arg = rlz.string
-    pattern = rlz.string
-    escape = rlz.optional(rlz.instance_of(str))
+    """SQL LIKE string match operation.
+
+    Similar to globbing.
+    """
+
+    arg: Value[dt.String]
+    pattern: Value[dt.String]
+    escape: Optional[str] = None
 
 
 @public
 class StringSQLILike(StringSQLLike):
-    """SQL ilike operation."""
+    """Case-insensitive SQL LIKE string match operation.
+
+    Similar to case-insensitive globbing.
+    """
 
 
 @public
 class RegexSearch(FuzzySearch):
-    pass
+    """Search a string with a regular expression."""
 
 
 @public
 class RegexExtract(Value):
-    arg = rlz.string
-    pattern = rlz.string
-    index = rlz.integer
+    """Extract a substring from a string using a regular expression."""
 
-    output_shape = rlz.shape_like("arg")
-    output_dtype = dt.string
+    arg: Value[dt.String]
+    pattern: Value[dt.String]
+    index: Value[dt.Integer]
+
+    shape = rlz.shape_like("args")
+    dtype = dt.string
+
+
+@public
+class RegexSplit(Value):
+    """Split a string using a regular expression."""
+
+    arg: Value[dt.String]
+    pattern: Value[dt.String]
+
+    shape = rlz.shape_like("args")
+    dtype = dt.Array(dt.string)
 
 
 @public
 class RegexReplace(Value):
-    arg = rlz.string
-    pattern = rlz.string
-    replacement = rlz.string
+    """Replace a substring in a string using a regular expression."""
 
-    output_shape = rlz.shape_like("arg")
-    output_dtype = dt.string
+    arg: Value[dt.String]
+    pattern: Value[dt.String]
+    replacement: Value[dt.String]
+
+    shape = rlz.shape_like("args")
+    dtype = dt.string
 
 
 @public
 class StringReplace(Value):
-    arg = rlz.string
-    pattern = rlz.string
-    replacement = rlz.string
+    """Replace a substring in a string with another string."""
 
-    output_shape = rlz.shape_like("arg")
-    output_dtype = dt.string
+    arg: Value[dt.String]
+    pattern: Value[dt.String]
+    replacement: Value[dt.String]
+
+    shape = rlz.shape_like("args")
+    dtype = dt.string
 
 
 @public
 class StringSplit(Value):
-    arg = rlz.string
-    delimiter = rlz.string
+    """Split a string using a delimiter."""
 
-    output_shape = rlz.shape_like("arg")
-    output_dtype = dt.Array(dt.string)
+    arg: Value[dt.String]
+    delimiter: Value[dt.String]
+
+    shape = rlz.shape_like("args")
+    dtype = dt.Array(dt.string)
 
 
 @public
 class StringConcat(Value):
-    arg = rlz.tuple_of(rlz.string)
-    output_shape = rlz.shape_like('arg')
-    output_dtype = rlz.dtype_like('arg')
+    """Concatenate strings."""
+
+    arg: VarTuple[Value[dt.String]]
+
+    shape = rlz.shape_like("arg")
+    dtype = rlz.dtype_like("arg")
 
 
 @public
-class ExtractURLField(Value):
-    arg = rlz.string
-
-    output_shape = rlz.shape_like("arg")
-    output_dtype = dt.string
+class ExtractProtocol(StringUnary):
+    """Extract the protocol from a URL."""
 
 
 @public
-class ExtractProtocol(ExtractURLField):
-    pass
+class ExtractAuthority(StringUnary):
+    """Extract the authority from a URL."""
 
 
 @public
-class ExtractAuthority(ExtractURLField):
-    pass
+class ExtractUserInfo(StringUnary):
+    """Extract the user info from a URL."""
 
 
 @public
-class ExtractUserInfo(ExtractURLField):
-    pass
+class ExtractHost(StringUnary):
+    """Extract the host from a URL."""
 
 
 @public
-class ExtractHost(ExtractURLField):
-    pass
+class ExtractFile(StringUnary):
+    """Extract the file from a URL."""
 
 
 @public
-class ExtractFile(ExtractURLField):
-    pass
+class ExtractPath(StringUnary):
+    """Extract the path from a URL."""
 
 
 @public
-class ExtractPath(ExtractURLField):
-    pass
+class ExtractQuery(StringUnary):
+    """Extract the query from a URL."""
+
+    key: Optional[Value[dt.String]] = None
 
 
 @public
-class ExtractQuery(ExtractURLField):
-    key = rlz.optional(rlz.string)
-
-
-@public
-class ExtractFragment(ExtractURLField):
-    pass
+class ExtractFragment(StringUnary):
+    """Extract the fragment from a URL."""
 
 
 @public
 class StringLength(StringUnary):
-    output_dtype = dt.int32
+    """Compute the length of a string."""
+
+    dtype = dt.int32
 
 
 @public
 class StringAscii(StringUnary):
-    output_dtype = dt.int32
+    """Compute the ASCII code of the first character of a string."""
+
+    dtype = dt.int32
 
 
 @public
 class StringContains(Value):
-    haystack = rlz.string
-    needle = rlz.string
+    """Check if a string contains a substring."""
 
-    output_shape = rlz.shape_like("args")
-    output_dtype = dt.bool
+    haystack: Value[dt.String]
+    needle: Value[dt.String]
+
+    shape = rlz.shape_like("args")
+    dtype = dt.bool
+
+
+@public
+class Levenshtein(Value):
+    """Compute the Levenshtein distance between two strings."""
+
+    left: Value[dt.String]
+    right: Value[dt.String]
+
+    dtype = dt.int64
+    shape = rlz.shape_like("args")

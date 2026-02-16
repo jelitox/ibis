@@ -4,17 +4,21 @@ from typing import TYPE_CHECKING
 
 from public import public
 
+import ibis
 import ibis.expr.operations as ops
-from ibis.expr.types.core import _binop
+from ibis import util
+from ibis.expr.types.generic import _binop
 from ibis.expr.types.numeric import NumericColumn, NumericScalar, NumericValue
 
 if TYPE_CHECKING:
+    from typing_extensions import Self
+
     import ibis.expr.types as ir
 
 
 @public
 class BooleanValue(NumericValue):
-    def ifelse(self, true_expr: ir.Value, false_expr: ir.Value) -> ir.Value:
+    def ifelse(self, true_expr: ir.Value, false_expr: ir.Value, /) -> ir.Value:
         """Construct a ternary conditional expression.
 
         Parameters
@@ -35,23 +39,23 @@ class BooleanValue(NumericValue):
         >>> ibis.options.interactive = True
         >>> t = ibis.memtable({"is_person": [True, False, True, None]})
         >>> t.is_person.ifelse("yes", "no")
-        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ Where(is_person, 'yes', 'no') ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-        │ string                        │
-        ├───────────────────────────────┤
-        │ yes                           │
-        │ no                            │
-        │ yes                           │
-        │ no                            │
-        └───────────────────────────────┘
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ IfElse(is_person, 'yes', 'no') ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string                         │
+        ├────────────────────────────────┤
+        │ yes                            │
+        │ no                             │
+        │ yes                            │
+        │ no                             │
+        └────────────────────────────────┘
         """
         # Result will be the result of promotion of true/false exprs. These
         # might be conflicting types; same type resolution as case expressions
         # must be used.
-        return ops.Where(self, true_expr, false_expr).to_expr()
+        return ops.IfElse(self, true_expr, false_expr).to_expr()
 
-    def __and__(self, other: BooleanValue) -> BooleanValue:
+    def __and__(self, other: bool | BooleanValue | ibis.Deferred) -> BooleanValue:
         """Construct a binary AND conditional expression with `self` and `other`.
 
         Parameters
@@ -99,7 +103,7 @@ class BooleanValue(NumericValue):
 
     __rand__ = __and__
 
-    def __or__(self, other: BooleanValue) -> BooleanValue:
+    def __or__(self, other: bool | BooleanValue | ibis.Deferred) -> BooleanValue:
         """Construct a binary OR conditional expression with `self` and `other`.
 
         Parameters
@@ -135,7 +139,7 @@ class BooleanValue(NumericValue):
 
     __ror__ = __or__
 
-    def __xor__(self, other: BooleanValue) -> BooleanValue:
+    def __xor__(self, other: bool | BooleanValue | ibis.Deferred) -> BooleanValue:
         """Construct a binary XOR conditional expression with `self` and `other`.
 
         Parameters
@@ -196,7 +200,7 @@ class BooleanValue(NumericValue):
 
     __rxor__ = __xor__
 
-    def __invert__(self) -> BooleanValue:
+    def __invert__(self) -> Self:
         """Construct a unary NOT conditional expression with `self`.
 
         Parameters
@@ -226,11 +230,16 @@ class BooleanValue(NumericValue):
         │ NULL     │
         └──────────┘
         """
-        return self.negate()
+        return ops.Not(self).to_expr()
 
-    @staticmethod
-    def __negate_op__():
-        return ops.Not
+    def negate(self) -> Self:
+        """DEPRECATED."""
+        util.warn_deprecated(
+            "`-bool_val`/`bool_val.negate()`",
+            instead="use `~bool_val` instead",
+            as_of="9.5",
+        )
+        return ~self
 
 
 @public
@@ -240,8 +249,14 @@ class BooleanScalar(NumericScalar, BooleanValue):
 
 @public
 class BooleanColumn(NumericColumn, BooleanValue):
-    def any(self, where: BooleanValue | None = None) -> BooleanValue:
+    def any(
+        self, *, where: bool | BooleanValue | ibis.Deferred | None = None
+    ) -> BooleanScalar:
         """Return whether at least one element is `True`.
+
+        If the expression does not reference any foreign tables, the result
+        will be a scalar reduction, otherwise it will be a deferred expression
+        constructing an exists subquery when passed to a table method.
 
         Parameters
         ----------
@@ -253,24 +268,84 @@ class BooleanColumn(NumericColumn, BooleanValue):
         BooleanValue
             Whether at least one element is `True`.
 
+        Notes
+        -----
+        Consider the following ibis expressions
+
+        ```python
+        import ibis
+
+        t = ibis.table(dict(a="string"))
+        s = ibis.table(dict(a="string"))
+
+        cond = (t.a == s.a).any()
+        ```
+
+        Without knowing the table to use as the outer query there are two ways to
+        turn this expression into a SQL `EXISTS` predicate, depending on which of
+        `t` or `s` is filtered on.
+
+        Filtering from `t`:
+
+        ```sql
+        SELECT *
+        FROM t
+        WHERE EXISTS (SELECT 1 FROM s WHERE t.a = s.a)
+        ```
+
+        Filtering from `s`:
+
+        ```sql
+        SELECT *
+        FROM s
+        WHERE EXISTS (SELECT 1 FROM t WHERE t.a = s.a)
+        ```
+
+        Notably the correlated subquery cannot stand on its own.
+
         Examples
         --------
         >>> import ibis
         >>> ibis.options.interactive = True
         >>> t = ibis.memtable({"arr": [1, 2, 3, None]})
         >>> (t.arr > 2).any()
-        True
+        ┌──────┐
+        │ True │
+        └──────┘
         >>> (t.arr > 4).any()
-        False
-        >>> m = ibis.memtable({"arr": [True, True, True, False]})
+        ┌───────┐
+        │ False │
+        └───────┘
         >>> (t.arr == None).any(where=t.arr != None)
-        False
+        ┌───────┐
+        │ False │
+        └───────┘
         """
-        import ibis.expr.analysis as an
+        from ibis.common.deferred import Call, Deferred, _
 
-        return an._make_any(self, ops.Any, where=where)
+        parents = self.op().relations
 
-    def notany(self, where: BooleanValue | None = None) -> BooleanValue:
+        def resolve_exists_subquery(outer):
+            """An exists subquery whose outer leaf table is unknown."""
+            (inner,) = (t for t in parents if t != outer.op())
+            relation = ops.Filter(inner, [self])
+            return ops.ExistsSubquery(relation).to_expr()
+
+        if len(parents) == 2:
+            return Deferred(Call(resolve_exists_subquery, _))
+        elif len(parents) == 1:
+            op = ops.Any(self, where=self._bind_to_parent_table(where))
+        else:
+            raise NotImplementedError(
+                f'Cannot compute "any" for expression of type {type(self)} '
+                f"with multiple foreign tables"
+            )
+
+        return op.to_expr()
+
+    def notany(
+        self, *, where: bool | BooleanValue | ibis.Deferred | None = None
+    ) -> BooleanScalar:
         """Return whether no elements are `True`.
 
         Parameters
@@ -289,18 +364,24 @@ class BooleanColumn(NumericColumn, BooleanValue):
         >>> ibis.options.interactive = True
         >>> t = ibis.memtable({"arr": [1, 2, 3, 4]})
         >>> (t.arr > 1).notany()
-        False
+        ┌───────┐
+        │ False │
+        └───────┘
         >>> (t.arr > 4).notany()
-        True
+        ┌──────┐
+        │ True │
+        └──────┘
         >>> m = ibis.memtable({"arr": [True, True, True, False]})
         >>> (t.arr == None).notany(where=t.arr != None)
-        True
+        ┌──────┐
+        │ True │
+        └──────┘
         """
-        import ibis.expr.analysis as an
+        return ~self.any(where=where)
 
-        return an._make_any(self, ops.NotAny, where=where)
-
-    def all(self, where: BooleanValue | None = None) -> BooleanScalar:
+    def all(
+        self, *, where: bool | BooleanValue | ibis.Deferred | None = None
+    ) -> BooleanScalar:
         """Return whether all elements are `True`.
 
         Parameters
@@ -319,18 +400,27 @@ class BooleanColumn(NumericColumn, BooleanValue):
         >>> ibis.options.interactive = True
         >>> t = ibis.memtable({"arr": [1, 2, 3, 4]})
         >>> (t.arr >= 1).all()
-        True
+        ┌──────┐
+        │ True │
+        └──────┘
         >>> (t.arr > 2).all()
-        False
+        ┌───────┐
+        │ False │
+        └───────┘
         >>> (t.arr == 2).all(where=t.arr == 2)
-        True
+        ┌──────┐
+        │ True │
+        └──────┘
         >>> (t.arr == 2).all(where=t.arr >= 2)
-        False
-
+        ┌───────┐
+        │ False │
+        └───────┘
         """
-        return ops.All(self, where=where).to_expr()
+        return ops.All(self, where=self._bind_to_parent_table(where)).to_expr()
 
-    def notall(self, where: BooleanValue | None = None) -> BooleanScalar:
+    def notall(
+        self, *, where: bool | BooleanValue | ibis.Deferred | None = None
+    ) -> BooleanScalar:
         """Return whether not all elements are `True`.
 
         Parameters
@@ -349,17 +439,31 @@ class BooleanColumn(NumericColumn, BooleanValue):
         >>> ibis.options.interactive = True
         >>> t = ibis.memtable({"arr": [1, 2, 3, 4]})
         >>> (t.arr >= 1).notall()
-        False
+        ┌───────┐
+        │ False │
+        └───────┘
         >>> (t.arr > 2).notall()
-        True
+        ┌──────┐
+        │ True │
+        └──────┘
         >>> (t.arr == 2).notall(where=t.arr == 2)
-        False
+        ┌───────┐
+        │ False │
+        └───────┘
         >>> (t.arr == 2).notall(where=t.arr >= 2)
-        True
+        ┌──────┐
+        │ True │
+        └──────┘
         """
-        return ops.NotAll(self, where=where).to_expr()
+        return ~self.all(where=where)
 
-    def cumany(self) -> BooleanColumn:
+    def cumany(
+        self,
+        *,
+        where: bool | BooleanValue | ibis.Deferred | None = None,
+        group_by=None,
+        order_by=None,
+    ) -> BooleanColumn:
         """Accumulate the `any` aggregate.
 
         Returns
@@ -373,32 +477,39 @@ class BooleanColumn(NumericColumn, BooleanValue):
         >>> ibis.options.interactive = True
         >>> t = ibis.memtable({"arr": [1, 2, 3, 4]})
         >>> ((t.arr > 1) | (t.arr >= 1)).cumany()
-        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ CumulativeAny(Or(Greater(arr, 1), GreaterEqual(arr, 1))) ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-        │ boolean                                                  │
-        ├──────────────────────────────────────────────────────────┤
-        │ True                                                     │
-        │ True                                                     │
-        │ True                                                     │
-        │ True                                                     │
-        └──────────────────────────────────────────────────────────┘
-
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ Any(Or(Greater(arr, 1), GreaterEqual(arr, 1))) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ boolean                                        │
+        ├────────────────────────────────────────────────┤
+        │ True                                           │
+        │ True                                           │
+        │ True                                           │
+        │ True                                           │
+        └────────────────────────────────────────────────┘
         >>> ((t.arr > 1) & (t.arr >= 1)).cumany()
-        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ CumulativeAny(And(Greater(arr, 1), GreaterEqual(arr, 1))) ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-        │ boolean                                                   │
-        ├───────────────────────────────────────────────────────────┤
-        │ False                                                     │
-        │ True                                                      │
-        │ True                                                      │
-        │ True                                                      │
-        └───────────────────────────────────────────────────────────┘
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ Any(And(Greater(arr, 1), GreaterEqual(arr, 1))) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ boolean                                         │
+        ├─────────────────────────────────────────────────┤
+        │ False                                           │
+        │ True                                            │
+        │ True                                            │
+        │ True                                            │
+        └─────────────────────────────────────────────────┘
         """
-        return ops.CumulativeAny(self).to_expr()
+        return self.any(where=where).over(
+            ibis.cumulative_window(group_by=group_by, order_by=order_by)
+        )
 
-    def cumall(self) -> BooleanColumn:
+    def cumall(
+        self,
+        *,
+        where: bool | BooleanValue | ibis.Deferred | None = None,
+        group_by=None,
+        order_by=None,
+    ) -> BooleanColumn:
         """Accumulate the `all` aggregate.
 
         Returns
@@ -412,27 +523,28 @@ class BooleanColumn(NumericColumn, BooleanValue):
         >>> ibis.options.interactive = True
         >>> t = ibis.memtable({"arr": [1, 2, 3, 4]})
         >>> ((t.arr > 1) & (t.arr >= 1)).cumall()
-        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ CumulativeAll(And(Greater(arr, 1), GreaterEqual(arr, 1))) ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-        │ boolean                                                   │
-        ├───────────────────────────────────────────────────────────┤
-        │ False                                                     │
-        │ False                                                     │
-        │ False                                                     │
-        │ False                                                     │
-        └───────────────────────────────────────────────────────────┘
-
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ All(And(Greater(arr, 1), GreaterEqual(arr, 1))) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ boolean                                         │
+        ├─────────────────────────────────────────────────┤
+        │ False                                           │
+        │ False                                           │
+        │ False                                           │
+        │ False                                           │
+        └─────────────────────────────────────────────────┘
         >>> ((t.arr > 0) & (t.arr >= 1)).cumall()
-        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ CumulativeAll(And(Greater(arr, 0), GreaterEqual(arr, 1))) ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-        │ boolean                                                   │
-        ├───────────────────────────────────────────────────────────┤
-        │ True                                                      │
-        │ True                                                      │
-        │ True                                                      │
-        │ True                                                      │
-        └───────────────────────────────────────────────────────────┘
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ All(And(Greater(arr, 0), GreaterEqual(arr, 1))) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ boolean                                         │
+        ├─────────────────────────────────────────────────┤
+        │ True                                            │
+        │ True                                            │
+        │ True                                            │
+        │ True                                            │
+        └─────────────────────────────────────────────────┘
         """
-        return ops.CumulativeAll(self).to_expr()
+        return self.all(where=where).over(
+            ibis.cumulative_window(group_by=group_by, order_by=order_by)
+        )

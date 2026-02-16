@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 import pytest
 
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
 from ibis import literal
-from ibis.tests.util import assert_equal
 
 
 def test_lower_upper(table):
@@ -30,7 +30,7 @@ def test_lower_upper(table):
     assert isinstance(lresult.op(), ops.Lowercase)
     assert isinstance(uresult.op(), ops.Uppercase)
 
-    lit = literal('FoO')
+    lit = literal("FoO")
 
     lresult = lit.lower()
     uresult = lit.upper()
@@ -39,7 +39,7 @@ def test_lower_upper(table):
 
 
 def test_substr(table):
-    lit = literal('FoO')
+    lit = literal("FoO")
 
     result = table.g.substr(2, 4)
     lit_result = lit.substr(0, 2)
@@ -68,7 +68,7 @@ def test_left_right(table):
 
 
 def test_length(table):
-    lit = literal('FoO')
+    lit = literal("FoO")
     result = table.g.length()
     lit_result = lit.length()
 
@@ -78,46 +78,36 @@ def test_length(table):
 
 
 def test_join(table):
-    dash = literal('-')
+    dash = literal("-")
 
-    expr = dash.join([table.f.cast('string'), table.g])
+    expr = dash.join([table.f.cast("string"), table.g])
     assert isinstance(expr, ir.StringColumn)
 
-    expr = dash.join([literal('ab'), literal('cd')])
+    expr = dash.join([literal("ab"), literal("cd")])
     assert isinstance(expr, ir.StringScalar)
 
 
 def test_contains(table):
-    expr = table.g.contains('foo')
+    expr = table.g.contains("foo")
     assert isinstance(expr.op(), ops.StringContains)
 
     with pytest.raises(TypeError):
-        'foo' in table.g  # noqa: B015
-
-
-@pytest.mark.parametrize(
-    ('left_slice', 'right_start', 'right_stop'),
-    [(slice(None, 3), 0, 3), (slice(2, 6), 2, 4)],
-)
-def test_getitem_slice(table, left_slice, right_start, right_stop):
-    case = table.g[left_slice]
-    expected = table.g.substr(right_start, right_stop)
-    assert_equal(case, expected)
+        "foo" in table.g  # noqa: B015
 
 
 def test_add_radd(table, string_col):
     string_col = table[string_col]
-    assert isinstance(literal('foo') + 'bar', ir.StringScalar)
-    assert isinstance('bar' + literal('foo'), ir.StringScalar)
-    assert isinstance(string_col + 'bar', ir.StringColumn)
-    assert isinstance('bar' + string_col, ir.StringColumn)
+    assert isinstance(literal("foo") + "bar", ir.StringScalar)
+    assert isinstance("bar" + literal("foo"), ir.StringScalar)
+    assert isinstance(string_col + "bar", ir.StringColumn)
+    assert isinstance("bar" + string_col, ir.StringColumn)
 
 
 def test_startswith(table):
-    assert isinstance(table.g.startswith('foo'), ir.BooleanColumn)
-    assert isinstance(literal('bar').startswith('foo'), ir.BooleanScalar)
+    assert isinstance(table.g.startswith("foo"), ir.BooleanColumn)
+    assert isinstance(literal("bar").startswith("foo"), ir.BooleanScalar)
 
 
 def test_endswith(table):
-    assert isinstance(table.g.endswith('foo'), ir.BooleanColumn)
-    assert isinstance(literal('bar').endswith('foo'), ir.BooleanScalar)
+    assert isinstance(table.g.endswith("foo"), ir.BooleanColumn)
+    assert isinstance(literal("bar").endswith("foo"), ir.BooleanScalar)

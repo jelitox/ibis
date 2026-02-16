@@ -1,206 +1,335 @@
+"""Operations for array expressions."""
+
 from __future__ import annotations
+
+from typing import Optional
 
 from public import public
 
-import ibis.common.exceptions as com
+import ibis.expr.datashape as ds
 import ibis.expr.datatypes as dt
 import ibis.expr.rules as rlz
 from ibis.common.annotations import attribute
+from ibis.common.typing import VarTuple  # noqa: TC001
 from ibis.expr.operations.core import Argument, Unary, Value
 
 
 @public
-class ArrayColumn(Value):
-    cols = rlz.tuple_of(rlz.column(rlz.any), min_length=1)
+class Array(Value):
+    """Construct an array."""
 
-    output_shape = rlz.Shape.COLUMNAR
+    exprs: VarTuple[Value]
 
-    def __init__(self, cols):
-        unique_dtypes = {col.output_dtype for col in cols}
-        if len(unique_dtypes) > 1:
-            raise com.IbisTypeError(
-                f'The types of all input columns must match exactly in a '
-                f'{type(self).__name__} operation.'
-            )
-        super().__init__(cols=cols)
+    @attribute
+    def shape(self):
+        return rlz.highest_precedence_shape(self.exprs)
 
-    @attribute.default
-    def output_dtype(self):
-        first_dtype = self.cols[0].output_dtype
-        return dt.Array(first_dtype)
+    @attribute
+    def dtype(self):
+        return dt.Array(rlz.highest_precedence_dtype(self.exprs))
 
 
 @public
 class ArrayLength(Unary):
-    arg = rlz.array
+    """Compute the length of an array."""
 
-    output_dtype = dt.int64
-    output_shape = rlz.shape_like("args")
+    arg: Value[dt.Array]
+
+    dtype = dt.int64
+    shape = rlz.shape_like("args")
 
 
 @public
 class ArraySlice(Value):
-    arg = rlz.array
-    start = rlz.integer
-    stop = rlz.optional(rlz.integer)
+    """Slice an array element."""
 
-    output_dtype = rlz.dtype_like("arg")
-    output_shape = rlz.shape_like("arg")
+    arg: Value[dt.Array]
+    start: Value[dt.Integer]
+    stop: Optional[Value[dt.Integer]] = None
+
+    dtype = rlz.dtype_like("arg")
+    shape = rlz.shape_like("args")
 
 
 @public
 class ArrayIndex(Value):
-    arg = rlz.array
-    index = rlz.integer
+    """Return the element of an array at some index."""
 
-    output_shape = rlz.shape_like("args")
+    arg: Value[dt.Array]
+    index: Value[dt.Integer]
 
-    @attribute.default
-    def output_dtype(self):
-        return self.arg.output_dtype.value_type
+    shape = rlz.shape_like("args")
+
+    @attribute
+    def dtype(self):
+        return self.arg.dtype.value_type
 
 
 @public
 class ArrayConcat(Value):
-    left = rlz.array
-    right = rlz.array
+    """Concatenate two or more arrays into a single array."""
 
-    output_dtype = rlz.dtype_like("left")
-    output_shape = rlz.shape_like("args")
+    arg: VarTuple[Value[dt.Array]]
 
-    def __init__(self, left, right):
-        if left.output_dtype != right.output_dtype:
-            raise com.IbisTypeError(
-                'Array types must match exactly in a {} operation. '
-                'Left type {} != Right type {}'.format(
-                    type(self).__name__, left.output_dtype, right.output_dtype
-                )
-            )
-        super().__init__(left=left, right=right)
+    shape = rlz.shape_like("arg")
+
+    @attribute
+    def dtype(self):
+        return dt.Array(dt.highest_precedence(arg.dtype.value_type for arg in self.arg))
 
 
 @public
 class ArrayRepeat(Value):
-    arg = rlz.array
-    times = rlz.integer
+    """Repeat the elements of an array."""
 
-    output_dtype = rlz.dtype_like("arg")
-    output_shape = rlz.shape_like("args")
+    arg: Value[dt.Array]
+    times: Value[dt.Integer]
 
-
-class ArrayApply(Value):
-    arg = rlz.array
-
-    @attribute.default
-    def parameter(self):
-        (name,) = self.func.__signature__.parameters.keys()
-        return name
-
-    @attribute.default
-    def result(self):
-        arg = Argument(
-            name=self.parameter,
-            shape=self.arg.output_shape,
-            dtype=self.arg.output_dtype.value_type,
-        )
-        return self.func(arg)
-
-    @attribute.default
-    def output_shape(self):
-        return self.arg.output_shape
+    dtype = rlz.dtype_like("arg")
+    shape = rlz.shape_like("args")
 
 
 @public
-class ArrayMap(ArrayApply):
-    func = rlz.callable_with([rlz.expr_of(rlz.any)], rlz.any)
+class ArrayMap(Value):
+    """Apply a function to every element of an array."""
 
-    @attribute.default
-    def output_dtype(self) -> dt.DataType:
-        return dt.Array(self.result.output_dtype)
+    arg: Value[dt.Array]
+    body: Value
+
+    param: Argument
+    index: Argument | None
+
+    shape = rlz.shape_like("arg")
+
+    @attribute
+    def dtype(self) -> dt.DataType:
+        return dt.Array(self.body.dtype)
 
 
 @public
-class ArrayFilter(ArrayApply):
-    func = rlz.callable_with([rlz.expr_of(rlz.any)], rlz.boolean)
+class ArrayFilter(Value):
+    """Filter array elements with a function."""
 
-    output_dtype = rlz.dtype_like("arg")
+    arg: Value[dt.Array]
+    body: Value[dt.Boolean]
+
+    param: Argument
+    index: Argument | None
+
+    shape = rlz.shape_like("arg")
+    dtype = rlz.dtype_like("arg")
 
 
 @public
 class Unnest(Value):
-    arg = rlz.array
+    """Unnest an array value into a column."""
 
-    @attribute.default
-    def output_dtype(self):
-        return self.arg.output_dtype.value_type
+    arg: Value[dt.Array]
 
-    output_shape = rlz.Shape.COLUMNAR
+    shape = ds.columnar
+
+    @attribute
+    def dtype(self):
+        return self.arg.dtype.value_type
 
 
 @public
 class ArrayContains(Value):
-    arg = rlz.array
-    other = rlz.any
+    """Return whether an array contains a specific value."""
 
-    output_dtype = dt.boolean
-    output_shape = rlz.shape_like("args")
+    arg: Value[dt.Array]
+    other: Value
+
+    dtype = dt.boolean
+    shape = rlz.shape_like("args")
 
 
 @public
 class ArrayPosition(Value):
-    arg = rlz.array
-    other = rlz.any
+    """Return the position of a specific value in an array."""
 
-    output_dtype = dt.int64
-    output_shape = rlz.shape_like("args")
+    arg: Value[dt.Array]
+    other: Value
+
+    dtype = dt.int64
+    shape = rlz.shape_like("args")
 
 
 @public
 class ArrayRemove(Value):
-    arg = rlz.array
-    other = rlz.any
+    """Remove an element from an array."""
 
-    output_dtype = rlz.dtype_like("arg")
-    output_shape = rlz.shape_like("args")
+    arg: Value[dt.Array]
+    other: Value
+
+    dtype = rlz.dtype_like("arg")
+    shape = rlz.shape_like("args")
 
 
 @public
 class ArrayDistinct(Value):
-    arg = rlz.array
-    output_dtype = rlz.dtype_like("arg")
-    output_shape = rlz.shape_like("arg")
+    """Return the unique elements of an array."""
+
+    arg: Value[dt.Array]
+
+    dtype = rlz.dtype_like("arg")
+    shape = rlz.shape_like("arg")
 
 
 @public
 class ArraySort(Value):
-    arg = rlz.array
+    """Sort the values of an array."""
 
-    output_dtype = rlz.dtype_like("arg")
-    output_shape = rlz.shape_like("arg")
+    arg: Value[dt.Array]
+
+    dtype = rlz.dtype_like("arg")
+    shape = rlz.shape_like("arg")
 
 
 @public
 class ArrayUnion(Value):
-    left = rlz.array
-    right = rlz.array
+    """Return the union of two arrays."""
 
-    output_dtype = rlz.dtype_like("args")
-    output_shape = rlz.shape_like("args")
+    left: Value[dt.Array]
+    right: Value[dt.Array]
+
+    dtype = rlz.dtype_like("args")
+    shape = rlz.shape_like("args")
+
+
+@public
+class ArrayIntersect(Value):
+    """Return the intersection of two arrays."""
+
+    left: Value[dt.Array]
+    right: Value[dt.Array]
+
+    dtype = rlz.dtype_like("args")
+    shape = rlz.shape_like("args")
 
 
 @public
 class ArrayZip(Value):
-    arg = rlz.tuple_of(rlz.array, min_length=2)
+    """Zip two or more arrays into an array of structs."""
 
-    output_shape = rlz.shape_like("arg")
+    arg: VarTuple[Value[dt.Array]]
 
-    @attribute.default
-    def output_dtype(self):
+    shape = rlz.shape_like("arg")
+
+    @attribute
+    def dtype(self):
         return dt.Array(
             dt.Struct(
                 {
-                    f"f{i:d}": array.output_dtype.value_type
+                    f"f{i:d}": array.dtype.value_type
                     for i, array in enumerate(self.arg, start=1)
                 }
             )
         )
+
+
+@public
+class ArrayFlatten(Value):
+    """Flatten a nested array one level.
+
+    The input expression must have at least one level of nesting for flattening
+    to make sense.
+    """
+
+    arg: Value[dt.Array[dt.Array]]
+    shape = rlz.shape_like("arg")
+
+    @property
+    def dtype(self):
+        return self.arg.dtype.value_type
+
+
+class Range(Value):
+    """Base class for range-generating operations."""
+
+    shape = rlz.shape_like("args")
+
+    @attribute
+    def dtype(self) -> dt.DataType:
+        return dt.Array(dt.highest_precedence((self.start.dtype, self.stop.dtype)))
+
+
+@public
+class IntegerRange(Range):
+    """Produce an array of integers from `start` to `stop`, moving by `step`."""
+
+    start: Value[dt.Integer]
+    stop: Value[dt.Integer]
+    step: Value[dt.Integer]
+
+
+@public
+class TimestampRange(Range):
+    """Produce an array of timestamps from `start` to `stop`, moving by `step`."""
+
+    start: Value[dt.Timestamp]
+    stop: Value[dt.Timestamp]
+    step: Value[dt.Interval]
+
+
+@public
+class ArrayAgg(Value):
+    arg: Value[dt.Array]
+    shape = rlz.shape_like("args")
+
+    @attribute
+    def dtype(self) -> dt.DataType:
+        return self.arg.dtype.value_type
+
+
+@public
+class ArrayMin(ArrayAgg):
+    """Compute the minimum value of an array."""
+
+
+@public
+class ArrayMax(ArrayAgg):
+    """Compute the maximum value of an array."""
+
+
+@public
+class ArrayMode(ArrayAgg):
+    """Compute the mode of an array."""
+
+
+# in duckdb summing an array of ints leads to an int, but for other backends
+# it might lead to a float??
+@public
+class ArraySum(ArrayAgg):
+    """Compute the sum of an array."""
+
+    arg: Value[dt.Array[dt.Numeric]]
+
+
+@public
+class ArrayMean(ArrayAgg):
+    """Compute the average of an array."""
+
+    arg: Value[dt.Array[dt.Numeric]]
+
+    @attribute
+    def dtype(self) -> dt.DataType:
+        dtype = self.arg.dtype.value_type
+        if dtype.is_floating() or dtype.is_integer():
+            return dt.float64
+        # do nothing for decimal types
+        return dtype
+
+
+@public
+class ArrayAny(ArrayAgg):
+    """Compute whether any array element is true."""
+
+    arg: Value[dt.Array[dt.Boolean]]
+
+
+@public
+class ArrayAll(ArrayAgg):
+    """Compute whether all array elements are true."""
+
+    arg: Value[dt.Array[dt.Boolean]]

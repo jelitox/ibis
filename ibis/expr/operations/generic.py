@@ -1,302 +1,286 @@
+"""Generic value operations."""
+
 from __future__ import annotations
 
-import abc
-import datetime
-import decimal
-import enum
-import ipaddress
 import itertools
-import uuid
-from operator import attrgetter
+from typing import Annotated, Any, Optional
+from typing import Literal as LiteralType
 
 from public import public
+from typing_extensions import TypeVar
 
+import ibis.expr.datashape as ds
 import ibis.expr.datatypes as dt
 import ibis.expr.rules as rlz
-from ibis.common import exceptions as com
 from ibis.common.annotations import attribute
-from ibis.common.collections import frozendict
+from ibis.common.deferred import Deferred
 from ibis.common.grounds import Singleton
-from ibis.expr.operations.core import Named, Unary, Value
+from ibis.common.patterns import InstanceOf, Length
+from ibis.common.typing import VarTuple  # noqa: TC001
+from ibis.expr.operations.core import Scalar, Unary, Value
+from ibis.expr.operations.relations import Relation  # noqa: TC001
 
 
 @public
-class TableColumn(Value, Named):
-    """Selects a column from a `Table`."""
-
-    table = rlz.table
-    name = rlz.instance_of((str, int))
-
-    output_shape = rlz.Shape.COLUMNAR
-
-    def __init__(self, table, name):
-        if isinstance(name, int):
-            name = table.schema.name_at_position(name)
-
-        if name not in table.schema:
-            columns_formatted = ', '.join(map(repr, table.schema.names))
-            raise com.IbisTypeError(
-                f"Column {name!r} is not found in table. "
-                f"Existing columns: {columns_formatted}."
-            )
-
-        super().__init__(table=table, name=name)
-
-    @property
-    def output_dtype(self):
-        return self.table.schema[self.name]
-
-
-@public
-class RowID(Value, Named):
-    """The row number (an autonumeric) of the returned result."""
+class RowID(Value):
+    """The row number of the returned result."""
 
     name = "rowid"
-    table = rlz.table
-    output_shape = rlz.Shape.COLUMNAR
-    output_dtype = dt.int64
+    table: Relation
 
+    shape = ds.columnar
+    dtype = dt.int64
 
-@public
-class TableArrayView(Value, Named):
-    """Helper operation class for creating scalar subqueries."""
-
-    table = rlz.table
-
-    output_shape = rlz.Shape.COLUMNAR
-
-    @property
-    def output_dtype(self):
-        return self.table.schema[self.name]
-
-    @property
-    def name(self):
-        return self.table.schema.names[0]
+    @attribute
+    def relations(self):
+        return frozenset({self.table})
 
 
 @public
 class Cast(Value):
-    """Explicitly cast value to a specific data type."""
+    """Explicitly cast a value to a specific data type."""
 
-    arg = rlz.any
-    to = rlz.datatype
+    arg: Value
+    to: dt.DataType
 
-    output_shape = rlz.shape_like("arg")
-    output_dtype = property(attrgetter("to"))
+    shape = rlz.shape_like("arg")
 
     @property
     def name(self):
         return f"{self.__class__.__name__}({self.arg.name}, {self.to})"
 
+    @property
+    def dtype(self):
+        return self.to
+
+
+@public
+class TryCast(Value):
+    """Try to cast a value to a specific data type."""
+
+    arg: Value
+    to: dt.DataType
+
+    shape = rlz.shape_like("arg")
+
+    @property
+    def dtype(self):
+        return self.to
+
 
 @public
 class TypeOf(Unary):
-    output_dtype = dt.string
+    """Return the _database_ data type of the input expression."""
+
+    dtype = dt.string
 
 
 @public
 class IsNull(Unary):
-    """Return true if values are null.
+    """Return true if values are null."""
 
-    Returns
-    -------
-    ir.BooleanValue
-        Value expression indicating whether values are null
-    """
-
-    output_dtype = dt.boolean
+    dtype = dt.boolean
 
 
 @public
 class NotNull(Unary):
-    """Returns true if values are not null.
+    """Returns true if values are not null."""
 
-    Returns
-    -------
-    ir.BooleanValue
-        Value expression indicating whether values are not null
-    """
-
-    output_dtype = dt.boolean
-
-
-@public
-class ZeroIfNull(Unary):
-    output_dtype = rlz.dtype_like("arg")
-
-
-@public
-class IfNull(Value):
-    """Set values to ifnull_expr if they are equal to NULL."""
-
-    arg = rlz.any
-    ifnull_expr = rlz.any
-    output_dtype = rlz.dtype_like("args")
-    output_shape = rlz.shape_like("args")
+    dtype = dt.boolean
 
 
 @public
 class NullIf(Value):
-    """Set values to NULL if they equal the null_if_expr."""
+    """Return NULL if an expression equals some specific value."""
 
-    arg = rlz.any
-    null_if_expr = rlz.any
-    output_dtype = rlz.dtype_like("args")
-    output_shape = rlz.shape_like("args")
+    arg: Value
+    null_if_expr: Value
+
+    dtype = rlz.dtype_like("args")
+    shape = rlz.shape_like("args")
 
 
 @public
 class Coalesce(Value):
-    arg = rlz.tuple_of(rlz.any)
-    output_shape = rlz.shape_like('arg')
-    output_dtype = rlz.dtype_like('arg')
+    """Return the first non-null expression from a tuple of expressions."""
+
+    arg: Annotated[VarTuple[Value], Length(at_least=1)]
+
+    shape = rlz.shape_like("arg")
+    dtype = rlz.dtype_like("arg")
 
 
 @public
 class Greatest(Value):
-    arg = rlz.tuple_of(rlz.any)
-    output_shape = rlz.shape_like('arg')
-    output_dtype = rlz.dtype_like('arg')
+    """Return the largest value from a tuple of expressions."""
+
+    arg: Annotated[VarTuple[Value], Length(at_least=1)]
+
+    shape = rlz.shape_like("arg")
+    dtype = rlz.dtype_like("arg")
 
 
 @public
 class Least(Value):
-    arg = rlz.tuple_of(rlz.any)
-    output_shape = rlz.shape_like('arg')
-    output_dtype = rlz.dtype_like('arg')
+    """Return the smallest value from a tuple of expressions."""
+
+    arg: Annotated[VarTuple[Value], Length(at_least=1)]
+
+    shape = rlz.shape_like("arg")
+    dtype = rlz.dtype_like("arg")
+
+
+T = TypeVar("T", bound=dt.DataType, covariant=True)
 
 
 @public
-class Literal(Value):
-    value = rlz.one_of(
-        (
-            rlz.instance_of(
-                (
-                    bytes,
-                    datetime.date,
-                    datetime.datetime,
-                    datetime.time,
-                    datetime.timedelta,
-                    enum.Enum,
-                    float,
-                    frozenset,
-                    int,
-                    ipaddress.IPv4Address,
-                    ipaddress.IPv6Address,
-                    frozendict,
-                    str,
-                    tuple,
-                    type(None),
-                    uuid.UUID,
-                    decimal.Decimal,
-                )
-            ),
-            rlz.lazy_instance_of(
-                (
-                    "shapely.geometry.BaseGeometry",
-                    "numpy.generic",
-                    "numpy.ndarray",
-                )
-            ),
-        )
-    )
-    dtype = rlz.datatype
+class Literal(Scalar[T]):
+    """A constant value."""
 
-    # TODO(kszucs): it should be named actually
+    value: Annotated[Any, ~InstanceOf(Deferred)]
+    dtype: T
 
-    output_shape = rlz.Shape.SCALAR
-    output_dtype = property(attrgetter("dtype"))
+    shape = ds.scalar
+
+    def __init__(self, value, dtype):
+        # normalize ensures that the value is a valid value for the given dtype
+        value = dt.normalize(dtype, value)
+        super().__init__(value=value, dtype=dtype)
 
     @property
     def name(self):
+        if self.dtype.is_interval():
+            return f"{self.value!r}{self.dtype.unit.short}"
         return repr(self.value)
 
 
-@public
-class NullLiteral(Literal, Singleton):
-    """Typeless NULL literal."""
-
-    value = rlz.optional(type(None), default=None)
-    dtype = rlz.optional(rlz.instance_of(dt.Null), default=dt.null)
+NULL = Literal(None, dt.null)
 
 
 @public
-class ScalarParameter(Value, Named):
+class ScalarParameter(Scalar):
     _counter = itertools.count()
 
-    dtype = rlz.datatype
-    counter = rlz.optional(
-        rlz.instance_of(int), default=lambda: next(ScalarParameter._counter)
-    )
+    dtype: dt.DataType
+    counter: Optional[int] = None
 
-    output_shape = rlz.Shape.SCALAR
-    output_dtype = property(attrgetter("dtype"))
+    shape = ds.scalar
+
+    def __init__(self, dtype, counter):
+        if counter is None:
+            counter = next(self._counter)
+        super().__init__(dtype=dtype, counter=counter)
 
     @property
     def name(self):
-        return f'param_{self.counter:d}'
-
-    def __hash__(self):
-        return hash((self.dtype, self.counter))
+        return f"param_{self.counter:d}"
 
 
 @public
-class Constant(Value, Singleton):
-    output_shape = rlz.Shape.SCALAR
+class Constant(Scalar, Singleton):
+    """A function that produces a constant."""
+
+    shape = ds.scalar
 
 
 @public
-class TimestampNow(Constant):
-    output_dtype = dt.timestamp
+class Impure(Value):
+    pass
 
 
 @public
-class RandomScalar(Constant):
-    output_dtype = dt.float64
+class TimestampNow(Impure):
+    """Return the current timestamp."""
+
+    dtype = dt.timestamp
+    shape = ds.scalar
+
+
+@public
+class DateNow(Impure):
+    """Return the current date."""
+
+    dtype = dt.date
+    shape = ds.scalar
+
+
+@public
+class RandomScalar(Impure):
+    """Return a random scalar between 0 and 1."""
+
+    dtype = dt.float64
+    shape = ds.scalar
+
+
+@public
+class RandomUUID(Impure):
+    """Return a random UUID."""
+
+    dtype = dt.uuid
+    shape = ds.scalar
 
 
 @public
 class E(Constant):
-    output_dtype = dt.float64
+    """The mathematical constant e."""
+
+    dtype = dt.float64
 
 
 @public
 class Pi(Constant):
-    output_dtype = dt.float64
+    """The mathematical constant pi."""
+
+    dtype = dt.float64
 
 
 @public
 class Hash(Value):
-    arg = rlz.any
+    """Return the hash of a value."""
 
-    output_dtype = dt.int64
-    output_shape = rlz.shape_like("arg")
+    arg: Value
+
+    dtype = dt.int64
+    shape = rlz.shape_like("arg")
 
 
 @public
 class HashBytes(Value):
-    arg = rlz.one_of({rlz.value(dt.string), rlz.value(dt.binary)})
-    # TODO: these don't necessarily all belong here
-    how = rlz.isin(
-        {
-            "md5",
-            "MD5",
-            "sha1",
-            "SHA1",
-            "SHA224",
-            "sha256",
-            "SHA256",
-            "sha512",
-            "intHash32",
-            "intHash64",
-            "cityHash64",
-            "sipHash64",
-            "sipHash128",
-        }
-    )
+    arg: Value[dt.String | dt.Binary]
+    how: LiteralType[
+        "md5",
+        "MD5",
+        "sha1",
+        "SHA1",
+        "SHA224",
+        "sha256",
+        "SHA256",
+        "sha512",
+        "intHash32",
+        "intHash64",
+        "cityHash64",
+        "sipHash64",
+        "sipHash128",
+    ]
 
-    output_dtype = dt.binary
-    output_shape = rlz.shape_like("arg")
+    dtype = dt.binary
+    shape = rlz.shape_like("arg")
+
+
+@public
+class HexDigest(Value):
+    """Return the hexadecimal digest of a value."""
+
+    arg: Value[dt.String | dt.Binary]
+    how: LiteralType[
+        "md5",
+        "sha1",
+        "sha256",
+        "sha512",
+    ]
+
+    dtype = dt.str
+    shape = rlz.shape_like("arg")
 
 
 # TODO(kszucs): we should merge the case operations by making the
@@ -304,45 +288,54 @@ class HashBytes(Value):
 # api.py
 @public
 class SimpleCase(Value):
-    base = rlz.any
-    cases = rlz.tuple_of(rlz.any)
-    results = rlz.tuple_of(rlz.any)
-    default = rlz.any
+    """Simple case statement."""
 
-    output_shape = rlz.shape_like("base")
+    base: Value
+    cases: Annotated[VarTuple[Value], Length(at_least=1)]
+    results: Annotated[VarTuple[Value], Length(at_least=1)]
+    default: Value
 
-    def __init__(self, cases, results, **kwargs):
+    def __init__(self, base, cases, results, default):
         assert len(cases) == len(results)
-        super().__init__(cases=cases, results=results, **kwargs)
+        for case in cases:
+            if not rlz.comparable(base, case):
+                raise TypeError(
+                    f"Base expression {rlz.arg_type_error_format(base)} and "
+                    f"case {rlz.arg_type_error_format(case)} are not comparable"
+                )
+        super().__init__(base=base, cases=cases, results=results, default=default)
 
-    @attribute.default
-    def output_dtype(self):
+    @attribute
+    def shape(self):
+        exprs = [self.base, *self.cases, *self.results, self.default]
+        return rlz.highest_precedence_shape(exprs)
+
+    @attribute
+    def dtype(self):
         values = [*self.results, self.default]
         return rlz.highest_precedence_dtype(values)
 
 
 @public
 class SearchedCase(Value):
-    cases = rlz.tuple_of(rlz.boolean)
-    results = rlz.tuple_of(rlz.any)
-    default = rlz.any
+    """Searched case statement."""
+
+    cases: Annotated[VarTuple[Value[dt.Boolean]], Length(at_least=1)]
+    results: Annotated[VarTuple[Value], Length(at_least=1)]
+    default: Value
 
     def __init__(self, cases, results, default):
         assert len(cases) == len(results)
         super().__init__(cases=cases, results=results, default=default)
 
-    @attribute.default
-    def output_shape(self):
-        # TODO(kszucs): can be removed after making Sequence iterable
-        return rlz.highest_precedence_shape(self.cases)
+    @attribute
+    def shape(self):
+        return rlz.highest_precedence_shape((*self.cases, *self.results, self.default))
 
-    @attribute.default
-    def output_dtype(self):
+    @attribute
+    def dtype(self):
         exprs = [*self.results, self.default]
         return rlz.highest_precedence_dtype(exprs)
 
 
-class _Negatable(abc.ABC):
-    @abc.abstractmethod
-    def negate(self):  # pragma: no cover
-        ...
+public(NULL=NULL)

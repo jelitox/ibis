@@ -1,11 +1,12 @@
+from __future__ import annotations
+
 import pytest
+import sqlglot as sg
 from pytest import param
 
+import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
-from ibis.backends.bigquery.datatypes import (
-    dtype_to_bigquery,
-    spread_type,
-)
+from ibis.backends.bigquery.datatypes import BigQueryType
 
 
 @pytest.mark.parametrize(
@@ -24,10 +25,15 @@ from ibis.backends.bigquery.datatypes import (
         param(dt.Array(dt.int64), "ARRAY<INT64>", id="array<int64>"),
         param(dt.Array(dt.string), "ARRAY<STRING>", id="array<string>"),
         param(
+            dt.Struct({"a": dt.String(nullable=False)}),
+            "STRUCT<`a` STRING NOT NULL>",
+            id="struct<a: !string>",
+        ),
+        param(
             dt.Struct.from_tuples(
                 [("a", dt.int64), ("b", dt.string), ("c", dt.Array(dt.string))]
             ),
-            "STRUCT<a INT64, b STRING, c ARRAY<STRING>>",
+            "STRUCT<`a` INT64, `b` STRING, `c` ARRAY<STRING>>",
             id="struct",
         ),
         param(dt.date, "DATE", id="date"),
@@ -41,13 +47,13 @@ from ibis.backends.bigquery.datatypes import (
             dt.Timestamp(timezone="US/Eastern"),
             "TIMESTAMP",
             marks=pytest.mark.xfail(
-                raises=TypeError, reason="Not supported in BigQuery"
+                raises=com.UnsupportedBackendType, reason="Not supported in BigQuery"
             ),
             id="timestamp_with_other_tz",
         ),
         param(
-            dt.Array(dt.Struct({'a': dt.string})),
-            "ARRAY<STRUCT<a STRING>>",
+            dt.Array(dt.Struct({"a": dt.string})),
+            "ARRAY<STRUCT<`a` STRING>>",
             id="array<struct>",
         ),
         param(dt.Decimal(38, 9), "NUMERIC", id="decimal-numeric"),
@@ -59,43 +65,28 @@ from ibis.backends.bigquery.datatypes import (
             dt.GeoSpatial(geotype="geography"),
             "GEOGRAPHY",
             marks=pytest.mark.xfail(
-                raises=TypeError,
+                raises=com.UnsupportedBackendType,
                 reason="Should use the WGS84 reference ellipsoid.",
             ),
-            id="geography",
+            id="geography-no-srid",
         ),
     ],
 )
 def test_simple(datatype, expected):
-    assert dtype_to_bigquery(datatype) == expected
+    assert BigQueryType.to_string(datatype) == expected
 
 
-@pytest.mark.parametrize("datatype", [dt.uint64, dt.Decimal(8, 3)])
+@pytest.mark.parametrize("datatype", [dt.uint64, dt.Decimal(84, 40)])
 def test_simple_failure_mode(datatype):
-    with pytest.raises(TypeError):
-        dtype_to_bigquery(datatype)
+    with pytest.raises(com.UnsupportedBackendType):
+        BigQueryType.to_string(datatype)
 
 
-@pytest.mark.parametrize(
-    ("type_", "expected"),
-    [
-        param(
-            dt.int64,
-            [dt.int64],
-        ),
-        param(
-            dt.Array(dt.int64),
-            [dt.int64, dt.Array(value_type=dt.int64)],
-        ),
-        param(
-            dt.Struct.from_tuples([("a", dt.Array(dt.int64))]),
-            [
-                dt.int64,
-                dt.Array(value_type=dt.int64),
-                dt.Struct.from_tuples([('a', dt.Array(value_type=dt.int64))]),
-            ],
-        ),
-    ],
-)
-def test_spread_type(type_, expected):
-    assert list(spread_type(type_)) == expected
+def test_array_type():
+    dtype = dt.Array(dt.int64)
+    parsed_type = sg.parse_one("BIGINT[]", into=sg.exp.DataType, read="duckdb")
+
+    expected = "ARRAY<INT64>"
+
+    assert parsed_type.sql(dialect="bigquery") == expected
+    assert BigQueryType.to_string(dtype) == expected

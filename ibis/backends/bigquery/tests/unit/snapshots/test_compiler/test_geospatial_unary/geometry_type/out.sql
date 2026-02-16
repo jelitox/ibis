@@ -1,2 +1,3 @@
-SELECT ST_GEOMETRYTYPE(t0.`geog`) AS `tmp`
-FROM t t0
+SELECT
+  st_geometrytype(`t0`.`geog`) AS `tmp`
+FROM `t` AS `t0`

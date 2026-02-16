@@ -1,1 +1,3 @@
-CAST(from_unixtime(CAST(floor(`c` / 1000000) AS int), "yyyy-MM-dd HH:mm:ss") AS timestamp)
+SELECT
+  CAST(FROM_UNIXTIME(CAST(`t0`.`c` DIV 1000000 AS INT), 'yyyy-MM-dd HH:mm:ss') AS TIMESTAMP) AS `TimestampFromUNIX(c, MICROSECOND)`
+FROM `alltypes` AS `t0`

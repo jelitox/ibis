@@ -2,23 +2,23 @@ from __future__ import annotations
 
 from typing import Any
 
-from streamlit.connections import ExperimentalBaseConnection
+from streamlit.connections import BaseConnection
 from streamlit.runtime.caching import cache_data
 
 import ibis
-from ibis.backends.base import BaseBackend
+from ibis.backends import BaseBackend
 
 __all__ = ["IbisConnection"]
 
 
-class IbisConnection(ExperimentalBaseConnection[BaseBackend]):
+class IbisConnection(BaseConnection[BaseBackend]):
     def _connect(self, **kwargs: Any) -> BaseBackend:
         """Connect to the backend and return a client object.
 
-        This method is invoked when `st.experimental_connection` is called and
-        pulls information from streamlit secrets. `_connect` is part of the
-        streamlit connection API to be implemented by developers of specific
-        connection types.
+        This method is invoked when `st.connection` is called and pulls
+        information from streamlit secrets. `_connect` is part of the streamlit
+        connection API to be implemented by developers of specific connection
+        types.
 
         Here's an example not-so-secret configuration:
 
@@ -48,7 +48,7 @@ class IbisConnection(ExperimentalBaseConnection[BaseBackend]):
 
         from ibis.streamlit import IbisConnection
 
-        con = st.experimental_connection("ch", type=IbisConnection)
+        con = st.connection("ch", type=IbisConnection)
 
         # Now you can use `con` as if it were an ibis backend
         con.list_tables()
@@ -66,7 +66,7 @@ class IbisConnection(ExperimentalBaseConnection[BaseBackend]):
 
         return ibis.connect(url, **kwargs)
 
-    def __getattr__(self, name: str) -> Any:
+    def __getattr__(self, name: str, /) -> Any:
         return getattr(self._instance, name)
 
     @cache_data

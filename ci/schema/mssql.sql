@@ -1,6 +1,6 @@
-DROP TABLE IF EXISTS diamonds;
+DROP TABLE IF EXISTS [ibis-testing].dbo.diamonds;
 
-CREATE TABLE diamonds (
+CREATE TABLE [ibis-testing].dbo.diamonds (
     carat FLOAT,
     cut VARCHAR(MAX),
     color VARCHAR(MAX),
@@ -17,13 +17,46 @@ CREATE TABLE diamonds (
 -- /data is a volume mount to the ibis testing data
 -- used for snappy test data loading
 -- DataFrame.to_sql is unusably slow for loading CSVs
-BULK INSERT diamonds
+BULK INSERT [ibis-testing].dbo.diamonds
 FROM '/data/diamonds.csv'
 WITH (FORMAT = 'CSV', FIELDTERMINATOR = ',', ROWTERMINATOR = '\n', FIRSTROW = 2)
 
-DROP TABLE IF EXISTS batting;
+DROP TABLE IF EXISTS [ibis-testing].dbo.astronauts;
 
-CREATE TABLE batting (
+CREATE TABLE [ibis-testing].dbo.astronauts (
+    "id" BIGINT,
+    "number" BIGINT,
+    "nationwide_number" BIGINT,
+    "name" VARCHAR(MAX),
+    "original_name" VARCHAR(MAX),
+    "sex" VARCHAR(MAX),
+    "year_of_birth" BIGINT,
+    "nationality" VARCHAR(MAX),
+    "military_civilian" VARCHAR(MAX),
+    "selection" VARCHAR(MAX),
+    "year_of_selection" BIGINT,
+    "mission_number" BIGINT,
+    "total_number_of_missions" BIGINT,
+    "occupation" VARCHAR(MAX),
+    "year_of_mission" BIGINT,
+    "mission_title" VARCHAR(MAX),
+    "ascend_shuttle" VARCHAR(MAX),
+    "in_orbit" VARCHAR(MAX),
+    "descend_shuttle" VARCHAR(MAX),
+    "hours_mission" DOUBLE PRECISION,
+    "total_hrs_sum" DOUBLE PRECISION,
+    "field21" BIGINT,
+    "eva_hrs_mission" DOUBLE PRECISION,
+    "total_eva_hrs" DOUBLE PRECISION
+);
+
+BULK INSERT [ibis-testing].dbo.astronauts
+FROM '/data/astronauts.csv'
+WITH (FORMAT = 'CSV', FIELDTERMINATOR = ',', ROWTERMINATOR = '\n', FIRSTROW = 2)
+
+DROP TABLE IF EXISTS [ibis-testing].dbo.batting;
+
+CREATE TABLE [ibis-testing].dbo.batting (
     "playerID" VARCHAR(MAX),
     "yearID" BIGINT,
     stint BIGINT,
@@ -48,13 +81,13 @@ CREATE TABLE batting (
     "GIDP" BIGINT
 );
 
-BULK INSERT batting
+BULK INSERT [ibis-testing].dbo.batting
 FROM '/data/batting.csv'
 WITH (FORMAT = 'CSV', FIELDTERMINATOR = ',', ROWTERMINATOR = '\n', FIRSTROW = 2)
 
-DROP TABLE IF EXISTS awards_players;
+DROP TABLE IF EXISTS [ibis-testing].dbo.awards_players;
 
-CREATE TABLE awards_players (
+CREATE TABLE [ibis-testing].dbo.awards_players (
     "playerID" VARCHAR(MAX),
     "awardID" VARCHAR(MAX),
     "yearID" BIGINT,
@@ -63,13 +96,13 @@ CREATE TABLE awards_players (
     notes VARCHAR(MAX)
 );
 
-BULK INSERT awards_players
+BULK INSERT [ibis-testing].dbo.awards_players
 FROM '/data/awards_players.csv'
 WITH (FORMAT = 'CSV', FIELDTERMINATOR = ',', ROWTERMINATOR = '\n', FIRSTROW = 2)
 
-DROP TABLE IF EXISTS functional_alltypes;
+DROP TABLE IF EXISTS [ibis-testing].dbo.functional_alltypes;
 
-CREATE TABLE functional_alltypes (
+CREATE TABLE [ibis-testing].dbo.functional_alltypes (
     id INTEGER,
     bool_col BIT,
     tinyint_col SMALLINT,
@@ -85,16 +118,21 @@ CREATE TABLE functional_alltypes (
     month INTEGER
 );
 
-BULK INSERT functional_alltypes
+BULK INSERT [ibis-testing].dbo.functional_alltypes
 FROM '/data/functional_alltypes.csv'
 WITH (FORMAT = 'CSV', FIELDTERMINATOR = ',', ROWTERMINATOR = '\n', FIRSTROW = 2)
 
-DROP TABLE IF EXISTS win;
+DROP TABLE IF EXISTS [ibis-testing].dbo.win;
 
-CREATE TABLE win (g VARCHAR(MAX), x BIGINT, y BIGINT);
-INSERT INTO win VALUES
+CREATE TABLE [ibis-testing].dbo.win (g VARCHAR(MAX), x BIGINT NOT NULL, y BIGINT);
+INSERT INTO [ibis-testing].dbo.win VALUES
     ('a', 0, 3),
     ('a', 1, 2),
     ('a', 2, 0),
     ('a', 3, 1),
     ('a', 4, 1);
+
+DROP TABLE IF EXISTS [ibis-testing].dbo.topk;
+
+CREATE TABLE [ibis-testing].dbo.topk (x BIGINT);
+INSERT INTO [ibis-testing].dbo.topk VALUES (1), (1), (NULL);

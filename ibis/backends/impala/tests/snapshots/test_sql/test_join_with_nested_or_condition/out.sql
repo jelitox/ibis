@@ -1,5 +1,13 @@
-SELECT t0.*
-FROM `t` t0
-  INNER JOIN `t` t1
-    ON (t0.`a` = t1.`a`) AND
-       ((t0.`a` != t1.`b`) OR (t0.`b` != t1.`a`))
+SELECT
+  `t1`.`a`,
+  `t1`.`b`
+FROM `t` AS `t1`
+INNER JOIN `t` AS `t2`
+  ON `t1`.`a` = `t2`.`a`
+  AND (
+    (
+      `t1`.`a` <> `t2`.`b`
+    ) OR (
+      `t1`.`b` <> `t2`.`a`
+    )
+  )

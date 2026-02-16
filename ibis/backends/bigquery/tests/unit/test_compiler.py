@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import datetime
-import re
+import time
 from operator import floordiv, methodcaller, truediv
 
 import pandas as pd
@@ -7,9 +9,12 @@ import pytest
 from pytest import param
 
 import ibis
+import ibis.common.exceptions as com
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 from ibis import _
+from ibis.backends.sql.compilers import BigQueryCompiler
+from ibis.common.annotations import ValidationError
 
 to_sql = ibis.bigquery.compile
 
@@ -19,8 +24,6 @@ def alltypes():
     return ibis.table(
         ibis.schema(
             dict(
-                index="int64",
-                Unnamed_0="int64",
                 id="int32",
                 bool_col="boolean",
                 tinyint_col="int8",
@@ -94,7 +97,7 @@ def test_hash(case, dtype, snapshot):
 @pytest.mark.parametrize("how", ["md5", "sha1", "sha256", "sha512"])
 def test_hashbytes(case, how, dtype, snapshot):
     var = ibis.literal(case, type=dtype)
-    expr = var.hashbytes(how=how).name("tmp")
+    expr = var.hashbytes(how).name("tmp")
     snapshot.assert_match(to_sql(expr), "out.sql")
 
 
@@ -108,7 +111,21 @@ def test_hashbytes(case, how, dtype, snapshot):
     ),
 )
 def test_integer_to_timestamp(case, unit, snapshot):
-    expr = ibis.literal(case, type=dt.int64).to_timestamp(unit=unit).name("tmp")
+    expr = ibis.literal(case, type=dt.int64).as_timestamp(unit).name("tmp")
+    snapshot.assert_match(to_sql(expr), "out.sql")
+
+
+@pytest.mark.parametrize(
+    ("case",),
+    [
+        param("a\\b\\c", id="escape_backslash"),
+        param("a\ab\bc\fd\ne\rf\tg\vh", id="escape_ascii_sequences"),
+        param("a'b\"c", id="escape_quote"),
+        param("`~!@#$%^&*()_=+-|[]{};:/?<>", id="not_escape_special_characters"),
+    ],
+)
+def test_literal_string(case, snapshot):
+    expr = ibis.literal(case)
     snapshot.assert_match(to_sql(expr), "out.sql")
 
 
@@ -134,11 +151,11 @@ def test_projection_fusion_only_peeks_at_immediate_parent(snapshot):
         ("val", "int64"),
     ]
     table = ibis.table(schema, name="unbound_table")
-    table = table[table.PARTITIONTIME < ibis.date("2017-01-01")]
+    table = table.filter(table.PARTITIONTIME < ibis.date("2017-01-01"))
     table = table.mutate(file_date=table.file_date.cast("date"))
-    table = table[table.file_date < ibis.date("2017-01-01")]
+    table = table.filter(table.file_date < ibis.date("2017-01-01"))
     table = table.mutate(XYZ=table.val * 2)
-    expr = table.join(table.view())[table]
+    expr = table.join(table.view()).select(table)
     snapshot.assert_match(to_sql(expr), "out.sql")
 
 
@@ -217,7 +234,7 @@ def test_substring_neg_length():
     t = ibis.table([("value", "string")], name="t")
     expr = t["value"].substr(3, -1).name("tmp")
     with pytest.raises(
-        Exception, match=r"Length parameter must be a non-negative value\."
+        Exception, match=r"Length parameter must be a non-negative value; got -1"
     ):
         to_sql(expr)
 
@@ -258,12 +275,13 @@ def test_large_compile():
     table = ops.SQLQueryResult("select * from t", schema, ibis_client).to_expr()
     for _ in range(num_joins):  # noqa: F402
         table = table.mutate(dummy=ibis.literal(""))
-        table = table.left_join(table, ["dummy"])[[table]]
+        table_ = table.view()
+        table = table.left_join(table_, ["dummy"]).select(table_)
 
-    start = datetime.datetime.now()
+    start = time.time()
     table.compile()
-    delta = datetime.datetime.now() - start
-    assert delta.total_seconds() < 10
+    delta = time.time() - start
+    assert delta < 10
 
 
 @pytest.mark.parametrize(
@@ -284,7 +302,7 @@ def test_set_operation(operation, keywords, snapshot):
 
 def test_geospatial_point(snapshot):
     t = ibis.table([("lon", "float64"), ("lat", "float64")], name="t")
-    expr = ibis.geo_point(t.lon, t.lat).name("tmp")
+    expr = t.lon.point(t.lat).name("tmp")
     snapshot.assert_match(to_sql(expr), "out.sql")
 
 
@@ -301,25 +319,34 @@ def test_geospatial_unary_union(snapshot):
 
 
 @pytest.mark.parametrize(
-    ("operation", "keywords"),
+    "operation",
     [
-        param("area", {}, id="aread"),
-        param("as_binary", {}, id="as_binary"),
-        param("as_text", {}, id="as_text"),
-        param("buffer", {"radius": 5.2}, id="buffer"),
-        param("centroid", {}, id="centroid"),
-        param("end_point", {}, id="end_point"),
-        param("geometry_type", {}, id="geometry_type"),
-        param("length", {}, id="length"),
-        param("n_points", {}, id="npoints"),
-        param("perimeter", {}, id="perimeter"),
-        param("point_n", {"n": 3}, id="point_n"),
-        param("start_point", {}, id="start_point"),
+        "area",
+        "as_binary",
+        "as_text",
+        "centroid",
+        "end_point",
+        "geometry_type",
+        "length",
+        "n_points",
+        "perimeter",
+        "start_point",
     ],
 )
-def test_geospatial_unary(operation, keywords, snapshot):
+def test_geospatial_unary(operation, snapshot):
     t = ibis.table([("geog", "geography")], name="t")
-    expr = getattr(t.geog, operation)(**keywords).name("tmp")
+    method = methodcaller(operation)
+    expr = method(t.geog).name("tmp")
+    snapshot.assert_match(to_sql(expr), "out.sql")
+
+
+@pytest.mark.parametrize(
+    ("operation", "arg"), [("buffer", 5.2), ("point_n", 3)], ids=["buffer", "point_n"]
+)
+def test_geospatial_unary_positional_only(operation, arg, snapshot):
+    t = ibis.table([("geog", "geography")], name="t")
+    method = methodcaller(operation, arg)
+    expr = method(t.geog).name("tmp")
     snapshot.assert_match(to_sql(expr), "out.sql")
 
 
@@ -364,17 +391,17 @@ def test_geospatial_xy(dimension_name, snapshot):
 
 def test_geospatial_simplify(snapshot):
     t = ibis.table([("geog", "geography")], name="t")
-    expr = t.geog.simplify(5.2, preserve_collapsed=False).name("tmp")
+    expr = t.geog.simplify(tolerance=5.2, preserve_collapsed=False).name("tmp")
     snapshot.assert_match(to_sql(expr), "out.sql")
 
 
 def test_geospatial_simplify_error():
     t = ibis.table([("geog", "geography")], name="t")
-    expr = t.geog.simplify(5.2, preserve_collapsed=True).name("tmp")
-    with pytest.raises(Exception) as exception_info:
+    expr = t.geog.simplify(tolerance=5.2, preserve_collapsed=True).name("tmp")
+    with pytest.raises(
+        Exception, match="simplify does not support preserving collapsed geometries"
+    ):
         to_sql(expr)
-    expected = "BigQuery simplify does not support preserving collapsed geometries, must pass preserve_collapsed=False"
-    assert str(exception_info.value) == expected
 
 
 def test_timestamp_accepts_date_literals(alltypes):
@@ -383,10 +410,7 @@ def test_timestamp_accepts_date_literals(alltypes):
     expr = alltypes.mutate(param=p)
     params = {p: date_string}
     result = to_sql(expr, params=params)
-    expected = """\
-SELECT t\\d+\\.\\*, @param_\\d+ AS `param`
-FROM functional_alltypes t\\d+"""
-    assert re.match(expected, result) is not None
+    assert "2009-03-01T00:00:00" in result
 
 
 @pytest.mark.parametrize("distinct", [True, False])
@@ -402,19 +426,19 @@ def test_divide_by_zero(alltypes, op, snapshot):
 
 
 def test_identical_to(alltypes, snapshot):
-    expr = alltypes[
+    expr = alltypes.filter(
         _.string_col.identical_to("a") & _.date_string_col.identical_to("b")
-    ]
+    )
     snapshot.assert_match(to_sql(expr), "out.sql")
 
 
 def test_to_timestamp_no_timezone(alltypes, snapshot):
-    expr = alltypes.date_string_col.to_timestamp("%F")
+    expr = alltypes.date_string_col.as_timestamp("%F")
     snapshot.assert_match(to_sql(expr), "out.sql")
 
 
 def test_to_timestamp_timezone(alltypes, snapshot):
-    expr = (alltypes.date_string_col + " America/New_York").to_timestamp("%F %Z")
+    expr = (alltypes.date_string_col + " America/New_York").as_timestamp("%F %Z")
     snapshot.assert_match(to_sql(expr), "out.sql")
 
 
@@ -470,7 +494,11 @@ def test_range_window_function(alltypes, window, snapshot):
     "preceding",
     [
         param(5, id="five"),
-        param(ibis.interval(nanoseconds=1), id="nanos", marks=pytest.mark.xfail),
+        param(
+            ibis.interval(nanoseconds=1),
+            id="nanos",
+            marks=pytest.mark.xfail(raises=com.UnsupportedOperationError),
+        ),
         param(ibis.interval(microseconds=1), id="micros"),
         param(ibis.interval(seconds=1), id="seconds"),
         param(ibis.interval(minutes=1), id="minutes"),
@@ -554,7 +582,7 @@ def test_cov(alltypes, how, snapshot):
 def test_cov_invalid_how(alltypes):
     d = alltypes.double_col
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValidationError):
         d.cov(d, how="error")
 
 
@@ -571,13 +599,115 @@ def test_scalar_param_scope(alltypes):
     t = alltypes
     param = ibis.param("timestamp")
     result = to_sql(t.mutate(param=param), params={param: "2017-01-01"})
-    expected = """\
-SELECT t\\d+\\.\\*, @param_\\d+ AS `param`
-FROM functional_alltypes t\\d+"""
-    assert re.match(expected, result) is not None
+    assert "2017-01-01T00:00:00" in result
 
 
 def test_cast_float_to_int(alltypes, snapshot):
     expr = alltypes.double_col.cast("int64")
     result = to_sql(expr)
     snapshot.assert_match(result, "out.sql")
+
+
+def test_unnest(snapshot):
+    table = ibis.table(
+        dict(
+            rowindex="int",
+            repeated_struct_col=dt.Array(
+                dt.Struct(
+                    dict(
+                        nested_struct_col=dt.Array(
+                            dt.Struct(
+                                dict(
+                                    doubly_nested_array="array<int>",
+                                    doubly_nested_field="string",
+                                )
+                            )
+                        )
+                    )
+                )
+            ),
+        ),
+        name="array_test",
+    )
+    repeated_struct_col = table.repeated_struct_col
+
+    # Works as expected :-)
+    result = ibis.bigquery.compile(
+        table.select("rowindex", repeated_struct_col.unnest())
+    )
+    snapshot.assert_match(result, "out_one_unnest.sql")
+
+    result = ibis.bigquery.compile(
+        table.select(
+            "rowindex", level_one=repeated_struct_col.unnest().nested_struct_col
+        ).select(level_two=lambda t: t.level_one.unnest())
+    )
+    snapshot.assert_match(result, "out_two_unnests.sql")
+
+
+@pytest.mark.parametrize(
+    "fieldname, expected",
+    [
+        ("TryCast(b, Float64)", "TryCast_b_Float64"),
+        ("Cast(b, Int64)", "Cast_b_Int64"),
+        ("that, is, a, lot, of, spaces", "that_is_a_lot_of_spaces"),
+    ],
+)
+def test_field_names_strip_whitespace(fieldname, expected):
+    assert BigQueryCompiler._gen_valid_name(fieldname) == expected
+
+
+def test_subquery_scalar_params(snapshot):
+    t = ibis.table(
+        schema={
+            "float_col": "float64",
+            "timestamp_col": "timestamp",
+            "string_col": "string",
+        },
+        name="alltypes",
+    )
+    p = ibis.param("timestamp").name("my_param")
+    expr = (
+        t.filter(lambda t: t.timestamp_col < p)
+        .group_by("string_col")
+        .aggregate(foo=lambda t: t.float_col.sum())
+        .foo.count()
+        .name("count")
+    )
+    result = ibis.to_sql(expr, params={p: "20140101"}, dialect="bigquery")
+    snapshot.assert_match(result, "out.sql")
+
+
+def test_time_from_hms_with_micros(snapshot):
+    literal = ibis.literal(datetime.time(12, 34, 56, 789101))
+    result = ibis.to_sql(literal, dialect="bigquery")
+    snapshot.assert_match(result, "micros.sql")
+
+    literal = ibis.literal(datetime.time(12, 34, 56))
+    result = ibis.to_sql(literal, dialect="bigquery")
+    snapshot.assert_match(result, "no_micros.sql")
+
+
+@pytest.mark.parametrize(
+    "quantiles",
+    [
+        param(0.5, id="scalar"),
+        param(1 / 3, id="tricky-scalar"),
+        param([0.25, 0.5, 0.75], id="array"),
+        param([0.5, 0.25, 0.75], id="shuffled-array"),
+        param([0, 0.25, 0.5, 0.75, 1], id="complete-array"),
+    ],
+)
+def test_approx_quantiles(alltypes, quantiles, snapshot):
+    query = alltypes.double_col.approx_quantile(quantiles).name("qs")
+    result = ibis.to_sql(query, dialect="bigquery")
+    snapshot.assert_match(result, "out.sql")
+
+
+def test_unreasonably_long_name():
+    expr = ibis.literal("hello, world!").name("a" * 301)
+    with pytest.raises(
+        com.IbisError,
+        match="BigQuery does not allow column names longer than 300 characters",
+    ):
+        ibis.to_sql(expr, dialect="bigquery")

@@ -2,28 +2,32 @@ from __future__ import annotations
 
 import functools
 import operator
-from typing import TYPE_CHECKING, Any, Iterable, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Literal
 
 from public import public
 
 import ibis.expr.operations as ops
 from ibis import util
-from ibis.expr.types.core import _binop
-from ibis.expr.types.generic import Column, Scalar, Value
+from ibis.expr.types.generic import Column, Scalar, Value, _binop
 
 if TYPE_CHECKING:
-    from ibis.expr import types as ir
+    from collections.abc import Iterable, Sequence
+
+    from typing_extensions import Self
+
+    import ibis.expr.types as ir
+    from ibis.common.deferred import Deferred
 
 
 @public
 class StringValue(Value):
-    def __getitem__(self, key: slice | int | ir.IntegerScalar) -> StringValue:
+    def __getitem__(self, key: slice | int | ir.IntegerValue | Deferred) -> StringValue:
         """Index or slice a string expression.
 
         Parameters
         ----------
         key
-            [`int`][int], [`slice`][slice] or integer scalar expression
+            [](`int`), [](`slice`) or integer scalar expression
 
         Returns
         -------
@@ -56,25 +60,25 @@ class StringValue(Value):
         │ r                     │
         └───────────────────────┘
         >>> t.food[:3]
-        ┏━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ Substring(food, 0, 3) ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━━┩
-        │ string                │
-        ├───────────────────────┤
-        │ bre                   │
-        │ che                   │
-        │ ric                   │
-        └───────────────────────┘
+        ┏━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ StringSlice(food, 3) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string               │
+        ├──────────────────────┤
+        │ bre                  │
+        │ che                  │
+        │ ric                  │
+        └──────────────────────┘
         >>> t.food[3:5]
-        ┏━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ Substring(food, 3, 2) ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━━┩
-        │ string                │
-        ├───────────────────────┤
-        │ ad                    │
-        │ es                    │
-        │ e                     │
-        └───────────────────────┘
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ StringSlice(food, 3, 5) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string                  │
+        ├─────────────────────────┤
+        │ ad                      │
+        │ es                      │
+        │ e                       │
+        └─────────────────────────┘
         >>> t.food[7]
         ┏━━━━━━━━━━━━━━━━━━━━━━━┓
         ┃ Substring(food, 7, 1) ┃
@@ -91,28 +95,19 @@ class StringValue(Value):
         if isinstance(key, slice):
             start, stop, step = key.start, key.stop, key.step
 
-            if step is not None and not isinstance(step, ir.Expr) and step != 1:
-                raise ValueError('Step can only be 1')
-
-            if not isinstance(start, ir.Expr):
-                if start is not None and start < 0:
-                    raise ValueError(
-                        "Negative slicing not yet supported, got start value "
-                        f"of {start:d}"
-                    )
-                if start is None:
-                    start = 0
-
-            if not isinstance(stop, ir.Expr):
-                if stop is not None and stop < 0:
-                    raise ValueError(
-                        "Negative slicing not yet supported, got stop value "
-                        f"of {stop:d}"
-                    )
-                if stop is None:
-                    stop = self.length()
-
-            return self.substr(start, stop - start)
+            if isinstance(step, ir.Expr) or (step is not None and step != 1):
+                raise ValueError("Step can only be 1")
+            if start is not None and not isinstance(start, ir.Expr) and start < 0:
+                raise ValueError(
+                    f"Negative slicing not yet supported, got start value of {start:d}"
+                )
+            if stop is not None and not isinstance(stop, ir.Expr) and stop < 0:
+                raise ValueError(
+                    f"Negative slicing not yet supported, got stop value of {stop:d}"
+                )
+            if start is None and stop is None:
+                return self
+            return ops.StringSlice(self, start, stop).to_expr()
         elif isinstance(key, int):
             return self.substr(key, 1)
         raise NotImplementedError(f"string __getitem__[{key.__class__.__name__}]")
@@ -143,7 +138,7 @@ class StringValue(Value):
         """
         return ops.StringLength(self).to_expr()
 
-    def lower(self) -> StringValue:
+    def lower(self) -> Self:
         """Convert string to all lowercase.
 
         Returns
@@ -179,7 +174,7 @@ class StringValue(Value):
         """
         return ops.Lowercase(self).to_expr()
 
-    def upper(self) -> StringValue:
+    def upper(self) -> Self:
         """Convert string to all uppercase.
 
         Returns
@@ -215,7 +210,7 @@ class StringValue(Value):
         """
         return ops.Uppercase(self).to_expr()
 
-    def reverse(self) -> StringValue:
+    def reverse(self) -> Self:
         """Reverse the characters of a string.
 
         Returns
@@ -277,7 +272,7 @@ class StringValue(Value):
         """
         return ops.StringAscii(self).to_expr()
 
-    def strip(self) -> StringValue:
+    def strip(self) -> Self:
         r"""Remove whitespace from left and right sides of a string.
 
         Returns
@@ -313,7 +308,7 @@ class StringValue(Value):
         """
         return ops.Strip(self).to_expr()
 
-    def lstrip(self) -> StringValue:
+    def lstrip(self) -> Self:
         r"""Remove whitespace from the left side of string.
 
         Returns
@@ -349,7 +344,7 @@ class StringValue(Value):
         """
         return ops.LStrip(self).to_expr()
 
-    def rstrip(self) -> StringValue:
+    def rstrip(self) -> Self:
         r"""Remove whitespace from the right side of string.
 
         Returns
@@ -385,8 +380,11 @@ class StringValue(Value):
         """
         return ops.RStrip(self).to_expr()
 
-    def capitalize(self) -> StringValue:
-        """Capitalize the input string.
+    def capitalize(self) -> Self:
+        """Uppercase the first letter, lowercase the rest.
+
+        This API matches the semantics of the Python [](`str.capitalize`)
+        method.
 
         Returns
         -------
@@ -397,7 +395,7 @@ class StringValue(Value):
         --------
         >>> import ibis
         >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({"s": ["abc", "def", "ghi"]})
+        >>> t = ibis.memtable({"s": ["aBC", " abc", "ab cd", None]})
         >>> t.s.capitalize()
         ┏━━━━━━━━━━━━━━━┓
         ┃ Capitalize(s) ┃
@@ -405,18 +403,17 @@ class StringValue(Value):
         │ string        │
         ├───────────────┤
         │ Abc           │
-        │ Def           │
-        │ Ghi           │
+        │  abc          │
+        │ Ab cd         │
+        │ NULL          │
         └───────────────┘
         """
         return ops.Capitalize(self).to_expr()
 
-    initcap = capitalize
-
     def __contains__(self, *_: Any) -> bool:
         raise TypeError("Use string_expr.contains(arg)")
 
-    def contains(self, substr: str | StringValue) -> ir.BooleanValue:
+    def contains(self, substr: str | StringValue | Deferred, /) -> ir.BooleanValue:
         """Return whether the expression contains `substr`.
 
         Parameters
@@ -448,10 +445,9 @@ class StringValue(Value):
         return ops.StringContains(self, substr).to_expr()
 
     def hashbytes(
-        self,
-        how: Literal["md5", "sha1", "sha256", "sha512"] = "sha256",
+        self, how: Literal["md5", "sha1", "sha256", "sha512"] = "sha256", /
     ) -> ir.BinaryValue:
-        """Compute the binary hash value of the input.
+        r"""Compute the binary hash value of the input.
 
         Parameters
         ----------
@@ -462,13 +458,52 @@ class StringValue(Value):
         -------
         BinaryValue
             Binary expression
+
+        Examples
+        --------
+        >>> import ibis
+        >>> str_lit = ibis.literal("hello")
+        >>> result = str_lit.hashbytes("md5")  # b']A@*\xbcK*v\xb9q\x9d\x91\x10\x17\xc5\x92'
         """
         return ops.HashBytes(self, how).to_expr()
 
+    def hexdigest(
+        self, how: Literal["md5", "sha1", "sha256", "sha512"] = "sha256", /
+    ) -> ir.StringValue:
+        """Return the hash digest of the input as a hex encoded string.
+
+        Parameters
+        ----------
+        how
+            Hash algorithm to use
+
+        Returns
+        -------
+        StringValue
+            Hexadecimal representation of the hash as a string
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable({"species": ["Adelie", "Chinstrap", "Gentoo"]})
+        >>> t.species.hexdigest()
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ HexDigest(species)                                               ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string                                                           │
+        ├──────────────────────────────────────────────────────────────────┤
+        │ a4d7d46b27480037bc1e513e0e157cbf258baae6ee69e3110d0f9ff418b57a3c │
+        │ cb97d113ca69899ae4f1fb581f4a90d86989db77b4a33873d604b0ee412b4cc9 │
+        │ b5e90cdff65949fe6bc226823245f7698110e563a12363fc57b3eed3e4a0a612 │
+        └──────────────────────────────────────────────────────────────────┘
+        """
+        return ops.HexDigest(self, how.lower()).to_expr()
+
     def substr(
         self,
-        start: int | ir.IntegerValue,
-        length: int | ir.IntegerValue | None = None,
+        start: int | ir.IntegerValue | Deferred,
+        length: int | ir.IntegerValue | Deferred | None = None,
     ) -> StringValue:
         """Extract a substring.
 
@@ -503,7 +538,7 @@ class StringValue(Value):
         """
         return ops.Substring(self, start, length).to_expr()
 
-    def left(self, nchars: int | ir.IntegerValue) -> StringValue:
+    def left(self, nchars: int | ir.IntegerValue | Deferred, /) -> StringValue:
         """Return the `nchars` left-most characters.
 
         Parameters
@@ -534,7 +569,7 @@ class StringValue(Value):
         """
         return self.substr(0, length=nchars)
 
-    def right(self, nchars: int | ir.IntegerValue) -> StringValue:
+    def right(self, nchars: int | ir.IntegerValue | Deferred, /) -> StringValue:
         """Return up to `nchars` from the end of each string.
 
         Parameters
@@ -565,7 +600,7 @@ class StringValue(Value):
         """
         return ops.StrRight(self, nchars).to_expr()
 
-    def repeat(self, n: int | ir.IntegerValue) -> StringValue:
+    def repeat(self, n: int | ir.IntegerValue | Deferred, /) -> StringValue:
         """Repeat a string `n` times.
 
         Parameters
@@ -596,8 +631,6 @@ class StringValue(Value):
         """
         return ops.Repeat(self, n).to_expr()
 
-    __mul__ = __rmul__ = repeat
-
     def translate(self, from_str: StringValue, to_str: StringValue) -> StringValue:
         """Replace `from_str` characters in `self` characters in `to_str`.
 
@@ -619,22 +652,23 @@ class StringValue(Value):
         Examples
         --------
         >>> import ibis
-        >>> table = ibis.table(dict(string_col='string'))
-        >>> result = table.string_col.translate('a', 'b')
+        >>> table = ibis.table(dict(string_col="string"))
+        >>> result = table.string_col.translate("a", "b")
         """
         return ops.Translate(self, from_str, to_str).to_expr()
 
     def find(
         self,
-        substr: str | StringValue,
-        start: int | ir.IntegerValue | None = None,
-        end: int | ir.IntegerValue | None = None,
+        sub: str | StringValue | Deferred,
+        start: int | ir.IntegerValue | Deferred | None = None,
+        end: int | ir.IntegerValue | Deferred | None = None,
+        /,
     ) -> ir.IntegerValue:
-        """Return the position of the first occurence of substring.
+        """Return the position of the first occurrence of substring.
 
         Parameters
         ----------
-        substr
+        sub
             Substring to search for
         start
             Zero based index of where to start the search
@@ -675,20 +709,21 @@ class StringValue(Value):
         """
         if end is not None:
             raise NotImplementedError("`end` parameter is not yet implemented")
-        return ops.StringFind(self, substr, start, end).to_expr()
+        return ops.StringFind(self, sub, start, end).to_expr()
 
     def lpad(
         self,
-        length: int | ir.IntegerValue,
-        pad: str | StringValue = " ",
+        width: int | ir.IntegerValue | Deferred,
+        fillchar: str | StringValue = " ",
+        /,
     ) -> StringValue:
         """Pad `arg` by truncating on the right or padding on the left.
 
         Parameters
         ----------
-        length
+        width
             Length of output string
-        pad
+        fillchar
             Pad character
 
         Returns
@@ -712,12 +747,13 @@ class StringValue(Value):
         │ -ghij           │
         └─────────────────┘
         """
-        return ops.LPad(self, length, pad).to_expr()
+        return ops.LPad(self, width, fillchar).to_expr()
 
     def rpad(
         self,
-        length: int | ir.IntegerValue,
-        pad: str | StringValue = " ",
+        width: int | ir.IntegerValue | Deferred,
+        fillchar: str | StringValue = " ",
+        /,
     ) -> StringValue:
         """Pad `self` by truncating or padding on the right.
 
@@ -725,9 +761,9 @@ class StringValue(Value):
         ----------
         self
             String to pad
-        length
+        width
             Length of output string
-        pad
+        fillchar
             Pad character
 
         Returns
@@ -751,10 +787,10 @@ class StringValue(Value):
         │ ghij-           │
         └─────────────────┘
         """
-        return ops.RPad(self, length, pad).to_expr()
+        return ops.RPad(self, width, fillchar).to_expr()
 
-    def find_in_set(self, str_list: Sequence[str]) -> ir.IntegerValue:
-        """Find the first occurence of `str_list` within a list of strings.
+    def find_in_set(self, str_list: Sequence[str], /) -> ir.IntegerValue:
+        """Find the first occurrence of `str_list` within a list of strings.
 
         No string in `str_list` can have a comma.
 
@@ -772,12 +808,16 @@ class StringValue(Value):
         Examples
         --------
         >>> import ibis
-        >>> table = ibis.table(dict(string_col='string'))
-        >>> result = table.string_col.find_in_set(['a', 'b'])
+        >>> table = ibis.table(dict(string_col="string"))
+        >>> result = table.string_col.find_in_set(["a", "b"])
         """
         return ops.FindInSet(self, str_list).to_expr()
 
-    def join(self, strings: Sequence[str | StringValue] | ir.ArrayValue) -> StringValue:
+    def join(
+        self,
+        strings: Sequence[str | StringValue | Deferred] | ir.ArrayValue | Deferred,
+        /,
+    ) -> StringValue:
         """Join a list of strings using `self` as the separator.
 
         Parameters
@@ -808,7 +848,7 @@ class StringValue(Value):
         └──────────────────────┘
         >>> ibis.literal("|").join(t.arr)
         ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ ArrayStringJoin('|', arr) ┃
+        ┃ ArrayStringJoin(arr, '|') ┃
         ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
         │ string                    │
         ├───────────────────────────┤
@@ -820,7 +860,7 @@ class StringValue(Value):
 
         See Also
         --------
-        [`ArrayValue.join`][ibis.expr.types.arrays.ArrayValue.join]
+        [`ArrayValue.join`](./expression-collections.qmd#ibis.expr.types.arrays.ArrayValue.join)
         """
         import ibis.expr.types as ir
 
@@ -828,10 +868,10 @@ class StringValue(Value):
             cls = ops.ArrayStringJoin
         else:
             cls = ops.StringJoin
-        return cls(self, strings).to_expr()
+        return cls(strings, sep=self).to_expr()
 
-    def startswith(self, start: str | StringValue) -> ir.BooleanValue:
-        """Determine whether `self` starts with `end`.
+    def startswith(self, start: str | StringValue | Deferred, /) -> ir.BooleanValue:
+        """Determine whether `self` starts with `start`.
 
         Parameters
         ----------
@@ -860,7 +900,7 @@ class StringValue(Value):
         """
         return ops.StartsWith(self, start).to_expr()
 
-    def endswith(self, end: str | StringValue) -> ir.BooleanValue:
+    def endswith(self, end: str | StringValue | Deferred, /) -> ir.BooleanValue:
         """Determine if `self` ends with `end`.
 
         Parameters
@@ -892,7 +932,8 @@ class StringValue(Value):
 
     def like(
         self,
-        patterns: str | StringValue | Iterable[str | StringValue],
+        patterns: str | StringValue | Deferred | Iterable[str | StringValue | Deferred],
+        /,
     ) -> ir.BooleanValue:
         """Match `patterns` against `self`, case-sensitive.
 
@@ -937,7 +978,8 @@ class StringValue(Value):
 
     def ilike(
         self,
-        patterns: str | StringValue | Iterable[str | StringValue],
+        patterns: str | StringValue | Deferred | Iterable[str | StringValue | Deferred],
+        /,
     ) -> ir.BooleanValue:
         """Match `patterns` against `self`, case-insensitive.
 
@@ -983,10 +1025,10 @@ class StringValue(Value):
     @util.backend_sensitive(
         why="Different backends support different regular expression syntax."
     )
-    def re_search(self, pattern: str | StringValue) -> ir.BooleanValue:
-        """Return whether the values match `pattern`.
+    def re_search(self, pattern: str | StringValue | Deferred, /) -> ir.BooleanValue:
+        """Return whether `self` contains the regex `pattern`.
 
-        Returns `True` if the regex matches a string and `False` otherwise.
+        Returns `True` if the regex matches any part of a string and `False` otherwise.
 
         Parameters
         ----------
@@ -1002,7 +1044,7 @@ class StringValue(Value):
         --------
         >>> import ibis
         >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({"s": ["Ibis project", "GitHub"]})
+        >>> t = ibis.memtable({"s": ["Ibis project", "GitHub", "GitHub Actions"]})
         >>> t.s.re_search(".+Hub")
         ┏━━━━━━━━━━━━━━━━━━━━━━━━━┓
         ┃ RegexSearch(s, '.+Hub') ┃
@@ -1010,6 +1052,7 @@ class StringValue(Value):
         │ boolean                 │
         ├─────────────────────────┤
         │ False                   │
+        │ True                    │
         │ True                    │
         └─────────────────────────┘
         """
@@ -1021,9 +1064,7 @@ class StringValue(Value):
         why="Different backends support different regular expression syntax."
     )
     def re_extract(
-        self,
-        pattern: str | StringValue,
-        index: int | ir.IntegerValue,
+        self, pattern: str | StringValue | Deferred, index: int | ir.IntegerValue
     ) -> StringValue:
         """Return the specified match at `index` from a regex `pattern`.
 
@@ -1081,12 +1122,58 @@ class StringValue(Value):
     @util.backend_sensitive(
         why="Different backends support different regular expression syntax."
     )
+    def re_split(self, pattern: str | StringValue | Deferred, /) -> ir.ArrayValue:
+        r"""Split a string by a regular expression `pattern`.
+
+        Parameters
+        ----------
+        pattern
+            Regular expression string to split by
+
+        Returns
+        -------
+        ArrayValue
+            Array of strings from splitting by `pattern`
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(dict(s=["a.b", "b.....c", "c.........a", "def"]))
+        >>> t.s
+        ┏━━━━━━━━━━━━━┓
+        ┃ s           ┃
+        ┡━━━━━━━━━━━━━┩
+        │ string      │
+        ├─────────────┤
+        │ a.b         │
+        │ b.....c     │
+        │ c.........a │
+        │ def         │
+        └─────────────┘
+        >>> t.s.re_split(r"\.+").name("splits")
+        ┏━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ splits               ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<string>        │
+        ├──────────────────────┤
+        │ ['a', 'b']           │
+        │ ['b', 'c']           │
+        │ ['c', 'a']           │
+        │ ['def']              │
+        └──────────────────────┘
+        """
+        return ops.RegexSplit(self, pattern).to_expr()
+
+    @util.backend_sensitive(
+        why="Different backends support different regular expression syntax."
+    )
     def re_replace(
         self,
-        pattern: str | StringValue,
-        replacement: str | StringValue,
+        pattern: str | StringValue | Deferred,
+        replacement: str | StringValue | Deferred,
     ) -> StringValue:
-        r"""Replace match found by regex `pattern` with `replacement`.
+        r"""Replace all matches found by regex `pattern` with `replacement`.
 
         Parameters
         ----------
@@ -1104,26 +1191,62 @@ class StringValue(Value):
         --------
         >>> import ibis
         >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({"s": ["abc", "bac", "bca"]})
-        >>> t.s.re_replace("^(a)", "b")
+        >>> t = ibis.memtable({"s": ["abc", "bac", "bca", "this has  multi \t whitespace"]})
+        >>> s = t.s
+
+        Replace all "a"s that are at the beginning of the string with "b":
+
+        >>> s.re_replace("^a", "b")
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ RegexReplace(s, '^a', 'b')    ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string                        │
+        ├───────────────────────────────┤
+        │ bbc                           │
+        │ bac                           │
+        │ bca                           │
+        │ this has  multi \t whitespace │
+        └───────────────────────────────┘
+
+        Double up any "a"s or "b"s, using capture groups and backreferences:
+
+        >>> s.re_replace("([ab])", r"\0\0")
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ RegexReplace(s, '()', '\\0\\0')     ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string                              │
+        ├─────────────────────────────────────┤
+        │ aabbc                               │
+        │ bbaac                               │
+        │ bbcaa                               │
+        │ this haas  multi \t whitespaace     │
+        └─────────────────────────────────────┘
+
+        Normalize all whitespace to a single space:
+
+        >>> s.re_replace(r"\s+", " ")
         ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ RegexReplace(s, '^(a)', 'b') ┃
+        ┃ RegexReplace(s, '\\s+', ' ') ┃
         ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
         │ string                       │
         ├──────────────────────────────┤
-        │ bbc                          │
+        │ abc                          │
         │ bac                          │
         │ bca                          │
+        │ this has multi whitespace    │
         └──────────────────────────────┘
         """
         return ops.RegexReplace(self, pattern, replacement).to_expr()
 
     def replace(
         self,
-        pattern: StringValue,
-        replacement: StringValue,
+        pattern: str | StringValue | Deferred,
+        replacement: str | StringValue | Deferred,
     ) -> StringValue:
         """Replace each exact match of `pattern` with `replacement`.
+
+        This method transforms strings to strings. For replacing arbitrary
+        types, see [`Value.substitute`](./expression-generic.qmd#ibis.expr.types.generic.Value.substitute).
 
         Parameters
         ----------
@@ -1136,6 +1259,10 @@ class StringValue(Value):
         -------
         StringValue
             Replaced string
+
+        See Also
+        --------
+        [`Value.substitute`](./expression-generic.qmd#ibis.expr.types.generic.Value.substitute)
 
         Examples
         --------
@@ -1155,7 +1282,7 @@ class StringValue(Value):
         """
         return ops.StringReplace(self, pattern, replacement).to_expr()
 
-    def to_timestamp(self, format_str: str) -> ir.TimestampValue:
+    def as_timestamp(self, format_str: str, /) -> ir.TimestampValue:
         """Parse a string and return a timestamp.
 
         Parameters
@@ -1173,7 +1300,7 @@ class StringValue(Value):
         >>> import ibis
         >>> ibis.options.interactive = True
         >>> t = ibis.memtable({"ts": ["20170206"]})
-        >>> t.ts.to_timestamp("%Y%m%d")
+        >>> t.ts.as_timestamp("%Y%m%d")
         ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
         ┃ StringToTimestamp(ts, '%Y%m%d') ┃
         ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
@@ -1184,7 +1311,65 @@ class StringValue(Value):
         """
         return ops.StringToTimestamp(self, format_str).to_expr()
 
-    def protocol(self):
+    def as_date(self, format_str: str, /) -> ir.DateValue:
+        """Parse a string and return a date.
+
+        Parameters
+        ----------
+        format_str
+            Format string in `strptime` format
+
+        Returns
+        -------
+        DateValue
+            Parsed date value
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable({"ts": ["20170206"]})
+        >>> t.ts.as_date("%Y%m%d")
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ StringToDate(ts, '%Y%m%d') ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ date                       │
+        ├────────────────────────────┤
+        │ 2017-02-06                 │
+        └────────────────────────────┘
+        """
+        return ops.StringToDate(self, format_str).to_expr()
+
+    def as_time(self, format_str: str, /) -> ir.TimeValue:
+        """Parse a string and return a time.
+
+        Parameters
+        ----------
+        format_str
+            Format string in `strptime` format
+
+        Returns
+        -------
+        TimeValue
+            Parsed time value
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable({"ts": ["20:01:02"]})
+        >>> t.ts.as_time("%H:%M:%S")
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ StringToTime(ts, '%H:%M:%S') ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ time                         │
+        ├──────────────────────────────┤
+        │ 20:01:02                     │
+        └──────────────────────────────┘
+        """
+        return ops.StringToTime(self, format_str).to_expr()
+
+    def protocol(self) -> Self:
         """Parse a URL and extract protocol.
 
         Examples
@@ -1200,7 +1385,7 @@ class StringValue(Value):
         """
         return ops.ExtractProtocol(self).to_expr()
 
-    def authority(self):
+    def authority(self) -> Self:
         """Parse a URL and extract authority.
 
         Examples
@@ -1216,14 +1401,14 @@ class StringValue(Value):
         """
         return ops.ExtractAuthority(self).to_expr()
 
-    def userinfo(self):
+    def userinfo(self) -> Self:
         """Parse a URL and extract user info.
 
         Examples
         --------
         >>> import ibis
         >>> url = ibis.literal("https://user:pass@example.com:80/docs/books")
-        >>> result = url.authority()  # user:pass
+        >>> result = url.userinfo()  # user:pass
 
         Returns
         -------
@@ -1232,14 +1417,14 @@ class StringValue(Value):
         """
         return ops.ExtractUserInfo(self).to_expr()
 
-    def host(self):
+    def host(self) -> Self:
         """Parse a URL and extract host.
 
         Examples
         --------
         >>> import ibis
         >>> url = ibis.literal("https://user:pass@example.com:80/docs/books")
-        >>> result = url.authority()  # example.com
+        >>> result = url.host()  # example.com
 
         Returns
         -------
@@ -1248,14 +1433,16 @@ class StringValue(Value):
         """
         return ops.ExtractHost(self).to_expr()
 
-    def file(self):
+    def file(self) -> Self:
         """Parse a URL and extract file.
 
         Examples
         --------
         >>> import ibis
-        >>> url = ibis.literal("https://example.com:80/docs/books/tutorial/index.html?name=networking")
-        >>> result = url.authority()  # docs/books/tutorial/index.html?name=networking
+        >>> url = ibis.literal(
+        ...     "https://example.com:80/docs/books/tutorial/index.html?name=networking"
+        ... )
+        >>> result = url.file()  # docs/books/tutorial/index.html?name=networking
 
         Returns
         -------
@@ -1264,14 +1451,16 @@ class StringValue(Value):
         """
         return ops.ExtractFile(self).to_expr()
 
-    def path(self):
+    def path(self) -> Self:
         """Parse a URL and extract path.
 
         Examples
         --------
         >>> import ibis
-        >>> url = ibis.literal("https://example.com:80/docs/books/tutorial/index.html?name=networking")
-        >>> result = url.authority()  # docs/books/tutorial/index.html
+        >>> url = ibis.literal(
+        ...     "https://example.com:80/docs/books/tutorial/index.html?name=networking"
+        ... )
+        >>> result = url.path()  # docs/books/tutorial/index.html
 
         Returns
         -------
@@ -1280,8 +1469,8 @@ class StringValue(Value):
         """
         return ops.ExtractPath(self).to_expr()
 
-    def query(self, key: str | StringValue | None = None):
-        """Parse a URL and returns query strring or query string parameter.
+    def query(self, key: str | StringValue | Deferred | None = None, /):
+        """Parse a URL and returns query string or query string parameter.
 
         If key is passed, return the value of the query string parameter named.
         If key is absent, return the query string.
@@ -1294,9 +1483,11 @@ class StringValue(Value):
         Examples
         --------
         >>> import ibis
-        >>> url = ibis.literal("https://example.com:80/docs/books/tutorial/index.html?name=networking")
+        >>> url = ibis.literal(
+        ...     "https://example.com:80/docs/books/tutorial/index.html?name=networking"
+        ... )
         >>> result = url.query()  # name=networking
-        >>> query_name = url.query('name')  # networking
+        >>> query_name = url.query("name")  # networking
 
         Returns
         -------
@@ -1305,7 +1496,7 @@ class StringValue(Value):
         """
         return ops.ExtractQuery(self, key).to_expr()
 
-    def fragment(self):
+    def fragment(self) -> Self:
         """Parse a URL and extract fragment identifier.
 
         Examples
@@ -1321,10 +1512,12 @@ class StringValue(Value):
         """
         return ops.ExtractFragment(self).to_expr()
 
-    def split(self, delimiter: str | StringValue) -> ir.ArrayValue:
+    def split(self, delimiter: str | StringValue | Deferred, /) -> ir.ArrayValue:
         """Split as string on `delimiter`.
 
-        !!! note "This API only works on backends with array support."
+        ::: {.callout-note}
+        ## This API only works on backends with array support.
+        :::
 
         Parameters
         ----------
@@ -1364,8 +1557,15 @@ class StringValue(Value):
         """
         return ops.StringSplit(self, delimiter).to_expr()
 
-    def concat(self, other: str | StringValue, *args: str | StringValue) -> StringValue:
+    def concat(
+        self,
+        other: str | StringValue | Deferred,
+        /,
+        *args: str | StringValue | Deferred,
+    ) -> StringValue:
         """Concatenate strings.
+
+        NULLs are propagated. This methods is equivalent to using the `+` operator.
 
         Parameters
         ----------
@@ -1383,21 +1583,29 @@ class StringValue(Value):
         --------
         >>> import ibis
         >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({"s": ["abc", "bac", "bca"]})
-        >>> t.s.concat("xyz")
-        ┏━━━━━━━━━━━━━━━━┓
-        ┃ StringConcat() ┃
-        ┡━━━━━━━━━━━━━━━━┩
-        │ string         │
-        ├────────────────┤
-        │ abcxyz         │
-        │ bacxyz         │
-        │ bcaxyz         │
-        └────────────────┘
+        >>> t = ibis.memtable({"s": ["abc", None]})
+        >>> t.s.concat("xyz", "123")
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ StringConcat((s, 'xyz', '123')) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string                          │
+        ├─────────────────────────────────┤
+        │ abcxyz123                       │
+        │ NULL                            │
+        └─────────────────────────────────┘
+        >>> t.s + "xyz"
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ StringConcat((s, 'xyz')) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string                   │
+        ├──────────────────────────┤
+        │ abcxyz                   │
+        │ NULL                     │
+        └──────────────────────────┘
         """
         return ops.StringConcat((self, other, *args)).to_expr()
 
-    def __add__(self, other: str | StringValue) -> StringValue:
+    def __add__(self, other: str | StringValue | Deferred) -> StringValue:
         """Concatenate strings.
 
         Parameters
@@ -1426,29 +1634,29 @@ class StringValue(Value):
         │ bca    │
         └────────┘
         >>> t.s + "z"
-        ┏━━━━━━━━━━━━━━━━┓
-        ┃ StringConcat() ┃
-        ┡━━━━━━━━━━━━━━━━┩
-        │ string         │
-        ├────────────────┤
-        │ abcz           │
-        │ bacz           │
-        │ bcaz           │
-        └────────────────┘
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ StringConcat((s, 'z')) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string                 │
+        ├────────────────────────┤
+        │ abcz                   │
+        │ bacz                   │
+        │ bcaz                   │
+        └────────────────────────┘
         >>> t.s + t.s
-        ┏━━━━━━━━━━━━━━━━┓
-        ┃ StringConcat() ┃
-        ┡━━━━━━━━━━━━━━━━┩
-        │ string         │
-        ├────────────────┤
-        │ abcabc         │
-        │ bacbac         │
-        │ bcabca         │
-        └────────────────┘
+        ┏━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ StringConcat((s, s)) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string               │
+        ├──────────────────────┤
+        │ abcabc               │
+        │ bacbac               │
+        │ bcabca               │
+        └──────────────────────┘
         """
         return self.concat(other)
 
-    def __radd__(self, other: str | StringValue) -> StringValue:
+    def __radd__(self, other: str | StringValue | Deferred) -> StringValue:
         """Concatenate strings.
 
         Parameters
@@ -1477,22 +1685,20 @@ class StringValue(Value):
         │ bca    │
         └────────┘
         >>> "z" + t.s
-        ┏━━━━━━━━━━━━━━━━┓
-        ┃ StringConcat() ┃
-        ┡━━━━━━━━━━━━━━━━┩
-        │ string         │
-        ├────────────────┤
-        │ zabc           │
-        │ zbac           │
-        │ zbca           │
-        └────────────────┘
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ StringConcat(('z', s)) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ string                 │
+        ├────────────────────────┤
+        │ zabc                   │
+        │ zbac                   │
+        │ zbca                   │
+        └────────────────────────┘
         """
         return ops.StringConcat((other, self)).to_expr()
 
     def convert_base(
-        self,
-        from_base: int | ir.IntegerValue,
-        to_base: int | ir.IntegerValue,
+        self, from_base: int | ir.IntegerValue, to_base: int | ir.IntegerValue
     ) -> ir.IntegerValue:
         """Convert a string representing an integer from one base to another.
 
@@ -1510,10 +1716,35 @@ class StringValue(Value):
         """
         return ops.BaseConvert(self, from_base, to_base).to_expr()
 
-    def __mul__(self, n: int | ir.IntegerValue) -> StringValue | NotImplemented:
+    def __mul__(self, n: int | ir.IntegerValue) -> StringValue:
         return _binop(ops.Repeat, self, n)
 
     __rmul__ = __mul__
+
+    def levenshtein(self, other: str | StringValue | Deferred, /) -> ir.IntegerValue:
+        """Return the Levenshtein distance between two strings.
+
+        Parameters
+        ----------
+        other
+            String to compare to
+
+        Returns
+        -------
+        IntegerValue
+            The edit distance between the two strings
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> s = ibis.literal("kitten")
+        >>> s.levenshtein("sitting")
+        ┌───┐
+        │ 3 │
+        └───┘
+        """
+        return ops.Levenshtein(self, other).to_expr()
 
 
 @public
@@ -1523,4 +1754,7 @@ class StringScalar(Scalar, StringValue):
 
 @public
 class StringColumn(Column, StringValue):
-    pass
+    def __getitem__(
+        self, key: slice | int | ir.IntegerValue | Deferred
+    ) -> StringColumn:
+        return StringValue.__getitem__(self, key)

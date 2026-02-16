@@ -1,195 +1,454 @@
 from __future__ import annotations
 
-import json
-import warnings
-from uuid import UUID
+import contextlib
+import datetime
+from functools import partial
+from importlib.util import find_spec as _find_spec
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 import pandas.api.types as pdt
-from dateutil.parser import parse as date_parse
+from packaging.version import parse as vparse
 
 import ibis.expr.datatypes as dt
 import ibis.expr.schema as sch
 from ibis import util
-from ibis.formats.numpy import dtype_from_numpy, dtype_to_numpy
-from ibis.formats.pyarrow import _infer_array_dtype, dtype_from_pyarrow
+from ibis.common.numeric import normalize_decimal
+from ibis.common.temporal import normalize_timezone
+from ibis.formats import DataMapper, SchemaMapper, TableProxy
+from ibis.formats.numpy import NumpyType
+from ibis.formats.pyarrow import PyArrowData, PyArrowSchema, PyArrowType
 
-_has_arrow_dtype = hasattr(pd, "ArrowDtype")
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
-if not _has_arrow_dtype:
-    warnings.warn(
-        f"The `ArrowDtype` class is not available in pandas {pd.__version__}. "
-        "Install pandas >= 1.5.0 for interop with pandas and arrow dtype support"
-    )
+    import polars as pl
+    import pyarrow as pa
+    from pandas.api.extensions import ExtensionDtype
 
+_DEFAULT_DATETIME_RESOLUTION = "ns" if vparse(pd.__version__) < vparse("3") else "us"
 
-def dtype_to_pandas(dtype: dt.DataType):
-    """Convert ibis dtype to the pandas / numpy alternative."""
-    assert isinstance(dtype, dt.DataType)
-
-    if dtype.is_timestamp() and dtype.timezone:
-        return pdt.DatetimeTZDtype('ns', dtype.timezone)
-    elif dtype.is_interval():
-        return np.dtype(f'timedelta64[{dtype.unit.short}]')
-    else:
-        return dtype_to_numpy(dtype)
+geospatial_supported = _find_spec("geopandas") is not None
 
 
-def dtype_from_pandas(typ, nullable=True):
-    if pdt.is_datetime64tz_dtype(typ):
-        return dt.Timestamp(timezone=str(typ.tz), nullable=nullable)
-    elif pdt.is_datetime64_dtype(typ):
-        return dt.Timestamp(nullable=nullable)
-    elif pdt.is_categorical_dtype(typ):
-        return dt.String(nullable=nullable)
-    elif pdt.is_extension_array_dtype(typ):
-        if _has_arrow_dtype and isinstance(typ, pd.ArrowDtype):
-            return dtype_from_pyarrow(typ.pyarrow_dtype, nullable=nullable)
+class PandasType(NumpyType):
+    @classmethod
+    def to_ibis(cls, typ, nullable=True):
+        if pd.options.future.infer_string and isinstance(typ, pd.StringDtype):
+            return dt.String(nullable=nullable)
+        elif isinstance(typ, pdt.DatetimeTZDtype):
+            return dt.Timestamp(timezone=str(typ.tz), nullable=nullable)
+        elif pdt.is_datetime64_dtype(typ):
+            return dt.Timestamp(nullable=nullable)
+        elif isinstance(typ, pdt.CategoricalDtype):
+            if typ.categories is None or pdt.is_string_dtype(typ.categories):
+                return dt.String(nullable=nullable)
+            return cls.to_ibis(typ.categories.dtype, nullable=nullable)
+        elif pdt.is_extension_array_dtype(typ):
+            if isinstance(typ, pd.ArrowDtype):
+                return PyArrowType.to_ibis(typ.pyarrow_dtype, nullable=nullable)
+            else:
+                name = typ.__class__.__name__.replace("Dtype", "")
+                klass = getattr(dt, name)
+                return klass(nullable=nullable)
         else:
-            name = typ.__class__.__name__.replace("Dtype", "")
-            klass = getattr(dt, name)
-            return klass(nullable=nullable)
-    else:
-        return dtype_from_numpy(typ, nullable=nullable)
+            return super().to_ibis(typ, nullable=nullable)
 
-
-def schema_to_pandas(schema):
-    pandas_types = map(dtype_to_pandas, schema.types)
-    return list(zip(schema.names, pandas_types))
-
-
-def schema_from_pandas(schema):
-    ibis_types = {name: dtype_from_pandas(typ) for name, typ in schema}
-    return sch.schema(ibis_types)
-
-
-def schema_from_pandas_dataframe(df: pd.DataFrame, schema=None):
-    schema = schema if schema is not None else {}
-
-    pairs = []
-    for column_name in df.dtypes.keys():
-        if not isinstance(column_name, str):
-            raise TypeError('Column names must be strings to use the pandas backend')
-
-        if column_name in schema:
-            ibis_dtype = schema[column_name]
+    @classmethod
+    def from_ibis(cls, dtype) -> np.dtype | pd.Ex:
+        if pd.options.future.infer_string and dtype.is_string():
+            return pd.StringDtype(na_value=np.nan)
+        elif dtype.is_timestamp():
+            if dtype.timezone:
+                return pdt.DatetimeTZDtype(_DEFAULT_DATETIME_RESOLUTION, dtype.timezone)
+            else:
+                return np.dtype(f"datetime64[{_DEFAULT_DATETIME_RESOLUTION}]")
+        elif dtype.is_date():
+            return np.dtype("datetime64[s]")
+        elif dtype.is_interval():
+            return np.dtype(f"timedelta64[{dtype.unit.short}]")
         else:
+            return super().from_ibis(dtype)
+
+
+class PandasSchema(SchemaMapper):
+    @classmethod
+    def to_ibis(
+        cls, pandas_schema: pd.Series | Iterable[tuple[str, np.dtype | ExtensionDtype]]
+    ) -> sch.Schema:
+        if isinstance(pandas_schema, pd.Series):
+            pandas_schema = pandas_schema.to_list()
+
+        fields = {name: PandasType.to_ibis(t) for name, t in pandas_schema}
+
+        return sch.Schema(fields)
+
+    @classmethod
+    def from_ibis(
+        cls, schema: sch.Schema
+    ) -> list[tuple[str, np.dtype | ExtensionDtype]]:
+        names = schema.names
+        types = [PandasType.from_ibis(t) for t in schema.types]
+        return list(zip(names, types))
+
+
+class PandasData(DataMapper):
+    @classmethod
+    def infer_scalar(cls, s):
+        return PyArrowData.infer_scalar(s)
+
+    @classmethod
+    def infer_column(cls, s):
+        return PyArrowData.infer_column(s)
+
+    @classmethod
+    def infer_table(cls, df):
+        pairs = []
+        for column_name in df.dtypes.keys():
+            if not isinstance(column_name, str):
+                raise TypeError(
+                    "Column names must be strings to ingest a pandas DataFrame"
+                )
+
             pandas_column = df[column_name]
             pandas_dtype = pandas_column.dtype
             if pandas_dtype == np.object_:
-                ibis_dtype = _infer_array_dtype(pandas_column.values)
+                ibis_dtype = cls.infer_column(pandas_column)
             else:
-                ibis_dtype = dtype_from_pandas(pandas_dtype)
+                ibis_dtype = PandasType.to_ibis(pandas_dtype)
 
-        pairs.append((column_name, ibis_dtype))
+            pairs.append((column_name, ibis_dtype))
 
-    return sch.schema(pairs)
+        return sch.Schema.from_tuples(pairs)
 
+    concat = staticmethod(pd.concat)
 
-@sch.convert.register(pdt.DatetimeTZDtype, dt.Timestamp, pd.Series)
-def convert_datetimetz_to_timestamp(_, out_dtype, column):
-    output_timezone = out_dtype.timezone
-    if output_timezone is not None:
-        return column.dt.tz_convert(output_timezone)
-    else:
-        return column.dt.tz_localize(None)
+    @classmethod
+    def convert_table(cls, df, schema):
+        if schema.names != tuple(df.columns):
+            raise ValueError("schema names don't match input data columns")
 
+        columns = {
+            name: cls.convert_column(df[name], dtype) for name, dtype in schema.items()
+        }
+        df = pd.DataFrame(columns)
 
-@sch.convert.register(np.dtype, dt.Interval, pd.Series)
-def convert_any_to_interval(_, out_dtype, column):
-    values = column.values
-    pandas_dtype = out_dtype.to_pandas()
-    try:
-        return values.astype(pandas_dtype)
-    except ValueError:  # can happen when `column` is DateOffsets
-        return column
+        if geospatial_supported:
+            from geopandas import GeoDataFrame
+            from geopandas.array import GeometryDtype
 
+            if (
+                # pluck out the first geometry column if it exists
+                geom := next(
+                    (
+                        name
+                        for name, c in df.items()
+                        if isinstance(c.dtype, GeometryDtype)
+                    ),
+                    None,
+                )
+            ) is not None:
+                return GeoDataFrame(df, geometry=geom)
+        return df
 
-@sch.convert.register(np.dtype, dt.String, pd.Series)
-def convert_any_to_string(_, out_dtype, column):
-    result = column.astype(out_dtype.to_pandas(), errors='ignore')
-    return result
+    @classmethod
+    def convert_column(cls, obj, dtype):
+        pandas_type = PandasType.from_ibis(dtype)
 
+        method_name = f"convert_{dtype.__class__.__name__}"
+        convert_method = getattr(cls, method_name, cls.convert_default)
 
-@sch.convert.register(np.dtype, dt.UUID, pd.Series)
-def convert_any_to_uuid(_, out_dtype, column):
-    return column.map(lambda v: v if isinstance(v, UUID) else UUID(v))
+        result = convert_method(obj, dtype, pandas_type)
+        assert not isinstance(result, np.ndarray), f"{convert_method} -> {type(result)}"
+        return result
 
+    @classmethod
+    def convert_scalar(cls, obj, dtype):
+        df = PandasData.convert_table(obj, sch.Schema({str(obj.columns[0]): dtype}))
+        value = df.iat[0, 0]
 
-@sch.convert.register(np.dtype, dt.Boolean, pd.Series)
-def convert_boolean_to_series(in_dtype, out_dtype, column):
-    # XXX: this is a workaround until #1595 can be addressed
-    in_dtype_type = in_dtype.type
-    out_dtype_type = out_dtype.to_pandas().type
-    if column.empty:
-        return column.astype(out_dtype_type)
-    elif in_dtype_type != np.object_ and in_dtype_type != out_dtype_type:
-        return column.map(lambda value: pd.NA if pd.isna(value) else bool(value))
-    return column
+        if dtype.is_array():
+            try:
+                return value.tolist()
+            except AttributeError:
+                return value
 
-
-@sch.convert.register(pdt.DatetimeTZDtype, dt.Date, pd.Series)
-def convert_timestamp_to_date(in_dtype, out_dtype, column):
-    if in_dtype.tz is not None:
-        column = column.dt.tz_convert("UTC").dt.tz_localize(None)
-    return column.astype(out_dtype.to_pandas(), errors='ignore').dt.normalize()
-
-
-@sch.convert.register(object, dt.DataType, pd.Series)
-def convert_any_to_any(_, out_dtype, column):
-    try:
-        return column.astype(out_dtype.to_pandas())
-    except Exception:  # noqa: BLE001
-        return column
-
-
-@sch.convert.register(np.dtype, dt.Timestamp, pd.Series)
-def convert_any_to_timestamp(_, out_dtype, column):
-    try:
-        return column.astype(out_dtype.to_pandas())
-    except pd.errors.OutOfBoundsDatetime:
         try:
-            return column.map(date_parse)
-        except TypeError:
-            return column
-    except TypeError:
-        column = pd.to_datetime(column)
-        timezone = out_dtype.timezone
+            return value.item()
+        except AttributeError:
+            return value
+
+    @classmethod
+    def convert_GeoSpatial(cls, s, dtype, pandas_type):
+        import geopandas as gpd
+
+        if isinstance(s.dtype, gpd.array.GeometryDtype):
+            return gpd.GeoSeries(s)
+        return gpd.GeoSeries.from_wkb(s)
+
+    convert_Point = convert_LineString = convert_Polygon = convert_MultiLineString = (
+        convert_MultiPoint
+    ) = convert_MultiPolygon = convert_GeoSpatial
+
+    @classmethod
+    def convert_default(cls, s, dtype, pandas_type):
+        if s.dtype == pandas_type and dtype.is_primitive():
+            return s
         try:
-            return column.dt.tz_convert(timezone)
-        except TypeError:
-            return column.dt.tz_localize(timezone)
+            return s.astype(pandas_type)
+        except Exception:  # noqa: BLE001
+            return s
 
+    @classmethod
+    def convert_Boolean(cls, s, dtype, pandas_type):
+        if s.empty:
+            return s.astype(pandas_type)
+        elif pdt.is_object_dtype(s.dtype):
+            return s
+        elif s.dtype != pandas_type:
+            return s.map(bool, na_action="ignore")
+        else:
+            return s
 
-@sch.convert.register(object, dt.Struct, pd.Series)
-def convert_struct_to_dict(_, out_dtype, column):
-    def convert_element(values, names=out_dtype.names):
-        if values is None or isinstance(values, dict) or pd.isna(values):
-            return values
-        return dict(zip(names, values))
+    @classmethod
+    def convert_Timestamp(cls, s, dtype, pandas_type):
+        if isinstance(pandas_type, pd.DatetimeTZDtype) and isinstance(
+            s.dtype, pd.DatetimeTZDtype
+        ):
+            return s if s.dtype == pandas_type else s.dt.tz_convert(dtype.timezone)
+        elif pdt.is_datetime64_dtype(s.dtype):
+            return s.dt.tz_localize(dtype.timezone)
+        else:
+            try:
+                return s.astype(pandas_type)
+            except pd.errors.OutOfBoundsDatetime:  # uncovered
+                try:
+                    from dateutil.parser import parse as date_parse
 
-    return column.map(convert_element)
+                    return s.map(date_parse, na_action="ignore")
+                except TypeError:
+                    return s
+            except (ValueError, TypeError):
+                try:
+                    return pd.to_datetime(s).dt.tz_convert(dtype.timezone)
+                except TypeError:
+                    return pd.to_datetime(s).dt.tz_localize(dtype.timezone)
 
+    @classmethod
+    def convert_Date(cls, s, dtype, pandas_type):
+        if isinstance(s.dtype, pd.DatetimeTZDtype):
+            s = s.dt.tz_convert("UTC").dt.tz_localize(None)
 
-@sch.convert.register(np.dtype, dt.Array, pd.Series)
-def convert_array_to_series(in_dtype, out_dtype, column):
-    return column.map(lambda x: list(x) if util.is_iterable(x) else x)
-
-
-@sch.convert.register(np.dtype, dt.Map, pd.Series)
-def convert_map_to_series(in_dtype, out_dtype, column):
-    return column.map(lambda x: dict(x) if util.is_iterable(x) else x)
-
-
-@sch.convert.register(np.dtype, dt.JSON, pd.Series)
-def convert_json_to_series(in_, out, col: pd.Series):
-    def try_json(x):
-        if x is None:
-            return x
         try:
-            return json.loads(x)
-        except (TypeError, json.JSONDecodeError):
-            return x
+            return s.astype(pandas_type)
+        except (ValueError, TypeError, pd._libs.tslibs.OutOfBoundsDatetime):
 
-    return pd.Series(list(map(try_json, col)), dtype="object")
+            def try_date(v):
+                if isinstance(v, datetime.date):
+                    return pd.Timestamp(v)
+                elif isinstance(v, str):
+                    if v.endswith("Z"):
+                        datetime_obj = datetime.datetime.fromisoformat(v[:-1])
+                    else:
+                        datetime_obj = datetime.datetime.fromisoformat(v)
+                    return pd.Timestamp(datetime_obj)
+                else:
+                    return v
+
+            return s.map(try_date, na_action="ignore")
+
+    @classmethod
+    def convert_Interval(cls, s, dtype, pandas_type):
+        values = s.values
+        try:
+            result = values.astype(pandas_type)
+        except ValueError:  # can happen when `column` is DateOffsets  # uncovered
+            result = s
+        else:
+            result = s.__class__(result, index=s.index, name=s.name)
+        return result
+
+    @classmethod
+    def convert_String(cls, s, dtype, pandas_type):
+        return s.astype(pandas_type, errors="ignore")
+
+    @classmethod
+    def convert_Decimal(cls, s, dtype, pandas_type):
+        func = partial(
+            normalize_decimal,
+            precision=dtype.precision,
+            scale=dtype.scale,
+            strict=False,
+        )
+        return s.map(func, na_action="ignore")
+
+    @classmethod
+    def convert_UUID(cls, s, dtype, pandas_type):
+        return s.map(cls.get_element_converter(dtype), na_action="ignore")
+
+    @classmethod
+    def convert_Struct(cls, s, dtype, pandas_type):
+        return s.map(cls.get_element_converter(dtype), na_action="ignore")
+
+    @classmethod
+    def convert_Array(cls, s, dtype, pandas_type):
+        return s.map(cls.get_element_converter(dtype), na_action="ignore")
+
+    @classmethod
+    def convert_Map(cls, s, dtype, pandas_type):
+        return s.map(cls.get_element_converter(dtype), na_action="ignore")
+
+    @classmethod
+    def convert_JSON(cls, s, dtype, pandas_type):
+        return s.map(cls.get_element_converter(dtype), na_action="ignore").astype(
+            "object"
+        )
+
+    @classmethod
+    def get_element_converter(cls, dtype):
+        name = f"convert_{type(dtype).__name__}_element"
+        funcgen = getattr(cls, name, lambda _: lambda x: x)
+        return funcgen(dtype)
+
+    @classmethod
+    def convert_Struct_element(cls, dtype):
+        converters = tuple(map(cls.get_element_converter, dtype.types))
+
+        def convert(values, names=dtype.names, converters=converters):
+            if values is None:
+                return values
+
+            items = (
+                values.items()
+                if isinstance(values, dict)
+                else zip(names, util.promote_list(values))
+            )
+            return {
+                k: converter(v) if v is not None else v
+                for converter, (k, v) in zip(converters, items)
+            }
+
+        return convert
+
+    @classmethod
+    def convert_JSON_element(cls, _):
+        import json
+
+        def convert(value):
+            if value is None:
+                return value
+            try:
+                return json.loads(value)
+            except (TypeError, json.JSONDecodeError):
+                return value
+
+        return convert
+
+    @classmethod
+    def convert_Timestamp_element(cls, dtype):
+        def converter(value, dtype=dtype):
+            if value is None:
+                return value
+
+            with contextlib.suppress(AttributeError):
+                value = value.item()
+
+            if isinstance(value, int):
+                # this can only mean a numpy or pandas timestamp because they
+                # both support nanosecond precision
+                #
+                # when the precision is less than or equal to the value
+                # supported by Python datetime.dateimte a call to .item() will
+                # return a datetime.datetime but when the precision is higher
+                # than the value supported by Python the value is an integer
+                #
+                # TODO: can we do better than implicit truncation to microseconds?
+                import dateutil
+
+                value = pd.Timestamp.fromtimestamp(value / 1e9, dateutil.tz.UTC)
+
+            if (tz := dtype.timezone) is not None:
+                value = pd.Timestamp(value)
+                normed_tz = normalize_timezone(tz)
+                if value.tzinfo is None:
+                    return value.tz_localize(normed_tz)
+                return value.tz_convert(normed_tz)
+
+            return value.replace(tzinfo=None)
+
+        return converter
+
+    @classmethod
+    def convert_Array_element(cls, dtype):
+        convert_value = cls.get_element_converter(dtype.value_type)
+
+        def convert(values):
+            if values is None:
+                return values
+
+            return [
+                convert_value(value) if value is not None else value for value in values
+            ]
+
+        return convert
+
+    @classmethod
+    def convert_Map_element(cls, dtype):
+        convert_key = cls.get_element_converter(dtype.key_type)
+        convert_value = cls.get_element_converter(dtype.value_type)
+
+        def convert(raw_row):
+            if raw_row is None:
+                return raw_row
+
+            row = dict(raw_row)
+            return dict(
+                zip(map(convert_key, row.keys()), map(convert_value, row.values()))
+            )
+
+        return convert
+
+    @classmethod
+    def convert_UUID_element(cls, _):
+        from uuid import UUID
+
+        def convert(value):
+            if value is None:
+                return value
+            elif isinstance(value, UUID):
+                return value
+            elif isinstance(value, bytes):
+                return UUID(bytes=value)
+            return UUID(value)
+
+        return convert
+
+
+class PandasDataFrameProxy(TableProxy[pd.DataFrame]):
+    def to_frame(self) -> pd.DataFrame:
+        return self.obj
+
+    def to_pyarrow(self, schema: sch.Schema) -> pa.Table:
+        from decimal import Decimal
+
+        import pyarrow as pa
+        import pyarrow_hotfix  # noqa: F401
+
+        pyarrow_schema = PyArrowSchema.from_ibis(schema)
+
+        obj = self.obj
+        if decimal_cols := [
+            name for name, dtype in schema.items() if dtype.is_decimal()
+        ]:
+            obj = obj.assign(**{col: obj[col].map(Decimal) for col in decimal_cols})
+
+        return pa.Table.from_pandas(obj, schema=pyarrow_schema)
+
+    def to_polars(self, schema: sch.Schema) -> pl.DataFrame:
+        import polars as pl
+
+        from ibis.formats.polars import PolarsSchema
+
+        pl_schema = PolarsSchema.from_ibis(schema)
+        return pl.from_pandas(self.obj, schema_overrides=pl_schema)

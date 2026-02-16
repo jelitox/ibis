@@ -1,65 +1,57 @@
 from __future__ import annotations
 
 import ast
-import json
-from contextlib import closing, suppress
+import contextlib
+import glob
+import re
+from contextlib import closing
 from functools import partial
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Literal, Mapping
+from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import unquote_plus
 
 import clickhouse_connect as cc
 import pyarrow as pa
-import sqlalchemy as sa
+import pyarrow_hotfix  # noqa: F401
 import sqlglot as sg
+import sqlglot.expressions as sge
 import toolz
+from clickhouse_connect.driver.exceptions import DatabaseError
 from clickhouse_connect.driver.external import ExternalData
 
 import ibis
+import ibis.backends.sql.compilers as sc
 import ibis.common.exceptions as com
 import ibis.config
-import ibis.expr.analysis as an
 import ibis.expr.operations as ops
 import ibis.expr.schema as sch
 import ibis.expr.types as ir
 from ibis import util
-from ibis.backends.base import BaseBackend
-from ibis.backends.clickhouse.compiler import translate
-from ibis.backends.clickhouse.datatypes import parse, serialize
+from ibis.backends import (
+    BaseBackend,
+    CanCreateDatabase,
+    DirectExampleLoader,
+    SupportsTempTables,
+)
+from ibis.backends.clickhouse.converter import ClickHousePandasData
+from ibis.backends.sql import SQLBackend
+from ibis.backends.sql.compilers.base import C
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator, Mapping
+    from pathlib import Path
+    from urllib.parse import ParseResult
+
     import pandas as pd
+    import polars as pl
 
 
 def _to_memtable(v):
     return ibis.memtable(v).op() if not isinstance(v, ops.InMemoryTable) else v
 
 
-class ClickhouseTable(ir.Table):
-    """References a physical table in Clickhouse."""
-
-    @property
-    def _client(self):
-        return self.op().source
-
-    @property
-    def name(self):
-        return self.op().name
-
-    def insert(self, obj, settings: Mapping[str, Any] | None = None, **kwargs):
-        import pandas as pd
-
-        if not isinstance(obj, pd.DataFrame):
-            raise com.IbisError(
-                f"Invalid input type {type(obj)}; only pandas DataFrames are accepted as input"
-            )
-
-        return self._client.con.insert_df(self.name, obj, settings=settings, **kwargs)
-
-
-class Backend(BaseBackend):
-    name = 'clickhouse'
-
-    # ClickHouse itself does, but the client driver does not
-    supports_temporary_tables = False
+class Backend(SupportsTempTables, SQLBackend, CanCreateDatabase, DirectExampleLoader):
+    name = "clickhouse"
+    compiler = sc.clickhouse.compiler
 
     class Options(ibis.config.Config):
         """Clickhouse options.
@@ -68,57 +60,32 @@ class Backend(BaseBackend):
         ----------
         bool_type : str
             Type to use for boolean columns
+
         """
 
         bool_type: Literal["Bool", "UInt8", "Int8"] = "Bool"
 
-    def _log(self, sql: str) -> None:
-        """Log the SQL, usually to the standard output.
+    def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
+        """No-op."""
 
-        This method can be implemented by subclasses. The logging
-        happens when `ibis.options.verbose` is `True`.
-        """
-        util.log(sql)
-
-    def sql(self, query: str, schema=None) -> ir.Table:
-        if schema is None:
-            schema = self._get_schema_using_query(query)
-        return ops.SQLQueryResult(query, ibis.schema(schema), self).to_expr()
-
-    def _from_url(self, url: str, **kwargs) -> BaseBackend:
-        """Connect to a backend using a URL `url`.
-
-        Parameters
-        ----------
-        url
-            URL with which to connect to a backend.
-        kwargs
-            Additional keyword arguments
-
-        Returns
-        -------
-        BaseBackend
-            A backend instance
-        """
-        url = sa.engine.make_url(url)
-
-        kwargs = toolz.merge(
-            {
-                name: value
-                for name in ("host", "port", "database", "password")
-                if (value := getattr(url, name, None))
-            },
-            kwargs,
-        )
-        if username := url.username:
-            kwargs["user"] = username
-
-        kwargs.update(url.query)
+    def _from_url(self, url: ParseResult, **kwarg_overrides) -> BaseBackend:
+        kwargs = {}
+        if url.username:
+            kwargs["user"] = url.username
+        if url.password:
+            kwargs["password"] = unquote_plus(url.password)
+        if url.hostname:
+            kwargs["host"] = url.hostname
+        if url.port:
+            kwargs["port"] = url.port
+        if database := url.path[1:]:
+            kwargs["database"] = database
+        kwargs.update(kwarg_overrides)
         self._convert_kwargs(kwargs)
         return self.connect(**kwargs)
 
     def _convert_kwargs(self, kwargs):
-        with suppress(KeyError):
+        with contextlib.suppress(KeyError):
             kwargs["secure"] = bool(ast.literal_eval(kwargs["secure"]))
 
     def do_connect(
@@ -131,6 +98,7 @@ class Backend(BaseBackend):
         client_name: str = "ibis",
         secure: bool | None = None,
         compression: str | bool = True,
+        settings: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ):
         """Create a ClickHouse client for use with Ibis.
@@ -149,23 +117,28 @@ class Backend(BaseBackend):
         password
             Password to authenticate with
         client_name
-            Name of client that wil appear in clickhouse server logs
+            Name of client that will appear in clickhouse server logs
         secure
             Whether or not to use an authenticated endpoint
         compression
             The kind of compression to use for requests. See
             https://clickhouse.com/docs/en/integrations/python#compression for
             more information.
+        settings
+            ClickHouse session settings
         kwargs
             Client specific keyword arguments
 
         Examples
         --------
         >>> import ibis
-        >>> client = ibis.clickhouse.connect()
+        >>> client = ibis.clickhouse.connect(user="ibis")
         >>> client
-        <ibis.clickhouse.client.ClickhouseClient object at 0x...>
+        <ibis.backends.clickhouse.Backend object at 0x...>
         """
+        if settings is None:
+            settings = {}
+
         self.con = cc.get_client(
             host=host,
             # 8123 is the default http port 443 is https
@@ -176,19 +149,44 @@ class Backend(BaseBackend):
             client_name=client_name,
             query_limit=0,
             compress=compression,
+            settings=settings,
             **kwargs,
         )
+
+    @util.experimental
+    @classmethod
+    def from_connection(cls, con: cc.driver.Client, /) -> Backend:
+        """Create an Ibis client from an existing ClickHouse Connect Client instance.
+
+        Parameters
+        ----------
+        con
+            An existing ClickHouse Connect Client instance.
+        """
+        new_backend = cls()
+        new_backend._can_reconnect = False
+        new_backend.con = con
+        return new_backend
 
     @property
     def version(self) -> str:
         return self.con.server_version
 
+    @contextlib.contextmanager
+    def _safe_raw_sql(self, *args, **kwargs):
+        with contextlib.closing(self.raw_sql(*args, **kwargs)) as result:
+            yield result
+
     @property
     def current_database(self) -> str:
-        return self.con.database
+        with self._safe_raw_sql(sg.select(self.compiler.f.currentDatabase())) as result:
+            [(db,)] = result.result_rows
+        return db
 
     def list_databases(self, like: str | None = None) -> list[str]:
-        with closing(self.raw_sql("SELECT name FROM system.databases")) as result:
+        with self._safe_raw_sql(
+            sg.select(C.name).from_(sg.table("databases", db="system"))
+        ) as result:
             results = result.result_columns
 
         if results:
@@ -198,10 +196,18 @@ class Backend(BaseBackend):
         return self._filter_with_like(databases, like)
 
     def list_tables(
-        self, like: str | None = None, database: str | None = None
+        self, *, like: str | None = None, database: str | None = None
     ) -> list[str]:
-        query = "SHOW TABLES" + (f" FROM `{database}`" * (database is not None))
-        with closing(self.raw_sql(query)) as result:
+        query = sg.select(C.name).from_(sg.table("tables", db="system"))
+
+        if database is None:
+            database = self.compiler.f.currentDatabase()
+        else:
+            database = sge.convert(database)
+
+        query = query.where(C.database.eq(database).or_(C.is_temporary))
+
+        with self._safe_raw_sql(query) as result:
             results = result.result_columns
 
         if results:
@@ -214,13 +220,20 @@ class Backend(BaseBackend):
         """Merge registered external tables with any new external tables."""
         external_data = ExternalData()
         n = 0
+        type_mapper = self.compiler.type_mapper
         for name, obj in (external_tables or {}).items():
             n += 1
             if not (schema := obj.schema):
-                raise TypeError(f'Schema is empty for external table {name}')
+                raise TypeError(f"Schema is empty for external table {name}")
+            if null_fields := schema.null_fields:
+                raise com.IbisTypeError(
+                    "ClickHouse doesn't support NULL-typed fields. "
+                    "Consider assigning a type through casting or on construction. "
+                    f"Got null typed fields: {null_fields}"
+                )
 
             structure = [
-                f"{name} {serialize(typ.copy(nullable=not typ.is_nested()))}"
+                f"{name} {type_mapper.to_string(typ.copy(nullable=not typ.is_nested()))}"
                 for name, typ in schema.items()
             ]
             external_data.add_file(
@@ -234,20 +247,18 @@ class Backend(BaseBackend):
         return external_data
 
     def _collect_in_memory_tables(
-        self, expr: ir.TableExpr | None, *, external_tables: Mapping | None = None
+        self, expr: ir.Table | None, external_tables: Mapping | None = None
     ):
-        return toolz.merge(
-            (
-                {op.name: op for op in an.find_memtables(expr.op())}
-                if expr is not None
-                else {}
-            ),
-            external_tables or {},
-        )
+        memtables = {
+            op.name: op for op in self._verify_in_memory_tables_are_unique(expr)
+        }
+        externals = toolz.valmap(_to_memtable, external_tables or {})
+        return toolz.merge(memtables, externals)
 
     def to_pyarrow(
         self,
         expr: ir.Expr,
+        /,
         *,
         params: Mapping[ir.Scalar, Any] | None = None,
         limit: int | str | None = None,
@@ -266,31 +277,23 @@ class Backend(BaseBackend):
         #
         # the extra code to make this dance work without first converting to
         # record batches isn't worth it without some benchmarking
-        reader = self.to_pyarrow_batches(
-            expr=expr,
-            params=params,
-            limit=limit,
-            external_tables=external_tables,
-            **kwargs,
-        )
-        t = reader.read_all()
+        with self.to_pyarrow_batches(
+            expr, params=params, limit=limit, external_tables=external_tables, **kwargs
+        ) as reader:
+            table = reader.read_all()
 
-        if isinstance(expr, ir.Scalar):
-            return t[0][0]
-        elif isinstance(expr, ir.Column):
-            return t[0]
-        else:
-            return t
+        return expr.__pyarrow_result__(table)
 
     def to_pyarrow_batches(
         self,
         expr: ir.Expr,
+        /,
         *,
         limit: int | str | None = None,
         params: Mapping[ir.Scalar, Any] | None = None,
         external_tables: Mapping[str, Any] | None = None,
         chunk_size: int = 1_000_000,
-        **_: Any,
+        **kwargs: Any,
     ) -> pa.ipc.RecordBatchReader:
         """Execute expression and return an iterator of pyarrow record batches.
 
@@ -310,6 +313,8 @@ class Backend(BaseBackend):
             External data
         chunk_size
             Maximum number of row to return in a single chunk
+        kwargs
+            Extra arguments passed directly to clickhouse-connect
 
         Returns
         -------
@@ -331,22 +336,25 @@ class Backend(BaseBackend):
            This is not implemented because it adds an unnecessary pandas step in
            between Python object -> arrow. We can go directly to record batches
            without pandas in the middle.
+
         """
         table = expr.as_table()
         sql = self.compile(table, limit=limit, params=params)
 
-        external_data = self._normalize_external_tables(
-            self._collect_in_memory_tables(expr, external_tables=external_tables)
-        )
+        external_tables = self._collect_in_memory_tables(expr, external_tables)
+        external_data = self._normalize_external_tables(external_tables)
 
-        def batcher(sql: str, *, schema: pa.Schema) -> Iterator[pa.RecordBatch]:
-            settings = {}
+        settings = kwargs.pop("settings", {})
 
-            # readonly != 1 means that the server setting is writable
-            if self.con.server_settings["max_block_size"].readonly != 1:
-                settings["max_block_size"] = chunk_size
+        # readonly != 1 means that the server setting is writable
+        if self.con.server_settings["max_block_size"].readonly != 1:
+            settings["max_block_size"] = chunk_size
+
+        def batcher(
+            sql: str, *, schema: pa.Schema, settings, **kwargs
+        ) -> Iterator[pa.RecordBatch]:
             with self.con.query_column_block_stream(
-                sql, external_data=external_data, settings=settings
+                sql, external_data=external_data, settings=settings, **kwargs
             ) as blocks:
                 yield from map(
                     partial(pa.RecordBatch.from_arrays, schema=schema), blocks
@@ -354,12 +362,17 @@ class Backend(BaseBackend):
 
         self._log(sql)
         schema = table.schema().to_pyarrow()
-        return pa.RecordBatchReader.from_batches(schema, batcher(sql, schema=schema))
+        return pa.ipc.RecordBatchReader.from_batches(
+            schema, batcher(sql, schema=schema, settings=settings, **kwargs)
+        )
 
     def execute(
         self,
         expr: ir.Expr,
-        limit: str | None = 'default',
+        /,
+        *,
+        limit: str | None = "default",
+        params: Mapping[ir.Scalar, Any] | None = None,
         external_tables: Mapping[str, pd.DataFrame] | None = None,
         **kwargs: Any,
     ) -> Any:
@@ -367,75 +380,65 @@ class Backend(BaseBackend):
         import pandas as pd
 
         table = expr.as_table()
-        sql = self.compile(table, limit=limit, **kwargs)
+        sql = self.compile(table, params=params, limit=limit)
 
         schema = table.schema()
         self._log(sql)
 
-        external_tables = self._collect_in_memory_tables(
-            expr, external_tables=toolz.valmap(_to_memtable, external_tables or {})
-        )
+        external_tables = self._collect_in_memory_tables(expr, external_tables)
         external_data = self._normalize_external_tables(external_tables)
         df = self.con.query_df(
-            sql, external_data=external_data, use_na_values=False, use_none=True
+            sql,
+            external_data=external_data,
+            use_na_values=False,
+            use_none=True,
+            **kwargs,
         )
 
         if df.empty:
             df = pd.DataFrame(columns=schema.names)
-
-        result = schema.apply_to(df)
-        if isinstance(expr, ir.Scalar):
-            return result.iat[0, 0]
-        elif isinstance(expr, ir.Column):
-            return result.iloc[:, 0]
         else:
-            return result
+            df.columns = list(schema.names)
 
-    def compile(self, expr: ir.Expr, limit: str | None = None, params=None, **_: Any):
-        table_expr = expr.as_table()
+        # TODO: remove the extra conversion by passing the converter to
+        # __pandas_result__, a la `__pandas_result__(df, converter)`
+        df = ClickHousePandasData.convert_table(df, schema=schema)
+        return expr.__pandas_result__(df)
 
-        if limit == "default":
-            limit = ibis.options.sql.default_limit
-        if limit is not None:
-            table_expr = table_expr.limit(limit)
+    def insert(
+        self,
+        name: str,
+        /,
+        obj: pd.DataFrame | ir.Table,
+        *,
+        settings: Mapping[str, Any] | None = None,
+        overwrite: bool = False,
+        database: str | None = None,
+        **kwargs: Any,
+    ):
+        import pandas as pd
+        import pyarrow as pa
 
-        if params is None:
-            params = {}
+        if overwrite:
+            self.truncate_table(name)
 
-        sql = translate(table_expr.op(), params=params)
-        assert not isinstance(sql, sg.exp.Subquery)
+        if isinstance(obj, pa.Table):
+            return self.con.insert_arrow(
+                name, obj, database=database, settings=settings, **kwargs
+            )
+        elif isinstance(obj, pd.DataFrame):
+            return self.con.insert_df(name, obj, settings=settings, **kwargs)
+        elif not isinstance(obj, ir.Table):
+            obj = ibis.memtable(obj)
 
-        if isinstance(sql, sg.exp.Table):
-            sql = sg.select("*").from_(sql)
-
-        assert not isinstance(sql, sg.exp.Subquery)
-        return sql.sql(dialect="clickhouse", pretty=True)
-
-    def _to_sql(self, expr: ir.Expr, **kwargs) -> str:
-        return str(self.compile(expr, **kwargs))
-
-    def table(self, name: str, database: str | None = None) -> ir.Table:
-        """Construct a table expression.
-
-        Parameters
-        ----------
-        name
-            Table name
-        database
-            Database name
-
-        Returns
-        -------
-        Table
-            Table expression
-        """
-        schema = self.get_schema(name, database=database)
-        qname = self._fully_qualified_name(name, database)
-        return ClickhouseTable(ops.DatabaseTable(qname, schema, self))
+        query = self._build_insert_from_table(target=name, source=obj, db=database)
+        external_tables = self._collect_in_memory_tables(obj, {})
+        external_data = self._normalize_external_tables(external_tables)
+        return self.con.command(query.sql(self.dialect), external_data=external_data)
 
     def raw_sql(
         self,
-        query: str,
+        query: str | sge.Expression,
         external_tables: Mapping[str, pd.DataFrame] | None = None,
         **kwargs,
     ) -> Any:
@@ -455,28 +458,26 @@ class Backend(BaseBackend):
         -------
         Cursor
             Clickhouse cursor
+
         """
         external_tables = toolz.valmap(_to_memtable, external_tables or {})
         external_data = self._normalize_external_tables(external_tables)
+        with contextlib.suppress(AttributeError):
+            query = query.sql(dialect=self.name, pretty=True)
         self._log(query)
         return self.con.query(query, external_data=external_data, **kwargs)
 
-    def fetch_from_cursor(self, cursor, schema):
-        import pandas as pd
-
-        df = pd.DataFrame.from_records(iter(cursor), columns=schema.names)
-        return schema.apply_to(df)
-
-    def close(self) -> None:
+    def disconnect(self) -> None:
         """Close ClickHouse connection."""
         self.con.close()
 
-    def _fully_qualified_name(self, name: str, database: str | None) -> str:
-        return sg.table(name, db=database or self.current_database or None).sql(
-            dialect="clickhouse"
-        )
-
-    def get_schema(self, table_name: str, database: str | None = None) -> sch.Schema:
+    def get_schema(
+        self,
+        table_name: str,
+        *,
+        catalog: str | None = None,
+        database: str | None = None,
+    ) -> sch.Schema:
         """Return a Schema object for the indicated table and database.
 
         Parameters
@@ -484,6 +485,8 @@ class Backend(BaseBackend):
         table_name
             May **not** be fully qualified. Use `database` if you want to
             qualify the identifier.
+        catalog
+            Catalog name, not supported by ClickHouse
         database
             Database name
 
@@ -491,65 +494,134 @@ class Backend(BaseBackend):
         -------
         sch.Schema
             Ibis schema
-        """
-        qualified_name = self._fully_qualified_name(table_name, database)
-        query = f"DESCRIBE {qualified_name}"
-        with closing(self.raw_sql(query)) as results:
-            names, types, *_ = results.result_columns
-        return sch.Schema(dict(zip(names, map(parse, types))))
 
-    def _get_schema_using_query(self, query: str) -> sch.Schema:
-        query = f"EXPLAIN json = 1, description = 0, header = 1 {query}"
-        with closing(self.raw_sql(query)) as results:
-            [[raw_plans]] = results.result_columns
-        [plan] = json.loads(raw_plans)
+        """
+        if catalog is not None:
+            raise com.UnsupportedOperationError(
+                "`catalog` namespaces are not supported by ClickHouse"
+            )
+        query = sge.Describe(this=sg.table(table_name, db=database))
+        try:
+            with self._safe_raw_sql(query) as results:
+                names, types, *_ = results.result_columns
+        except DatabaseError as e:
+            if re.search(r"\bUNKNOWN_TABLE\b", str(e)):
+                raise com.TableNotFound(table_name) from e
+            raise
+
         return sch.Schema(
-            {field["Name"]: parse(field["Type"]) for field in plan["Plan"]["Header"]}
+            dict(zip(names, map(self.compiler.type_mapper.from_string, types)))
         )
 
-    @classmethod
-    def has_operation(cls, operation: type[ops.Value]) -> bool:
-        from ibis.backends.clickhouse.compiler.values import translate_val
-
-        return operation in translate_val.registry
+    def _get_schema_using_query(self, query: str) -> sch.Schema:
+        name = util.gen_name("clickhouse_metadata")
+        with closing(self.raw_sql(f"CREATE VIEW {name} AS {query}")):
+            pass
+        try:
+            return self.get_schema(name)
+        finally:
+            with closing(self.raw_sql(f"DROP VIEW {name}")):
+                pass
 
     def create_database(
-        self, name: str, *, force: bool = False, engine: str = "Atomic"
+        self, name: str, /, *, force: bool = False, engine: str = "Atomic"
     ) -> None:
-        if_not_exists = "IF NOT EXISTS " * force
-        with closing(
-            self.raw_sql(f"CREATE DATABASE {if_not_exists}{name} ENGINE = {engine}")
-        ):
+        src = sge.Create(
+            this=sg.to_identifier(name),
+            kind="DATABASE",
+            exists=force,
+            properties=sge.Properties(
+                expressions=[sge.EngineProperty(this=sg.to_identifier(engine))]
+            ),
+        )
+        with self._safe_raw_sql(src):
             pass
 
-    def drop_database(self, name: str, *, force: bool = False) -> None:
-        if_exists = "IF EXISTS " * force
-        with closing(self.raw_sql(f"DROP DATABASE {if_exists}{name}")):
-            pass
-
-    def truncate_table(self, name: str, database: str | None = None) -> None:
-        ident = self._fully_qualified_name(name, database)
-        with closing(self.raw_sql(f"TRUNCATE TABLE {ident}")):
-            pass
-
-    def drop_table(
-        self, name: str, database: str | None = None, force: bool = False
+    def drop_database(
+        self, name: str, /, *, catalog: str | None = None, force: bool = False
     ) -> None:
-        ident = self._fully_qualified_name(name, database)
-        with closing(self.raw_sql(f"DROP TABLE {'IF EXISTS ' * force}{ident}")):
+        src = sge.Drop(
+            this=sg.table(name, catalog=catalog), kind="DATABASE", exists=force
+        )
+        with self._safe_raw_sql(src):
             pass
+
+    def truncate_table(self, name: str, /, *, database: str | None = None) -> None:
+        ident = sg.table(name, db=database).sql(self.name)
+        with self._safe_raw_sql(f"TRUNCATE TABLE {ident}"):
+            pass
+
+    def read_parquet(
+        self,
+        path: str | Path,
+        /,
+        *,
+        table_name: str | None = None,
+        engine: str = "MergeTree",
+        **kwargs: Any,
+    ) -> ir.Table:
+        import pyarrow.dataset as ds
+        from clickhouse_connect.driver.tools import insert_file
+
+        from ibis.formats.pyarrow import PyArrowSchema
+
+        paths = list(glob.glob(str(path)))
+        schema = PyArrowSchema.to_ibis(ds.dataset(paths, format="parquet").schema)
+
+        name = table_name or util.gen_name("read_parquet")
+        table = self.create_table(name, engine=engine, schema=schema, temp=True)
+
+        for file_path in paths:
+            insert_file(
+                client=self.con,
+                table=name,
+                file_path=file_path,
+                fmt="Parquet",
+                **kwargs,
+            )
+        return table
+
+    def read_csv(
+        self,
+        path: str | Path,
+        /,
+        *,
+        table_name: str | None = None,
+        engine: str = "MergeTree",
+        **kwargs: Any,
+    ) -> ir.Table:
+        import pyarrow.dataset as ds
+        from clickhouse_connect.driver.tools import insert_file
+
+        from ibis.formats.pyarrow import PyArrowSchema
+
+        paths = list(glob.glob(str(path)))
+        schema = PyArrowSchema.to_ibis(ds.dataset(paths, format="csv").schema)
+
+        name = table_name or util.gen_name("read_csv")
+        table = self.create_table(name, engine=engine, schema=schema, temp=True)
+
+        for file_path in paths:
+            insert_file(client=self.con, table=name, file_path=file_path, **kwargs)
+        return table
 
     def create_table(
         self,
         name: str,
-        obj: pd.DataFrame | ir.Table | None = None,
+        /,
+        obj: ir.Table
+        | pd.DataFrame
+        | pa.Table
+        | pl.DataFrame
+        | pl.LazyFrame
+        | None = None,
         *,
-        schema: ibis.Schema | None = None,
+        schema: sch.IntoSchema | None = None,
         database: str | None = None,
         temp: bool = False,
         overwrite: bool = False,
         # backend specific arguments
-        engine: str = "File(Native)",
+        engine: str = "MergeTree",
         order_by: Iterable[str] | None = None,
         partition_by: Iterable[str] | None = None,
         sample_by: str | None = None,
@@ -574,7 +646,9 @@ class Backend(BaseBackend):
             Whether to overwrite the table
         engine
             The table engine to use. See [ClickHouse's `CREATE TABLE` documentation](https://clickhouse.com/docs/en/sql-reference/statements/create/table)
-            for specifics.
+            for specifics. Defaults to [`MergeTree`](https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree)
+            with `ORDER BY tuple()` because `MergeTree` is the most
+            feature-complete engine.
         order_by
             String column names to order by. Required for some table engines like `MergeTree`.
         partition_by
@@ -589,78 +663,118 @@ class Backend(BaseBackend):
         Table
             The new table
         """
-        if temp:
-            raise com.IbisError(
-                "ClickHouse temporary tables are not yet supported due to a bug in `clickhouse_driver`"
+        if temp and overwrite:
+            raise com.IbisInputError(
+                "Cannot specify both `temp=True` and `overwrite=True` for ClickHouse"
             )
 
-        tmp = "TEMPORARY " * temp
-        replace = "OR REPLACE " * overwrite
-        table = self._fully_qualified_name(name, database)
-        code = f"CREATE {replace}{tmp}TABLE {table}"
-
         if obj is None and schema is None:
-            raise com.IbisError("The schema or obj parameter is required")
+            raise com.IbisError("The `schema` or `obj` parameter is required")
+        if schema is not None:
+            schema = ibis.schema(schema)
 
         if obj is not None and not isinstance(obj, ir.Expr):
             obj = ibis.memtable(obj, schema=schema)
 
-        if schema is None:
-            schema = obj.schema()
-
-        serialized_schema = ", ".join(
-            f"`{name}` {serialize(typ)}" for name, typ in schema.items()
+        this = sge.Schema(
+            this=sg.table(name, db=database, quoted=self.compiler.quoted),
+            expressions=(schema or obj.schema()).to_sqlglot_column_defs(self.dialect),
         )
+        properties = [
+            # the engine cannot be quoted, since clickhouse won't allow e.g.,
+            # "File(Native)"
+            sge.EngineProperty(this=sg.to_identifier(engine, quoted=False))
+        ]
 
-        code += f" ({serialized_schema}) ENGINE = {engine}"
+        if temp:
+            properties.append(sge.TemporaryProperty())
 
-        if order_by is not None:
-            code += f" ORDER BY {', '.join(util.promote_list(order_by))}"
+        if order_by is not None or engine == "MergeTree":
+            # engine == "MergeTree" requires an order by clause, which is the
+            # empty tuple if order_by is False-y
+            properties.append(
+                sge.Order(
+                    expressions=[
+                        sge.Ordered(
+                            this=sge.Tuple(
+                                expressions=list(map(sg.column, order_by or ()))
+                            )
+                        )
+                    ]
+                )
+            )
 
         if partition_by is not None:
-            code += f" PARTITION BY {', '.join(util.promote_list(partition_by))}"
+            properties.append(
+                sge.PartitionedByProperty(
+                    this=sge.Schema(
+                        expressions=list(map(sg.to_identifier, partition_by))
+                    )
+                )
+            )
 
         if sample_by is not None:
-            code += f" SAMPLE BY {sample_by}"
+            properties.append(
+                sge.SampleProperty(
+                    this=sge.Tuple(expressions=list(map(sg.column, sample_by)))
+                )
+            )
 
         if settings:
-            kvs = ", ".join(f"{name}={value!r}" for name, value in settings.items())
-            code += f" SETTINGS {kvs}"
+            properties.append(
+                sge.SettingsProperty(
+                    expressions=[
+                        sge.SetItem(
+                            this=sge.EQ(
+                                this=sg.to_identifier(name),
+                                expression=sge.convert(value),
+                            )
+                        )
+                        for name, value in settings.items()
+                    ]
+                )
+            )
+
+        external_tables = {}
+        expression = None
 
         if obj is not None:
-            code += f" AS {self.compile(obj)}"
+            expression = self.compiler.to_sqlglot(obj)
+            external_tables.update(self._collect_in_memory_tables(obj))
 
-        external_tables = self._collect_in_memory_tables(obj)
+        code = sge.Create(
+            this=this,
+            kind="TABLE",
+            replace=overwrite,
+            expression=expression,
+            properties=sge.Properties(expressions=properties),
+        )
+
+        external_data = self._normalize_external_tables(external_tables)
 
         # create the table
-        self.con.raw_query(
-            code, external_data=self._normalize_external_tables(external_tables)
-        )
+        sql = code.sql(self.name, pretty=True)
+        self.con.raw_query(sql, external_data=external_data)
 
         return self.table(name, database=database)
 
     def create_view(
         self,
         name: str,
+        /,
         obj: ir.Table,
         *,
         database: str | None = None,
         overwrite: bool = False,
     ) -> ir.Table:
-        qualname = self._fully_qualified_name(name, database)
-        replace = "OR REPLACE " * overwrite
-        query = self.compile(obj)
-        code = f"CREATE {replace}VIEW {qualname} AS {query}"
-        with closing(
-            self.raw_sql(code, external_tables=self._collect_in_memory_tables(obj))
-        ):
+        expression = self.compiler.to_sqlglot(obj)
+        src = sge.Create(
+            this=sg.table(name, db=database),
+            kind="VIEW",
+            replace=overwrite,
+            expression=expression,
+        )
+        external_tables = self._collect_in_memory_tables(obj)
+        with self._safe_raw_sql(src, external_tables=external_tables):
             pass
         return self.table(name, database=database)
-
-    def drop_view(
-        self, name: str, *, database: str | None = None, force: bool = False
-    ) -> None:
-        name = self._fully_qualified_name(name, database)
-        if_exists = "IF EXISTS " * force
-        with closing(self.raw_sql(f"DROP VIEW {if_exists}{name}")):
-            pass

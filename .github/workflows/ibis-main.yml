@@ -5,19 +5,21 @@ on:
     # Skip the test suite if all changes are in the docs directory
     paths-ignore:
       - "docs/**"
-      - "mkdocs.yml"
       - "**/*.md"
+      - "**/*.qmd"
+      - ".envrc"
     branches:
-      - master
+      - main
       - "*.x.x"
   pull_request:
     # Skip the test suite if all changes are in the docs directory
     paths-ignore:
       - "docs/**"
-      - "mkdocs.yml"
       - "**/*.md"
+      - "**/*.qmd"
+      - ".envrc"
     branches:
-      - master
+      - main
       - "*.x.x"
   merge_group:
 
@@ -30,12 +32,12 @@ concurrency:
 
 env:
   FORCE_COLOR: "1"
+  SQLALCHEMY_WARN_20: "1"
+  HYPOTHESIS_PROFILE: "ci"
 
 jobs:
   test_core:
-    name: Test ${{ matrix.os }} python-${{ matrix.python-version }}
-    env:
-      SQLALCHEMY_WARN_20: "1"
+    name: Test ${{ matrix.os }} python-${{ matrix.python-version }} pyarrow-${{ matrix.pyarrow }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -44,176 +46,99 @@ jobs:
           - ubuntu-latest
           - windows-latest
         python-version:
-          - "3.8"
-          - "3.9"
           - "3.10"
-          - "3.11"
+          - "3.14"
+        pyarrow:
+          - true
+          - false
     steps:
       - name: checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
 
       - name: install python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         id: install_python
         with:
           python-version: ${{ matrix.python-version }}
 
-      - uses: syphar/restore-pip-download-cache@v1
-        with:
-          requirement_files: poetry.lock
-          custom_cache_key_element: no-backends-${{ steps.install_python.outputs.python-version }}
-
-      - run: python -m pip install --upgrade pip 'poetry<1.4'
-
-      - uses: syphar/restore-virtualenv@v1
-        with:
-          requirement_files: poetry.lock
-          custom_cache_key_element: core
+      - name: install uv
+        uses: astral-sh/setup-uv@v7.3.0
 
       - name: install ${{ matrix.os }} system dependencies
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os != 'windows-latest'
         run: |
           set -euo pipefail
 
-          sudo apt-get update -y -q
-          sudo apt-get install -y -q build-essential graphviz libgeos-dev
+          sudo apt-get update -y -qq
+          sudo apt-get install -y -q build-essential graphviz
 
       - name: install ${{ matrix.os }} system dependencies
         if: matrix.os == 'windows-latest'
         run: choco install graphviz
 
-      - name: install ibis
-        run: poetry install --without dev --without docs --extras visualization
+      - name: install numpy/pandas/pyarrow
+        if: matrix.pyarrow
+        run: pip install numpy pandas pyarrow pyarrow-hotfix
 
-      - uses: extractions/setup-just@v1
+      - uses: extractions/setup-just@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: run all core tests and run benchmarks once parallel
         if: matrix.os != 'windows-latest'
-        run: just ci-check -m "'core or benchmark'" -n auto
+        run: just ci-check "--extra visualization --extra decompiler" -m "'core or benchmark'" --numprocesses auto -rfEs
 
       - name: run all core tests and run benchmarks once serial
         if: matrix.os == 'windows-latest'
-        run: just ci-check -m "'core or benchmark'"
+        run: just ci-check "--extra visualization --extra decompiler" -m "'core or benchmark'" -rfEs
 
       - name: upload code coverage
         if: success()
-        uses: codecov/codecov-action@v3
+        continue-on-error: true
+        uses: codecov/codecov-action@v5
         with:
           flags: core,${{ runner.os }},python-${{ steps.install_python.outputs.python-version }}
-
-      - name: publish test report
-        uses: actions/upload-artifact@v3
-        if: success() || failure()
-        with:
-          name: no-backends-${{ matrix.os }}-${{ matrix.python-version }}
-          path: junit.xml
-
-  test_shapely_duckdb_import:
-    name: Test shapely and duckdb import
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-        python-version:
-          - "3.11"
-    steps:
-      - name: checkout
-        uses: actions/checkout@v3
-
-      - name: install python
-        uses: actions/setup-python@v4
-        id: install_python
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - uses: syphar/restore-virtualenv@v1
-        with:
-          requirement_files: poetry.lock
-          custom_cache_key_element: shapely-duckdb
-
-      - uses: syphar/restore-pip-download-cache@v1
-        with:
-          requirement_files: poetry.lock
-          custom_cache_key_element: shapely-duckdb-${{ steps.install_python.outputs.python-version }}
-
-      - name: install ${{ matrix.os }} system dependencies
-        run: |
-          set -euo pipefail
-
-          sudo apt-get update -y -q
-          sudo apt-get install -y -q build-essential libgeos-dev
-
-      - run: python -m pip install --upgrade pip 'poetry<1.4'
-
-      - name: install ibis
-        # install duckdb and geospatial because of https://github.com/ibis-project/ibis/issues/4856
-        run: poetry install --without dev --without docs --without test --extras duckdb --extras geospatial
-
-      - name: check shapely and duckdb imports
-        run: poetry run python -c 'import shapely.geometry, duckdb'
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   test_doctests:
     name: Doctests
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-        python-version:
-          - "3.11"
+    runs-on: ubuntu-latest
     steps:
       - name: install system dependencies
         run: |
           set -euo pipefail
 
           sudo apt-get update -y -q
-          sudo apt-get install -y -q build-essential graphviz libgeos-dev libkrb5-dev
+          sudo apt-get install -y -q build-essential graphviz libgeos-dev freetds-dev unixodbc-dev
 
       - name: checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v6
 
       - name: install python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         id: install_python
         with:
-          python-version: ${{ matrix.python-version }}
+          # 3.14 + pyspark + cloudpickle causes a stack overflow, so keep this
+          # at 3.13 for now
+          python-version: "3.13"
 
-      - uses: syphar/restore-pip-download-cache@v1
-        with:
-          requirement_files: poetry.lock
-          custom_cache_key_element: doctests-${{ steps.install_python.outputs.python-version }}
+      - name: install uv
+        uses: astral-sh/setup-uv@v7.3.0
 
-      - run: python -m pip install --upgrade pip 'poetry<1.4'
-
-      - uses: syphar/restore-virtualenv@v1
-        with:
-          requirement_files: poetry.lock
-          custom_cache_key_element: doctests
-
-      - name: install ibis with all extras
-        run: poetry install --without dev --without docs --extras all
-
-      - uses: extractions/setup-just@v1
+      - uses: extractions/setup-just@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: run doctests
-        run: just doctest --junitxml=junit.xml --cov=ibis --cov-report=xml:coverage.xml
+        run: just doctest --cov=ibis --cov-report=xml:coverage.xml
+
+      - name: check for dead fixtures
+        run: uv run --all-extras --group tests pytest --dead-fixtures -m 'not flink'
 
       - name: upload code coverage
         if: success()
-        uses: codecov/codecov-action@v3
+        continue-on-error: true
+        uses: codecov/codecov-action@v5
         with:
           flags: core,doctests,${{ runner.os }},python-${{ steps.install_python.outputs.python-version }}
-
-      - name: publish test report
-        uses: actions/upload-artifact@v3
-        if: success() || failure()
-        with:
-          name: doctest-${{ matrix.os }}-${{ matrix.python-version }}
-          path: junit.xml
+          token: ${{ secrets.CODECOV_TOKEN }}

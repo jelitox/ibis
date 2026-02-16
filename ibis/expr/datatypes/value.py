@@ -5,8 +5,12 @@ import datetime
 import decimal
 import enum
 import ipaddress
+import json
 import uuid
-from typing import Any, Mapping, NamedTuple, Sequence
+from collections.abc import Mapping, Sequence
+from functools import partial
+from operator import attrgetter
+from typing import Any
 
 import toolz
 from public import public
@@ -15,30 +19,38 @@ import ibis.expr.datatypes as dt
 from ibis.common.collections import frozendict
 from ibis.common.dispatch import lazy_singledispatch
 from ibis.common.exceptions import IbisTypeError, InputTypeError
-from ibis.common.temporal import normalize_datetime, normalize_timezone
+from ibis.common.numeric import normalize_decimal
+from ibis.common.temporal import (
+    IntervalUnit,
+    normalize_datetime,
+    normalize_timedelta,
+    normalize_timezone,
+)
 from ibis.expr.datatypes.cast import highest_precedence
 
 
 @lazy_singledispatch
 def infer(value: Any) -> dt.DataType:
     """Infer the corresponding ibis dtype for a python object."""
-    raise InputTypeError(value)
+    raise InputTypeError(
+        f"Unable to infer datatype of value {value!r} with type {type(value)}"
+    )
 
 
 # TODO(kszucs): support NamedTuples and dataclasses instead of OrderedDict
 # which should trigger infer_map instead
 @infer.register(collections.OrderedDict)
 def infer_struct(value: Mapping[str, Any]) -> dt.Struct:
-    """Infer the [`Struct`][ibis.expr.datatypes.Struct] type of `value`."""
+    """Infer the [`Struct`](./datatypes.qmd#ibis.expr.datatypes.Struct) type of `value`."""
     if not value:
-        raise TypeError('Empty struct type not supported')
+        raise TypeError("Empty struct type not supported")
     fields = {name: infer(val) for name, val in value.items()}
     return dt.Struct(fields)
 
 
 @infer.register(collections.abc.Mapping)
 def infer_map(value: Mapping[Any, Any]) -> dt.Map:
-    """Infer the [`Map`][ibis.expr.datatypes.Map] type of `value`."""
+    """Infer the [`Map`](./datatypes.qmd#ibis.expr.datatypes.Map) type of `value`."""
     if not value:
         return dt.Map(dt.null, dt.null)
     try:
@@ -52,7 +64,7 @@ def infer_map(value: Mapping[Any, Any]) -> dt.Map:
 
 @infer.register((list, tuple, set, frozenset))
 def infer_list(values: Sequence[Any]) -> dt.Array:
-    """Infer the [`Array`][ibis.expr.datatypes.Array] type of `value`."""
+    """Infer the [`Array`](./datatypes.qmd#ibis.expr.datatypes.Array) type of `value`."""
     if not values:
         return dt.Array(dt.null)
     return dt.Array(highest_precedence(map(infer, values)))
@@ -79,12 +91,23 @@ def infer_timestamp(value: datetime.datetime) -> dt.Timestamp:
 @infer.register(datetime.timedelta)
 def infer_interval(value: datetime.timedelta) -> dt.Interval:
     # datetime.timedelta only stores days, seconds, and microseconds internally
-    unit_fields = ['days', 'seconds', 'microseconds']
-    time_units = [field for field in unit_fields if getattr(value, field) > 0]
-
-    # we can attempt a conversion in the simplest case, i.e. there is exactly
-    # one unit (e.g. datime.timedelta(days=2) vs. datetime.timedelta(days=2, seconds=3)
-    return dt.Interval(time_units[0]) if len(time_units) == 1 else dt.interval
+    if value.days:
+        if value.seconds or value.microseconds:
+            raise ValueError(
+                "Unable to infer interval type from mixed units, "
+                "use ibis.interval(timedelta) instead"
+            )
+        else:
+            return dt.Interval(IntervalUnit.DAY)
+    elif value.seconds:
+        if value.microseconds:
+            return dt.Interval(IntervalUnit.MICROSECOND)
+        else:
+            return dt.Interval(IntervalUnit.SECOND)
+    elif value.microseconds:
+        return dt.Interval(IntervalUnit.MICROSECOND)
+    else:
+        raise ValueError("Unable to infer interval type from zero value")
 
 
 @infer.register(str)
@@ -119,7 +142,7 @@ def infer_enum(_: enum.Enum) -> dt.String:
 
 @infer.register(decimal.Decimal)
 def infer_decimal(value: decimal.Decimal) -> dt.Decimal:
-    """Infer the [`Decimal`][ibis.expr.datatypes.Decimal] type of `value`."""
+    """Infer the [`Decimal`](./datatypes.qmd#ibis.expr.datatypes.Decimal) type of `value`."""
     return dt.decimal
 
 
@@ -133,6 +156,11 @@ def infer_null(value: dt.Null | None) -> dt.Null:
     return dt.null
 
 
+@infer.register(uuid.UUID)
+def infer_uuid(value: uuid.UUID) -> dt.UUID:
+    return dt.uuid
+
+
 @infer.register((ipaddress.IPv4Address, ipaddress.IPv6Address))
 def infer_ipaddr(
     _: ipaddress.IPv4Address | ipaddress.IPv6Address | None,
@@ -142,9 +170,9 @@ def infer_ipaddr(
 
 @infer.register("numpy.generic")
 def infer_numpy_scalar(value):
-    from ibis.formats.numpy import dtype_from_numpy
+    from ibis.formats.numpy import NumpyType
 
-    return dtype_from_numpy(value.dtype)
+    return NumpyType.to_ibis(value.dtype)
 
 
 @infer.register("pandas.Timestamp")
@@ -158,26 +186,35 @@ def infer_pandas_timestamp(value):
 @infer.register("pandas.Timedelta")
 def infer_interval_pandas(value) -> dt.Interval:
     # pandas Timedelta has more granularity
-    unit_fields = value.components._fields
-    time_units = [
-        field for field in unit_fields if getattr(value.components, field) > 0
-    ]
-
-    # we can attempt a conversion in the simplest case, i.e. there is exactly
-    # one unit (e.g. pd.Timedelta('2 days') vs. pd.Timedelta('2 days 3 hours')
-    return dt.Interval(time_units[0]) if len(time_units) == 1 else dt.interval
+    units = {
+        "D": "d",
+        "H": "h",
+        "h": "h",
+        "T": "m",
+        "min": "m",
+        "S": "s",
+        "s": "s",
+        "L": "ms",
+        "ms": "ms",
+        "U": "us",
+        "us": "us",
+        "N": "ns",
+        "ns": "ns",
+    }
+    unit = units[value.resolution_string]
+    return dt.Interval(unit)
 
 
 @infer.register("numpy.ndarray")
 @infer.register("pandas.Series")
 def infer_numpy_array(value):
-    from ibis.formats.numpy import dtype_from_numpy
-    from ibis.formats.pyarrow import _infer_array_dtype
+    from ibis.formats.numpy import NumpyType
+    from ibis.formats.pyarrow import PyArrowData
 
-    if value.dtype.kind == 'O':
-        value_dtype = _infer_array_dtype(value)
+    if value.dtype.kind == "O":
+        value_dtype = PyArrowData.infer_column(value)
     else:
-        value_dtype = dtype_from_numpy(value.dtype)
+        value_dtype = NumpyType.to_ibis(value.dtype)
 
     return dt.Array(value_dtype)
 
@@ -216,39 +253,54 @@ def infer_shapely_multipolygon(value) -> dt.MultiPolygon:
 del infer.register
 
 
-@public
-class _WellKnownText(NamedTuple):
-    text: str
-
-    def __str__(self):
-        return self.text
-
-    def __repr__(self):
-        return self.text
-
-
+# TODO(kszucs): should raise ValueError instead of TypeError
 def normalize(typ, value):
     """Ensure that the Python type underlying a literal resolves to a single type."""
 
     dtype = dt.dtype(typ)
     if value is None:
         if not dtype.nullable:
-            raise TypeError("Cannot convert `None` to non-nullable type {typ!r}")
+            raise TypeError(f"Cannot convert `None` to non-nullable type {typ!r}")
         return None
 
     if dtype.is_boolean():
-        return bool(value)
+        try:
+            return bool(value)
+        except ValueError:
+            raise TypeError(f"Unable to normalize {value!r} to {dtype!r}")
     elif dtype.is_integer():
-        return int(value)
+        try:
+            value = int(value)
+        except ValueError:
+            raise TypeError(f"Unable to normalize {value!r} to {dtype!r}")
+        if value not in dtype.bounds:
+            raise TypeError(
+                f"Value {value} is out of bounds for type {dtype!r} "
+                f"(bounds: {dtype.bounds})"
+            )
+        else:
+            return value
     elif dtype.is_floating():
-        return float(value)
-    elif dtype.is_string() and not dtype.is_json():
+        try:
+            return float(value)
+        except ValueError:
+            raise TypeError(f"Unable to normalize {value!r} to {dtype!r}")
+    elif dtype.is_json():
+        if isinstance(value, str):
+            try:
+                json.loads(value)
+            except json.JSONDecodeError:
+                raise TypeError(f"Invalid JSON string: {value!r}")
+            else:
+                return value
+        else:
+            return json.dumps(value)
+    elif dtype.is_binary():
+        return bytes(value)
+    elif dtype.is_string() or dtype.is_macaddr() or dtype.is_inet():
         return str(value)
     elif dtype.is_decimal():
-        out = decimal.Decimal(value)
-        if isinstance(value, int):
-            return out.scaleb(-dtype.scale)
-        return out
+        return normalize_decimal(value, precision=dtype.precision, scale=dtype.scale)
     elif dtype.is_uuid():
         return value if isinstance(value, uuid.UUID) else uuid.UUID(value)
     elif dtype.is_array():
@@ -256,22 +308,48 @@ def normalize(typ, value):
     elif dtype.is_map():
         return frozendict({k: normalize(dtype.value_type, v) for k, v in value.items()})
     elif dtype.is_struct():
-        return frozendict(
-            {k: normalize(dtype[k], v) for k, v in value.items() if k in dtype.fields}
-        )
+        if not isinstance(value, Mapping):
+            raise TypeError(f"Unable to normalize {dtype} from non-mapping {value!r}")
+        if missing_keys := (dtype.keys() - value.keys()):
+            raise TypeError(
+                f"Unable to normalize {value!r} to {dtype} because of missing keys {missing_keys!r}"
+            )
+        return frozendict({k: normalize(t, value[k]) for k, t in dtype.items()})
     elif dtype.is_geospatial():
+        import shapely as shp
+
         if isinstance(value, (tuple, list)):
             if dtype.is_point():
-                return tuple(normalize(dt.float64, item) for item in value)
-            elif dtype.is_linestring() or dtype.is_multipoint():
-                return tuple(normalize(dt.point, item) for item in value)
-            elif dtype.is_polygon() or dtype.is_multilinestring():
-                return tuple(normalize(dt.linestring, item) for item in value)
+                return shp.Point(value)
+            elif dtype.is_linestring():
+                return shp.LineString(value)
+            elif dtype.is_polygon():
+                return shp.Polygon(
+                    toolz.concat(
+                        map(
+                            attrgetter("coords"),
+                            map(partial(normalize, dt.linestring), value),
+                        )
+                    )
+                )
+            elif dtype.is_multipoint():
+                return shp.MultiPoint(tuple(map(partial(normalize, dt.point), value)))
+            elif dtype.is_multilinestring():
+                return shp.MultiLineString(
+                    tuple(map(partial(normalize, dt.linestring), value))
+                )
             elif dtype.is_multipolygon():
-                return tuple(normalize(dt.polygon, item) for item in value)
-        return _WellKnownText(value.wkt)
+                return shp.MultiPolygon(map(partial(normalize, dt.polygon), value))
+            else:
+                raise IbisTypeError(f"Unsupported geospatial type: {dtype}")
+        elif isinstance(value, shp.geometry.base.BaseGeometry):
+            return value
+        else:
+            return shp.from_wkt(value)
     elif dtype.is_date():
         return normalize_datetime(value).date()
+    elif dtype.is_time():
+        return normalize_datetime(value).time()
     elif dtype.is_timestamp():
         value = normalize_datetime(value)
         tzinfo = normalize_timezone(dtype.timezone)
@@ -281,8 +359,20 @@ def normalize(typ, value):
             return value.replace(tzinfo=tzinfo)
         else:
             return value.astimezone(tzinfo)
+    elif dtype.is_interval():
+        return normalize_timedelta(value, dtype.unit)
     else:
-        return value
+        raise TypeError(f"Unable to normalize {value!r} to {dtype!r}")
+
+
+def normalizable(typ, value):
+    """Check if a value can be normalized to a given type."""
+    try:
+        normalize(typ, value)
+    except TypeError:
+        return False
+    else:
+        return True
 
 
 public(infer=infer, normalize=normalize)

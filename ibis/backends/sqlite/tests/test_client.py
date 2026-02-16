@@ -1,111 +1,112 @@
-import uuid
+from __future__ import annotations
+
+import os
+import sqlite3
 from pathlib import Path
 
-import numpy as np
-import pandas.testing as tm
+import pandas as pd
 import pytest
+from pytest import param
 
 import ibis
-import ibis.expr.types as ir
-from ibis import config
-
-pytest.importorskip("sqlalchemy")
-
-
-def test_table(con):
-    table = con.table('functional_alltypes')
-    assert isinstance(table, ir.Table)
-
-
-def test_column_execute(alltypes, df):
-    expr = alltypes.double_col
-    result = expr.execute()
-    expected = df.double_col
-    tm.assert_series_equal(result, expected)
-
-
-def test_literal_execute(con):
-    expr = ibis.literal('1234')
-    result = con.execute(expr)
-    assert result == '1234'
-
-
-def test_simple_aggregate_execute(alltypes, df):
-    expr = alltypes.double_col.sum()
-    result = expr.execute()
-    expected = df.double_col.sum()
-    np.testing.assert_allclose(result, expected)
-
-
-def test_list_tables(con):
-    assert con.list_tables()
-    assert len(con.list_tables(like='functional')) == 1
+import ibis.expr.operations as ops
+from ibis.conftest import not_windows
 
 
 def test_attach_file(tmp_path):
     dbpath = str(tmp_path / "attached.db")
     path_client = ibis.sqlite.connect(dbpath)
-    path_client.create_table("test", schema=ibis.schema(dict(a="int")))
-
     client = ibis.sqlite.connect()
+    try:
+        path_client.create_table("test", schema=ibis.schema(dict(a="int")))
 
-    assert not client.list_tables()
+        assert not client.list_tables()
 
-    client.attach('baz', Path(dbpath))
-    client.attach('bar', dbpath)
+        client.attach("baz", Path(dbpath))
+        client.attach("bar", dbpath)
 
-    foo_tables = client.list_tables(database='baz')
-    bar_tables = client.list_tables(database='bar')
+        foo_tables = client.list_tables(database="baz")
+        bar_tables = client.list_tables(database="bar")
 
-    assert foo_tables == ["test"]
-    assert foo_tables == bar_tables
-
-
-def test_compile_toplevel(snapshot):
-    t = ibis.table([("a", "double")], name="t")
-
-    expr = t.a.sum()
-    result = ibis.sqlite.compile(expr)
-    snapshot.assert_match(str(result), "out.sql")
+        assert foo_tables == ["test"]
+        assert foo_tables == bar_tables
+    finally:
+        client.disconnect()
+        path_client.disconnect()
 
 
-def test_create_and_drop_table(con):
-    t = con.table('functional_alltypes')
-    name = str(uuid.uuid4())
-    new_table = con.create_table(name, t.limit(5))
-    tm.assert_frame_equal(new_table.execute(), t.limit(5).execute())
-    con.drop_table(name)
-    assert name not in con.list_tables()
+def test_builtin_scalar_udf(con):
+    @ibis.udf.scalar.builtin
+    def zeroblob(n: int) -> bytes:
+        """Return a length `n` blob of zero bytes."""
+
+    n = 42
+    expr = zeroblob(n)
+    result = con.execute(expr)
+    assert result == b"\x00" * n
 
 
-def test_verbose_log_queries(con):
-    queries = []
+def test_builtin_agg_udf(con):
+    @ibis.udf.agg.builtin
+    def total(x) -> float:
+        """Totally total."""
 
-    with config.option_context('verbose', True):
-        with config.option_context('verbose_log', queries.append):
-            con.table('functional_alltypes')['year'].execute()
-
-    assert len(queries) == 1
-    (query,) = queries
-    assert "SELECT t0.year" in query
+    expr = total(con.tables.functional_alltypes.limit(2).select(n=ibis.null()).n)
+    result = con.execute(expr)
+    assert result == 0.0
 
 
-def test_table_equality(dbpath):
-    con1 = ibis.sqlite.connect(dbpath)
-    t1 = con1.table("t")
+@pytest.mark.parametrize(
+    "url, ext",
+    [
+        param(lambda p: p, "sqlite", id="no-scheme-sqlite-ext"),
+        param(lambda p: p, "db", id="no-scheme-db-ext"),
+        param(lambda p: f"sqlite://{p}", "db", id="absolute-path"),
+        param(
+            lambda p: f"sqlite://{os.path.relpath(p)}",
+            "db",
+            # hard to test in CI since tmpdir & cwd are on different drives
+            marks=[not_windows],
+            id="relative-path",
+        ),
+        param(lambda _: "sqlite://", "db", id="in-memory-empty"),
+        param(lambda _: "sqlite://:memory:", "db", id="in-memory-explicit"),
+    ],
+)
+def test_connect(url, ext, tmp_path):
+    path = os.path.abspath(tmp_path / f"test.{ext}")
 
-    con2 = ibis.sqlite.connect(dbpath)
-    t2 = con2.table("t")
+    sqlite3.connect(path).close()
 
-    assert t1.op() == t2.op()
-    assert t1.equals(t2)
+    con = ibis.connect(url(path))
+    try:
+        assert con.execute(ibis.literal(1)) == 1
+    finally:
+        con.disconnect()
 
 
-def test_table_inequality(dbpath):
-    con = ibis.sqlite.connect(dbpath)
+def test_has_operation(con):
+    # Core operations handled in non-standard ways
+    for op in [ops.Project, ops.Filter, ops.Sort, ops.Aggregate]:
+        assert con.has_operation(op)
+    # Handled by base class rewrite
+    assert con.has_operation(ops.Capitalize)
+    # Handled by compiler-specific rewrite
+    assert con.has_operation(ops.Sample)
+    # Handled by visit_* method
+    assert con.has_operation(ops.Cast)
 
-    t = con.table("t")
-    s = con.table("s")
 
-    assert t.op() != s.op()
-    assert not t.equals(s)
+def test_list_temp_tables_by_default(con):
+    name = ibis.util.gen_name("sqlite_temp_table")
+    con.create_table(name, schema={"a": "int"}, temp=True)
+    assert name in con.list_tables(database="temp")
+    assert name in con.list_tables()
+
+
+@pytest.mark.parametrize("temp", [False, True])
+def test_create_table_from_in_memory_data(temp):
+    con = ibis.sqlite.connect()
+    con.create_table("foo", pd.DataFrame({"id": [1, 2, 3]}), temp=temp)
+
+    assert con.list_tables() == ["foo"]

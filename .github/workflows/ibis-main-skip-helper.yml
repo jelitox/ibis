@@ -6,20 +6,26 @@ on:
   push:
     paths:
       - "docs/**"
-      - "mkdocs.yml"
       - "**/*.md"
+      - "**/*.qmd"
+      - ".envrc"
     branches:
-      - master
+      - main
       - "*.x.x"
   pull_request:
     paths:
       - "docs/**"
-      - "mkdocs.yml"
       - "**/*.md"
+      - "**/*.qmd"
+      - ".envrc"
     branches:
-      - master
+      - main
       - "*.x.x"
   merge_group:
+
+permissions:
+  contents: none
+
 jobs:
   test_core:
     runs-on: ubuntu-latest

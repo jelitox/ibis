@@ -1,8 +1,7 @@
-SELECT t0.`a`
-FROM (
-  SELECT t1.*
-  FROM t0 t1
-  UNION ALL
-  SELECT t1.*
-  FROM t1 t1
-) t0
+SELECT
+  *
+FROM `t0` AS `t0`
+UNION ALL
+SELECT
+  *
+FROM `t1` AS `t1`

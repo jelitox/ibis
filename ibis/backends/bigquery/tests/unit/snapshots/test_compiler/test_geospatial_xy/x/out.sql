@@ -1,2 +1,3 @@
-SELECT ST_X(t0.`pt`) AS `tmp`
-FROM t t0
+SELECT
+  st_x(`t0`.`pt`) AS `tmp`
+FROM `t` AS `t0`

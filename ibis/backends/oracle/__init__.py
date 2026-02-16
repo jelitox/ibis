@@ -2,84 +2,100 @@
 
 from __future__ import annotations
 
-import atexit
 import contextlib
-import sys
+import re
+import warnings
+from functools import cached_property
+from operator import itemgetter
+from typing import TYPE_CHECKING, Any
+from urllib.parse import unquote_plus
 
 import oracledb
+import sqlglot as sg
+import sqlglot.expressions as sge
 
-# Wow, this is truly horrible
-# Get out your clippers, it's time to shave a yak.
-#
-# 1. snowflake-sqlalchemy doesn't support sqlalchemy 2.0
-# 2. oracledb is only supported in sqlalchemy 2.0
-# 3. Ergo, module hacking is required to avoid doing a silly amount of work
-#    to create multiple lockfiles or port snowflake away from sqlalchemy
-# 4. Also the version needs to be spoofed to be >= 7 or else the cx_Oracle
-#    dialect barfs
-oracledb.__version__ = oracledb.version = "7"
-
-sys.modules["cx_Oracle"] = oracledb
-
-from typing import TYPE_CHECKING, Any, Iterable  # noqa: E402
-
-import sqlalchemy as sa  # noqa: E402
-
-import ibis.expr.datatypes as dt  # noqa: E402
-import ibis.expr.operations as ops  # noqa: E402
-from ibis.backends.base.sql.alchemy import (  # noqa: E402
-    AlchemyCompiler,
-    AlchemyExprTranslator,
-    BaseAlchemyBackend,
+import ibis
+import ibis.backends.sql.compilers as sc
+import ibis.common.exceptions as exc
+import ibis.expr.datatypes as dt
+import ibis.expr.operations as ops
+import ibis.expr.schema as sch
+import ibis.expr.types as ir
+from ibis import util
+from ibis.backends import (
+    CanListDatabase,
+    HasCurrentCatalog,
+    HasCurrentDatabase,
+    PyArrowExampleLoader,
 )
-from ibis.backends.oracle.datatypes import (  # noqa: E402
-    dtype_from_oracle,
-    dtype_to_oracle,
-    parse,
-)
-from ibis.backends.oracle.registry import operation_registry  # noqa: E402
+from ibis.backends.sql import SQLBackend
+from ibis.backends.sql.compilers.base import STAR, C
 
 if TYPE_CHECKING:
-    import ibis.expr.schema as sch
+    from collections.abc import Callable
+    from urllib.parse import ParseResult
+
+    import pandas as pd
+    import polars as pl
+    import pyarrow as pa
 
 
-class OracleExprTranslator(AlchemyExprTranslator):
-    _registry = operation_registry.copy()
-    _rewrites = AlchemyExprTranslator._rewrites.copy()
-    _dialect_name = "oracle"
-    _has_reduction_filter_syntax = False
-    _require_order_by = (
-        *AlchemyExprTranslator._require_order_by,
-        ops.Reduction,
-        ops.Lag,
-        ops.Lead,
-    )
+def metadata_row_to_type(
+    *, type_mapper, type_string, precision, scale, nullable
+) -> dt.DataType:
+    """Convert a row from an Oracle metadata table to an Ibis type."""
+    # See
+    # https://docs.oracle.com/en/database/oracle/oracle-database/19/sqlrf/Data-Types.html#GUID-0BC16006-32F1-42B1-B45E-F27A494963FF
+    # for details
+    #
+    # NUMBER(null, null) --> NUMBER(38) -> NUMBER(38, 0)
+    # (null, null) --> from_string()
+    if type_string == "NUMBER" and precision is None and not scale:
+        typ = dt.Int64(nullable=nullable)
 
-    _forbids_frame_clause = (
-        *AlchemyExprTranslator._forbids_frame_clause,
-        ops.Lag,
-        ops.Lead,
-    )
+    # (null, 0) --> INT
+    # (null, 3), (null, 6), (null, 9) --> from_string() - TIMESTAMP(3)/(6)/(9)
+    elif precision is None and (scale is not None and scale == 0):
+        typ = dt.Int64(nullable=nullable)
 
-    _quote_column_names = True
-    _quote_table_names = True
+    # NUMBER(*, 0) --> INT
+    # (*, 0) --> from_string() - INTERVAL DAY(3) TO SECOND(0)
+    elif (
+        type_string == "NUMBER"
+        and precision is not None
+        and (scale is not None and scale == 0)
+    ):
+        typ = dt.Int64(nullable=nullable)
 
-    get_sqla_type = staticmethod(dtype_to_oracle)
-    get_ibis_type = staticmethod(dtype_from_oracle)
+    # NUMBER(*, > 0) --> DECIMAL
+    # (*, > 0) --> from_string() - INTERVAL DAY(3) TO SECOND(2)
+    elif (
+        type_string == "NUMBER"
+        and precision is not None
+        and (scale is not None and scale > 0)
+    ):
+        typ = dt.Decimal(precision=int(precision), scale=int(scale), nullable=nullable)
+
+    else:
+        typ = type_mapper.from_string(type_string, nullable=nullable)
+    return typ
 
 
-class OracleCompiler(AlchemyCompiler):
-    translator_class = OracleExprTranslator
-    support_values_syntax_in_select = False
-    supports_indexed_grouping_keys = False
-
-
-class Backend(BaseAlchemyBackend):
+class Backend(
+    SQLBackend,
+    CanListDatabase,
+    HasCurrentDatabase,
+    HasCurrentCatalog,
+    PyArrowExampleLoader,
+):
     name = "oracle"
-    compiler = OracleCompiler
-    supports_create_or_replace = False
+    compiler = sc.oracle.compiler
     supports_temporary_tables = True
-    _temporary_prefix = "GLOBAL TEMPORARY"
+
+    @cached_property
+    def version(self):
+        matched = re.search(r"(\d+)\.(\d+)\.(\d+)", self.con.version)
+        return ".".join(matched.groups())
 
     def do_connect(
         self,
@@ -88,7 +104,10 @@ class Backend(BaseAlchemyBackend):
         password: str,
         host: str = "localhost",
         port: int = 1521,
-        database: str | None = "FREE",
+        database: str | None = None,
+        sid: str | None = None,
+        service_name: str | None = None,
+        dsn: str | None = None,
         **_: Any,
     ) -> None:
         """Create an Ibis client using the passed connection parameters.
@@ -104,97 +123,372 @@ class Backend(BaseAlchemyBackend):
         port
             Port
         database
-            Database to connect to
+            Used as an Oracle service name if provided.
+        sid
+            Unique name of an Oracle Instance, used to construct a DSN if
+            provided.
+        service_name
+            Oracle service name, used to construct a DSN if provided.  Only one
+            of database and service_name should be provided.
+        dsn
+            An Oracle Data Source Name.  If provided, overrides all other
+            connection arguments except username and password.
+
+        Examples
+        --------
+        >>> import os
+        >>> import ibis
+        >>> host = os.environ.get("IBIS_TEST_ORACLE_HOST", "localhost")
+        >>> user = os.environ.get("IBIS_TEST_ORACLE_USER", "ibis")
+        >>> password = os.environ.get("IBIS_TEST_ORACLE_PASSWORD", "ibis")
+        >>> database = os.environ.get("IBIS_TEST_ORACLE_DATABASE", "IBIS_TESTING")
+        >>> con = ibis.oracle.connect(database=database, host=host, user=user, password=password)
+        >>> con.list_tables()  # doctest: +ELLIPSIS
+        [...]
+        >>> t = con.table("functional_alltypes")
+        >>> t
+        DatabaseTable: functional_alltypes
+          id              int64
+          bool_col        int64
+          tinyint_col     int64
+          smallint_col    int64
+          int_col         int64
+          bigint_col      int64
+          float_col       float64
+          double_col      float64
+          date_string_col string
+          string_col      string
+          timestamp_col   timestamp(3)
+          year            int64
+          month           int64
         """
-        url = sa.engine.url.make_url(
-            f"oracle://{user}:{password}@{host}:{port}/{database}"
+        # SID: unique name of an INSTANCE running an oracle process (a single, identifiable machine)
+        # service name: an ALIAS to one (or many) individual instances that can
+        # be hotswapped without the client knowing / caring
+        if dsn is not None and (
+            database is not None or sid is not None or service_name is not None
+        ):
+            warnings.warn(
+                "Oracle DSN provided, overriding additional provided connection arguments"
+            )
+
+        if service_name is not None and database is not None:
+            raise exc.IbisInputError(
+                "Values provided for both service_name and database. "
+                "Both of these values map to an Oracle service_name, "
+                "please provide only one of them."
+            )
+
+        if service_name is None and database is not None:
+            service_name = database
+
+        if dsn is None:
+            dsn = oracledb.makedsn(host, port, service_name=service_name, sid=sid)
+
+        # We set the statement cache size to 0 because Oracle will otherwise
+        # attempt to reuse prepared statements even if the type of the bound variable
+        # has changed.
+        # This is apparently accepted behavior.
+        # https://python-oracledb.readthedocs.io/en/latest/user_guide/appendix_b.html#statement-caching-in-thin-and-thick-modes
+        self.con = oracledb.connect(dsn, user=user, password=password, stmtcachesize=0)
+
+        self._post_connect()
+
+    @util.experimental
+    @classmethod
+    def from_connection(cls, con: oracledb.Connection, /) -> Backend:
+        """Create an Ibis client from an existing connection to an Oracle database.
+
+        Parameters
+        ----------
+        con
+            An existing connection to an Oracle database.
+        """
+        new_backend = cls()
+        new_backend._can_reconnect = False
+        new_backend.con = con
+        new_backend._post_connect()
+        return new_backend
+
+    def _post_connect(self) -> None:
+        # turn on autocommit
+        # TODO: it would be great if this worked but it doesn't seem to do the trick
+        # I had to hack in the commit lines to the compiler
+        # self.con.autocommit = True
+
+        # Set to ensure decimals come back as decimals
+        oracledb.defaults.fetch_decimals = True
+
+    def _from_url(self, url: ParseResult, **kwarg_overrides):
+        kwargs = {}
+        if url.username:
+            kwargs["user"] = url.username
+        if url.password:
+            kwargs["password"] = unquote_plus(url.password)
+        if url.hostname:
+            kwargs["host"] = url.hostname
+        if database := url.path.removeprefix("/"):
+            kwargs["database"] = database
+        if url.port:
+            kwargs["port"] = url.port
+        kwargs.update(kwarg_overrides)
+        self._convert_kwargs(kwargs)
+        return self.connect(**kwargs)
+
+    @property
+    def current_catalog(self) -> str:
+        with self._safe_raw_sql(sg.select(STAR).from_("global_name")) as cur:
+            [(catalog,)] = cur.fetchall()
+        return catalog
+
+    @property
+    def current_database(self) -> str:
+        # databases correspond to users, other than that there's
+        # no notion of a database inside a catalog for oracle
+        with self._safe_raw_sql(sg.select("user").from_("dual")) as cur:
+            [(database,)] = cur.fetchall()
+        return database
+
+    @contextlib.contextmanager
+    def begin(self):
+        con = self.con
+        cur = con.cursor()
+        try:
+            yield cur
+        except Exception:
+            con.rollback()
+            raise
+        else:
+            con.commit()
+        finally:
+            cur.close()
+
+    @contextlib.contextmanager
+    def _safe_raw_sql(self, *args, **kwargs):
+        with contextlib.closing(self.raw_sql(*args, **kwargs)) as result:
+            yield result
+
+    def raw_sql(self, query: str | sg.Expression, **kwargs: Any) -> Any:
+        with contextlib.suppress(AttributeError):
+            query = query.sql(dialect=self.name)
+
+        con = self.con
+        cursor = con.cursor()
+
+        try:
+            cursor.execute(query, **kwargs)
+        except Exception:
+            con.rollback()
+            cursor.close()
+            raise
+        else:
+            con.commit()
+            return cursor
+
+    def list_tables(
+        self, *, like: str | None = None, database: tuple[str, str] | str | None = None
+    ) -> list[str]:
+        if database is not None:
+            table_loc = database
+        else:
+            table_loc = self.con.username.upper()
+
+        table_loc = self._to_sqlglot_table(table_loc)
+
+        dialect = self.dialect
+
+        # Deeply frustrating here where if we call `convert` on `table_loc`,
+        # which is a sg.exp.Table, the quotes are rendered as double-quotes
+        # which are invalid. So, we unquote the database name here.
+        def unquote(node):
+            if isinstance(node, sg.exp.Identifier):
+                return sg.to_identifier(node.name, quoted=False)
+            return node
+
+        conditions = C.owner.eq(sge.convert(table_loc.transform(unquote).sql(dialect)))
+
+        tables = (
+            sg.select(C.table_name)
+            .from_("all_tables")
+            .distinct()
+            .where(conditions)
+            .union(
+                sg.select(C.view_name).from_("all_views").distinct().where(conditions)
+            )
         )
 
-        # Creating test DB and user
-        # The ORACLE_DB env-var needs to be set in the docker-compose.yml file
-        # Then, after the container is running, exec in and run (from `/opt/oracle`)
-        # ./createAppUser user pass ORACLE_DB
-        # where ORACLE_DB is the same name you used in the docker-compose file.
+        with self._safe_raw_sql(tables) as cur:
+            out = cur.fetchall()
 
-        # ORACLE IS VERY CONFUSING
-        # SID -- instance identifier -- meant to distinguish oracle instances running on the same machine
-        # TABLESPACE -- logical grouping of tables and views, unclear how different from DATABASE
-        # DATABASE can be assigned (defaults?) to a tablespace
-        #
-        # sqlplus ibis/ibis@localhost:1521/IBIS_TESTING
-        # for connecting from docker exec
-        #
-        # for current session parameters
-        # select * from nls_session_parameters;
-        #
-        # alter session parameter e.g.
-        # alter session set nls_timestamp_format='YYYY-MM-DD HH24:MI:SS.FF3'
-        #
-        # see user tables
-        # select table_name from user_tables
+        return self._filter_with_like(map(itemgetter(0), out), like)
 
-        self.database_name = database  # not sure what should go here
+    def list_databases(
+        self, *, like: str | None = None, catalog: str | None = None
+    ) -> list[str]:
+        if catalog is not None:
+            raise exc.UnsupportedArgumentError(
+                "No cross-catalog schema access in Oracle"
+            )
 
-        # Note: for the moment, we need to pass the `database` in to the `make_url` call
-        # AND specify it here as the `service_name`.  I don't know why.
-        engine = sa.create_engine(
-            url,
-            poolclass=sa.pool.StaticPool,
-            # We set the statement cache size to 0 because Oracle will otherwise
-            # attempt to reuse prepared statements even if the type of the bound variable
-            # has changed.
-            # This is apparently accepted behavior.
-            # https://python-oracledb.readthedocs.io/en/latest/user_guide/appendix_b.html#statement-caching-in-thin-and-thick-modes
-            connect_args={"service_name": database, "stmtcachesize": 0},
+        query = sg.select("username").from_("all_users").order_by("username")
+
+        with self._safe_raw_sql(query) as con:
+            schemata = list(map(itemgetter(0), con))
+
+        return self._filter_with_like(schemata, like)
+
+    def get_schema(
+        self, name: str, *, catalog: str | None = None, database: str | None = None
+    ) -> sch.Schema:
+        if database is None:
+            database = self.con.username.upper()
+        stmt = (
+            sg.select(
+                C.column_name,
+                C.data_type,
+                C.data_precision,
+                C.data_scale,
+                C.nullable.eq(sge.convert("Y")).as_("nullable"),
+            )
+            .from_(sg.table("all_tab_columns"))
+            .where(
+                C.table_name.eq(sge.convert(name)),
+                C.owner.eq(sge.convert(database)),
+            )
+            .order_by(C.column_id)
         )
+        with self._safe_raw_sql(stmt) as cur:
+            results = cur.fetchall()
 
-        super().do_connect(engine)
+        if not results:
+            raise exc.TableNotFound(name)
 
-        def normalize_name(name):
-            if name is None:
-                return None
-            elif not name:
-                return ""
-            elif name.lower() == name:
-                return sa.sql.quoted_name(name, quote=True)
-            else:
-                return name
+        type_mapper = self.compiler.type_mapper
+        fields = {
+            name: metadata_row_to_type(
+                type_mapper=type_mapper,
+                type_string=type_string,
+                precision=precision,
+                scale=scale,
+                nullable=nullable,
+            )
+            for name, type_string, precision, scale, nullable in results
+        }
 
-        self.con.dialect.normalize_name = normalize_name
+        return sch.Schema(fields)
 
-    def _metadata(self, query: str) -> Iterable[tuple[str, dt.DataType]]:
-        query = f"SELECT * FROM ({query.strip(';')}) FETCH FIRST 0 ROWS ONLY"
-        with self.begin() as con, con.connection.cursor() as cur:
-            result = cur.execute(query)
-            desc = result.description
-
-        for name, type_code, _, _, precision, scale, is_nullable in desc:
-            if precision is not None and scale is not None and precision != 0:
-                typ = dt.Decimal(precision=precision, scale=scale, nullable=is_nullable)
-            elif precision == 0:
-                # TODO: how to disambiguate between int and float here without inspecting the value?
-                typ = dt.float
-            else:
-                typ = parse(type_code).copy(nullable=is_nullable)
-            yield name, typ
-
-    def _table_from_schema(
+    def create_table(
         self,
         name: str,
-        schema: sch.Schema,
-        temp: bool = False,
+        /,
+        obj: ir.Table
+        | pd.DataFrame
+        | pa.Table
+        | pl.DataFrame
+        | pl.LazyFrame
+        | None = None,
+        *,
+        schema: sch.IntoSchema | None = None,
         database: str | None = None,
-        **kwargs: Any,
-    ) -> sa.Table:
-        if temp:
-            kwargs["oracle_on_commit"] = "PRESERVE ROWS"
-        t = super()._table_from_schema(name, schema, temp, database, **kwargs)
-        if temp:
-            atexit.register(self._clean_up_tmp_table, t)
-        return t
+        temp: bool = False,
+        overwrite: bool = False,
+    ):
+        """Create a table in Oracle.
 
-    def _clean_up_tmp_table(self, name: str) -> None:
-        tmptable = self._get_sqla_table(name, autoload=False)
+        Parameters
+        ----------
+        name
+            Name of the table to create
+        obj
+            The data with which to populate the table; optional, but at least
+            one of `obj` or `schema` must be specified
+        schema
+            The schema of the table to create; optional, but at least one of
+            `obj` or `schema` must be specified
+        database
+            The name of the database in which to create the table; if not
+            passed, the current database is used.
+        temp
+            Create a temporary table
+        overwrite
+            If `True`, replace the table if it already exists, otherwise fail
+            if the table exists
+        """
+        if obj is None and schema is None:
+            raise ValueError("Either `obj` or `schema` must be specified")
+        if schema is not None:
+            schema = ibis.schema(schema)
+
+        properties = []
+
+        if temp:
+            properties.append(sge.TemporaryProperty())
+
+        if obj is not None:
+            if not isinstance(obj, ir.Expr):
+                table = ibis.memtable(obj)
+            else:
+                table = obj
+
+            self._run_pre_execute_hooks(table)
+
+            query = self.compiler.to_sqlglot(table)
+        else:
+            query = None
+
+        if overwrite:
+            temp_name = util.gen_name(f"{self.name}_table")
+        else:
+            temp_name = name
+
+        initial_table = sg.table(temp_name, db=database, quoted=self.compiler.quoted)
+        target = sge.Schema(
+            this=initial_table,
+            expressions=(schema or table.schema()).to_sqlglot_column_defs(self.dialect),
+        )
+
+        create_stmt = sge.Create(
+            kind="TABLE",
+            this=target,
+            properties=sge.Properties(expressions=properties),
+        )
+
+        # This is the same table as initial_table unless overwrite == True
+        final_table = sg.table(name, db=database, quoted=self.compiler.quoted)
+        with self._safe_raw_sql(create_stmt) as cur:
+            if query is not None:
+                insert_stmt = sge.Insert(this=initial_table, expression=query).sql(
+                    self.name
+                )
+                cur.execute(insert_stmt)
+
+            if overwrite:
+                self.drop_table(final_table.name, database=final_table.db, force=True)
+                cur.execute(
+                    f"ALTER TABLE IF EXISTS {initial_table.sql(self.name)} RENAME TO {final_table.sql(self.name)}"
+                )
+
+        if schema is None:
+            return self.table(name, database=database)
+
+        # preserve the input schema if it was provided
+        return ops.DatabaseTable(
+            name, schema=schema, source=self, namespace=ops.Namespace(database=database)
+        ).to_expr()
+
+    def drop_table(
+        self,
+        name: str,
+        /,
+        *,
+        database: tuple[str, str] | str | None = None,
+        force: bool = False,
+    ) -> None:
+        table_loc = self._to_sqlglot_table(database or None)
+        catalog, db = self._to_catalog_db_tuple(table_loc)
+
+        table = sg.table(name, db=db, catalog=catalog, quoted=self.compiler.quoted)
+
         with self.begin() as bind:
             # global temporary tables cannot be dropped without first truncating them
             #
@@ -202,10 +496,168 @@ class Backend(BaseAlchemyBackend):
             #
             # ignore DatabaseError exceptions because the table may not exist
             # because it's already been deleted
-            with contextlib.suppress(sa.exc.DatabaseError):
-                bind.exec_driver_sql(f'TRUNCATE TABLE "{tmptable.name}"')
-            with contextlib.suppress(sa.exc.DatabaseError):
-                tmptable.drop(bind=bind)
+            with contextlib.suppress(oracledb.DatabaseError):
+                bind.execute(f"TRUNCATE TABLE {table.sql(self.name)}")
 
-    def _clean_up_cached_table(self, op):
-        self._clean_up_tmp_table(op.name)
+        super().drop_table(name, database=(catalog, db), force=force)
+
+    def _register_in_memory_table(self, op: ops.InMemoryTable) -> None:
+        schema = op.schema
+        if null_columns := schema.null_fields:
+            raise exc.IbisTypeError(
+                f"{self.name} cannot yet reliably handle `null` typed columns; "
+                f"got null typed columns: {null_columns}"
+            )
+
+        name = op.name
+        quoted = self.compiler.quoted
+        create_stmt = sge.Create(
+            kind="TABLE",
+            this=sg.exp.Schema(
+                this=sg.to_identifier(name, quoted=quoted),
+                expressions=schema.to_sqlglot_column_defs(self.dialect),
+            ),
+            properties=sge.Properties(expressions=[sge.TemporaryProperty()]),
+        ).sql(self.name)
+
+        data = op.data.to_frame().replace(float("nan"), None)
+        insert_stmt = self._build_insert_template(
+            name, schema=schema, placeholder=":{i:d}"
+        )
+        with self.begin() as cur:
+            cur.execute(create_stmt)
+            for start, end in util.chunks(len(data), chunk_size=128):
+                cur.executemany(
+                    insert_stmt, list(data.iloc[start:end].itertuples(index=False))
+                )
+
+    def _get_schema_using_query(self, query: str) -> sch.Schema:
+        name = util.gen_name("oracle_metadata")
+        dialect = self.name
+
+        try:
+            sg_expr = sg.parse_one(query, into=sg.exp.Table, dialect=dialect)
+        except sg.ParseError:
+            sg_expr = sg.parse_one(query, dialect=dialect)
+
+        # If query is a table, adjust the query accordingly
+        if isinstance(sg_expr, sg.exp.Table):
+            sg_expr = sg.select(STAR).from_(sg_expr)
+
+        # TODO(gforsyth): followup -- this should probably be made a default
+        # transform for quoting backends
+        def transformer(node):
+            if isinstance(node, sg.exp.Table):
+                return sg.table(node.name, quoted=True)
+            elif isinstance(node, sg.exp.Column):
+                return sg.column(col=node.name, quoted=True)
+            return node
+
+        sg_expr = sg_expr.transform(transformer)
+
+        this = sg.table(name, quoted=True)
+        create_view = sg.exp.Create(kind="VIEW", this=this, expression=sg_expr).sql(
+            dialect
+        )
+        drop_view = sg.exp.Drop(kind="VIEW", this=this).sql(dialect)
+
+        metadata_query = (
+            sg.select(
+                C.column_name,
+                C.data_type,
+                C.data_precision,
+                C.data_scale,
+                C.nullable.eq(sge.convert("Y")),
+            )
+            .from_("all_tab_columns")
+            .where(C.table_name.eq(sge.convert(name)))
+            .order_by(C.column_id)
+            .sql(dialect)
+        )
+
+        with self.begin() as con:
+            con.execute(create_view)
+            try:
+                results = con.execute(metadata_query).fetchall()
+            finally:
+                # drop the view no matter what
+                con.execute(drop_view)
+
+        schema = {}
+
+        # TODO: hand all this off to the type mapper
+        type_mapper = self.compiler.type_mapper
+        for name, type_string, precision, scale, nullable in results:
+            typ = metadata_row_to_type(
+                type_mapper=type_mapper,
+                type_string=type_string,
+                precision=precision,
+                scale=scale,
+                nullable=nullable,
+            )
+            schema[name] = typ
+
+        return sch.Schema(schema)
+
+    def _fetch_from_cursor(self, cursor, schema: sch.Schema) -> pd.DataFrame:
+        # TODO(gforsyth): this can probably be generalized a bit and put into
+        # the base backend (or a mixin)
+        import pandas as pd
+
+        from ibis.backends.oracle.converter import OraclePandasData
+
+        df = pd.DataFrame.from_records(cursor, columns=schema.names, coerce_float=True)
+        return OraclePandasData.convert_table(df, schema)
+
+    def _clean_up_tmp_table(self, name: str) -> None:
+        dialect = self.dialect
+
+        ident = sg.to_identifier(name, quoted=self.compiler.quoted)
+
+        truncate = sge.TruncateTable(expressions=[ident]).sql(dialect)
+        drop = sge.Drop(kind="TABLE", this=ident).sql(dialect)
+
+        with self.begin() as bind:
+            # global temporary tables cannot be dropped without first truncating them
+            #
+            # https://stackoverflow.com/questions/32423397/force-oracle-drop-global-temp-table
+            #
+            # ignore DatabaseError exceptions because the table may not exist
+            # because it's already been deleted
+            with contextlib.suppress(oracledb.DatabaseError):
+                bind.execute(truncate)
+            with contextlib.suppress(oracledb.DatabaseError):
+                bind.execute(drop)
+
+    _drop_cached_table = _clean_up_tmp_table
+
+    def _make_memtable_finalizer(self, name: str) -> Callable[..., None]:
+        dialect = self.dialect
+
+        ident = sg.to_identifier(name, quoted=self.compiler.quoted)
+
+        truncate = sge.TruncateTable(expressions=[ident]).sql(dialect)
+        drop = sge.Drop(kind="TABLE", this=ident).sql(dialect)
+
+        def finalizer(con=self.con, name: str = name) -> None:
+            cursor = con.cursor()
+            try:
+                # global temporary tables cannot be dropped without first truncating them
+                #
+                # https://stackoverflow.com/questions/32423397/force-oracle-drop-global-temp-table
+                #
+                # ignore DatabaseError exceptions because the table may not exist
+                # because it's already been deleted
+                with contextlib.suppress(oracledb.DatabaseError):
+                    cursor.execute(truncate)
+                with contextlib.suppress(oracledb.DatabaseError):
+                    cursor.execute(drop)
+            except Exception:
+                con.rollback()
+                raise
+            else:
+                con.commit()
+            finally:
+                cursor.close()
+
+        return finalizer

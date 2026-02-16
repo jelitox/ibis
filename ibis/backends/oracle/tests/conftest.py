@@ -5,48 +5,57 @@ import contextlib
 import itertools
 import os
 import subprocess
-from pathlib import Path
-from typing import Any, TextIO
+from typing import TYPE_CHECKING, Any
 
+import oracledb
 import pytest
-import sqlalchemy as sa
 
 import ibis
-from ibis.backends.tests.base import RoundHalfToEven, ServiceBackendTest, ServiceSpec
+from ibis.backends.tests.base import ServiceBackendTest
 
-ORACLE_USER = os.environ.get('IBIS_TEST_ORACLE_USER', 'ibis')
-ORACLE_PASS = os.environ.get('IBIS_TEST_ORACLE_PASSWORD', 'ibis')
-ORACLE_HOST = os.environ.get('IBIS_TEST_ORACLE_HOST', 'localhost')
-ORACLE_PORT = int(os.environ.get('IBIS_TEST_ORACLE_PORT', 1521))
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from pathlib import Path
+
+ORACLE_USER = os.environ.get("IBIS_TEST_ORACLE_USER", "ibis")
+ORACLE_PASS = os.environ.get("IBIS_TEST_ORACLE_PASSWORD", "ibis")
+ORACLE_HOST = os.environ.get("IBIS_TEST_ORACLE_HOST", "localhost")
+ORACLE_PORT = int(os.environ.get("IBIS_TEST_ORACLE_PORT", "1521"))
+
+# Creating test DB and user
+# The ORACLE_DB env-var needs to be set in the compose.yaml file
+# Then, after the container is running, exec in and run (from `/opt/oracle`)
+# ./createAppUser user pass ORACLE_DB
+# where ORACLE_DB is the same name you used in the Compose file.
+
+# Set to ensure decimals come back as decimals
+oracledb.defaults.fetch_decimals = True
 
 
-class TestConf(ServiceBackendTest, RoundHalfToEven):
+class TestConf(ServiceBackendTest):
     check_dtype = False
-    supports_window_operations = False
-    returned_timestamp_unit = 's'
+    returned_timestamp_unit = "s"
     supports_arrays = False
-    supports_arrays_outside_of_select = False
     # Automatic mutate so that logical type in ibis returns as bool
     # but the backend will still do whatever it's going to do
     native_bool = False
     supports_structs = False
     supports_json = False
+    rounding_method = "half_to_even"
+    data_volume = "/opt/oracle/data"
+    service_name = "oracle"
+    deps = ("oracledb",)
 
-    @classmethod
-    def service_spec(cls, data_dir: Path) -> ServiceSpec:
-        return ServiceSpec(
-            name=cls.name(),
-            data_volume="/opt/oracle/data",
-            files=itertools.chain(
-                data_dir.joinpath("csv").glob("*.csv"),
-                data_dir.parent.joinpath("schema", "oracle").glob("*.ctl"),
-            ),
+    @property
+    def test_files(self) -> Iterable[Path]:
+        return itertools.chain(
+            self.data_dir.joinpath("csv").glob("*.csv"),
+            self.script_dir.joinpath("oracle").glob("*.ctl"),
         )
 
-    @staticmethod
     def _load_data(
-        data_dir: Path,
-        script_dir: Path,
+        self,
+        *,
         user: str = ORACLE_USER,
         password: str = ORACLE_PASS,
         host: str = ORACLE_HOST,
@@ -71,7 +80,7 @@ class TestConf(ServiceBackendTest, RoundHalfToEven):
                     "docker",
                     "compose",
                     "exec",
-                    "oracle",
+                    self.service_name,
                     "./createAppUser",
                     user,
                     password,
@@ -79,15 +88,12 @@ class TestConf(ServiceBackendTest, RoundHalfToEven):
                 ]
             )
 
-        with open(script_dir / 'schema' / 'oracle.sql') as schema:
-            init_oracle_database(
-                url=sa.engine.make_url(
-                    f"oracle://{user}:{password}@{host}:{port:d}/{database}",
-                ),
-                database=database,
-                schema=schema,
-                connect_args=dict(service_name=database),
-            )
+        init_oracle_database(
+            dsn=oracledb.makedsn(host, port, service_name=database),
+            user=user,
+            password=password,
+            schema=self.ddl_script,
+        )
 
         # then call sqlldr to ingest
         with concurrent.futures.ThreadPoolExecutor() as executor:
@@ -98,25 +104,26 @@ class TestConf(ServiceBackendTest, RoundHalfToEven):
                         "docker",
                         "compose",
                         "exec",
-                        "oracle",
+                        self.service_name,
                         "sqlldr",
                         f"{user}/{password}@{host}:{port:d}/{database}",
                         f"control=data/{ctl_file.name}",
                     ],
                     stdout=subprocess.DEVNULL,
                 )
-                for ctl_file in script_dir.joinpath("schema", "oracle").glob("*.ctl")
+                for ctl_file in self.script_dir.joinpath("oracle").glob("*.ctl")
             ):
                 fut.result()
 
     @staticmethod
-    def connect(_: Path):
+    def connect(*, tmpdir, worker_id, **kw):  # noqa: ARG004
         return ibis.oracle.connect(
             host=ORACLE_HOST,
             user=ORACLE_USER,
             password=ORACLE_PASS,
             database="IBIS_TESTING",
             port=ORACLE_PORT,
+            **kw,
         )
 
     @staticmethod
@@ -124,64 +131,20 @@ class TestConf(ServiceBackendTest, RoundHalfToEven):
         return f'"{name}"'
 
 
-@pytest.fixture(scope='session')
-def con():
-    return ibis.oracle.connect(
-        host=ORACLE_HOST,
-        user=ORACLE_USER,
-        password=ORACLE_PASS,
-        database="IBIS_TESTING",
-        port=ORACLE_PORT,
-    )
+@pytest.fixture(scope="session")
+def con(tmp_path_factory, data_dir, worker_id):
+    with TestConf.load_data(data_dir, tmp_path_factory, worker_id) as be:
+        yield be.connection
 
 
 def init_oracle_database(
-    url: sa.engine.url.URL,
-    database: str,
-    schema: TextIO | None = None,
-    **kwargs: Any,
-) -> sa.engine.Engine:
-    """Initialise `database` at `url` with `schema`.
-
-    If `recreate`, drop the `database` at `url`, if it exists.
-
-    Parameters
-    ----------
-    url : url.sa.engine.url.URL
-        Connection url to the database
-    database : str
-        Name of the database to be dropped
-    schema : TextIO
-        File object containing schema to use
-
-    Returns
-    -------
-    sa.engine.Engine
-        SQLAlchemy engine object
-    """
-    try:
-        url.database = database
-    except AttributeError:
-        url = url.set(database=database)
-
-    engine = sa.create_engine(url, **kwargs)
-
-    if schema:
-        with engine.begin() as conn:
-            for stmt in filter(
-                None,
-                map(str.strip, schema.read().split(';')),
-            ):
-                # XXX: maybe should just remove the comments in the sql file
-                # so we don't end up writing an entire parser here.
-                if not stmt.startswith("--"):
-                    # TODO: find a nicer way to do this (but for now, keep this
-                    # as a special case in the oracle conftest)
-                    # But srsly, why is there no `CREATE OR REPLACE TABLE`?
-                    if stmt.startswith("DROP TABLE"):
-                        with contextlib.suppress(sa.exc.DatabaseError):
-                            conn.exec_driver_sql(stmt)
-                    else:
-                        conn.exec_driver_sql(stmt)
-
-    return engine
+    user: str, password: str, dsn: str, schema: str | None = None
+) -> None:
+    with oracledb.connect(
+        dsn, user=user, password=password, stmtcachesize=0
+    ).cursor() as cursor:
+        for stmt in schema:
+            # XXX: maybe should just remove the comments in the sql file
+            # so we don't end up writing an entire parser here.
+            if not stmt.startswith("--"):
+                cursor.execute(stmt)

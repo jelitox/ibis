@@ -15,7 +15,14 @@
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+
+class TableNotFound(Exception):
+    """Exception to raise when a table cannot be found."""
 
 
 class IbisError(Exception):
@@ -79,39 +86,78 @@ class BackendConversionError(IbisError):
 
 
 class BackendConfigurationNotRegistered(IbisError):
-    """A backend has options but isn't regsitered in ibis/config.py."""
+    """A backend has options but isn't registered in ibis/config.py."""
 
     def __init__(self, backend_name: str) -> None:
         super().__init__(backend_name)
-        self.backend_name = backend_name
 
     def __str__(self) -> str:
-        return (
-            f"Please register options for the `{self.backend_name}` "
-            "backend in ibis/config.py"
-        )
+        (backend_name,) = self.args
+        return f"Please register options for the `{backend_name}` backend in ibis/config.py"
 
 
-class DDLError(IbisError):
-    """DDL related errors."""
-
-
-class DuplicateUDFError(DDLError):
+class DuplicateUDFError(IbisError):
     def __init__(self, name: str) -> None:
         super().__init__(name)
-        self.name = name
 
     def __str__(self) -> str:
-        return f"More than one function with {self.name} found."
+        (name,) = self.args
+        return f"More than one function with `{name}` found."
 
 
-class MissingUDFError(DDLError):
+class MissingUDFError(IbisError):
     def __init__(self, name: str) -> None:
         super().__init__(name)
-        self.name = name
 
     def __str__(self) -> str:
-        return f"No function found with name {self.name}"
+        (name,) = self.args
+        return f"No user-defined function found with name `{name}`"
+
+
+class AmbiguousUDFError(IbisError):
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+
+    def __str__(self) -> str:
+        (name,) = self.args
+        return f"Multiple implementations of function `{name}`. Only one implementation is supported."
+
+
+class MissingReturnAnnotationError(IbisError):
+    def __init__(self, func_name: str):
+        super().__init__(func_name)
+
+    def __str__(self):
+        (func_name,) = self.args
+        return f"function `{func_name}` has no return type annotation"
+
+
+class MissingParameterAnnotationError(IbisError):
+    def __init__(self, func_name: str, param_name: str):
+        super().__init__(func_name, param_name)
+
+    def __str__(self):
+        func_name, param_name = self.args
+        return f"parameter `{param_name}` in function `{func_name}` is missing a type annotation"
+
+
+class InvalidDecoratorError(IbisError):
+    def __init__(self, name: str, lines: str):
+        super().__init__(name, lines)
+
+    def __str__(self) -> str:
+        name, lines = self.args
+        return f"Only the `@udf` decorator is allowed in user-defined function: `{name}`; found lines {lines}"
+
+
+class ConflictingValuesError(ValueError):
+    """A single key has conflicting values in two different mappings."""
+
+    def __init__(self, conflicts: set[tuple[Any, Any, Any]]):
+        self.conflicts = conflicts
+        msgs = [f"  `{key}`: {v1} != {v2}" for key, v1, v2 in conflicts]
+        msg = "Conflicting values for keys:\n" + "\n".join(msgs)
+        super().__init__(msg)
 
 
 def mark_as_unsupported(f: Callable) -> Callable:
@@ -120,7 +166,7 @@ def mark_as_unsupported(f: Callable) -> Callable:
     # function that raises UnsupportedOperationError
     def _mark_as_unsupported(self):
         raise UnsupportedOperationError(
-            f'Method `{f.__name__}` is unsupported by class `{self.__class__.__name__}`.'
+            f"Method `{f.__name__}` is unsupported by class `{self.__class__.__name__}`."
         )
 
     _mark_as_unsupported.__doc__ = f.__doc__

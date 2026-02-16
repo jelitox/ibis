@@ -1,28 +1,34 @@
 """Initialize Ibis module."""
+
 from __future__ import annotations
 
-__version__ = "5.1.0"
+__version__ = "12.0.0"
+
+import warnings
+from typing import Any
 
 from ibis import examples, util
-from ibis.backends.base import BaseBackend
+from ibis.backends import BaseBackend
 from ibis.common.exceptions import IbisError
 from ibis.config import options
 from ibis.expr import api
 from ibis.expr import types as ir
 from ibis.expr.api import *  # noqa: F403
+from ibis.expr.operations import udf
 
 __all__ = [  # noqa: PLE0604
-    'api',
-    'examples',
-    'ir',
-    'util',
-    'BaseBackend',
-    'IbisError',
-    'options',
+    "api",
+    "examples",
+    "ir",
+    "udf",
+    "util",
+    "BaseBackend",
+    "IbisError",
+    "options",
     *api.__all__,
 ]
 
-_KNOWN_BACKENDS = ['heavyai']
+_KNOWN_BACKENDS = ["heavyai"]
 
 
 def __dir__() -> list[str]:
@@ -33,7 +39,7 @@ def __dir__() -> list[str]:
     return sorted(out)
 
 
-def __getattr__(name: str) -> BaseBackend:
+def load_backend(name: str) -> BaseBackend:
     """Load backends in a lazy way with `ibis.<backend-name>`.
 
     This also registers the backend options.
@@ -47,14 +53,16 @@ def __getattr__(name: str) -> BaseBackend:
     is called, and a backend with the `sqlite` name is tried to load from
     the `ibis.backends` entrypoints. If successful, the `ibis.sqlite`
     attribute is "cached", so this function is only called the first time.
+
     """
+
     entry_points = {ep for ep in util.backend_entry_points() if ep.name == name}
 
     if not entry_points:
         msg = f"module 'ibis' has no attribute '{name}'. "
         if name in _KNOWN_BACKENDS:
             msg += f"""If you are trying to access the '{name}' backend,
-                    try installing it first with `pip install ibis-{name}`"""
+                    try installing it first with `pip install 'ibis-framework[{name}]'`"""
         raise AttributeError(msg)
 
     if len(entry_points) > 1:
@@ -70,7 +78,15 @@ def __getattr__(name: str) -> BaseBackend:
     import ibis
 
     (entry_point,) = entry_points
-    module = entry_point.load()
+    try:
+        module = entry_point.load()
+    except ImportError as exc:
+        raise ImportError(
+            f"Failed to import the {name} backend due to missing dependencies.\n\n"
+            f"You can pip or conda install the {name} backend as follows:\n\n"
+            f'  python -m pip install -U "ibis-framework[{name}]"  # pip install\n'
+            f"  conda install -c conda-forge ibis-{name}           # or conda install"
+        ) from exc
     backend = module.Backend()
     # The first time a backend is loaded, we register its options, and we set
     # it as an attribute of `ibis`, so `__getattr__` is not called again for it
@@ -83,10 +99,7 @@ def __getattr__(name: str) -> BaseBackend:
     # - connect
     # - compile
     # - has_operation
-    # - add_operation
     # - _from_url
-    # - _to_sql
-    # - _sqlglot_dialect (if defined)
     #
     # We also copy over the docstring from `do_connect` to the proxy `connect`
     # method, since that's where all the backend-specific kwargs are currently
@@ -105,14 +118,25 @@ def __getattr__(name: str) -> BaseBackend:
     proxy.connect = connect
     proxy.compile = backend.compile
     proxy.has_operation = backend.has_operation
-    proxy.add_operation = backend.add_operation
     proxy.name = name
     proxy._from_url = backend._from_url
-    proxy._to_sql = backend._to_sql
-    if hasattr(backend, "_sqlglot_dialect"):
-        proxy._sqlglot_dialect = backend._sqlglot_dialect
+
     # Add any additional methods that should be exposed at the top level
-    for name in getattr(backend, "_top_level_methods", ()):
-        setattr(proxy, name, getattr(backend, name))
+    for attr in getattr(backend, "_top_level_methods", ()):
+        setattr(proxy, attr, getattr(backend, attr))
 
     return proxy
+
+
+def __getattr__(name: str) -> Any:
+    if name == "NA":
+        warnings.warn(
+            "The 'ibis.NA' constant is deprecated as of v9.1 and will be removed in a future "
+            "version. Use 'ibis.null()' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+        return null()  # noqa: F405
+    else:
+        return load_backend(name)

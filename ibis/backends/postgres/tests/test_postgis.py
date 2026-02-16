@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import functools
 
 import pandas as pd
@@ -5,68 +7,51 @@ import pandas.testing as tm
 import pytest
 from numpy import testing
 
-pytest.importorskip("psycopg2")
-pytest.importorskip("geoalchemy2")
+pytest.importorskip("psycopg")
 gpd = pytest.importorskip("geopandas")
 pytest.importorskip("shapely")
-
-sa = pytest.importorskip("sqlalchemy")
 
 pytestmark = pytest.mark.geospatial
 
 
 def test_load_geodata(con):
-    t = con.table('geo')
+    t = con.table("geo")
     result = t.execute()
     assert isinstance(result, gpd.GeoDataFrame)
 
 
 def test_empty_select(geotable):
-    expr = geotable[geotable.geo_point.geo_equals(geotable.geo_linestring)]
+    expr = geotable.filter(geotable.geo_point.geo_equals(geotable.geo_linestring))
     result = expr.execute()
     assert len(result) == 0
 
 
-def test_select_point_geodata(geotable):
-    expr = geotable['geo_point']
-    sqla_expr = expr.compile()
-    compiled = str(sqla_expr.compile(compile_kwargs={'literal_binds': True}))
-    expected = "SELECT ST_AsEWKB(t0.geo_point) AS geo_point \nFROM geo AS t0"
-    assert compiled == expected
+def test_select_point_geodata(geotable, assert_sql):
+    expr = geotable["geo_point"]
+    assert_sql(expr)
     data = expr.execute()
-    assert data.geom_type.iloc[0] == 'Point'
+    assert data.geom_type.iloc[0] == "Point"
 
 
-def test_select_linestring_geodata(geotable):
-    expr = geotable['geo_linestring']
-    sqla_expr = expr.compile()
-    compiled = str(sqla_expr.compile(compile_kwargs={'literal_binds': True}))
-    expected = "SELECT ST_AsEWKB(t0.geo_linestring) AS geo_linestring \nFROM geo AS t0"
-    assert compiled == expected
+def test_select_linestring_geodata(geotable, assert_sql):
+    expr = geotable["geo_linestring"]
+    assert_sql(expr)
     data = expr.execute()
-    assert data.geom_type.iloc[0] == 'LineString'
+    assert data.geom_type.iloc[0] == "LineString"
 
 
-def test_select_polygon_geodata(geotable):
-    expr = geotable['geo_polygon']
-    sqla_expr = expr.compile()
-    compiled = str(sqla_expr.compile(compile_kwargs={'literal_binds': True}))
-    expected = "SELECT ST_AsEWKB(t0.geo_polygon) AS geo_polygon \nFROM geo AS t0"
-    assert compiled == expected
+def test_select_polygon_geodata(geotable, assert_sql):
+    expr = geotable["geo_polygon"]
+    assert_sql(expr)
     data = expr.execute()
-    assert data.geom_type.iloc[0] == 'Polygon'
+    assert data.geom_type.iloc[0] == "Polygon"
 
 
-def test_select_multipolygon_geodata(geotable):
-    expr = geotable['geo_multipolygon']
-    sqla_expr = expr.compile()
-    compiled = str(sqla_expr.compile(compile_kwargs={'literal_binds': True}))
-    expected = (
-        "SELECT ST_AsEWKB(t0.geo_multipolygon) AS geo_multipolygon \nFROM geo AS t0"
-    )
-    assert compiled == expected
+def test_select_multipolygon_geodata(geotable, assert_sql):
+    expr = geotable["geo_multipolygon"]
+    assert_sql(expr)
     data = expr.execute()
-    assert data.geom_type.iloc[0] == 'MultiPolygon'
+    assert data.geom_type.iloc[0] == "MultiPolygon"
 
 
 def test_geo_area(geotable, gdf):
@@ -106,19 +91,23 @@ def test_geo_covered_by(geotable):
 
 
 def test_geo_d_fully_within(geotable):
-    expr = geotable.geo_point.d_fully_within(geotable.geo_point.buffer(1.0), 2.0)
+    expr = geotable.geo_point.d_fully_within(
+        geotable.geo_point.buffer(1.0), distance=2.0
+    )
     assert expr.execute().all()
 
 
 def test_geo_d_within(geotable):
-    expr = geotable.geo_point.d_within(geotable.geo_point.buffer(1.0), 1.0)
+    expr = geotable.geo_point.d_within(geotable.geo_point.buffer(1.0), distance=1.0)
     assert expr.execute().all()
 
 
 def test_geo_end_point(geotable, gdf):
     expr = geotable.geo_linestring.end_point()
     result = expr.execute()
-    end_point = gdf.apply(lambda x: x.geo_linestring.interpolate(1, True), axis=1)
+    end_point = gdf.apply(
+        lambda x: x.geo_linestring.interpolate(1, normalized=True), axis=1
+    )
     for a, b in zip(result, end_point):
         assert a.equals(b)
 
@@ -164,9 +153,9 @@ def test_geo_geometry_n(geotable, gdf):
 
 def test_geo_geometry_type(geotable):
     expr = geotable.geo_point.geometry_type()
-    assert (expr.execute() == 'ST_Point').all()
+    assert (expr.execute() == "ST_Point").all()
     expr = geotable.geo_multipolygon.geometry_type()
-    assert (expr.execute() == 'ST_MultiPolygon').all()
+    assert (expr.execute() == "ST_MultiPolygon").all()
 
 
 def test_geo_intersects(geotable):
@@ -253,7 +242,9 @@ def test_geo_srid(geotable):
 def test_geo_start_point(geotable, gdf):
     expr = geotable.geo_linestring.start_point()
     result = expr.execute()
-    start_point = gdf.apply(lambda x: x.geo_linestring.interpolate(0, True), axis=1)
+    start_point = gdf.apply(
+        lambda x: x.geo_linestring.interpolate(0, normalized=True), axis=1
+    )
     for a, b in zip(result, start_point):
         assert a.equals(b)
 

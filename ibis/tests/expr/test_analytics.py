@@ -11,11 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 import pytest
 
 import ibis
 import ibis.expr.types as ir
+from ibis import _
+from ibis.common.annotations import ValidationError
 from ibis.tests.expr.mocks import MockBackend
 from ibis.tests.util import assert_equal
 
@@ -27,22 +30,22 @@ def con():
 
 @pytest.fixture
 def alltypes(con):
-    return con.table('functional_alltypes')
+    return con.table("functional_alltypes")
 
 
 @pytest.fixture
 def airlines():
     return ibis.table(
-        [('dest', 'string'), ('origin', 'string'), ('arrdelay', 'int32')],
-        'airlines',
+        [("dest", "string"), ("origin", "string"), ("arrdelay", "int32")],
+        "airlines",
     )
 
 
 def test_category_project(alltypes):
     t = alltypes
 
-    tier = t.double_col.bucket([0, 50, 100]).name('tier')
-    expr = t[tier, t]
+    tier = t.double_col.bucket([0, 50, 100]).name("tier")
+    expr = t.select(tier, t)
 
     assert isinstance(expr.tier, ir.IntegerColumn)
 
@@ -65,22 +68,22 @@ def test_bucket(alltypes):
 def test_bucket_error_cases(alltypes):
     d = alltypes.double_col
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValidationError):
         d.bucket([])
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValidationError):
         d.bucket([1, 2], closed="foo")
 
     # it works!
     d.bucket([10], include_under=True, include_over=True)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValidationError):
         d.bucket([10])
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValidationError):
         d.bucket([10], include_under=True)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValidationError):
         d.bucket([10], include_over=True)
 
 
@@ -96,8 +99,8 @@ def test_histogram(alltypes):
 
 def test_topk_analysis_bug(airlines):
     # GH #398
-    dests = ['ORD', 'JFK', 'SFO']
-    t = airlines[airlines.dest.isin(dests)]
+    dests = ["ORD", "JFK", "SFO"]
+    t = airlines.filter(airlines.dest.isin(dests))
     filtered = t.semi_join(t.origin.topk(10, by=t.arrdelay.mean()), "origin")
     assert filtered is not None
 
@@ -108,3 +111,15 @@ def test_topk_function_late_bind(airlines):
     expr2 = airlines.dest.topk(5, by=airlines.arrdelay.mean())
 
     assert_equal(expr1, expr2)
+
+
+def test_topk_name(airlines):
+    expr1 = airlines.dest.topk(5, name="mycol")
+    expr2 = airlines.dest.topk(5, by=_.count().name("mycol"))
+    assert expr1.columns == ("dest", "mycol")
+    assert_equal(expr1, expr2)
+
+    expr3 = airlines.dest.topk(5, by=_.arrdelay.mean(), name="mycol")
+    expr4 = airlines.dest.topk(5, by=_.arrdelay.mean().name("mycol"))
+    assert expr3.columns == ("dest", "mycol")
+    assert_equal(expr3, expr4)

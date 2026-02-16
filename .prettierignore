@@ -10,7 +10,12 @@ docs/SUMMARY.md
 docs/api/expressions/top_level.md
 docs/overrides/*.html
 docs/release_notes.md
+docs/_freeze
+docs/_publish.yml
+docs/_extensions
+docs/.quarto
+docs/_output
 ibis
-poetry.lock
 result*
-site
+*.delta
+*.lock

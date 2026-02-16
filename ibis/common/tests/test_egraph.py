@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import itertools
-from typing import Any, Tuple
+from typing import Any
 
 import pytest
 
@@ -81,6 +83,13 @@ def test_disjoint_set():
         ds._classes[1] = {1}
         ds.verify()
 
+    # test copying the disjoint set
+    ds2 = ds.copy()
+    assert ds == ds2
+    assert ds is not ds2
+    ds2.add(5)
+    assert ds != ds2
+
 
 class PatternNamespace:
     def __init__(self, module):
@@ -107,8 +116,8 @@ seven = six + 1
 seven_ = seven * 1
 eleven = seven_ + 4
 
-a, b, c = Variable('a'), Variable('b'), Variable('c')
-x, y, z = Variable('x'), Variable('y'), Variable('z')
+a, b, c = Variable("a"), Variable("b"), Variable("c")
+x, y, z = Variable("x"), Variable("y"), Variable("z")
 
 
 class Base(Concrete, Node):
@@ -146,12 +155,13 @@ def test_enode():
         node.args = (2, 3)
 
 
-def test_enode_roundtrip():
-    class MyNode(Concrete, Node):
-        a: int
-        b: int
-        c: str
+class MyNode(Concrete, Node):
+    a: int
+    b: int
+    c: str
 
+
+def test_enode_roundtrip():
     # create e-node from node
     node = MyNode(a=1, b=2, c="3")
     enode = ENode.from_node(node)
@@ -162,54 +172,61 @@ def test_enode_roundtrip():
     assert node_ == node
 
 
-def test_enode_roundtrip_with_variadic_arg():
-    class MyNode(Concrete, Node):
-        a: int
-        b: Tuple[int, ...]
+class MySecondNode(Concrete, Node):
+    a: int
+    b: tuple[int, ...]
 
+
+def test_enode_roundtrip_with_variadic_arg():
     # create e-node from node
-    node = MyNode(a=1, b=(2, 3))
+    node = MySecondNode(a=1, b=(2, 3))
     enode = ENode.from_node(node)
-    assert enode == ENode(MyNode, (1, (2, 3)))
+    assert enode == ENode(MySecondNode, (1, (2, 3)))
 
     # reconstruct node from e-node
     node_ = enode.to_node()
     assert node_ == node
+
+
+class MyInt(Concrete, Node):
+    value: int
+
+
+class MyThirdNode(Concrete, Node):
+    a: int
+    b: tuple[MyInt, ...]
 
 
 def test_enode_roundtrip_with_nested_arg():
-    class MyInt(Concrete, Node):
-        value: int
-
-    class MyNode(Concrete, Node):
-        a: int
-        b: Tuple[MyInt, ...]
-
     # create e-node from node
-    node = MyNode(a=1, b=(MyInt(value=2), MyInt(value=3)))
+    node = MyThirdNode(a=1, b=(MyInt(value=2), MyInt(value=3)))
     enode = ENode.from_node(node)
-    assert enode == ENode(MyNode, (1, (ENode(MyInt, (2,)), ENode(MyInt, (3,)))))
+    assert enode == ENode(MyThirdNode, (1, (ENode(MyInt, (2,)), ENode(MyInt, (3,)))))
 
     # reconstruct node from e-node
     node_ = enode.to_node()
     assert node_ == node
 
 
+class MyFourthNode(Concrete, Node):
+    pass
+
+
+class MyLit(MyFourthNode):
+    value: int
+
+
+class MyAdd(MyFourthNode):
+    a: MyFourthNode
+    b: MyFourthNode
+
+
+class MyMul(MyFourthNode):
+    a: MyFourthNode
+    b: MyFourthNode
+
+
 def test_disjoint_set_with_enode():
-    class MyNode(Concrete, Node):
-        pass
-
-    class MyLit(MyNode):
-        value: int
-
-    class MyAdd(MyNode):
-        a: MyNode
-        b: MyNode
-
-    class MyMul(MyNode):
-        a: MyNode
-        b: MyNode
-
     # number postfix highlights the depth of the node
     one = MyLit(value=1)
     two = MyLit(value=2)
@@ -301,8 +318,8 @@ def test_egraph_match_simple():
 
     enode = ENode.from_node(seven_.op())
     matches = res[enode]
-    assert matches['a'] == ENode.from_node(seven.op())
-    assert matches['lit'] == ENode.from_node(one.op())
+    assert matches["a"] == ENode.from_node(seven.op())
+    assert matches["lit"] == ENode.from_node(one.op())
 
 
 def test_egraph_match_wrong_argnum():
@@ -326,8 +343,8 @@ def test_egraph_match_wrong_argnum():
             0: ENode.from_node(four.op()),
             1: ENode.from_node(two.op()),
             2: ENode.from_node(one.op()),
-            'a': ENode.from_node(two.op()),
-            'b': ENode.from_node(one.op()),
+            "a": ENode.from_node(two.op()),
+            "b": ENode.from_node(one.op()),
         }
     }
     assert res == expected
@@ -347,8 +364,8 @@ def test_egraph_match_nested():
         matched: {
             0: matched,
             1: ENode.from_node(one.op()),
-            'a': ENode.from_node(seven.op()),
-            'b': dt.int8,
+            "a": ENode.from_node(seven.op()),
+            "b": dt.int8,
         }
     }
     assert result == expected
@@ -426,7 +443,7 @@ def test_egraph_rewrite_to_pattern():
 
 
 def test_egraph_rewrite_dynamic():
-    def applier(egraph, match, a, mul, times):
+    def applier(egraph, match, a, *_, **__):  # noqa: ARG001
         return ENode(ops.Add, (a, a))
 
     node = (one * 2).op()
@@ -460,7 +477,7 @@ def test_egraph_rewrite_commutative():
 
 
 @pytest.mark.parametrize(
-    ('node', 'expected'),
+    ("node", "expected"),
     [(Mul(Lit(0), Lit(42)), Lit(0)), (Add(Lit(0), Mul(Lit(1), Lit(2))), Lit(2))],
 )
 def test_egraph_rewrite(node, expected):
@@ -501,7 +518,7 @@ def test_math_associate_adds(benchmark):
     benchmark(is_equal, expr_a, expr_b, math_rules, iters=500)
 
 
-def replace_add(egraph, enode, **kwargs):
+def replace_add(egraph, enode, **_):
     node = egraph.extract(enode)
     enode = egraph.add(node)
     return enode

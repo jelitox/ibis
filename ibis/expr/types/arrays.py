@@ -1,22 +1,46 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Iterable
+import inspect
+from typing import TYPE_CHECKING
 
 from public import public
 
+import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
-from ibis.expr.types.generic import Column, Scalar, Value, literal
-from ibis.expr.types.typing import V
+from ibis.common.annotations import EMPTY
+from ibis.common.deferred import Deferred, deferrable
+from ibis.expr.types.generic import Column, Scalar, Value
 
 if TYPE_CHECKING:
-    import ibis.expr.datatypes as dt
+    from collections.abc import Callable, Iterable
+
     import ibis.expr.types as ir
+    from ibis.expr.types.typing import V
 
 import ibis.common.exceptions as com
 
 
 @public
 class ArrayValue(Value):
+    """An Array is a variable-length sequence of values of a single type.
+
+    Examples
+    --------
+    >>> import ibis
+    >>> ibis.options.interactive = True
+    >>> ibis.memtable({"a": [[1, None, 3], [4], [], None]})
+    ┏━━━━━━━━━━━━━━━━━━━━━━┓
+    ┃ a                    ┃
+    ┡━━━━━━━━━━━━━━━━━━━━━━┩
+    │ array<int64>         │
+    ├──────────────────────┤
+    │ [1, None, ... +1]    │
+    │ [4]                  │
+    │ []                   │
+    │ NULL                 │
+    └──────────────────────┘
+    """
+
     def length(self) -> ir.IntegerValue:
         """Compute the length of an array.
 
@@ -64,10 +88,10 @@ class ArrayValue(Value):
         Returns
         -------
         Value
-            - If `index` is an [`int`][int] or
-              [`IntegerValue`][ibis.expr.types.IntegerValue] then the return
-              type is the element type of `self`.
-            - If `index` is a [`slice`][slice] then the return type is the same
+            - If `index` is an [](`int`) or
+              [`IntegerValue`](./expression-numeric.qmd#ibis.expr.types.IntegerValue)
+              then the return type is the element type of `self`.
+            - If `index` is a [](`slice`) then the return type is the same
               type as the input.
 
         Examples
@@ -118,31 +142,33 @@ class ArrayValue(Value):
             step = index.step
 
             if step is not None and step != 1:
-                raise NotImplementedError('step can only be 1')
+                raise NotImplementedError("step can only be 1")
 
             op = ops.ArraySlice(self, start if start is not None else 0, stop)
         else:
             op = ops.ArrayIndex(self, index)
         return op.to_expr()
 
-    def __add__(self, other: ArrayValue) -> ArrayValue:
-        """Concatenate this array with another.
+    def concat(self, other: ArrayValue, /, *args: ArrayValue) -> ArrayValue:
+        """Concatenate this array with one or more arrays.
 
         Parameters
         ----------
         other
-            Array to concat with `self`
+            Other array to concat with `self`
+        args
+            Other arrays to concat with `self`
 
         Returns
         -------
         ArrayValue
-            `self` concatenated with `other`
+            `self` concatenated with `other` and `args`
 
         Examples
         --------
         >>> import ibis
         >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({"a": [[7], [3] , None]})
+        >>> t = ibis.memtable({"a": [[7], [3], None]})
         >>> t
         ┏━━━━━━━━━━━━━━━━━━━━━━┓
         ┃ a                    ┃
@@ -153,9 +179,9 @@ class ArrayValue(Value):
         │ [3]                  │
         │ NULL                 │
         └──────────────────────┘
-        >>> t.a + t.a
+        >>> t.a.concat(t.a)
         ┏━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ ArrayConcat(a, a)    ┃
+        ┃ ArrayConcat((a, a))  ┃
         ┡━━━━━━━━━━━━━━━━━━━━━━┩
         │ array<int64>         │
         ├──────────────────────┤
@@ -163,61 +189,49 @@ class ArrayValue(Value):
         │ [3, 3]               │
         │ NULL                 │
         └──────────────────────┘
-        >>> t.a + ibis.literal([4], type="array<int64>")
-        ┏━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ ArrayConcat(a, (4,)) ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━┩
-        │ array<int64>         │
-        ├──────────────────────┤
-        │ [7, 4]               │
-        │ [3, 4]               │
-        │ [4]                  │
-        └──────────────────────┘
+        >>> t.a.concat(ibis.literal([4], type="array<int64>"))
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayConcat((a, (4,))) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<int64>           │
+        ├────────────────────────┤
+        │ [7, 4]                 │
+        │ [3, 4]                 │
+        │ NULL                   │
+        └────────────────────────┘
+
+        `concat` is also available using the `+` operator
+
+        >>> [1] + t.a
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayConcat(((1,), a)) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<int64>           │
+        ├────────────────────────┤
+        │ [1, 7]                 │
+        │ [1, 3]                 │
+        │ NULL                   │
+        └────────────────────────┘
+        >>> t.a + [1]
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayConcat((a, (1,))) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<int64>           │
+        ├────────────────────────┤
+        │ [7, 1]                 │
+        │ [3, 1]                 │
+        │ NULL                   │
+        └────────────────────────┘
         """
-        return ops.ArrayConcat(self, other).to_expr()
+        return ops.ArrayConcat((self, other, *args)).to_expr()
+
+    def __add__(self, other: ArrayValue) -> ArrayValue:
+        return self.concat(other)
 
     def __radd__(self, other: ArrayValue) -> ArrayValue:
-        """Concatenate this array with another.
+        return ops.ArrayConcat((other, self)).to_expr()
 
-        Parameters
-        ----------
-        other
-            Array to concat with `self`
-
-        Returns
-        -------
-        ArrayValue
-            `self` concatenated with `other`
-
-        Examples
-        --------
-        >>> import ibis
-        >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({"a": [[7], [3] , None]})
-        >>> t
-        ┏━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ a                    ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━┩
-        │ array<int64>         │
-        ├──────────────────────┤
-        │ [7]                  │
-        │ [3]                  │
-        │ NULL                 │
-        └──────────────────────┘
-        >>> ibis.literal([4], type="array<int64>") + t.a
-        ┏━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ ArrayConcat((4,), a) ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━┩
-        │ array<int64>         │
-        ├──────────────────────┤
-        │ [4, 7]               │
-        │ [4, 3]               │
-        │ [4]                  │
-        └──────────────────────┘
-        """
-        return ops.ArrayConcat(other, self).to_expr()
-
-    def __mul__(self, n: int | ir.IntegerValue) -> ArrayValue:
+    def repeat(self, n: int | ir.IntegerValue, /) -> ArrayValue:
         """Repeat this array `n` times.
 
         Parameters
@@ -234,7 +248,7 @@ class ArrayValue(Value):
         --------
         >>> import ibis
         >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({"a": [[7], [3] , None]})
+        >>> t = ibis.memtable({"a": [[7], [3], None]})
         >>> t
         ┏━━━━━━━━━━━━━━━━━━━━━━┓
         ┃ a                    ┃
@@ -245,7 +259,7 @@ class ArrayValue(Value):
         │ [3]                  │
         │ NULL                 │
         └──────────────────────┘
-        >>> t.a * 2
+        >>> t.a.repeat(2)
         ┏━━━━━━━━━━━━━━━━━━━━━━┓
         ┃ ArrayRepeat(a, 2)    ┃
         ┡━━━━━━━━━━━━━━━━━━━━━━┩
@@ -255,37 +269,9 @@ class ArrayValue(Value):
         │ [3, 3]               │
         │ []                   │
         └──────────────────────┘
-        """
-        return ops.ArrayRepeat(self, n).to_expr()
 
-    def __rmul__(self, n: int | ir.IntegerValue) -> ArrayValue:
-        """Repeat this array `n` times.
+        `repeat` is also available using the `*` operator
 
-        Parameters
-        ----------
-        n
-            Number of times to repeat `self`.
-
-        Returns
-        -------
-        ArrayValue
-            `self` repeated `n` times
-
-        Examples
-        --------
-        >>> import ibis
-        >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({"a": [[7], [3] , None]})
-        >>> t
-        ┏━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ a                    ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━┩
-        │ array<int64>         │
-        ├──────────────────────┤
-        │ [7]                  │
-        │ [3]                  │
-        │ NULL                 │
-        └──────────────────────┘
         >>> 2 * t.a
         ┏━━━━━━━━━━━━━━━━━━━━━━┓
         ┃ ArrayRepeat(a, 2)    ┃
@@ -299,16 +285,31 @@ class ArrayValue(Value):
         """
         return ops.ArrayRepeat(self, n).to_expr()
 
-    def unnest(self) -> ir.Value:
-        """Flatten an array into a column.
+    __mul__ = __rmul__ = repeat
 
-        !!! note "This operation changes the cardinality of the result"
+    def unnest(self) -> ir.Value:
+        """Unnest an array into a column.
+
+        ::: {.callout-note}
+        ## Empty arrays and `NULL`s are dropped in the output.
+        To preserve empty arrays as `NULL`s as well as existing `NULL` values,
+        use [`Table.unnest`](./expression-tables.qmd#ibis.expr.types.relations.Table.unnest).
+        :::
+
+        Returns
+        -------
+        ir.Value
+            Unnested array
+
+        See Also
+        --------
+        [`Table.unnest`](./expression-tables.qmd#ibis.expr.types.relations.Table.unnest)
 
         Examples
         --------
         >>> import ibis
         >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({"a": [[7, 42], [3, 3] , None]})
+        >>> t = ibis.memtable({"a": [[7, 42], [3, 3], None]})
         >>> t
         ┏━━━━━━━━━━━━━━━━━━━━━━┓
         ┃ a                    ┃
@@ -330,11 +331,6 @@ class ArrayValue(Value):
         │     3 │
         │     3 │
         └───────┘
-
-        Returns
-        -------
-        ir.Value
-            Unnested array
         """
         expr = ops.Unnest(self).to_expr()
         try:
@@ -342,7 +338,7 @@ class ArrayValue(Value):
         except com.ExpressionError:
             return expr
 
-    def join(self, sep: str | ir.StringValue) -> ir.StringValue:
+    def join(self, sep: str | ir.StringValue, /) -> ir.StringValue:
         """Join the elements of this array expression with `sep`.
 
         Parameters
@@ -373,7 +369,7 @@ class ArrayValue(Value):
         └──────────────────────┘
         >>> t.arr.join("|")
         ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ ArrayStringJoin('|', arr) ┃
+        ┃ ArrayStringJoin(arr, '|') ┃
         ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
         │ string                    │
         ├───────────────────────────┤
@@ -385,17 +381,60 @@ class ArrayValue(Value):
 
         See Also
         --------
-        [`StringValue.join`][ibis.expr.types.strings.StringValue.join]
+        [`StringValue.join`](./expression-strings.qmd#ibis.expr.types.strings.StringValue.join)
         """
-        return ops.ArrayStringJoin(sep, self).to_expr()
+        return ops.ArrayStringJoin(self, sep=sep).to_expr()
 
-    def map(self, func: Callable[[ir.Value], ir.Value]) -> ir.ArrayValue:
-        """Apply a callable `func` to each element of this array expression.
+    def _construct_array_func_inputs(self, func):
+        if isinstance(func, Deferred):
+            name = "_"
+            index = None
+            resolve = func.resolve
+        elif callable(func):
+            names = (
+                key
+                for key, value in inspect.signature(func).parameters.items()
+                # arg is already bound
+                if value.default is EMPTY
+            )
+            name = next(names)
+            index = next(names, None)
+            resolve = func
+        else:
+            raise TypeError(
+                f"function must be a Deferred or Callable, got `{type(func).__name__}`"
+            )
+
+        shape = self.op().shape
+        parameter = ops.Argument(name=name, shape=shape, dtype=self.type().value_type)
+
+        kwargs = {name: parameter.to_expr()}
+
+        if index is not None:
+            index_arg = ops.Argument(name=index, shape=shape, dtype=dt.int64)
+            kwargs[index] = index_arg.to_expr()
+            index = index_arg
+
+        body = resolve(**kwargs)
+        return parameter, index, body
+
+    def map(
+        self,
+        func: Deferred
+        | Callable[[ir.Value], ir.Value]
+        | Callable[[ir.Value, ir.Value], ir.Value],
+        /,
+    ) -> ir.ArrayValue:
+        """Apply a `func` or `Deferred` to each element of this array expression.
 
         Parameters
         ----------
         func
-            Function to apply to each element of this array
+            Function or `Deferred` to apply to each element of this array.
+
+            Callables must accept one or two arguments. If there are two
+            arguments, the second argument is the **zero**-based index of each
+            element of the array.
 
         Returns
         -------
@@ -405,6 +444,7 @@ class ArrayValue(Value):
         Examples
         --------
         >>> import ibis
+        >>> from ibis import _
         >>> ibis.options.interactive = True
         >>> t = ibis.memtable({"a": [[1, None, 2], [4], []]})
         >>> t
@@ -417,26 +457,95 @@ class ArrayValue(Value):
         │ [4]                  │
         │ []                   │
         └──────────────────────┘
-        >>> t.a.map(lambda x: (x + 100).cast("float"))
-        ┏━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ ArrayMap(a)           ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━━┩
-        │ array<float64>        │
-        ├───────────────────────┤
-        │ [101.0, None, ... +1] │
-        │ [104.0]               │
-        │ []                    │
-        └───────────────────────┘
-        """
-        return ops.ArrayMap(self, func=func).to_expr()
 
-    def filter(self, predicate: Callable[[ir.Value], ir.BooleanValue]) -> ir.ArrayValue:
-        """Filter array elements using `predicate`.
+        The most succinct way to use `map` is with `Deferred` expressions:
+
+        >>> t.a.map((_ + 100).cast("float"))
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayMap(a, Cast(Add(_, 100), float64), _) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<float64>                             │
+        ├────────────────────────────────────────────┤
+        │ [101.0, None, ... +1]                      │
+        │ [104.0]                                    │
+        │ []                                         │
+        └────────────────────────────────────────────┘
+
+        You can also use `map` with a lambda function:
+
+        >>> t.a.map(lambda x: (x + 100).cast("float"))
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayMap(a, Cast(Add(x, 100), float64), x) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<float64>                             │
+        ├────────────────────────────────────────────┤
+        │ [101.0, None, ... +1]                      │
+        │ [104.0]                                    │
+        │ []                                         │
+        └────────────────────────────────────────────┘
+
+        `.map()` also supports more complex callables like `functools.partial`
+        and `lambda`s with closures
+
+        >>> from functools import partial
+        >>> def add(x, y):
+        ...     return x + y
+        >>> add2 = partial(add, y=2)
+        >>> t.a.map(add2)
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayMap(a, Add(x, 2), x) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<int64>              │
+        ├───────────────────────────┤
+        │ [3, None, ... +1]         │
+        │ [6]                       │
+        │ []                        │
+        └───────────────────────────┘
+        >>> y = 2
+        >>> t.a.map(lambda x: x + y)
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayMap(a, Add(x, 2), x) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<int64>              │
+        ├───────────────────────────┤
+        │ [3, None, ... +1]         │
+        │ [6]                       │
+        │ []                        │
+        └───────────────────────────┘
+
+        You can optionally include a second index argument in the mapped function
+
+        >>> t.a.map(lambda x, i: i % 2)
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayMap(a, Modulus(i, 2), x, i) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<int64>                     │
+        ├──────────────────────────────────┤
+        │ [0, 1, ... +1]                   │
+        │ [0]                              │
+        │ []                               │
+        └──────────────────────────────────┘
+        """
+        param, index, body = self._construct_array_func_inputs(func)
+        return ops.ArrayMap(self, param=param, index=index, body=body).to_expr()
+
+    def filter(
+        self,
+        predicate: Deferred
+        | Callable[[ir.Value], bool | ir.BooleanValue]
+        | Callable[[ir.Value, ir.IntegerValue], bool | ir.BooleanValue],
+        /,
+    ) -> ir.ArrayValue:
+        """Filter array elements using `predicate` function or `Deferred`.
 
         Parameters
         ----------
         predicate
-            Function to use to filter array elements
+            Function or `Deferred` to use to filter array elements.
+
+            Callables must accept one or two arguments. If there are two
+            arguments, the second argument is the **zero**-based index of each
+            element of the array.
 
         Returns
         -------
@@ -446,6 +555,7 @@ class ArrayValue(Value):
         Examples
         --------
         >>> import ibis
+        >>> from ibis import _
         >>> ibis.options.interactive = True
         >>> t = ibis.memtable({"a": [[1, None, 2], [4], []]})
         >>> t
@@ -458,20 +568,79 @@ class ArrayValue(Value):
         │ [4]                  │
         │ []                   │
         └──────────────────────┘
-        >>> t.a.filter(lambda x: x > 1)
-        ┏━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ ArrayFilter(a)       ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━┩
-        │ array<int64>         │
-        ├──────────────────────┤
-        │ [2]                  │
-        │ [4]                  │
-        │ []                   │
-        └──────────────────────┘
-        """
-        return ops.ArrayFilter(self, func=predicate).to_expr()
 
-    def contains(self, other: ir.Value) -> ir.BooleanValue:
+        The most succinct way to use `filter` is with `Deferred` expressions:
+
+        >>> t.a.filter(_ > 1)
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayFilter(a, Greater(_, 1), _) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<int64>                     │
+        ├──────────────────────────────────┤
+        │ [2]                              │
+        │ [4]                              │
+        │ []                               │
+        └──────────────────────────────────┘
+
+        You can also use `filter` with a lambda function:
+
+        >>> t.a.filter(lambda x: x > 1)
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayFilter(a, Greater(x, 1), x) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<int64>                     │
+        ├──────────────────────────────────┤
+        │ [2]                              │
+        │ [4]                              │
+        │ []                               │
+        └──────────────────────────────────┘
+
+        `.filter()` also supports more complex callables like `functools.partial`
+        and `lambda`s with closures
+
+        >>> from functools import partial
+        >>> def gt(x, y):
+        ...     return x > y
+        >>> gt1 = partial(gt, y=1)
+        >>> t.a.filter(gt1)
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayFilter(a, Greater(x, 1), x) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<int64>                     │
+        ├──────────────────────────────────┤
+        │ [2]                              │
+        │ [4]                              │
+        │ []                               │
+        └──────────────────────────────────┘
+        >>> y = 1
+        >>> t.a.filter(lambda x: x > y)
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayFilter(a, Greater(x, 1), x) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<int64>                     │
+        ├──────────────────────────────────┤
+        │ [2]                              │
+        │ [4]                              │
+        │ []                               │
+        └──────────────────────────────────┘
+
+        You can optionally include a second index argument in the predicate function
+
+        >>> t.a.filter(lambda x, i: i % 4 == 0)
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayFilter(a, Equals(Modulus(i, 4), 0), x, i) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<int64>                                   │
+        ├────────────────────────────────────────────────┤
+        │ [1]                                            │
+        │ [4]                                            │
+        │ []                                             │
+        └────────────────────────────────────────────────┘
+        """
+        param, index, body = self._construct_array_func_inputs(predicate)
+        return ops.ArrayFilter(self, param=param, index=index, body=body).to_expr()
+
+    def contains(self, other: ir.Value, /) -> ir.BooleanValue:
         """Return whether the array contains `other`.
 
         Parameters
@@ -525,7 +694,7 @@ class ArrayValue(Value):
         """
         return ops.ArrayContains(self, other).to_expr()
 
-    def index(self, other: ir.Value) -> ir.IntegerValue:
+    def index(self, other: ir.Value, /) -> ir.IntegerValue:
         """Return the position of `other` in an array.
 
         Parameters
@@ -590,7 +759,7 @@ class ArrayValue(Value):
         """
         return ops.ArrayPosition(self, other).to_expr()
 
-    def remove(self, other: ir.Value) -> ir.ArrayValue:
+    def remove(self, other: ir.Value, /) -> ir.ArrayValue:
         """Remove `other` from `self`.
 
         Parameters
@@ -633,7 +802,9 @@ class ArrayValue(Value):
     def unique(self) -> ir.ArrayValue:
         """Return the unique values in an array.
 
-        !!! note "Element ordering in array may not be retained."
+        ::: {.callout-note}
+        ## Element ordering in array may not be retained.
+        :::
 
         Returns
         -------
@@ -644,18 +815,7 @@ class ArrayValue(Value):
         --------
         >>> import ibis
         >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({"arr": [[1, 3, 3], [], [42, 42], None]})
-        >>> t
-        ┏━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ arr                  ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━┩
-        │ array<int64>         │
-        ├──────────────────────┤
-        │ [1, 3, ... +1]       │
-        │ []                   │
-        │ [42, 42]             │
-        │ NULL                 │
-        └──────────────────────┘
+        >>> t = ibis.memtable({"arr": [[1, 3, 3], [], [42, 42, None], None]})
         >>> t.arr.unique()
         ┏━━━━━━━━━━━━━━━━━━━━━━┓
         ┃ ArrayDistinct(arr)   ┃
@@ -664,7 +824,7 @@ class ArrayValue(Value):
         ├──────────────────────┤
         │ [3, 1]               │
         │ []                   │
-        │ [42]                 │
+        │ [42, None]           │
         │ NULL                 │
         └──────────────────────┘
         """
@@ -708,7 +868,7 @@ class ArrayValue(Value):
         """
         return ops.ArraySort(self).to_expr()
 
-    def union(self, other: ir.ArrayValue) -> ir.ArrayValue:
+    def union(self, other: ir.ArrayValue, /) -> ir.ArrayValue:
         """Union two arrays.
 
         Parameters
@@ -743,7 +903,7 @@ class ArrayValue(Value):
         │ array<int64>           │
         ├────────────────────────┤
         │ [1, 2, ... +1]         │
-        │ []                     │
+        │ [None]                 │
         │ [5]                    │
         └────────────────────────┘
         >>> t.arr1.union(t.arr2).contains(3)
@@ -759,7 +919,48 @@ class ArrayValue(Value):
         """
         return ops.ArrayUnion(self, other).to_expr()
 
-    def zip(self, other: ir.Array, *others: ir.Array) -> ir.Array:
+    def intersect(self, other: ArrayValue, /) -> ArrayValue:
+        """Intersect two arrays.
+
+        Parameters
+        ----------
+        other
+            Another array to intersect with `self`
+
+        Returns
+        -------
+        ArrayValue
+            Intersected arrays
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable({"arr1": [[3, 2], [], None], "arr2": [[1, 3], [None], [5]]})
+        >>> t
+        ┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ arr1                 ┃ arr2                 ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<int64>         │ array<int64>         │
+        ├──────────────────────┼──────────────────────┤
+        │ [3, 2]               │ [1, 3]               │
+        │ []                   │ [None]               │
+        │ NULL                 │ [5]                  │
+        └──────────────────────┴──────────────────────┘
+        >>> t.arr1.intersect(t.arr2)
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayIntersect(arr1, arr2) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<int64>               │
+        ├────────────────────────────┤
+        │ [3]                        │
+        │ []                         │
+        │ NULL                       │
+        └────────────────────────────┘
+        """
+        return ops.ArrayIntersect(self, other).to_expr()
+
+    def zip(self, other: ArrayValue, /, *others: ArrayValue) -> ArrayValue:
         """Zip two or more arrays together.
 
         Parameters
@@ -773,13 +974,19 @@ class ArrayValue(Value):
         -------
         Array
             Array of structs where each struct field is an element of each input
-            array.
+            array. The fields are named `f1`, `f2`, `f3`, etc.
 
         Examples
         --------
         >>> import ibis
         >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({"numbers": [[3, 2], [], None], "strings": [["a", "c"], None, ["e"]]})
+        >>> ibis.options.repr.interactive.max_depth = 2
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "numbers": [[3, 2], [6, 7], [], None],
+        ...         "strings": [["a", "c"], ["d"], [], ["x", "y"]],
+        ...     }
+        ... )
         >>> t
         ┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┓
         ┃ numbers              ┃ strings              ┃
@@ -787,33 +994,384 @@ class ArrayValue(Value):
         │ array<int64>         │ array<string>        │
         ├──────────────────────┼──────────────────────┤
         │ [3, 2]               │ ['a', 'c']           │
-        │ []                   │ NULL                 │
-        │ NULL                 │ ['e']                │
+        │ [6, 7]               │ ['d']                │
+        │ []                   │ []                   │
+        │ NULL                 │ ['x', 'y']           │
         └──────────────────────┴──────────────────────┘
-        >>> expr = t.numbers.zip(t.strings)
-        >>> expr
-        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ ArrayZip()                           ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-        │ array<struct<f1: int64, f2: string>> │
-        ├──────────────────────────────────────┤
-        │ [{...}, {...}]                       │
-        │ []                                   │
-        │ [{...}]                              │
-        └──────────────────────────────────────┘
-        >>> expr.unnest()
-        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ ArrayZip()                    ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-        │ struct<f1: int64, f2: string> │
-        ├───────────────────────────────┤
-        │ {'f1': 3, 'f2': 'a'}          │
-        │ {'f1': 2, 'f2': 'c'}          │
-        │ {'f1': None, 'f2': 'e'}       │
-        └───────────────────────────────┘
+        >>> t.numbers.zip(t.strings)
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayZip((numbers, strings))                  ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<struct<f1: int64, f2: string>>          │
+        ├───────────────────────────────────────────────┤
+        │ [{'f1': 3, 'f2': 'a'}, {'f1': 2, 'f2': 'c'}]  │
+        │ [{'f1': 6, 'f2': 'd'}, {'f1': 7, 'f2': None}] │
+        │ []                                            │
+        │ NULL                                          │
+        └───────────────────────────────────────────────┘
         """
 
         return ops.ArrayZip((self, other, *others)).to_expr()
+
+    def flatten(self) -> ir.ArrayValue:
+        """Remove one level of nesting from an array expression.
+
+        Returns
+        -------
+        ArrayValue
+            Flattened array expression
+
+        Examples
+        --------
+        >>> import ibis
+        >>> import ibis.selectors as s
+        >>> from ibis import _
+        >>> ibis.options.interactive = True
+        >>> schema = {
+        ...     "empty": "array<array<int>>",
+        ...     "happy": "array<array<string>>",
+        ...     "nulls_only": "array<array<struct<a: array<string>>>>",
+        ...     "mixed_nulls": "array<array<string>>",
+        ... }
+        >>> data = {
+        ...     "empty": [[], [], []],
+        ...     "happy": [[["abc"]], [["bcd"]], [["def"]]],
+        ...     "nulls_only": [None, None, None],
+        ...     "mixed_nulls": [[], None, [None]],
+        ... }
+        >>> import pyarrow as pa
+        >>> t = ibis.memtable(
+        ...     pa.Table.from_pydict(
+        ...         data,
+        ...         schema=ibis.schema(schema).to_pyarrow(),
+        ...     )
+        ... )
+        >>> t
+        ┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━┓
+        ┃ empty                ┃ happy                ┃ nulls_only ┃ … ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━┩
+        │ array<array<int64>>  │ array<array<string>> │ array<arr… │ … │
+        ├──────────────────────┼──────────────────────┼────────────┼───┤
+        │ []                   │ [[...]]              │ NULL       │ … │
+        │ []                   │ [[...]]              │ NULL       │ … │
+        │ []                   │ [[...]]              │ NULL       │ … │
+        └──────────────────────┴──────────────────────┴────────────┴───┘
+        >>> t.empty.flatten()
+        ┏━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayFlatten(empty)  ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<int64>         │
+        ├──────────────────────┤
+        │ []                   │
+        │ []                   │
+        │ []                   │
+        └──────────────────────┘
+        >>> t.happy.flatten()
+        ┏━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayFlatten(happy)  ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<string>        │
+        ├──────────────────────┤
+        │ ['abc']              │
+        │ ['bcd']              │
+        │ ['def']              │
+        └──────────────────────┘
+        >>> t.nulls_only.flatten()
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayFlatten(nulls_only) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<struct<a: array<s… │
+        ├──────────────────────────┤
+        │ NULL                     │
+        │ NULL                     │
+        │ NULL                     │
+        └──────────────────────────┘
+        >>> t.mixed_nulls.flatten()
+        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+        ┃ ArrayFlatten(mixed_nulls) ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+        │ array<string>             │
+        ├───────────────────────────┤
+        │ []                        │
+        │ NULL                      │
+        │ []                        │
+        └───────────────────────────┘
+        >>> t.select(s.across(s.all(), _.flatten()))
+        ┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━┓
+        ┃ empty                ┃ happy                ┃ nulls_only ┃ … ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━┩
+        │ array<int64>         │ array<string>        │ array<str… │ … │
+        ├──────────────────────┼──────────────────────┼────────────┼───┤
+        │ []                   │ ['abc']              │ NULL       │ … │
+        │ []                   │ ['bcd']              │ NULL       │ … │
+        │ []                   │ ['def']              │ NULL       │ … │
+        └──────────────────────┴──────────────────────┴────────────┴───┘
+        """
+        return ops.ArrayFlatten(self).to_expr()
+
+    def anys(self) -> ir.BooleanValue:
+        """Return whether any element in the array is true.
+
+        Returns NULL if the array is empty or contains only NULLs.
+
+        See Also
+        --------
+        [`BooleanColumn.any`](./expression-numeric.qmd#ibis.expr.types.logical.BooleanColumn.any)
+
+        Returns
+        -------
+        BooleanValue
+            Whether any element in the array is true
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "arr": [
+        ...             [True, False],
+        ...             [False],
+        ...             [True],
+        ...             [None, False],
+        ...             [None, True],
+        ...             [None],
+        ...             [],
+        ...             None,
+        ...         ]
+        ...     }
+        ... )
+        >>> t.mutate(x=t.arr.anys())
+        ┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┓
+        ┃ arr                  ┃ x       ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━┩
+        │ array<boolean>       │ boolean │
+        ├──────────────────────┼─────────┤
+        │ [True, False]        │ True    │
+        │ [False]              │ False   │
+        │ [True]               │ True    │
+        │ [None, False]        │ False   │
+        │ [None, True]         │ True    │
+        │ [None]               │ NULL    │
+        │ []                   │ NULL    │
+        │ NULL                 │ NULL    │
+        └──────────────────────┴─────────┘
+        """
+        return ops.ArrayAny(self).to_expr()
+
+    def alls(self) -> ir.BooleanValue:
+        """Return whether all elements (ignoring nulls) in the array are true.
+
+        Returns NULL if the array is empty or contains only NULLs.
+
+        See Also
+        --------
+        [`BooleanColumn.all`](./expression-numeric.qmd#ibis.expr.types.logical.BooleanColumn.all)
+
+        Returns
+        -------
+        BooleanValue
+            Whether all elements (ignoring nulls) in the array are true.
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {
+        ...         "id": range(8),
+        ...         "arr": [
+        ...             [True, False],
+        ...             [False],
+        ...             [True],
+        ...             [None, False],
+        ...             [None, True],
+        ...             [None],
+        ...             [],
+        ...             None,
+        ...         ],
+        ...     }
+        ... )
+        >>> t.mutate(x=t.arr.alls()).order_by("id")
+        ┏━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┓
+        ┃ id    ┃ arr                  ┃ x       ┃
+        ┡━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━┩
+        │ int64 │ array<boolean>       │ boolean │
+        ├───────┼──────────────────────┼─────────┤
+        │     0 │ [True, False]        │ False   │
+        │     1 │ [False]              │ False   │
+        │     2 │ [True]               │ True    │
+        │     3 │ [None, False]        │ False   │
+        │     4 │ [None, True]         │ True    │
+        │     5 │ [None]               │ NULL    │
+        │     6 │ []                   │ NULL    │
+        │     7 │ NULL                 │ NULL    │
+        └───────┴──────────────────────┴─────────┘
+        """
+        return ops.ArrayAll(self).to_expr()
+
+    def modes(self) -> ir.Value:
+        """Return the mode of the values in the array.
+
+        See Also
+        --------
+        [`Column.mode`](./expression-generic.qmd#ibis.expr.types.generic.Column.mode)
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable({"arr": [[1, 2, 3, 3], [None, 6], [None], [], None]})
+        >>> t.mutate(mode=t.arr.modes())
+        ┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━┓
+        ┃ arr                  ┃ mode  ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━┩
+        │ array<int64>         │ int64 │
+        ├──────────────────────┼───────┤
+        │ [1, 2, ... +2]       │     3 │
+        │ [None, 6]            │     6 │
+        │ [None]               │  NULL │
+        │ []                   │  NULL │
+        │ NULL                 │  NULL │
+        └──────────────────────┴───────┘
+        """
+        return ops.ArrayMode(self).to_expr()
+
+    def mins(self) -> ir.NumericValue:
+        """Return the minimum value in the array.
+
+        Returns NULL if the array is empty or contains only NULLs.
+
+        See Also
+        --------
+        [`Column.min`](./expression-generic.qmd#ibis.expr.types.generic.Column.min)
+
+        Returns
+        -------
+        Value
+            Minimum value in the array
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable({"arr": [[1, 2, 3], [None, 6], [None], [], None]})
+        >>> t.mutate(x=t.arr.mins())
+        ┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━┓
+        ┃ arr                  ┃ x     ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━┩
+        │ array<int64>         │ int64 │
+        ├──────────────────────┼───────┤
+        │ [1, 2, ... +1]       │     1 │
+        │ [None, 6]            │     6 │
+        │ [None]               │  NULL │
+        │ []                   │  NULL │
+        │ NULL                 │  NULL │
+        └──────────────────────┴───────┘
+        """
+        return ops.ArrayMin(self).to_expr()
+
+    def maxs(self) -> ir.NumericValue:
+        """Return the maximum value in the array.
+
+        Returns NULL if the array is empty or contains only NULLs.
+
+        See Also
+        --------
+        [`Column.max`](./expression-generic.qmd#ibis.expr.types.generic.Column.max)
+
+        Returns
+        -------
+        Value
+            Maximum value in the array
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable({"arr": [[1, 2, 3], [None, 6], [None], [], None]})
+        >>> t.mutate(x=t.arr.maxs())
+        ┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━┓
+        ┃ arr                  ┃ x     ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━┩
+        │ array<int64>         │ int64 │
+        ├──────────────────────┼───────┤
+        │ [1, 2, ... +1]       │     3 │
+        │ [None, 6]            │     6 │
+        │ [None]               │  NULL │
+        │ []                   │  NULL │
+        │ NULL                 │  NULL │
+        └──────────────────────┴───────┘
+        """
+        return ops.ArrayMax(self).to_expr()
+
+    def sums(self) -> ir.NumericValue:
+        """Return the sum of the values in the array.
+
+        Returns NULL if the array is empty or contains only NULLs.
+
+        See Also
+        --------
+        [`NumericColumn.sum`](./expression-numeric.qmd#ibis.expr.types.numeric.NumericColumn.sum)
+
+        Returns
+        -------
+        Value
+            Sum of the values in the array
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable({"arr": [[1, 2, 3], [None, 6], [None], [], None]})
+        >>> t.mutate(x=t.arr.sums())
+        ┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━┓
+        ┃ arr                  ┃ x     ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━┩
+        │ array<int64>         │ int64 │
+        ├──────────────────────┼───────┤
+        │ [1, 2, ... +1]       │     6 │
+        │ [None, 6]            │     6 │
+        │ [None]               │  NULL │
+        │ []                   │  NULL │
+        │ NULL                 │  NULL │
+        └──────────────────────┴───────┘
+        """
+        return ops.ArraySum(self).to_expr()
+
+    def means(self) -> ir.FloatingValue:
+        """Return the mean of the values in the array.
+
+        Returns NULL if the array is empty or contains only NULLs.
+
+        See Also
+        --------
+        [`NumericColumn.mean`](./expression-numeric.qmd#ibis.expr.types.numeric.NumericColumn.mean)
+
+        Returns
+        -------
+        Value
+            Mean of the values in the array
+
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable({"arr": [[1, 2, 3], [None, 6], [None], [], None]})
+        >>> t.mutate(x=t.arr.means())
+        ┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┓
+        ┃ arr                  ┃ x       ┃
+        ┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━┩
+        │ array<int64>         │ float64 │
+        ├──────────────────────┼─────────┤
+        │ [1, 2, ... +1]       │     2.0 │
+        │ [None, 6]            │     6.0 │
+        │ [None]               │    NULL │
+        │ []                   │    NULL │
+        │ NULL                 │    NULL │
+        └──────────────────────┴─────────┘
+        """
+        return ops.ArrayMean(self).to_expr()
 
 
 @public
@@ -823,85 +1381,62 @@ class ArrayScalar(Scalar, ArrayValue):
 
 @public
 class ArrayColumn(Column, ArrayValue):
-    pass
+    def __getitem__(self, index: int | ir.IntegerValue | slice) -> ir.Column:
+        return ArrayValue.__getitem__(self, index)
 
 
 @public
-def array(values: Iterable[V], type: str | dt.DataType | None = None) -> ArrayValue:
+@deferrable
+def array(values: Iterable[V], /) -> ArrayValue:
     """Create an array expression.
 
-    If the input expressions are all column expressions, then the output will
-    be an `ArrayColumn`. The input columns will be concatenated row-wise to
-    produce each array in the output array column. Each array will have length
-    _n_, where _n_ is the number of input columns. All input columns should be
-    of the same datatype.
-
-    If the input expressions are Python literals, then the output will be a
-    single `ArrayScalar` of length _n_, where _n_ is the number of input
-    values. This is equivalent to
-
-    ```python
-    values = [1, 2, 3]
-    ibis.literal(values)
-    ```
+    If any values are [column expressions](../concepts/datatypes.qmd) the
+    result will be a column. Otherwise the result will be a
+    [scalar](../concepts/datatypes.qmd).
 
     Parameters
     ----------
     values
-        An iterable of Ibis expressions or a list of Python literals
-    type
-        An instance of `ibis.expr.datatypes.DataType` or a string indicating
-        the ibis type of `value`.
+        An iterable of Ibis expressions or Python literals
 
     Returns
     -------
     ArrayValue
-        An array column (if the inputs are column expressions), or an array
-        scalar (if the inputs are Python literals)
 
     Examples
     --------
-    Create an array column from column expressions
+    Create an array scalar from scalar values
 
     >>> import ibis
     >>> ibis.options.interactive = True
-    >>> t = ibis.memtable({'a': [1, 2, 3], 'b': [4, 5, 6]})
-    >>> ibis.array([t.a, t.b])
+    >>> ibis.array([1.0, None])
+    ┌─────────────┐
+    │ [1.0, None] │
+    └─────────────┘
+
+    Create an array from column and scalar expressions
+
+    >>> t = ibis.memtable({"a": [1, 2, 3], "b": [4, 5, 6]})
+    >>> ibis.array([t.a, 42, ibis.literal(None)])
     ┏━━━━━━━━━━━━━━━━━━━━━━┓
-    ┃ ArrayColumn()        ┃
+    ┃ Array((a, 42, None)) ┃
     ┡━━━━━━━━━━━━━━━━━━━━━━┩
     │ array<int64>         │
     ├──────────────────────┤
-    │ [1, 4]               │
-    │ [2, 5]               │
-    │ [3, 6]               │
+    │ [1, 42, ... +1]      │
+    │ [2, 42, ... +1]      │
+    │ [3, 42, ... +1]      │
     └──────────────────────┘
 
-    Create an array scalar from Python literals
-
-    >>> ibis.array([1.0, 2.0, 3.0])
-    [1.0, 2.0, 3.0]
-
-    Mixing scalar and column expressions is not allowed
-
-    >>> ibis.array([t.a, 1.0])
-    Traceback (most recent call last):
-        ...
-    ibis.common.exceptions.IbisTypeError: To create an array column using `array`, all input values must be column expressions.
+    >>> ibis.array([t.a, 42 + ibis.literal(5)])
+    ┏━━━━━━━━━━━━━━━━━━━━━━━━┓
+    ┃ Array((a, Add(5, 42))) ┃
+    ┡━━━━━━━━━━━━━━━━━━━━━━━━┩
+    │ array<int64>           │
+    ├────────────────────────┤
+    │ [1, 47]                │
+    │ [2, 47]                │
+    │ [3, 47]                │
+    └────────────────────────┘
     """
-    if all(isinstance(value, Column) for value in values):
-        return ops.ArrayColumn(values).to_expr()
-    elif any(isinstance(value, Column) for value in values):
-        raise com.IbisTypeError(
-            'To create an array column using `array`, all input values must '
-            'be column expressions.'
-        )
-    else:
-        try:
-            return literal(list(values), type=type)
-        except com.IbisTypeError as e:
-            raise com.IbisTypeError(
-                'Could not create an array scalar from the values provided '
-                'to `array`. Ensure that all input values have the same '
-                'Python type, or can be casted to a single Python type.'
-            ) from e
+    return ops.Array(tuple(values)).to_expr()

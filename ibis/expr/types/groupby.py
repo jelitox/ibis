@@ -16,125 +16,101 @@
 
 from __future__ import annotations
 
-import itertools
-import types
-from typing import Iterable, Sequence
+from typing import TYPE_CHECKING, Annotated
+
+from public import public
 
 import ibis
-import ibis.expr.analysis as an
+import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
-from ibis import util
-from ibis.expr.deferred import Deferred
-from ibis.selectors import Selector
-from ibis.expr.types.relations import bind_expr
-import ibis.common.exceptions as com
+from ibis.common.grounds import Concrete
+from ibis.common.patterns import Length
+from ibis.common.typing import VarTuple  # noqa: TC001
+from ibis.expr.rewrites import rewrite_window_input
 
-_function_types = tuple(
-    filter(
-        None,
-        (
-            types.BuiltinFunctionType,
-            types.BuiltinMethodType,
-            types.FunctionType,
-            types.LambdaType,
-            types.MethodType,
-            getattr(types, "UnboundMethodType", None),
-        ),
-    )
-)
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
-def _get_group_by_key(table, value):
-    if isinstance(value, str):
-        yield table[value]
-    elif isinstance(value, _function_types):
-        yield value(table)
-    elif isinstance(value, Deferred):
-        yield value.resolve(table)
-    elif isinstance(value, Selector):
-        yield from value.expand(table)
-    elif isinstance(value, ir.Expr):
-        yield an.sub_immediate_parents(value.op(), table.op()).to_expr()
-    else:
-        yield value
-
-
-# TODO(kszucs): make a builder class for this
-class GroupedTable:
+@public
+class GroupedTable(Concrete):
     """An intermediate table expression to hold grouping information."""
 
-    def __init__(
-        self, table, by, having=None, order_by=None, window=None, **expressions
-    ):
-        self.table = table
-        self.by = list(
-            itertools.chain(
-                itertools.chain.from_iterable(
-                    _get_group_by_key(table, v) for v in util.promote_list(by)
-                ),
-                (
-                    expr.name(k)
-                    for k, v in expressions.items()
-                    for expr in _get_group_by_key(table, v)
-                ),
-            )
-        )
-
-        if not self.by:
-            raise com.IbisInputError("The grouping keys list is empty")
-
-        self._order_by = order_by or []
-        self._having = having or []
-        self._window = window
+    table: ops.Relation
+    groupings: Annotated[VarTuple[ops.Value], Length(at_least=1)]
+    orderings: VarTuple[ops.SortKey] = ()
+    havings: VarTuple[ops.Value[dt.Boolean]] = ()
 
     def __getitem__(self, args):
         # Shortcut for projection with window functions
         return self.select(*args)
 
     def __getattr__(self, attr):
-        if hasattr(self.table, attr):
-            return self._column_wrapper(attr)
+        try:
+            field = getattr(self.table.to_expr(), attr)
+        except AttributeError as e:
+            raise AttributeError(f"GroupedTable has no attribute {attr}") from e
 
-        raise AttributeError("GroupBy has no attribute %r" % attr)
-
-    def _column_wrapper(self, attr):
-        col = self.table[attr]
-        if isinstance(col, ir.NumericValue):
-            return GroupedNumbers(col, self)
+        if isinstance(field, ir.NumericValue):
+            return GroupedNumbers(field, self)
         else:
-            return GroupedArray(col, self)
+            return GroupedArray(field, self)
 
-    def aggregate(self, metrics=None, **kwds):
+    def aggregate(self, *metrics, **kwds) -> ir.Table:
         """Compute aggregates over a group by."""
-        return self.table.aggregate(metrics, by=self.by, having=self._having, **kwds)
+        metrics = self.table.to_expr().bind(*metrics, **kwds)
+        return self.table.to_expr().aggregate(
+            metrics, by=self.groupings, having=self.havings
+        )
 
     agg = aggregate
 
-    def having(self, expr: ir.BooleanScalar) -> GroupedTable:
+    def having(self, *predicates: ir.BooleanScalar) -> GroupedTable:
         """Add a post-aggregation result filter `expr`.
 
-        !!! warning "Expressions like `x is None` return `bool` and **will not** generate a SQL comparison to `NULL`"
+        ::: {.callout-warning}
+        ## Expressions like `x is None` return `bool` and **will not** generate a SQL comparison to `NULL`
+        :::
 
         Parameters
         ----------
-        expr
-            An expression that filters based on an aggregate value.
+        predicates
+            Expressions that filters based on an aggregate value.
 
         Returns
         -------
         GroupedTable
             A grouped table expression
-        """
-        return self.__class__(
-            self.table,
-            self.by,
-            having=self._having + util.promote_list(expr),
-            order_by=self._order_by,
-            window=self._window,
-        )
 
-    def order_by(self, expr: ir.Value | Iterable[ir.Value]) -> GroupedTable:
+        Examples
+        --------
+        >>> import ibis
+        >>> ibis.options.interactive = True
+        >>> t = ibis.memtable(
+        ...     {"grouper": ["a", "a", "a", "b", "b", "c"], "values": [1, 2, 3, 1, 2, 1]}
+        ... )
+        >>> expr = (
+        ...     t.group_by(t.grouper)
+        ...     .having(t.count() < 3)
+        ...     .aggregate(values_count=t.count(), values_sum=t.values.sum())
+        ...     .order_by(t.grouper)
+        ... )
+        >>> expr
+        ┏━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━━┓
+        ┃ grouper ┃ values_count ┃ values_sum ┃
+        ┡━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━━━┩
+        │ string  │ int64        │ int64      │
+        ├─────────┼──────────────┼────────────┤
+        │ b       │            2 │          3 │
+        │ c       │            1 │          1 │
+        └─────────┴──────────────┴────────────┘
+        """
+        table = self.table.to_expr()
+        havings = table.bind(*predicates)
+        return self.copy(havings=(*self.havings, *havings))
+
+    def order_by(self, *by: ir.Value) -> GroupedTable:
         """Sort a grouped table expression by `expr`.
 
         Notes
@@ -143,7 +119,7 @@ class GroupedTable:
 
         Parameters
         ----------
-        expr
+        by
             Expressions to order the results by
 
         Returns
@@ -151,15 +127,13 @@ class GroupedTable:
         GroupedTable
             A sorted grouped GroupedTable
         """
-        return self.__class__(
-            self.table,
-            self.by,
-            having=self._having,
-            order_by=self._order_by + util.promote_list(expr),
-            window=self._window,
-        )
+        table = self.table.to_expr()
+        orderings = table.bind(*by)
+        return self.copy(orderings=(*self.orderings, *orderings))
 
-    def mutate(self, *exprs: ir.Value | Sequence[ir.Value], **kwexprs: ir.Value):
+    def mutate(
+        self, *exprs: ir.Value | Sequence[ir.Value], **kwexprs: ir.Value
+    ) -> ir.Table:
         """Return a table projection with window functions applied.
 
         Any arguments can be functions.
@@ -174,83 +148,82 @@ class GroupedTable:
         Examples
         --------
         >>> import ibis
-        >>> t = ibis.table([
-        ...     ('foo', 'string'),
-        ...     ('bar', 'string'),
-        ...     ('baz', 'double'),
-        ... ], name='t')
+        >>> import ibis.selectors as s
+        >>> ibis.options.interactive = True
+        >>> t = ibis.examples.penguins.fetch()
         >>> t
-        UnboundTable: t
-          foo string
-          bar string
-          baz float64
-        >>> expr = (t.group_by('foo')
-        ...          .order_by(ibis.desc('bar'))
-        ...          .mutate(qux=lambda x: x.baz.lag(), qux2=t.baz.lead()))
-        >>> print(expr)
-        r0 := UnboundTable: t
-          foo string
-          bar string
-          baz float64
-        Selection[r0]
-          selections:
-            r0
-            qux:  WindowFunction(...)
-            qux2: WindowFunction(...)
+        ┏━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━┓
+        ┃ species ┃ island    ┃ bill_length_mm ┃ bill_depth_mm ┃ flipper_length_mm ┃ … ┃
+        ┡━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━┩
+        │ string  │ string    │ float64        │ float64       │ int64             │ … │
+        ├─────────┼───────────┼────────────────┼───────────────┼───────────────────┼───┤
+        │ Adelie  │ Torgersen │           39.1 │          18.7 │               181 │ … │
+        │ Adelie  │ Torgersen │           39.5 │          17.4 │               186 │ … │
+        │ Adelie  │ Torgersen │           40.3 │          18.0 │               195 │ … │
+        │ Adelie  │ Torgersen │           NULL │          NULL │              NULL │ … │
+        │ Adelie  │ Torgersen │           36.7 │          19.3 │               193 │ … │
+        │ Adelie  │ Torgersen │           39.3 │          20.6 │               190 │ … │
+        │ Adelie  │ Torgersen │           38.9 │          17.8 │               181 │ … │
+        │ Adelie  │ Torgersen │           39.2 │          19.6 │               195 │ … │
+        │ Adelie  │ Torgersen │           34.1 │          18.1 │               193 │ … │
+        │ Adelie  │ Torgersen │           42.0 │          20.2 │               190 │ … │
+        │ …       │ …         │              … │             … │                 … │ … │
+        └─────────┴───────────┴────────────────┴───────────────┴───────────────────┴───┘
+        >>> (
+        ...     t.select("species", "bill_length_mm")
+        ...     .group_by("species")
+        ...     .mutate(centered_bill_len=ibis._.bill_length_mm - ibis._.bill_length_mm.mean())
+        ...     .order_by(s.all())
+        ... )
+        ┏━━━━━━━━━┳━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┓
+        ┃ species ┃ bill_length_mm ┃ centered_bill_len ┃
+        ┡━━━━━━━━━╇━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━┩
+        │ string  │ float64        │ float64           │
+        ├─────────┼────────────────┼───────────────────┤
+        │ Adelie  │           32.1 │         -6.691391 │
+        │ Adelie  │           33.1 │         -5.691391 │
+        │ Adelie  │           33.5 │         -5.291391 │
+        │ Adelie  │           34.0 │         -4.791391 │
+        │ Adelie  │           34.1 │         -4.691391 │
+        │ Adelie  │           34.4 │         -4.391391 │
+        │ Adelie  │           34.5 │         -4.291391 │
+        │ Adelie  │           34.6 │         -4.191391 │
+        │ Adelie  │           34.6 │         -4.191391 │
+        │ Adelie  │           35.0 │         -3.791391 │
+        │ …       │              … │                 … │
+        └─────────┴────────────────┴───────────────────┘
 
         Returns
         -------
         Table
             A table expression with window functions applied
         """
-
         exprs = self._selectables(*exprs, **kwexprs)
-        return self.table.mutate(exprs)
+        return self.table.to_expr().mutate(exprs)
 
-    def select(self, *exprs, **kwexprs):
+    def select(self, *exprs, **kwexprs) -> ir.Table:
         """Project new columns out of the grouped table.
 
         See Also
         --------
-        [`GroupedTable.mutate`][ibis.expr.types.groupby.GroupedTable.mutate]
+        [`GroupedTable.mutate`](#ibis.expr.types.groupby.GroupedTable.mutate)
         """
         exprs = self._selectables(*exprs, **kwexprs)
-        return self.table.select(exprs)
+        return self.table.to_expr().select(exprs)
 
     def _selectables(self, *exprs, **kwexprs):
         """Project new columns out of the grouped table.
 
         See Also
         --------
-        [`GroupedTable.mutate`][ibis.expr.types.groupby.GroupedTable.mutate]
+        [`GroupedTable.mutate`](#ibis.expr.types.groupby.GroupedTable.mutate)
         """
-        table = self.table
-        default_frame = self._get_window()
-        return [
-            an.windowize_function(e2, frame=default_frame)
-            for expr in exprs
-            for e1 in util.promote_list(expr)
-            for e2 in util.promote_list(table._ensure_expr(e1))
-        ] + [
-            an.windowize_function(e, frame=default_frame).name(k)
-            for k, expr in kwexprs.items()
-            for e in util.promote_list(table._ensure_expr(expr))
-        ]
+        table = self.table.to_expr()
+        values = table.bind(*exprs, **kwexprs)
+        window = ibis.window(group_by=self.groupings, order_by=self.orderings)
+        return [rewrite_window_input(expr.op(), window).to_expr() for expr in values]
 
     projection = select
-
-    def _get_window(self):
-        if self._window is None:
-            return ops.RowsWindowFrame(
-                table=self.table,
-                group_by=self.by,
-                order_by=bind_expr(self.table, self._order_by),
-            )
-        else:
-            return self._window.copy(
-                groupy_by=bind_expr(self.table, self._window.group_by + self.by),
-                order_by=bind_expr(self.table, self._window.order_by + self._order_by),
-            )
 
     def over(
         self,
@@ -297,21 +270,16 @@ class GroupedTable:
             window=window,
         )
 
-    def count(self, metric_name: str = 'count') -> ir.Table:
+    def count(self) -> ir.Table:
         """Computing the number of rows per group.
-
-        Parameters
-        ----------
-        metric_name
-            Name to use for the row count metric
 
         Returns
         -------
         Table
             The aggregated table
         """
-        metric = self.table.count().name(metric_name)
-        return self.table.aggregate([metric], by=self.by, having=self._having)
+        table = self.table.to_expr()
+        return table.aggregate(table.count(), by=self.groupings, having=self.havings)
 
     size = count
 
@@ -320,27 +288,29 @@ def _group_agg_dispatch(name):
     def wrapper(self, *args, **kwargs):
         f = getattr(self.arr, name)
         metric = f(*args, **kwargs)
-        alias = f'{name}({self.arr.get_name()})'
+        alias = f"{name}({self.arr.get_name()})"
         return self.parent.aggregate(metric.name(alias))
 
     wrapper.__name__ = name
     return wrapper
 
 
+@public
 class GroupedArray:
     def __init__(self, arr, parent):
         self.arr = arr
         self.parent = parent
 
-    count = _group_agg_dispatch('count')
+    count = _group_agg_dispatch("count")
     size = count
-    min = _group_agg_dispatch('min')
-    max = _group_agg_dispatch('max')
-    approx_nunique = _group_agg_dispatch('approx_nunique')
-    approx_median = _group_agg_dispatch('approx_median')
-    group_concat = _group_agg_dispatch('group_concat')
+    min = _group_agg_dispatch("min")
+    max = _group_agg_dispatch("max")
+    approx_nunique = _group_agg_dispatch("approx_nunique")
+    approx_median = _group_agg_dispatch("approx_median")
+    group_concat = _group_agg_dispatch("group_concat")
 
 
+@public
 class GroupedNumbers(GroupedArray):
-    mean = _group_agg_dispatch('mean')
-    sum = _group_agg_dispatch('sum')
+    mean = _group_agg_dispatch("mean")
+    sum = _group_agg_dispatch("sum")

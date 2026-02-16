@@ -1,23 +1,28 @@
+"""Operations for working with structs."""
+
 from __future__ import annotations
 
 from public import public
 
 import ibis.expr.datatypes as dt
 import ibis.expr.rules as rlz
-from ibis.common.annotations import attribute
+from ibis.common.annotations import ValidationError, attribute
+from ibis.common.typing import VarTuple  # noqa: TC001
 from ibis.expr.operations.core import Value
 
 
 @public
 class StructField(Value):
-    arg = rlz.struct
-    field = rlz.instance_of(str)
+    """Extract a field from a struct value."""
 
-    output_shape = rlz.shape_like("arg")
+    arg: Value[dt.Struct]
+    field: str
 
-    @attribute.default
-    def output_dtype(self) -> dt.DataType:
-        struct_dtype = self.arg.output_dtype
+    shape = rlz.shape_like("arg")
+
+    @attribute
+    def dtype(self) -> dt.DataType:
+        struct_dtype = self.arg.dtype
         value_dtype = struct_dtype[self.field]
         return value_dtype
 
@@ -28,12 +33,29 @@ class StructField(Value):
 
 @public
 class StructColumn(Value):
-    names = rlz.tuple_of(rlz.instance_of(str), min_length=1)
-    values = rlz.tuple_of(rlz.any, min_length=1)
+    """Construct a struct column from literals or expressions."""
 
-    output_shape = rlz.Shape.COLUMNAR
+    names: VarTuple[str]
+    values: VarTuple[Value]
 
-    @attribute.default
-    def output_dtype(self) -> dt.DataType:
-        dtypes = (value.output_dtype for value in self.values)
+    shape = rlz.shape_like("values")
+
+    def __init__(self, names, values):
+        if len(names) != len(values):
+            raise ValidationError(
+                f"Length of names ({len(names)}) does not match length of "
+                f"values ({len(values)})"
+            )
+        super().__init__(names=names, values=values)
+
+    @property
+    def name(self) -> str:
+        pairs = ", ".join(
+            f"{name!r}: {op.name}" for name, op in zip(self.names, self.values)
+        )
+        return f"{self.__class__.__name__}({{{pairs}}})"
+
+    @attribute
+    def dtype(self) -> dt.DataType:
+        dtypes = (value.dtype for value in self.values)
         return dt.Struct.from_tuples(zip(self.names, dtypes))

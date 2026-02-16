@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import getpass
 import os
 
 import google.api_core.exceptions as gexc
@@ -8,10 +9,11 @@ import google.auth.exceptions
 import pytest
 
 import ibis
+from ibis.backends.tests.base import PYTHON_SHORT_VERSION
 
 DEFAULT_PROJECT_ID = "ibis-gbq"
 PROJECT_ID_ENV_VAR = "GOOGLE_BIGQUERY_PROJECT_ID"
-DATASET_ID = "ibis_gbq_testing"
+DATASET_ID = f"ibis_gbq_testing_{getpass.getuser()}_{PYTHON_SHORT_VERSION}"
 
 
 def pytest_addoption(parser):
@@ -64,6 +66,7 @@ def con(credentials, project_id, dataset_id):
     con = ibis.bigquery.connect(
         project_id=project_id, dataset_id=dataset_id, credentials=credentials
     )
+    con.client.default_query_job_config.use_query_cache = False
     try:
         con.sql("SELECT 1")
     except gexc.Forbidden:
@@ -76,6 +79,22 @@ def con(credentials, project_id, dataset_id):
 def con2(credentials, project_id, dataset_id):
     con = ibis.bigquery.connect(
         project_id=project_id, dataset_id=dataset_id, credentials=credentials
+    )
+    try:
+        con.sql("SELECT 1")
+    except gexc.Forbidden:
+        pytest.skip("Cannot access BigQuery")
+    else:
+        return con
+
+
+@pytest.fixture(scope="session")
+def con3(credentials, project_id, dataset_id):
+    con = ibis.bigquery.connect(
+        project_id=project_id,
+        dataset_id=dataset_id,
+        credentials=credentials,
+        generate_job_id_prefix=lambda: "ibis_test_",
     )
     try:
         con.sql("SELECT 1")

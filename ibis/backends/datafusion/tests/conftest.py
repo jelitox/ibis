@@ -1,85 +1,89 @@
 from __future__ import annotations
 
-from pathlib import Path
+from typing import Any
 
 import pytest
+import sqlglot as sg
 
 import ibis
-import ibis.expr.types as ir
-from ibis.backends.tests.base import BackendTest, RoundAwayFromZero
+from ibis.backends.conftest import TEST_TABLES
+from ibis.backends.tests.base import BackendTest
+from ibis.backends.tests.data import array_types, topk, win
 
-pa = pytest.importorskip("pyarrow")
 
-
-class TestConf(BackendTest, RoundAwayFromZero):
+class TestConf(BackendTest):
     # check_names = False
-    # additional_skipped_operations = frozenset({ops.StringSQLLike})
-    # supports_divide_by_zero = True
     # returned_timestamp_unit = 'ns'
-    native_bool = False
     supports_structs = False
     supports_json = False
-    supports_arrays = False
+    supports_arrays = True
+    supports_tpch = True
+    supports_tpcds = True
+    stateful = False
+    deps = ("datafusion",)
+    # Query 1 seems to require a bit more room here
+    tpc_absolute_tolerance = 0.11
+
+    def _load_data(self, **_: Any) -> None:
+        con = self.connection
+        for table_name in TEST_TABLES:
+            path = self.data_dir / "parquet" / f"{table_name}.parquet"
+            con.read_parquet(path, table_name=table_name)
+        con.create_table("array_types", array_types)
+        con.create_table("win", win)
+        con.create_table("topk", topk)
 
     @staticmethod
-    def connect(data_directory: Path):
-        # can be various types:
-        #   pyarrow.RecordBatch
-        #   parquet file path
-        #   csv file path
-        client = ibis.datafusion.connect({})
-        client.register(
-            data_directory / "csv" / 'functional_alltypes.csv',
-            table_name='functional_alltypes',
-            schema=pa.schema(
-                [
-                    ('id', 'int64'),
-                    ('bool_col', 'int8'),
-                    ('tinyint_col', 'int8'),
-                    ('smallint_col', 'int16'),
-                    ('int_col', 'int32'),
-                    ('bigint_col', 'int64'),
-                    ('float_col', 'float32'),
-                    ('double_col', 'float64'),
-                    ('date_string_col', 'string'),
-                    ('string_col', 'string'),
-                    ('timestamp_col', 'string'),
-                    ('year', 'int64'),
-                    ('month', 'int64'),
-                ]
-            ),
-        )
-        client.register(
-            data_directory / "parquet" / 'batting.parquet', table_name='batting'
-        )
-        client.register(
-            data_directory / "parquet" / 'awards_players.parquet',
-            table_name='awards_players',
-        )
-        client.register(
-            data_directory / "parquet" / 'diamonds.parquet', table_name='diamonds'
-        )
-        return client
+    def connect(*, tmpdir, worker_id, **kw):  # noqa: ARG004
+        return ibis.datafusion.connect(**kw)
 
-    @property
-    def functional_alltypes(self) -> ir.Table:
-        t = self.connection.table('functional_alltypes')
-        return t.mutate(
-            bool_col=t.bool_col == 1,
-            timestamp_col=t.timestamp_col.cast('timestamp'),
-        )
+    def _load_tpc(self, *, suite, scale_factor):
+        con = self.connection
+        schema = f"tpc{suite}"
+        con.create_database(schema)
+        for path in self.data_dir.joinpath(
+            schema, f"sf={scale_factor}", "parquet"
+        ).glob("*.parquet"):
+            table_name = path.with_suffix("").name
+            con.con.sql(
+                # datafusion can't create an external table in a specific schema it seems
+                # so hack around that by
+                #
+                # 1. creating an external table in the current schema
+                # 2. create an internal table in the desired schema using a
+                #    CTAS from the external table
+                # 3. drop the external table
+                f"CREATE EXTERNAL TABLE {table_name} STORED AS PARQUET LOCATION '{path}'"
+            )
+
+            con.con.sql(
+                f"CREATE TABLE {schema}.{table_name} AS SELECT * FROM {table_name}"
+            )
+            con.con.sql(f"DROP TABLE {table_name}")
+
+    def _transform_tpc_sql(self, parsed, *, suite, leaves):
+        def add_catalog_and_schema(node):
+            if isinstance(node, sg.exp.Table) and node.name in leaves:
+                return node.__class__(
+                    catalog=f"tpc{suite}",
+                    **{k: v for k, v in node.args.items() if k != "catalog"},
+                )
+            return node
+
+        return parsed.transform(add_catalog_and_schema)
 
 
-@pytest.fixture(scope='session')
-def client(data_directory):
-    return TestConf.connect(data_directory)
+@pytest.fixture(scope="session")
+def con(tmp_path_factory, data_dir, worker_id):
+    with TestConf.load_data(data_dir, tmp_path_factory, worker_id) as be:
+        yield be.connection
 
 
-@pytest.fixture(scope='session')
-def alltypes(client):
-    return client.table("functional_alltypes")
+@pytest.fixture(scope="session")
+def alltypes(con):
+    return con.table("functional_alltypes")
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def alltypes_df(alltypes):
     return alltypes.execute()

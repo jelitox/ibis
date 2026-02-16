@@ -1,5 +1,5 @@
-name: Feature Request
-description: Suggest an idea for ibis
+name: Feature request
+description: Suggest an idea for Ibis.
 title: "feat: "
 labels: ["feature"]
 body:
@@ -11,7 +11,15 @@ body:
     attributes:
       label: Is your feature request related to a problem?
       description: If so, please describe the problem.
-      placeholder: "I am frustated by ..."
+      placeholder: "I am frustrated by ..."
+    validations:
+      required: false
+  - type: textarea
+    id: motivation
+    attributes:
+      label: What is the motivation behind your request?
+      description: Discuss the use case behind this feature request, and why it is needed.
+      placeholder: "I'm trying to do ... because I need ..."
     validations:
       required: false
   - type: textarea
@@ -40,7 +48,7 @@ body:
     id: terms
     attributes:
       label: Code of Conduct
-      description: By submitting this issue, you agree to follow our [Code of Conduct](https://github.com/ibis-project/ibis/blob/master/CODE_OF_CONDUCT.md)
+      description: By submitting this issue, you agree to follow our [Code of Conduct](https://github.com/ibis-project/ibis/blob/main/CODE_OF_CONDUCT.md)
       options:
         - label: I agree to follow this project's Code of Conduct
           required: true

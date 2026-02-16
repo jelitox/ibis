@@ -1,38 +1,60 @@
 from __future__ import annotations
 
-import functools
+import ast
+import re
+from functools import lru_cache, partial
 from operator import methodcaller
 
 import parsy
 from public import public
 
 import ibis.expr.datatypes.core as dt
-from ibis.common.parsing import (
-    COLON,
-    COMMA,
-    FIELD,
-    LANGLE,
-    LPAREN,
-    NUMBER,
-    PRECISION,
-    RANGLE,
-    RAW_NUMBER,
-    RAW_STRING,
-    RPAREN,
-    SCALE,
-    SEMICOLON,
-    SINGLE_DIGIT,
-    spaceless,
-    spaceless_string,
+
+_STRING_REGEX = (
+    """('[^\n'\\\\]*(?:\\\\.[^\n'\\\\]*)*'|"[^\n"\\\\"]*(?:\\\\.[^\n"\\\\]*)*")"""
 )
+
+SPACES = parsy.regex(r"\s*", re.MULTILINE)
+
+
+def spaceless(parser):
+    return SPACES.then(parser).skip(SPACES)
+
+
+def spaceless_string(*strings: str):
+    return spaceless(
+        parsy.alt(*(parsy.string(string, transform=str.lower) for string in strings))
+    )
+
+
+SINGLE_DIGIT = parsy.decimal_digit
+RAW_NUMBER = SINGLE_DIGIT.at_least(1).concat()
+PRECISION = SCALE = NUMBER = LENGTH = RAW_NUMBER.map(int)
+TEMPORAL_SCALE = SINGLE_DIGIT.map(int)
+
+LPAREN = spaceless_string("(")
+RPAREN = spaceless_string(")")
+
+LBRACKET = spaceless_string("[")
+RBRACKET = spaceless_string("]")
+
+LANGLE = spaceless_string("<")
+RANGLE = spaceless_string(">")
+
+COMMA = spaceless_string(",")
+COLON = spaceless_string(":")
+SEMICOLON = spaceless_string(";")
+
+RAW_STRING = parsy.regex(_STRING_REGEX).map(ast.literal_eval)
+FIELD = parsy.regex("[a-zA-Z_0-9]+") | parsy.string("")
 
 
 @public
-@functools.lru_cache(maxsize=100)
+@lru_cache(maxsize=100)
 def parse(
     text: str, default_decimal_parameters: tuple[int | None, int | None] = (None, None)
 ) -> dt.DataType:
-    """Parse a type from a [`str`][str] `text`.
+    """Parse a type from a [](`str`) `text`.
 
     The default `maxsize` parameter for caching is chosen to cache the most
     commonly used types--there are about 30--along with some capacity for less
@@ -52,7 +74,7 @@ def parse(
     >>> import ibis
     >>> import ibis.expr.datatypes as dt
     >>> dt.parse("array<int64>")
-    Array(value_type=Int64(nullable=True), nullable=True)
+    Array(value_type=Int64(nullable=True), length=None, nullable=True)
 
     You can avoid parsing altogether by constructing objects directly
 
@@ -61,16 +83,20 @@ def parse(
     >>> ty = dt.parse("array<int64>")
     >>> ty == dt.Array(dt.int64)
     True
+
     """
     geotype = spaceless_string("geography", "geometry")
 
     srid_geotype = SEMICOLON.then(parsy.seq(srid=NUMBER.skip(COLON), geotype=geotype))
+    geotype_srid = COLON.then(parsy.seq(geotype=geotype, srid=SEMICOLON.then(NUMBER)))
     geotype_part = COLON.then(parsy.seq(geotype=geotype))
     srid_part = SEMICOLON.then(parsy.seq(srid=NUMBER))
 
     def geotype_parser(typ: type[dt.DataType]) -> dt.DataType:
         return spaceless_string(typ.__name__.lower()).then(
-            (srid_geotype | geotype_part | srid_part).optional(dict()).combine_dict(typ)
+            (srid_geotype | geotype_srid | geotype_part | srid_part)
+            .optional(dict())
+            .combine_dict(typ)
         )
 
     primitive = (
@@ -87,27 +113,38 @@ def parse(
             "uint16",
             "uint32",
             "uint64",
-            "string",
             "binary",
             "timestamp",
             "time",
             "date",
             "null",
-        ).map(functools.partial(getattr, dt))
-        | spaceless_string("bytes").result(dt.binary)
-        | geotype.map(dt.GeoSpatial)
+        ).map(partial(getattr, dt))
         | geotype_parser(dt.LineString)
         | geotype_parser(dt.Polygon)
         | geotype_parser(dt.Point)
         | geotype_parser(dt.MultiLineString)
         | geotype_parser(dt.MultiPolygon)
         | geotype_parser(dt.MultiPoint)
+        | spaceless_string("bytes").result(dt.binary)
+        | spaceless_string("geospatial:geography").then(
+            srid_part.optional(dict()).combine_dict(
+                partial(dt.GeoSpatial, geotype="geography")
+            )
+        )
+        | spaceless_string("geospatial:geometry").then(
+            srid_part.optional(dict()).combine_dict(
+                partial(dt.GeoSpatial, geotype="geometry")
+            )
+        )
+        | geotype.map(dt.GeoSpatial)
     )
 
     varchar_or_char = (
-        spaceless_string("varchar", "char")
-        .then(LPAREN.then(RAW_NUMBER).skip(RPAREN).optional())
-        .result(dt.string)
+        spaceless_string("varchar", "string", "char")
+        .then(
+            LPAREN.then(parsy.seq(length=spaceless(LENGTH))).skip(RPAREN).optional({})
+        )
+        .combine_dict(dt.String)
     )
 
     decimal = spaceless_string("decimal").then(
@@ -146,20 +183,32 @@ def parse(
     )
 
     ty = parsy.forward_declaration()
-    angle_type = LANGLE.then(ty).skip(RANGLE)
-    array = spaceless_string("array").then(angle_type).map(dt.Array)
+
+    array = (
+        spaceless_string("array")
+        .then(LANGLE)
+        .then(parsy.seq(ty, COMMA.then(LENGTH).optional()).combine(dt.Array))
+        .skip(RANGLE)
+    )
 
     map = (
         spaceless_string("map")
         .then(LANGLE)
-        .then(parsy.seq(primitive, COMMA.then(ty)).combine(dt.Map))
+        .then(parsy.seq(ty, COMMA.then(ty)).combine(dt.Map))
         .skip(RANGLE)
     )
 
     struct = (
         spaceless_string("struct")
         .then(LANGLE)
-        .then(parsy.seq(spaceless(FIELD).skip(COLON), ty).sep_by(COMMA))
+        .then(
+            parsy.alt(
+                parsy.seq(spaceless(FIELD).skip(COLON), ty)
+                .sep_by(COMMA, min=1)
+                .skip(COMMA.optional()),
+                parsy.seq(),
+            )
+        )
         .skip(RANGLE)
         .map(dt.Struct.from_tuples)
     )
@@ -177,8 +226,8 @@ def parse(
         | array
         | map
         | struct
-        | spaceless_string("json", "uuid", "macaddr", "inet").map(
-            functools.partial(getattr, dt)
+        | spaceless_string("jsonb", "json", "uuid", "macaddr", "inet").map(
+            partial(getattr, dt)
         )
         | spaceless_string("int").result(dt.int64)
         | spaceless_string("str").result(dt.string)

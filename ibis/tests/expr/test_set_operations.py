@@ -1,7 +1,8 @@
+from __future__ import annotations
+
 import pytest
 
 import ibis
-import ibis.expr.operations as ops
 from ibis.common.exceptions import RelationError
 
 
@@ -37,28 +38,28 @@ c = ibis.table(C)
 d = ibis.table(D)
 
 
-@pytest.mark.parametrize('method', ['union', 'intersect', 'difference'])
+@pytest.mark.parametrize("method", ["union", "intersect", "difference"])
 def test_operation_requires_equal_schemas(method):
-    with pytest.raises(RelationError):
+    with pytest.raises(RelationError, match="`c`: string != float64"):
         getattr(a, method)(d)
 
 
-@pytest.mark.parametrize('method', ['union', 'intersect', 'difference'])
+@pytest.mark.parametrize("method", ["union", "intersect", "difference"])
 def test_operation_supports_schemas_with_different_field_order(method):
     u1 = getattr(a, method)(b)
     u2 = getattr(a, method)(c)
 
     assert u1.schema() == a.schema()
 
-    u1 = u1.op().table
+    u1 = u1.op()
     assert u1.left == a.op()
     assert u1.right == b.op()
 
     # a selection is added to ensure that the field order of the right table
     # matches the field order of the left table
-    u2 = u2.op().table
+    u2 = u2.op()
     assert u2.schema == a.schema()
     assert u2.left == a.op()
 
-    columns = [ops.TableColumn(c, name) for name in 'abc']
-    assert u2.right == ops.Selection(c.op(), columns)
+    reprojected = c.select(["a", "b", "c"])
+    assert u2.right == reprojected.op()

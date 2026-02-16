@@ -1,84 +1,138 @@
+"""Reduction operations."""
+
 from __future__ import annotations
+
+from typing import Literal, Optional
 
 from public import public
 
-import ibis.common.exceptions as exc
+import ibis.expr.datashape as ds
 import ibis.expr.datatypes as dt
 import ibis.expr.rules as rlz
-from ibis.common.annotations import attribute
-from ibis.expr.operations.core import Value
-from ibis.expr.operations.generic import _Negatable
+from ibis.common.annotations import ValidationError, attribute
+from ibis.common.typing import VarTuple  # noqa: TC001
+from ibis.expr.operations.core import Column, Value
+from ibis.expr.operations.relations import Relation  # noqa: TC001
+from ibis.expr.operations.sortkeys import SortKey  # noqa: TC001
 
 
 @public
 class Reduction(Value):
-    output_shape = rlz.Shape.SCALAR
+    """Base class for reduction operations."""
 
-    @property
-    def __window_op__(self):
-        return self
+    shape = ds.scalar
 
 
+# note: all Reductions in this file are Filterable, but ReductionVectorizedUDF
+# is a Reduction that is not Filterable, so cannot directly remove Filterable.
 class Filterable(Value):
-    where = rlz.optional(rlz.boolean)
+    where: Optional[Value[dt.Boolean]] = None
+
+
+class Orderable(Filterable, Reduction):
+    """A Reduction with an `order_by` clause, e.g. `first`, `last`, `collect`."""
+
+    order_by: VarTuple[SortKey] = ()
+
+
+@public
+class First(Orderable):
+    """Retrieve the first element."""
+
+    arg: Column[dt.Any]
+    include_null: bool = False
+
+    dtype = rlz.dtype_like("arg")
+
+
+@public
+class Last(Orderable):
+    """Retrieve the last element."""
+
+    arg: Column[dt.Any]
+    include_null: bool = False
+
+    dtype = rlz.dtype_like("arg")
+
+
+@public
+class ArrayCollect(Orderable):
+    """Collect values into an array."""
+
+    arg: Column
+    include_null: bool = False
+    distinct: bool = False
+
+    def __init__(self, arg, order_by, distinct, **kwargs):
+        if distinct and order_by and [arg] != [key.arg for key in order_by]:
+            raise ValidationError(
+                "`collect` with `order_by` and `distinct=True` and may only "
+                "order by the collected column"
+            )
+        super().__init__(arg=arg, order_by=order_by, distinct=distinct, **kwargs)
+
+    @attribute
+    def dtype(self):
+        return dt.Array(self.arg.dtype)
+
+
+# TODO(NickCrews): This is the only Orderable without a include_null parameter,
+# should we add it and push that
+@public
+class GroupConcat(Orderable):
+    """Concatenate strings in a group with a given separator character."""
+
+    arg: Column
+    sep: Value[dt.String]
+
+    dtype = dt.string
 
 
 @public
 class Count(Filterable, Reduction):
-    arg = rlz.column(rlz.any)
+    """Count the number of non-null elements of a column."""
 
-    output_dtype = dt.int64
+    arg: Column[dt.Any]
+
+    dtype = dt.int64
 
 
 @public
 class CountStar(Filterable, Reduction):
-    arg = rlz.table
+    """Count the number of rows of a relation."""
 
-    output_dtype = dt.int64
+    arg: Relation
+
+    dtype = dt.int64
+
+    @attribute
+    def relations(self):
+        return frozenset({self.arg})
+
+
+@public
+class CountDistinctStar(Filterable, Reduction):
+    """Count the number of distinct rows of a relation."""
+
+    arg: Relation
+
+    dtype = dt.int64
+
+    @attribute
+    def relations(self):
+        return frozenset({self.arg})
 
 
 @public
 class Arbitrary(Filterable, Reduction):
-    arg = rlz.column(rlz.any)
-    how = rlz.isin({'first', 'last', 'heavy'})
+    """Retrieve an arbitrary element.
 
-    output_dtype = rlz.dtype_like('arg')
+    Returns a non-null value unless the column is empty or all values are NULL.
+    """
 
+    arg: Column[dt.Any]
 
-@public
-class First(Filterable, Reduction):
-    """Retrieve the first element."""
-
-    arg = rlz.column(rlz.any)
-    output_dtype = rlz.dtype_like("arg")
-
-    @property
-    def __window_op__(self):
-        import ibis.expr.operations as ops
-
-        if self.where is not None:
-            raise exc.OperationNotDefinedError(
-                "FirstValue cannot be filtered in a window context"
-            )
-        return ops.FirstValue(arg=self.arg)
-
-
-@public
-class Last(Filterable, Reduction):
-    """Retrieve the last element."""
-
-    arg = rlz.column(rlz.any)
-    output_dtype = rlz.dtype_like("arg")
-
-    @property
-    def __window_op__(self):
-        import ibis.expr.operations as ops
-
-        if self.where is not None:
-            raise exc.OperationNotDefinedError(
-                "LastValue cannot be filtered in a window context"
-            )
-        return ops.LastValue(arg=self.arg)
+    dtype = rlz.dtype_like("arg")
 
 
 @public
@@ -89,15 +143,15 @@ class BitAnd(Filterable, Reduction):
 
     This can be used to determine which bit flags are set on all elements.
 
-    Resources:
-
+    See Also
+    --------
     * BigQuery [`BIT_AND`](https://cloud.google.com/bigquery/docs/reference/standard-sql/aggregate_functions#bit_and)
     * MySQL [`BIT_AND`](https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_bit-and)
     """
 
-    arg = rlz.column(rlz.integer)
+    arg: Column[dt.Integer]
 
-    output_dtype = rlz.dtype_like('arg')
+    dtype = rlz.dtype_like("arg")
 
 
 @public
@@ -107,15 +161,15 @@ class BitOr(Filterable, Reduction):
     All elements in an integer column are ORed together. This can be used
     to determine which bit flags are set on any element.
 
-    Resources:
-
+    See Also
+    --------
     * BigQuery [`BIT_OR`](https://cloud.google.com/bigquery/docs/reference/standard-sql/aggregate_functions#bit_or)
     * MySQL [`BIT_OR`](https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_bit-or)
     """
 
-    arg = rlz.column(rlz.integer)
+    arg: Column[dt.Integer]
 
-    output_dtype = rlz.dtype_like('arg')
+    dtype = rlz.dtype_like("arg")
 
 
 @public
@@ -125,235 +179,251 @@ class BitXor(Filterable, Reduction):
     All elements in an integer column are XORed together. This can be used
     as a parity checksum of element values.
 
-    Resources:
-
+    See Also
+    --------
     * BigQuery [`BIT_XOR`](https://cloud.google.com/bigquery/docs/reference/standard-sql/aggregate_functions#bit_xor)
     * MySQL [`BIT_XOR`](https://dev.mysql.com/doc/refman/5.7/en/aggregate-functions.html#function_bit-xor)
     """
 
-    arg = rlz.column(rlz.integer)
+    arg: Column[dt.Integer]
 
-    output_dtype = rlz.dtype_like('arg')
+    dtype = rlz.dtype_like("arg")
 
 
 @public
 class Sum(Filterable, Reduction):
-    arg = rlz.column(rlz.numeric)
+    """Compute the sum of a column."""
 
-    @attribute.default
-    def output_dtype(self):
-        if self.arg.output_dtype.is_boolean():
+    arg: Column[dt.Numeric | dt.Boolean]
+
+    @attribute
+    def dtype(self):
+        dtype = self.arg.dtype
+        if dtype.is_boolean():
             return dt.int64
+        elif dtype.is_integer():
+            return dt.int64
+        elif dtype.is_unsigned_integer():
+            return dt.uint64
+        elif dtype.is_floating():
+            return dt.float64
+        elif dtype.is_decimal():
+            return dt.Decimal(
+                precision=max(dtype.precision, 38)
+                if dtype.precision is not None
+                else None,
+                scale=max(dtype.scale, 2) if dtype.scale is not None else None,
+            )
         else:
-            return self.arg.output_dtype.largest
+            raise TypeError(f"Cannot compute sum of {dtype} values")
 
 
 @public
 class Mean(Filterable, Reduction):
-    arg = rlz.column(rlz.numeric)
+    """Compute the mean of a column."""
 
-    @attribute.default
-    def output_dtype(self):
-        if (dtype := self.arg.output_dtype).is_boolean():
+    arg: Column[dt.Numeric | dt.Boolean]
+
+    @attribute
+    def dtype(self):
+        if (dtype := self.arg.dtype).is_boolean():
             return dt.float64
         else:
             return dt.higher_precedence(dtype, dt.float64)
 
 
+class QuantileBase(Filterable, Reduction):
+    arg: Column
+
+    @attribute
+    def dtype(self):
+        dtype = self.arg.dtype
+        if dtype.is_numeric():
+            dtype = dt.higher_precedence(dtype, dt.float64)
+        return dtype
+
+
 @public
-class Median(Filterable, Reduction):
-    arg = rlz.column(rlz.numeric)
-
-    @attribute.default
-    def output_dtype(self):
-        return dt.higher_precedence(self.arg.output_dtype, dt.float64)
+class Median(QuantileBase):
+    """Compute the median of a column."""
 
 
 @public
-class Quantile(Filterable, Reduction):
-    arg = rlz.any
-    quantile = rlz.strict_numeric
-    interpolation = rlz.optional(
-        rlz.isin({'linear', 'lower', 'higher', 'midpoint', 'nearest'})
-    )
+class ApproxMedian(Median):
+    """Compute the approximate median of a column."""
 
-    output_dtype = dt.float64
+
+@public
+class Quantile(QuantileBase):
+    """Compute the quantile of a column."""
+
+    quantile: Value[dt.Numeric]
+
+
+@public
+class ApproxQuantile(Quantile):
+    """Compute the approximate quantile of a column."""
+
+    arg: Column[dt.Numeric]
 
 
 @public
 class MultiQuantile(Filterable, Reduction):
-    arg = rlz.any
-    quantile = rlz.value(dt.Array(dt.float64))
-    interpolation = rlz.optional(
-        rlz.isin({'linear', 'lower', 'higher', 'midpoint', 'nearest'})
-    )
+    """Compute multiple quantiles of a column."""
 
-    output_dtype = dt.Array(dt.float64)
+    arg: Column
+    quantile: Value[dt.Array[dt.Numeric]]
+
+    @attribute
+    def dtype(self):
+        dtype = self.arg.dtype
+        if dtype.is_numeric():
+            dtype = dt.higher_precedence(dtype, dt.float64)
+        return dt.Array(dtype)
 
 
 @public
-class VarianceBase(Filterable, Reduction):
-    arg = rlz.column(rlz.numeric)
-    how = rlz.isin({'sample', 'pop'})
+class ApproxMultiQuantile(MultiQuantile):
+    """Compute multiple approximate quantiles of a column."""
 
-    @attribute.default
-    def output_dtype(self):
-        if (dtype := self.arg.output_dtype).is_decimal():
-            return dtype.largest
+    arg: Column[dt.Numeric]
+
+
+class VarianceBase(Filterable, Reduction):
+    """Base class for variance and standard deviation."""
+
+    arg: Column[dt.Numeric | dt.Boolean]
+    how: Literal["sample", "pop"]
+
+    @attribute
+    def dtype(self):
+        if self.arg.dtype.is_decimal():
+            return self.arg.dtype
         else:
             return dt.float64
 
 
 @public
 class StandardDev(VarianceBase):
-    pass
+    """Compute the standard deviation of a column."""
 
 
 @public
 class Variance(VarianceBase):
-    pass
+    """Compute the variance of a column."""
 
 
 @public
 class Correlation(Filterable, Reduction):
-    """Coefficient of correlation of a set of number pairs."""
+    """Correlation coefficient of two columns."""
 
-    left = rlz.column(rlz.numeric)
-    right = rlz.column(rlz.numeric)
-    how = rlz.optional(rlz.isin({'sample', 'pop'}), default='sample')
+    left: Column[dt.Numeric | dt.Boolean]
+    right: Column[dt.Numeric | dt.Boolean]
+    how: Literal["sample", "pop"] = "sample"
 
-    output_dtype = dt.float64
+    dtype = dt.float64
 
 
 @public
 class Covariance(Filterable, Reduction):
-    """Covariance of a set of number pairs."""
+    """Covariance of two columns."""
 
-    left = rlz.column(rlz.numeric)
-    right = rlz.column(rlz.numeric)
-    how = rlz.isin({'sample', 'pop'})
+    left: Column[dt.Numeric | dt.Boolean]
+    right: Column[dt.Numeric | dt.Boolean]
+    how: Literal["sample", "pop"]
 
-    output_dtype = dt.float64
+    dtype = dt.float64
+
+
+@public
+class Kurtosis(Filterable, Reduction):
+    """Compute the kurtosis of a column."""
+
+    arg: Column[dt.Numeric | dt.Boolean]
+    how: Literal["sample", "pop"]
+
+    @attribute
+    def dtype(self):
+        if self.arg.dtype.is_decimal():
+            return self.arg.dtype
+        else:
+            return dt.float64
 
 
 @public
 class Mode(Filterable, Reduction):
-    arg = rlz.column(rlz.any)
+    """Compute the mode of a column."""
 
-    output_dtype = rlz.dtype_like('arg')
+    arg: Column
+
+    dtype = rlz.dtype_like("arg")
 
 
 @public
 class Max(Filterable, Reduction):
-    arg = rlz.column(rlz.any)
+    """Compute the maximum of a column."""
 
-    output_dtype = rlz.dtype_like('arg')
+    arg: Column
+
+    dtype = rlz.dtype_like("arg")
 
 
 @public
 class Min(Filterable, Reduction):
-    arg = rlz.column(rlz.any)
+    """Compute the minimum of a column."""
 
-    output_dtype = rlz.dtype_like('arg')
+    arg: Column
+
+    dtype = rlz.dtype_like("arg")
 
 
 @public
 class ArgMax(Filterable, Reduction):
-    arg = rlz.column(rlz.any)
-    key = rlz.column(rlz.any)
+    """Compute the index of the maximum value in a column."""
 
-    output_dtype = rlz.dtype_like("arg")
+    arg: Column
+    key: Column
+
+    dtype = rlz.dtype_like("arg")
 
 
 @public
 class ArgMin(Filterable, Reduction):
-    arg = rlz.column(rlz.any)
-    key = rlz.column(rlz.any)
+    """Compute the index of the minimum value in a column."""
 
-    output_dtype = rlz.dtype_like("arg")
+    arg: Column
+    key: Column
 
-
-@public
-class ApproxCountDistinct(Filterable, Reduction):
-    """Approximate number of unique values using HyperLogLog algorithm.
-
-    Impala offers the NDV built-in function for this.
-    """
-
-    arg = rlz.column(rlz.any)
-
-    # Impala 2.0 and higher returns a DOUBLE
-    output_dtype = dt.int64
-
-
-@public
-class ApproxMedian(Filterable, Reduction):
-    """Compute the approximate median of a set of comparable values."""
-
-    arg = rlz.column(rlz.any)
-
-    output_dtype = rlz.dtype_like('arg')
-
-
-@public
-class GroupConcat(Filterable, Reduction):
-    arg = rlz.column(rlz.any)
-    sep = rlz.string
-
-    output_dtype = dt.string
+    dtype = rlz.dtype_like("arg")
 
 
 @public
 class CountDistinct(Filterable, Reduction):
-    arg = rlz.column(rlz.any)
+    """Count the number of distinct values in a column."""
 
-    output_dtype = dt.int64
+    arg: Column
 
-
-@public
-class ArrayCollect(Filterable, Reduction):
-    arg = rlz.column(rlz.any)
-
-    @attribute.default
-    def output_dtype(self):
-        return dt.Array(self.arg.output_dtype)
+    dtype = dt.int64
 
 
 @public
-class All(Filterable, Reduction, _Negatable):
-    arg = rlz.column(rlz.boolean)
-
-    output_dtype = dt.boolean
-
-    def negate(self):
-        return NotAll(self.arg)
+class ApproxCountDistinct(CountDistinct):
+    """Approximate number of unique values."""
 
 
 @public
-class NotAll(Filterable, Reduction, _Negatable):
-    arg = rlz.column(rlz.boolean)
+class All(Filterable, Reduction):
+    """Check if all values in a column are true."""
 
-    output_dtype = dt.boolean
+    arg: Column[dt.Boolean]
 
-    def negate(self) -> Any:
-        return All(*self.args)
-
-
-@public
-class Any(Filterable, Reduction, _Negatable):
-    arg = rlz.column(rlz.boolean)
-
-    output_dtype = dt.boolean
-
-    def negate(self) -> NotAny:
-        return NotAny(*self.args)
+    dtype = dt.boolean
 
 
 @public
-class NotAny(Filterable, Reduction, _Negatable):
-    arg = rlz.column(rlz.boolean)
+class Any(Filterable, Reduction):
+    """Check if any value in a column is true."""
 
-    output_dtype = dt.boolean
+    arg: Column[dt.Boolean]
 
-    def negate(self) -> Any:
-        return Any(*self.args)
+    dtype = dt.boolean

@@ -1,2 +1,3 @@
-SELECT ST_ASBINARY(t0.`geog`) AS `tmp`
-FROM t t0
+SELECT
+  st_asbinary(`t0`.`geog`) AS `tmp`
+FROM `t` AS `t0`

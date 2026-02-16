@@ -1,11 +1,10 @@
 from __future__ import annotations
 
+import functools
 import json
-import os
 from typing import TYPE_CHECKING, Optional
 
 import ibis
-from ibis.backends.base import BaseBackend
 from ibis.common.grounds import Concrete
 
 try:
@@ -15,20 +14,12 @@ except ImportError:
 
 if TYPE_CHECKING:
     import ibis.expr.types as ir
-
-_EXAMPLES = None
-
-_METADATA = json.loads(resources.files(__name__).joinpath("metadata.json").read_text())
-
-# These backends load the data directly using `read_csv`/`read_parquet`. All
-# other backends load the data using pyarrow, then passing it off to
-# `create_table`.
-_DIRECT_BACKENDS = frozenset({"duckdb", "polars"})
+    from ibis.backends import BaseBackend
 
 
 class Example(Concrete):
-    descr: Optional[str]
-    key: str
+    name: str
+    help: Optional[str]
 
     def fetch(
         self,
@@ -36,51 +27,17 @@ class Example(Concrete):
         table_name: str | None = None,
         backend: BaseBackend | None = None,
     ) -> ir.Table:
-        path = _EXAMPLES.fetch(self.key, progressbar=True)
-
         if backend is None:
             backend = ibis.get_backend()
 
+        name = self.name
+
         if table_name is None:
-            table_name = ibis.util.gen_name(f"examples_{type(self).__name__}")
+            table_name = name
 
-        if backend.name in _DIRECT_BACKENDS:
-            # Read directly into these backends. This helps reduce memory
-            # usage, making the larger example datasets easier to work with.
-            if path.endswith(".parquet"):
-                return backend.read_parquet(path, table_name=table_name)
-            else:
-                return backend.read_csv(path, table_name=table_name)
-        else:
-            if path.endswith(".parquet"):
-                import pyarrow.parquet
-
-                table = pyarrow.parquet.read_table(path)
-            else:
-                import pyarrow.csv
-
-                # The convert options lets pyarrow treat empty strings as null for
-                # string columns, but not quoted empty strings.
-                table = pyarrow.csv.read_csv(
-                    path,
-                    convert_options=pyarrow.csv.ConvertOptions(
-                        strings_can_be_null=True,
-                        quoted_strings_can_be_null=False,
-                    ),
-                )
-
-                # All null columns are inferred as null-type, but not all
-                # backends support null-type columns. Cast to an all-null
-                # string column instead.
-                for i, field in enumerate(table.schema):
-                    if pyarrow.types.is_null(field.type):
-                        table = table.set_column(i, field.name, table[i].cast("string"))
-
-            # TODO: It should be possible to avoid this memtable call, once all
-            # backends support passing a `pyarrow.Table` to `create_table`
-            # directly.
-            obj = ibis.memtable(table)
-            return backend.create_table(table_name, obj, temp=True, overwrite=True)
+        board = _get_board()
+        (path,) = board.pin_download(name)
+        return backend._load_example(path=path, table_name=table_name)
 
 
 _FETCH_DOCSTRING_TEMPLATE = """\
@@ -104,40 +61,69 @@ Examples
 >>> t = ibis.examples.{name}.fetch()
 """
 
+_BUCKET = "ibis-pins"
 
+
+@functools.cache
+def _get_metadata():
+    return json.loads(resources.files(__name__).joinpath("metadata.json").read_text())
+
+
+@functools.cache
+def _get_board():
+    import pins
+
+    return pins.board(
+        "gcs", _BUCKET, storage_options={"cache_timeout": 0, "token": "anon"}
+    )
+
+
+@functools.cache
 def __dir__() -> list[str]:
-    return sorted(_METADATA.keys())
+    return sorted(_get_metadata().keys())
+
+
+class Zones(Concrete):
+    name: str
+    help: Optional[str]
+
+    def fetch(
+        self,
+        *,
+        table_name: str | None = None,
+        backend: BaseBackend | None = None,
+    ) -> ir.Table:
+        if backend is None:
+            backend = ibis.get_backend()
+
+        name = self.name
+
+        if table_name is None:
+            table_name = name
+
+        board = _get_board()
+
+        (path,) = board.pin_download(name)
+        return backend.read_geo(path)
+
+
+zones = Zones("zones", help="Taxi zones in New York City (EPSG:2263)")
 
 
 def __getattr__(name: str) -> Example:
-    global _EXAMPLES  # noqa: PLW0603
+    try:
+        meta = _get_metadata()
 
-    if _EXAMPLES is None:
-        import pooch
+        description = meta[name].get("description")
 
-        _EXAMPLES = pooch.create(
-            path=pooch.os_cache("ibis-framework"),
-            # the trailing slash matters here
-            base_url="https://storage.googleapis.com/ibis-examples/data/",
-            version=ibis.__version__,
-            env="IBIS_EXAMPLES_DATA",
-        )
-        with resources.files(__name__).joinpath("registry.txt").open(mode="r") as _f:
-            _EXAMPLES.load_registry(_f)
+        fields = {"__doc__": description} if description is not None else {}
 
-    spec = _METADATA.get(name, {})
+        example_class = type(name, (Example,), fields)
+        example_class.fetch.__doc__ = _FETCH_DOCSTRING_TEMPLATE.format(name=name)
 
-    if (key := spec.get("key")) is None:
-        raise AttributeError(name)
-
-    description = spec.get("description")
-
-    _, ext = key.split(os.extsep, maxsplit=1)
-
-    fields = {"__doc__": description} if description is not None else {}
-
-    example_class = type(name, (Example,), fields)
-    example_class.fetch.__doc__ = _FETCH_DOCSTRING_TEMPLATE.format(name=name)
-    example = example_class(descr=description, key=key)
-    setattr(ibis.examples, name, example)
-    return example
+        example = example_class(name=name, help=description)
+        setattr(ibis.examples, name, example)
+    except Exception as e:
+        raise AttributeError(name) from e
+    else:
+        return example

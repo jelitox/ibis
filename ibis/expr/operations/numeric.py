@@ -1,6 +1,9 @@
+"""Operations for numeric expressions."""
+
 from __future__ import annotations
 
 import operator
+from typing import Optional
 
 from public import public
 
@@ -10,28 +13,38 @@ from ibis import util
 from ibis.common.annotations import attribute
 from ibis.expr.operations.core import Binary, Unary, Value
 
+Integer = Value[dt.Integer]
+SoftNumeric = Value[dt.Numeric | dt.Boolean]
+StrictNumeric = Value[dt.Numeric]
+
 
 @public
 class NumericBinary(Binary):
-    left = rlz.numeric
-    right = rlz.numeric
+    left: SoftNumeric
+    right: SoftNumeric
 
 
 @public
 class Add(NumericBinary):
-    output_dtype = rlz.numeric_like("args", operator.add)
+    """Add two values."""
+
+    dtype = rlz.numeric_like("args", operator.add)
 
 
 @public
 class Multiply(NumericBinary):
-    output_dtype = rlz.numeric_like("args", operator.mul)
+    """Multiply two values."""
+
+    dtype = rlz.numeric_like("args", operator.mul)
 
 
 @public
 class Power(NumericBinary):
+    """Raise the left value to the power of the right value."""
+
     @property
-    def output_dtype(self):
-        dtypes = (arg.output_dtype for arg in self.args)
+    def dtype(self):
+        dtypes = (arg.dtype for arg in self.args)
         if util.all_of(dtypes, dt.Integer):
             return dt.float64
         else:
@@ -40,195 +53,204 @@ class Power(NumericBinary):
 
 @public
 class Subtract(NumericBinary):
-    output_dtype = rlz.numeric_like("args", operator.sub)
+    """Subtract the right value from the left value."""
+
+    dtype = rlz.numeric_like("args", operator.sub)
 
 
 @public
 class Divide(NumericBinary):
-    output_dtype = dt.float64
+    """Divide the left value by the right value."""
+
+    dtype = dt.float64
 
 
 @public
 class FloorDivide(Divide):
-    output_dtype = dt.int64
+    """Divide the left value by the right value and round down to the nearest integer."""
+
+    dtype = dt.int64
 
 
 @public
 class Modulus(NumericBinary):
-    output_dtype = rlz.numeric_like("args", operator.mod)
+    """Return the remainder after the division of the left value by the right value."""
+
+    dtype = rlz.numeric_like("args", operator.mod)
 
 
 @public
 class Negate(Unary):
-    arg = rlz.one_of((rlz.numeric, rlz.interval))
+    """Negate the value."""
 
-    output_dtype = rlz.dtype_like("arg")
+    arg: Value[dt.Numeric | dt.Interval]
 
-
-@public
-class NullIfZero(Unary):
-    """Set values to NULL if they are equal to zero.
-
-    Commonly used in cases where divide-by-zero would produce an overflow or
-    infinity.
-
-    Equivalent to
-
-    ```python
-    (value == 0).ifelse(ibis.NA, value)
-    ```
-
-    Returns
-    -------
-    NumericValue
-        The input if not zero otherwise `NULL`.
-    """
-
-    arg = rlz.numeric
-    output_dtype = rlz.dtype_like("arg")
+    dtype = rlz.dtype_like("arg")
 
 
 @public
 class IsNan(Unary):
-    arg = rlz.floating
-    output_dtype = dt.boolean
+    """Check if the value is NaN."""
+
+    arg: Value[dt.Floating]
+
+    dtype = dt.boolean
 
 
 @public
 class IsInf(Unary):
-    arg = rlz.floating
-    output_dtype = dt.boolean
+    """Check if the value is infinite."""
+
+    arg: Value[dt.Floating]
+
+    dtype = dt.boolean
 
 
 @public
 class Abs(Unary):
     """Absolute value."""
 
-    arg = rlz.numeric
-    output_dtype = rlz.dtype_like("arg")
+    arg: SoftNumeric
+
+    dtype = rlz.dtype_like("arg")
 
 
 @public
 class Ceil(Unary):
-    """Round up to the nearest integer value greater than or equal to this value.
+    """Round up to the nearest integer value greater than or equal to this value."""
 
-    Returns
-    -------
-    DecimalValue | IntegerValue
-        Decimal values: yield decimal
-        Other numeric values: yield integer (int32)
-    """
-
-    arg = rlz.numeric
+    arg: SoftNumeric
 
     @property
-    def output_dtype(self):
-        if self.arg.output_dtype.is_decimal():
-            return self.arg.output_dtype
+    def dtype(self):
+        if self.arg.dtype.is_decimal():
+            return self.arg.dtype
         else:
             return dt.int64
 
 
 @public
 class Floor(Unary):
-    """Round down to the nearest integer value less than or equal to this value.
+    """Round down to the nearest integer value less than or equal to this value."""
 
-    Returns
-    -------
-    DecimalValue | IntegerValue
-        Decimal values: yield decimal
-        Other numeric values: yield integer (int32)
-    """
-
-    arg = rlz.numeric
+    arg: SoftNumeric
 
     @property
-    def output_dtype(self):
-        if self.arg.output_dtype.is_decimal():
-            return self.arg.output_dtype
+    def dtype(self):
+        if self.arg.dtype.is_decimal():
+            return self.arg.dtype
         else:
             return dt.int64
 
 
 @public
 class Round(Value):
-    arg = rlz.numeric
-    # TODO(kszucs): the default should be 0 instead of being None
-    digits = rlz.optional(rlz.numeric)
+    """Round a value."""
 
-    output_shape = rlz.shape_like("arg")
+    arg: StrictNumeric
+    digits: Integer
+
+    shape = rlz.shape_like("arg")
 
     @property
-    def output_dtype(self):
-        if self.arg.output_dtype.is_decimal():
-            return self.arg.output_dtype
-        elif self.digits is None:
-            return dt.int64
-        else:
-            return dt.double
+    def dtype(self):
+        digits = self.digits
+        arg_dtype = self.arg.dtype
+
+        raw_digits = getattr(digits, "value", None)
+
+        # decimals with literal-typed digits return decimals
+        if arg_dtype.is_decimal() and raw_digits is not None:
+            return arg_dtype.copy(scale=raw_digits)
+
+        nullable = arg_dtype.nullable
+
+        # if digits are unspecified that means round to an integer
+        if raw_digits is not None and raw_digits == 0:
+            return dt.int64.copy(nullable=nullable)
+
+        # otherwise one of the following is true:
+        # 1. digits are specified as a more complex expression
+        # 2. self.arg is a double column
+        return dt.double.copy(nullable=nullable)
 
 
 @public
 class Clip(Value):
-    arg = rlz.strict_numeric
-    lower = rlz.optional(rlz.strict_numeric)
-    upper = rlz.optional(rlz.strict_numeric)
+    """Clip a value to a specified range."""
 
-    output_dtype = rlz.dtype_like("arg")
-    output_shape = rlz.shape_like("arg")
+    arg: StrictNumeric
+    lower: Optional[StrictNumeric] = None
+    upper: Optional[StrictNumeric] = None
+
+    dtype = rlz.dtype_like("arg")
+    shape = rlz.shape_like("arg")
 
 
 @public
 class BaseConvert(Value):
-    arg = rlz.one_of([rlz.integer, rlz.string])
-    from_base = rlz.integer
-    to_base = rlz.integer
+    """Convert a number from one base to another."""
 
-    output_dtype = dt.string
-    output_shape = rlz.shape_like("args")
+    # TODO(kszucs): this should be Integer simply
+    arg: Value[dt.Integer | dt.String]
+    from_base: Integer
+    to_base: Integer
+
+    dtype = dt.string
+    shape = rlz.shape_like("args")
 
 
 @public
 class MathUnary(Unary):
-    arg = rlz.numeric
+    """Base class for unary math operations."""
 
-    @attribute.default
-    def output_dtype(self):
-        return dt.higher_precedence(self.arg.output_dtype, dt.double)
+    arg: SoftNumeric
+
+    @attribute
+    def dtype(self):
+        return dt.higher_precedence(self.arg.dtype, dt.float64)
 
 
-@public
 class ExpandingMathUnary(MathUnary):
-    @attribute.default
-    def output_dtype(self):
-        return dt.higher_precedence(self.arg.output_dtype.largest, dt.double)
+    @attribute
+    def dtype(self):
+        if self.arg.dtype.is_decimal():
+            return self.arg.dtype
+        else:
+            return dt.float64
 
 
 @public
 class Exp(ExpandingMathUnary):
-    pass
+    """Exponential function."""
 
 
 @public
 class Sign(Unary):
-    arg = rlz.numeric
-    output_dtype = rlz.dtype_like("arg")
+    """Sign of the value."""
+
+    arg: SoftNumeric
+
+    dtype = rlz.dtype_like("arg")
 
 
 @public
 class Sqrt(MathUnary):
-    pass
+    """Square root of the value."""
 
 
 @public
 class Logarithm(MathUnary):
-    arg = rlz.strict_numeric
+    """Base class for logarithmic operations."""
+
+    arg: StrictNumeric
 
 
 @public
 class Log(Logarithm):
-    arg = rlz.strict_numeric
-    base = rlz.optional(rlz.strict_numeric)
+    """Logarithm with a specific base."""
+
+    base: Optional[StrictNumeric] = None
 
 
 @public
@@ -256,9 +278,6 @@ class Radians(MathUnary):
     """Converts degrees to radians."""
 
 
-# TRIGONOMETRIC OPERATIONS
-
-
 @public
 class TrigonometricUnary(MathUnary):
     """Trigonometric base unary."""
@@ -268,9 +287,10 @@ class TrigonometricUnary(MathUnary):
 class TrigonometricBinary(Binary):
     """Trigonometric base binary."""
 
-    left = rlz.numeric
-    right = rlz.numeric
-    output_dtype = dt.float64
+    left: SoftNumeric
+    right: SoftNumeric
+
+    dtype = dt.float64
 
 
 @public
@@ -315,38 +335,53 @@ class Tan(TrigonometricUnary):
 
 @public
 class BitwiseNot(Unary):
-    arg = rlz.integer
-    output_dtype = rlz.numeric_like("args", operator.invert)
+    """Bitwise NOT operation."""
+
+    arg: Integer
+
+    dtype = rlz.numeric_like("args", operator.invert)
 
 
 @public
 class BitwiseBinary(Binary):
-    left = rlz.integer
-    right = rlz.integer
+    """Base class for bitwise binary operations."""
+
+    left: Integer
+    right: Integer
 
 
 @public
 class BitwiseAnd(BitwiseBinary):
-    output_dtype = rlz.numeric_like("args", operator.and_)
+    """Bitwise AND operation."""
+
+    dtype = rlz.numeric_like("args", operator.and_)
 
 
 @public
 class BitwiseOr(BitwiseBinary):
-    output_dtype = rlz.numeric_like("args", operator.or_)
+    """Bitwise OR operation."""
+
+    dtype = rlz.numeric_like("args", operator.or_)
 
 
 @public
 class BitwiseXor(BitwiseBinary):
-    output_dtype = rlz.numeric_like("args", operator.xor)
+    """Bitwise XOR operation."""
+
+    dtype = rlz.numeric_like("args", operator.xor)
 
 
 @public
 class BitwiseLeftShift(BitwiseBinary):
-    output_shape = rlz.shape_like("args")
-    output_dtype = dt.int64
+    """Bitwise left shift operation."""
+
+    shape = rlz.shape_like("args")
+    dtype = dt.int64
 
 
 @public
 class BitwiseRightShift(BitwiseBinary):
-    output_shape = rlz.shape_like("args")
-    output_dtype = dt.int64
+    """Bitwise right shift operation."""
+
+    shape = rlz.shape_like("args")
+    dtype = dt.int64

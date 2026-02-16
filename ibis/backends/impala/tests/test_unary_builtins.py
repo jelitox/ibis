@@ -1,8 +1,12 @@
-import pytest
+from __future__ import annotations
 
+import pytest
+from pytest import param
+
+import ibis
 import ibis.expr.types as ir
-from ibis import literal as L
 from ibis.backends.impala.tests.conftest import translate
+from ibis.common.annotations import ValidationError
 
 
 @pytest.fixture(scope="module")
@@ -11,27 +15,27 @@ def table(mockcon):
 
 
 @pytest.mark.parametrize(
-    "ibis_name",
+    "method",
     [
-        'abs',
-        'ceil',
-        'floor',
-        'exp',
-        'sqrt',
-        'log',
-        'approx_median',
-        'approx_nunique',
-        'ln',
-        'log2',
-        'log10',
-        'nullifzero',
-        'zeroifnull',
+        param(lambda x: x.abs(), id="abs"),
+        param(lambda x: x.ceil(), id="ceil"),
+        param(lambda x: x.floor(), id="floor"),
+        param(lambda x: x.exp(), id="exp"),
+        param(lambda x: x.sqrt(), id="sqrt"),
+        param(lambda x: x.log(), id="log"),
+        param(lambda x: x.approx_median(), id="approx_median"),
+        param(lambda x: x.approx_nunique(), id="approx_nunique"),
+        param(lambda x: x.ln(), id="ln"),
+        param(lambda x: x.log2(), id="log2"),
+        param(lambda x: x.log10(), id="log10"),
+        param(lambda x: x.nullif(0), id="nullif_zero"),
+        param(lambda x: x.fill_null(0), id="zero_ifnull"),
     ],
 )
 @pytest.mark.parametrize("cname", ["double_col", "int_col"])
-def test_numeric_unary_builtins(ibis_name, cname, table, snapshot):
-    method = getattr(table[cname], ibis_name)
-    expr = method()
+def test_numeric_unary_builtins(method, cname, table, snapshot):
+    col = table[cname]
+    expr = method(col)
 
     result = translate(expr)
     snapshot.assert_match(result, "out.sql")
@@ -69,23 +73,23 @@ def test_hash(table, snapshot):
 @pytest.mark.parametrize(
     "expr_fn",
     [
-        pytest.param(lambda t: t.double_col.sum(where=t.bigint_col < 70), id='sum'),
-        pytest.param(lambda t: t.double_col.count(where=t.bigint_col < 70), id='count'),
-        pytest.param(lambda t: t.double_col.mean(where=t.bigint_col < 70), id='avg'),
-        pytest.param(lambda t: t.double_col.max(where=t.bigint_col < 70), id='max'),
-        pytest.param(lambda t: t.double_col.min(where=t.bigint_col < 70), id='min'),
+        pytest.param(lambda t: t.double_col.sum(where=t.bigint_col < 70), id="sum"),
+        pytest.param(lambda t: t.double_col.count(where=t.bigint_col < 70), id="count"),
+        pytest.param(lambda t: t.double_col.mean(where=t.bigint_col < 70), id="avg"),
+        pytest.param(lambda t: t.double_col.max(where=t.bigint_col < 70), id="max"),
+        pytest.param(lambda t: t.double_col.min(where=t.bigint_col < 70), id="min"),
         pytest.param(
-            lambda t: t.double_col.std(where=t.bigint_col < 70), id='stddev_samp'
+            lambda t: t.double_col.std(where=t.bigint_col < 70), id="stddev_samp"
         ),
         pytest.param(
-            lambda t: t.double_col.std(where=t.bigint_col < 70, how='pop'),
-            id='stddev_pop',
+            lambda t: t.double_col.std(where=t.bigint_col < 70, how="pop"),
+            id="stddev_pop",
         ),
         pytest.param(
-            lambda t: t.double_col.var(where=t.bigint_col < 70), id='var_samp'
+            lambda t: t.double_col.var(where=t.bigint_col < 70), id="var_samp"
         ),
         pytest.param(
-            lambda t: t.double_col.var(where=t.bigint_col < 70, how='pop'), id='var_pop'
+            lambda t: t.double_col.var(where=t.bigint_col < 70, how="pop"), id="var_pop"
         ),
     ],
 )
@@ -97,8 +101,8 @@ def test_reduction_where(table, expr_fn, snapshot):
 
 @pytest.mark.parametrize("method_name", ["sum", "count", "mean", "max", "min"])
 def test_reduction_invalid_where(table, method_name):
-    condbad_literal = L('T')
+    condbad_literal = ibis.literal("T")
     reduction = getattr(table.double_col, method_name)
 
-    with pytest.raises(TypeError):
+    with pytest.raises(ValidationError):
         reduction(where=condbad_literal)

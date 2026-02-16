@@ -1,19 +1,98 @@
-pkgs: _:
+{
+  uv2nix,
+  pyproject-nix,
+  pyproject-build-systems,
+}:
+pkgs: super:
 let
-  mkPoetryEnv = { groups, python, extras ? [ "*" ] }: pkgs.poetry2nix.mkPoetryEnv {
-    inherit python groups extras;
-    projectDir = pkgs.gitignoreSource ../.;
-    editablePackageSources = { ibis = pkgs.gitignoreSource ../ibis; };
-    overrides = [
-      (import ../poetry-overrides.nix)
-      pkgs.poetry2nix.defaultPoetryOverrides
-    ];
-    preferWheels = true;
+  # Create package overlay from workspace.
+  workspace = uv2nix.lib.workspace.loadWorkspace { workspaceRoot = ../.; };
+
+  envOverlay = workspace.mkPyprojectOverlay {
+    sourcePreference = "wheel";
   };
 
-  mkPoetryDevEnv = python: mkPoetryEnv {
-    inherit python;
-    groups = [ "dev" "docs" "test" ];
+  # Create an overlay enabling editable mode for all local dependencies.
+  # This is for usage with `nix develop`
+  editableOverlay = workspace.mkEditablePyprojectOverlay {
+    root = "$REPO_ROOT";
+  };
+
+  # Build fixups overlay
+  pyprojectOverrides = import ./pyproject-overrides.nix { inherit pkgs; };
+
+  # Adds tests to ibis-framework.passthru.tests
+  testOverlay = import ./tests.nix {
+    inherit pkgs;
+    deps = defaultDeps;
+  };
+
+  # Default dependencies for env
+  defaultDeps = {
+    ibis-framework = [
+      "duckdb"
+      "datafusion"
+      "sqlite"
+      "polars"
+      "decompiler"
+      "visualization"
+    ];
+  };
+
+  inherit (pkgs) lib stdenv;
+
+  mkEnv' =
+    {
+      # Python dependency specification
+      deps,
+      # Installs ibis-framework as an editable package for use with `nix develop`.
+      # This means that any changes done to your local files do not require a rebuild.
+      editable,
+    }:
+    python:
+    let
+      inherit (stdenv) targetPlatform;
+      # Construct package set
+      pythonSet =
+        # Use base package set from pyproject.nix builders
+        (pkgs.callPackage pyproject-nix.build.packages {
+          inherit python;
+          stdenv = stdenv.override {
+            targetPlatform = targetPlatform // {
+              darwinSdkVersion = if targetPlatform.isAarch64 then "14.0" else "12.0";
+            };
+          };
+        }).overrideScope
+          (
+            lib.composeManyExtensions (
+              [
+                pyproject-build-systems.overlays.default
+                envOverlay
+                pyprojectOverrides
+              ]
+              ++ lib.optionals editable [ editableOverlay ]
+              ++ lib.optionals (!editable) [ testOverlay ]
+            )
+          );
+    in
+    # Build virtual environment
+    (pythonSet.mkVirtualEnv "ibis-${python.pythonVersion}" deps).overrideAttrs (_old: {
+      # Add passthru.tests from ibis-framework to venv passthru.
+      # This is used to build tests by CI.
+      passthru = {
+        inherit (pythonSet.ibis-framework.passthru) tests;
+      };
+    });
+
+  mkEnv = mkEnv' {
+    deps = defaultDeps;
+    editable = false;
+  };
+
+  mkDevEnv = mkEnv' {
+    # Enable all dependencies for development shell
+    deps = workspace.deps.all;
+    editable = true;
   };
 in
 {
@@ -21,45 +100,68 @@ in
     name = "ibis-testing-data";
     owner = "ibis-project";
     repo = "testing-data";
-    rev = "master";
-    sha256 = "sha256-q1b5IcOl5oIFXP7/P5RufncjHEVrWp4NjoU2uo/BE9U=";
+    rev = "b26bd40cf29004372319df620c4bbe41420bb6f8";
+    sha256 = "sha256-1fenQNQB+Q0pbb0cbK2S/UIwZDE4PXXG15MH3aVbyLU=";
   };
 
-  ibis38 = pkgs.callPackage ./ibis.nix { python3 = pkgs.python38; };
-  ibis39 = pkgs.callPackage ./ibis.nix { python3 = pkgs.python39; };
-  ibis310 = pkgs.callPackage ./ibis.nix { python3 = pkgs.python310; };
-  ibis311 = pkgs.callPackage ./ibis.nix { python3 = pkgs.python311; };
+  ibis310 = mkEnv pkgs.python310;
+  ibis311 = mkEnv pkgs.python311;
+  ibis312 = mkEnv pkgs.python312;
+  ibis313 = mkEnv pkgs.python313;
+  ibis314 = mkEnv pkgs.python314;
 
-  ibisDevEnv38 = mkPoetryDevEnv pkgs.python38;
-  ibisDevEnv39 = mkPoetryDevEnv pkgs.python39;
-  ibisDevEnv310 = mkPoetryDevEnv pkgs.python310;
-  ibisDevEnv311 = mkPoetryDevEnv pkgs.python311;
+  ibisDevEnv310 = mkDevEnv pkgs.python310;
+  ibisDevEnv311 = mkDevEnv pkgs.python311;
+  ibisDevEnv312 = mkDevEnv pkgs.python312;
+  ibisDevEnv313 = mkDevEnv pkgs.python313;
+  ibisDevEnv314 = mkDevEnv pkgs.python314;
 
-  ibisSmallDevEnv = mkPoetryEnv {
-    python = pkgs.python311;
-    groups = [ "dev" ];
-    extras = [ ];
-  };
+  ibisSmallDevEnv = mkEnv' {
+    deps = {
+      ibis-framework = [ "dev" ];
+    };
+    editable = false;
+  } pkgs.python313;
+
+  duckdb = super.duckdb.overrideAttrs (
+    _:
+    lib.optionalAttrs (stdenv.isAarch64 && stdenv.isLinux) {
+      doInstallCheck = false;
+    }
+  );
+
+  quarto = pkgs.callPackage ./quarto { };
 
   changelog = pkgs.writeShellApplication {
     name = "changelog";
-    runtimeInputs = [ pkgs.nodePackages.conventional-changelog-cli ];
-    text = "conventional-changelog --config ./.conventionalcommits.js";
+    runtimeInputs = [ pkgs.nodejs.pkgs.conventional-changelog-cli ];
+    text = ''
+      conventional-changelog --config ./.conventionalcommits.js "$@"
+    '';
   };
 
-  update-lock-files = pkgs.writeShellApplication {
-    name = "update-lock-files";
-    runtimeInputs = [ pkgs.poetry ];
+  check-release-notes-spelling = pkgs.writeShellApplication {
+    name = "check-release-notes-spelling";
+    runtimeInputs = [
+      pkgs.changelog
+      pkgs.coreutils
+      pkgs.codespell
+    ];
     text = ''
-      poetry lock --no-update
-      poetry export --extras all --with dev --with test --with docs --without-hashes --no-ansi > requirements.txt
+      tmp="$(mktemp)"
+      changelog --release-count 1 --output-unreleased --outfile "$tmp"
+      if ! codespell "$tmp"; then
+        # cat -n to output line numbers
+        cat -n "$tmp"
+        exit 1
+      fi
     '';
   };
 
   gen-examples = pkgs.writeShellApplication {
     name = "gen-examples";
     runtimeInputs = [
-      pkgs.ibisDevEnv311
+      pkgs.ibisDevEnv313
       (pkgs.rWrapper.override {
         packages = with pkgs.rPackages; [
           Lahman
@@ -77,33 +179,38 @@ in
     '';
   };
 
-  gen-all-extras = pkgs.writeShellApplication {
-    name = "gen-all-extras";
-    runtimeInputs = with pkgs; [ yj jq ];
-    text = ''
-      echo -n 'all = '
-      yj -tj < pyproject.toml | jq -rM '.tool.poetry.extras | with_entries(select(.key != "all")) | [.[]] | add | unique | sort'
-    '';
-  };
-
-  check-poetry-version = pkgs.writeShellApplication {
-    name = "check-poetry-version";
+  get-latest-quarto-hash = pkgs.writeShellApplication {
+    name = "get-latest-quarto-hash";
     runtimeInputs = [
-      (
-        mkPoetryEnv {
-          python = pkgs.python311;
-          groups = [ ];
-          extras = [ ];
-        }
-      ).pkgs.poetry
+      pkgs.nix
+      pkgs.gh
+      pkgs.jq
     ];
     text = ''
-      expected="$1"
-      out="$(poetry --version --no-ansi)"
-      if [[ "$out" != *"$expected"* ]]; then
-        >&2 echo "error: expected version $expected; got: $out"
-        exit 1
-      fi
+      declare -A systems=(["x86_64-linux"]="linux-amd64" ["aarch64-linux"]="linux-arm64" ["aarch64-darwin"]="macos")
+      declare -a out=()
+      version="$(gh release --repo quarto-dev/quarto-cli list --json isPrerelease,tagName --jq '[.[] | select(.isPrerelease)][0].tagName[1:]')"
+      i=1
+      nsystems="''${#systems[@]}"
+      for nix_system in "''${!systems[@]}"; do
+        quarto_system="''${systems[''${nix_system}]}"
+        url="https://github.com/quarto-dev/quarto-cli/releases/download/v''${version}/quarto-''${version}-''${quarto_system}.tar.gz"
+        fetched_hash="$(nix-prefetch-url "$url")"
+        hash="$(nix hash convert --hash-algo sha256 --from nix32 "''${fetched_hash}")"
+        row="\"''${nix_system}\":\"''${hash}\""
+        if [ "''${i}" -ne "''${nsystems}" ]; then
+          row+=","
+        fi
+        out+=("''${row}")
+        ((++i))
+      done
+      {
+        echo -n "{\"version\":\"''${version}\",\"hashes\":{"
+        for row in "''${out[@]}"; do
+          echo -n "''${row}"
+        done
+        echo -n '}}'
+      } | jq --sort-keys | tee "''${PWD}/nix/quarto/version-info.json"
     '';
   };
 }

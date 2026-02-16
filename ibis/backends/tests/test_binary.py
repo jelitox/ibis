@@ -1,32 +1,36 @@
+from __future__ import annotations
+
 import contextlib
 
 import pytest
-import sqlalchemy.exc
 
 import ibis
 import ibis.common.exceptions as com
 
 BINARY_BACKEND_TYPES = {
-    'bigquery': "BYTES",
-    'clickhouse': 'String',
-    'duckdb': 'BLOB',
-    'snowflake': "BINARY",
-    'sqlite': "blob",
-    'trino': 'STRING',
+    "bigquery": "BYTES",
+    "clickhouse": "String",
+    "duckdb": "BLOB",
+    "snowflake": "BINARY",
+    "sqlite": "blob",
+    "trino": "varbinary",
     "postgres": "bytea",
+    "materialize": "bytea",
+    "risingwave": "bytea",
+    "flink": "BYTES NOT NULL",
+    "databricks": "binary",
+    "athena": "varbinary",
 }
 
-pytestmark = pytest.mark.broken(["druid"], raises=AssertionError)
 
-
-@pytest.mark.broken(
-    ['trino'],
-    "(builtins.AttributeError) 'bytes' object has no attribute 'encode'",
-    raises=sqlalchemy.exc.StatementError,
-)
-@pytest.mark.broken(
-    ['clickhouse', 'impala', 'polars'],
+@pytest.mark.notimpl(
+    ["clickhouse", "impala", "druid", "oracle"],
     "Unsupported type: Binary(nullable=True)",
+    raises=NotImplementedError,
+)
+@pytest.mark.notimpl(
+    ["exasol"],
+    "Exasol does not have native support for a binary data type.",
     raises=NotImplementedError,
 )
 def test_binary_literal(con, backend):

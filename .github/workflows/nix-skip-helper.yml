@@ -7,20 +7,25 @@ on:
   push:
     paths:
       - "docs/**"
-      - "mkdocs.yml"
       - "**/*.md"
+      - "**/*.qmd"
+      - ".envrc"
     branches:
-      - master
+      - main
       - "*.x.x"
   pull_request:
     paths:
       - "docs/**"
-      - "mkdocs.yml"
       - "**/*.md"
+      - "**/*.qmd"
+      - ".envrc"
     branches:
-      - master
+      - main
       - "*.x.x"
   merge_group:
+
+permissions:
+  contents: none
 
 jobs:
   nix:
@@ -29,14 +34,11 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - ubuntu-latest
+          - ubuntu-latest # x86_64-linux
+          - ubuntu-24.04-arm # aarch64-linux
+          - macos-15 # aarch64-darwin
         python-version:
-          - "3.8"
-          - "3.9"
           - "3.10"
-          - "3.11"
-        include:
-          - os: macos-latest
-            python-version: "3.10"
+          - "3.14"
     steps:
       - run: echo "No build required"

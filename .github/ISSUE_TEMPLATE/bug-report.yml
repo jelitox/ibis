@@ -1,5 +1,5 @@
-name: Bug Report
-description: File a bug report
+name: Bug report
+description: File a bug report for Ibis.
 title: "bug: "
 labels: ["bug"]
 body:
@@ -38,7 +38,7 @@ body:
     id: terms
     attributes:
       label: Code of Conduct
-      description: By submitting this issue, you agree to follow our [Code of Conduct](https://github.com/ibis-project/ibis/blob/master/CODE_OF_CONDUCT.md)
+      description: By submitting this issue, you agree to follow our [Code of Conduct](https://github.com/ibis-project/ibis/blob/main/CODE_OF_CONDUCT.md)
       options:
         - label: I agree to follow this project's Code of Conduct
           required: true

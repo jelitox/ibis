@@ -4,32 +4,27 @@ import contextlib
 import importlib
 import importlib.metadata
 import itertools
-import os
-import platform
-import sys
-from functools import lru_cache
-from pathlib import Path
-from typing import Any, TextIO
+from functools import cache
+from typing import TYPE_CHECKING, Any
 
 import _pytest
-import numpy as np
-import pandas as pd
 import pytest
-import sqlalchemy as sa
 from packaging.requirements import Requirement
-from packaging.version import parse as vparse
 
 import ibis
 from ibis import util
-from ibis.backends.base import _get_backend_names
-
-SANDBOXED = (
-    any(key.startswith("NIX_") for key in os.environ)
-    and os.environ.get("IN_NIX_SHELL") != "impure"
+from ibis.backends import (
+    CanCreateCatalog,
+    CanCreateDatabase,
+    _get_backend_names,
 )
-LINUX = platform.system() == "Linux"
-MACOS = platform.system() == "Darwin"
-WINDOWS = platform.system() == "Windows"
+from ibis.conftest import WINDOWS
+from ibis.util import promote_tuple
+
+if TYPE_CHECKING:
+    from ibis.backends import BaseBackend
+    from ibis.backends.tests.base import BackendTest
+
 
 TEST_TABLES = {
     "functional_alltypes": ibis.schema(
@@ -99,6 +94,34 @@ TEST_TABLES = {
             "notes": "string",
         }
     ),
+    "astronauts": ibis.schema(
+        {
+            "id": "int64",
+            "number": "int64",
+            "nationwide_number": "int64",
+            "name": "string",
+            "original_name": "string",
+            "sex": "string",
+            "year_of_birth": "int64",
+            "nationality": "string",
+            "military_civilian": "string",
+            "selection": "string",
+            "year_of_selection": "int64",
+            "mission_number": "int64",
+            "total_number_of_missions": "int64",
+            "occupation": "string",
+            "year_of_mission": "int64",
+            "mission_title": "string",
+            "ascend_shuttle": "string",
+            "in_orbit": "string",
+            "descend_shuttle": "string",
+            "hours_mission": "float64",
+            "total_hrs_sum": "float64",
+            "field21": "int64",
+            "eva_hrs_mission": "float64",
+            "total_eva_hrs": "float64",
+        }
+    ),
 }
 
 # We want to check for exceptions in xfail tests for two reasons:
@@ -108,122 +131,20 @@ TEST_TABLES = {
 # For now, many of our tests don't do this, and we're working to change this situation
 # by improving all tests file by file. All files that have already been improved are
 # added to this list to prevent regression.
-FIlES_WITH_STRICT_EXCEPTION_CHECK = [
-    'ibis/backends/tests/test_api.py',
-    'ibis/backends/tests/test_array.py',
-    'ibis/backends/tests/test_aggregation.py',
-    'ibis/backends/tests/test_binary.py',
-    'ibis/backends/tests/test_numeric.py',
-    'ibis/backends/tests/test_column.py',
-    'ibis/backends/tests/test_string.py',
-    'ibis/backends/tests/test_temporal.py',
-    'ibis/backends/tests/test_uuid.py',
-    'ibis/backends/tests/test_window.py',
+FILES_WITH_STRICT_EXCEPTION_CHECK = [
+    "ibis/backends/tests/test_api.py",
+    "ibis/backends/tests/test_array.py",
+    "ibis/backends/tests/test_aggregation.py",
+    "ibis/backends/tests/test_binary.py",
+    "ibis/backends/tests/test_numeric.py",
+    "ibis/backends/tests/test_column.py",
+    "ibis/backends/tests/test_string.py",
+    "ibis/backends/tests/test_temporal.py",
+    "ibis/backends/tests/test_uuid.py",
+    "ibis/backends/tests/test_window.py",
 ]
 
-
-@pytest.fixture(scope='session')
-def script_directory() -> Path:
-    """Return the test script directory.
-
-    Returns
-    -------
-    Path
-        Test script directory
-    """
-    return Path(__file__).absolute().parents[2] / "ci"
-
-
-@pytest.fixture(scope='session')
-def data_directory() -> Path:
-    """Return the test data directory.
-
-    Returns
-    -------
-    Path
-        Test data directory
-    """
-    root = Path(__file__).absolute().parents[2]
-
-    return root / "ci" / "ibis-testing-data"
-
-
-def recreate_database(
-    url: sa.engine.url.URL,
-    database: str,
-    **kwargs: Any,
-) -> None:
-    """Drop the `database` at `url`, if it exists.
-
-    Create a new, blank database with the same name.
-
-    Parameters
-    ----------
-    url : url.sa.engine.url.URL
-        Connection url to the database
-    database : str
-        Name of the database to be dropped.
-    """
-    engine = sa.create_engine(url.set(database=""), **kwargs)
-
-    if url.database is not None:
-        with engine.begin() as con:
-            con.exec_driver_sql(f"DROP DATABASE IF EXISTS {database}")
-            con.exec_driver_sql(f"CREATE DATABASE {database}")
-
-
-def init_database(
-    url: sa.engine.url.URL,
-    database: str,
-    schema: TextIO | None = None,
-    recreate: bool = True,
-    isolation_level: str | None = "AUTOCOMMIT",
-    **kwargs: Any,
-) -> sa.engine.Engine:
-    """Initialise `database` at `url` with `schema`.
-
-    If `recreate`, drop the `database` at `url`, if it exists.
-
-    Parameters
-    ----------
-    url : url.sa.engine.url.URL
-        Connection url to the database
-    database : str
-        Name of the database to be dropped
-    schema : TextIO
-        File object containing schema to use
-    recreate : bool
-        If true, drop the database if it exists
-    isolation_level : str
-        Transaction isolation_level
-
-    Returns
-    -------
-    sa.engine.Engine
-        SQLAlchemy engine object
-    """
-    if isolation_level is not None:
-        kwargs["isolation_level"] = isolation_level
-
-    if recreate:
-        recreate_database(url, database, **kwargs)
-
-    try:
-        url.database = database
-    except AttributeError:
-        url = url.set(database=database)
-
-    engine = sa.create_engine(url, **kwargs)
-
-    if schema:
-        with engine.begin() as conn:
-            for stmt in filter(
-                None,
-                map(str.strip, schema.read().split(';')),
-            ):
-                conn.exec_driver_sql(stmt)
-
-    return engine
+ALL_BACKENDS = set(_get_backend_names())
 
 
 def _get_backend_conf(backend_str: str):
@@ -248,11 +169,9 @@ def _get_backend_from_parts(parts: tuple[str, ...]) -> str | None:
         return parts[index + 1]
 
 
-def pytest_ignore_collect(path, config):
+def pytest_ignore_collect(collection_path, config):
     # get the backend path part
-    #
-    # path is a py.path.local object hence the conversion to Path first
-    backend = _get_backend_from_parts(Path(path).parts)
+    backend = _get_backend_from_parts(collection_path.parts)
     if backend is None or backend not in _get_backend_names():
         return False
 
@@ -273,22 +192,29 @@ def pytest_ignore_collect(path, config):
         return False
     expr = _pytest.mark.expression.Expression.compile(mark_expr)
     # we check the "backend" marker as well since if that's passed
-    # any file matching a backed should be skipped
+    # any file matching a backend should be skipped
     keep = expr.evaluate(lambda s: s in (backend, "backend"))
     return not keep
 
 
 def pytest_collection_modifyitems(session, config, items):
-    # add the backend marker to any tests are inside "ibis/backends"
     all_backends = _get_backend_names()
     additional_markers = []
 
-    try:
-        import pyspark
-    except ImportError:
-        pyspark = None
-
+    unrecognized_backends = set()
     for item in items:
+        # Yell loudly if unrecognized backend in notimpl, notyet or never
+        for name in ("notimpl", "notyet", "never"):
+            for mark in item.iter_markers(name=name):
+                if backend := set(util.promote_list(mark.args[0])).difference(
+                    ALL_BACKENDS
+                ):
+                    unrecognized_backends.add(
+                        f"""Unrecognize backend(s) {backend} passed to {name} marker in
+{item.path}::{item.originalname}"""
+                    )
+
+        # add the backend marker to any tests are inside "ibis/backends"
         parts = item.path.parts
         backend = _get_backend_from_parts(parts)
         if backend is not None and backend in all_backends:
@@ -298,43 +224,21 @@ def pytest_collection_modifyitems(session, config, items):
             itertools.chain(
                 *(item.iter_markers(name=name) for name in all_backends),
                 item.iter_markers(name="backend"),
-                item.iter_markers(name="backend_nodata"),
             )
         ):
             # anything else is a "core" test and is run by default
             if not any(item.iter_markers(name="benchmark")):
                 item.add_marker(pytest.mark.core)
 
-        for _ in item.iter_markers(name="pyspark"):
-            if not isinstance(item, pytest.DoctestItem):
-                additional_markers.append(
-                    (
-                        item,
-                        [
-                            pytest.mark.xfail(
-                                sys.version_info >= (3, 11),
-                                reason="PySpark doesn't support Python 3.11",
-                            ),
-                            pytest.mark.xfail(
-                                vparse(pd.__version__) >= vparse("2"),
-                                reason="PySpark doesn't support pandas>=2",
-                            ),
-                            pytest.mark.skipif(
-                                pyspark is not None
-                                and vparse(pyspark.__version__) < vparse("3.3.3")
-                                and vparse(np.__version__) >= vparse("1.24"),
-                                reason="PySpark doesn't support numpy >= 1.24",
-                            ),
-                        ],
-                    )
-                )
+    if unrecognized_backends:
+        raise pytest.PytestCollectionWarning("\n" + "\n".join(unrecognized_backends))
 
     for item, markers in additional_markers:
         for marker in markers:
             item.add_marker(marker)
 
 
-@lru_cache(maxsize=None)
+@cache
 def _get_backends_to_test(
     keep: tuple[str, ...] = (),
     discard: tuple[str, ...] = (),
@@ -361,9 +265,9 @@ def _get_backends_to_test(
 def pytest_runtest_call(item):
     """Dynamically add various custom markers."""
     backend = [
-        backend.name()
+        getattr(backend, "name", lambda backend=backend: backend)()
         for key, backend in item.funcargs.items()
-        if key.endswith(("backend", "backend_nodata"))
+        if key.endswith(("backend", "backend_name", "backend_no_data"))
     ]
     if len(backend) > 1:
         raise ValueError(
@@ -374,126 +278,74 @@ def pytest_runtest_call(item):
     if not backend:
         # Check item path to see if test is in backend-specific folder
         backend = set(_get_backend_names()).intersection(item.path.parts)
+    if not backend:
+        # Check if this is one of the uninstantiated backend class fixture
+        # used for signature checking
+        backend = [
+            backend.name
+            for key, backend in item.funcargs.items()
+            if key.endswith("backend_cls")
+        ]
 
     if not backend:
         return
 
     backend = next(iter(backend))
 
-    for marker in item.iter_markers(name="min_server_version"):
-        kwargs = marker.kwargs
-        if backend not in kwargs:
-            continue
-
-        funcargs = item.funcargs
-        con = funcargs.get(
-            "con",
-            getattr(
-                funcargs.get("backend", funcargs.get("backend_nodata")),
-                "connection",
-                None,
-            ),
-        )
-
-        if con is None:
-            continue
-
-        min_server_version = kwargs.pop(backend)
-        server_version = con.version
-        condition = vparse(server_version) < vparse(min_server_version)
-        item.add_marker(
-            pytest.mark.xfail(
-                condition,
-                reason=(
-                    f"unsupported functionality for server version {server_version}"
-                ),
-                **kwargs,
-            )
-        )
-
-    for marker in item.iter_markers(name="min_version"):
-        kwargs = marker.kwargs
-        if backend not in kwargs:
-            continue
-
-        min_version = kwargs.pop(backend)
-        reason = kwargs.pop("reason", None)
-        version = getattr(importlib.import_module(backend), "__version__", None)
-        if condition := version is None:  # pragma: no cover
-            if reason is None:
-                reason = f"{backend} backend module has no __version__ attribute"
-        else:
-            condition = vparse(version) < vparse(min_version)
-            if reason is None:
-                reason = f"test requires {backend}>={version}; got version {version}"
+    def _filter_none_from_raises(kwargs):
+        # Filter out any None values from kwargs['raises']
+        # to cover any missing backend error types as defined in ibis/backends/tests/errors.py
+        if (raises := kwargs.get("raises")) is not None:
+            raises = tuple(filter(None, promote_tuple(raises)))
+            if raises:
+                kwargs["raises"] = raises
             else:
-                reason = f"{backend}@{version} (<{min_version}): {reason}"
-        item.add_marker(pytest.mark.xfail(condition, reason=reason, **kwargs))
+                # if filtering removes all of the values of raises pop the
+                # argument otherwise it gets passed as an empty tuple and this
+                # messes up xfail
+                kwargs.pop("raises")
+        return kwargs
 
     # Ibis hasn't exposed existing functionality
     # This xfails so that you know when it starts to pass
     for marker in item.iter_markers(name="notimpl"):
         if backend in marker.args[0]:
             if (
-                item.location[0] in FIlES_WITH_STRICT_EXCEPTION_CHECK
+                item.location[0] in FILES_WITH_STRICT_EXCEPTION_CHECK
                 and "raises" not in marker.kwargs.keys()
             ):
                 raise ValueError("notimpl requires a raises")
-            reason = marker.kwargs.get("reason")
-            item.add_marker(
-                pytest.mark.xfail(
-                    reason=reason or f'Feature not yet exposed in {backend}',
-                    **{k: v for k, v in marker.kwargs.items() if k != "reason"},
-                )
-            )
+            kwargs = marker.kwargs.copy()
+            kwargs.setdefault("reason", f"Feature not yet exposed in {backend}")
+            kwargs = _filter_none_from_raises(kwargs)
+            item.add_marker(pytest.mark.xfail(**kwargs))
 
     # Functionality is unavailable upstream (but could be)
     # This xfails so that you know when it starts to pass
     for marker in item.iter_markers(name="notyet"):
         if backend in marker.args[0]:
             if (
-                item.location[0] in FIlES_WITH_STRICT_EXCEPTION_CHECK
+                item.location[0] in FILES_WITH_STRICT_EXCEPTION_CHECK
                 and "raises" not in marker.kwargs.keys()
             ):
                 raise ValueError("notyet requires a raises")
-            reason = marker.kwargs.get("reason")
-            item.add_marker(
-                pytest.mark.xfail(
-                    reason=reason or f'Feature not available upstream for {backend}',
-                    **{k: v for k, v in marker.kwargs.items() if k != "reason"},
-                )
-            )
+
+            kwargs = marker.kwargs.copy()
+            kwargs.setdefault("reason", f"Feature not available upstream for {backend}")
+            kwargs = _filter_none_from_raises(kwargs)
+            item.add_marker(pytest.mark.xfail(**kwargs))
 
     for marker in item.iter_markers(name="never"):
         if backend in marker.args[0]:
             if "reason" not in marker.kwargs.keys():
                 raise ValueError("never requires a reason")
-            item.add_marker(
-                pytest.mark.xfail(
-                    **marker.kwargs,
-                )
-            )
-
-    # Something has been exposed as broken by a new test and it shouldn't be
-    # imperative for a contributor to fix it just because they happened to
-    # bring it to attention  -- USE SPARINGLY
-    for marker in item.iter_markers(name="broken"):
-        if backend in marker.args[0]:
-            if (
-                item.location[0] in FIlES_WITH_STRICT_EXCEPTION_CHECK
-                and "raises" not in marker.kwargs.keys()
-            ):
-                raise ValueError("broken requires a raises")
-            reason = marker.kwargs.get("reason")
-            item.add_marker(
-                pytest.mark.xfail(
-                    reason=reason or f"Feature is failing on {backend}",
-                    **{k: v for k, v in marker.kwargs.items() if k != "reason"},
-                )
-            )
+            kwargs = marker.kwargs.copy()
+            kwargs = _filter_none_from_raises(kwargs)
+            item.add_marker(pytest.mark.xfail(**kwargs))
 
     for marker in item.iter_markers(name="xfail_version"):
-        kwargs = marker.kwargs
+        kwargs = marker.kwargs.copy()
+        kwargs = _filter_none_from_raises(kwargs)
         if backend not in kwargs:
             continue
 
@@ -502,7 +354,9 @@ def pytest_runtest_call(item):
         failing_specs = []
         for spec in specs:
             req = Requirement(spec)
-            if req.specifier.contains(importlib.import_module(req.name).__version__):
+            if req.specifier.contains(pytest.importorskip(req.name).__version__) and (
+                (not req.marker) or req.marker.evaluate()
+            ):
                 failing_specs.append(spec)
         reason = f"{backend} backend test fails with {backend}{specs}"
         if provided_reason is not None:
@@ -511,12 +365,29 @@ def pytest_runtest_call(item):
             item.add_marker(pytest.mark.xfail(reason=reason, **kwargs))
 
 
-@pytest.fixture(params=_get_backends_to_test(), scope='session')
-def backend(request, data_directory, script_directory, tmp_path_factory, worker_id):
+def _get_backend_cls(backend_str: str):
+    """Convert a backend string to the test class for the backend."""
+    backend_mod = importlib.import_module(f"ibis.backends.{backend_str}")
+    return backend_mod.Backend
+
+
+@pytest.fixture(params=_get_backends_to_test(), scope="session")
+def backend_cls(request) -> BaseBackend:
+    """Return the uninstantiated backend class, unconnected.
+
+    This is used for signature checking and nothing should be executed."""
+
+    cls = _get_backend_cls(request.param)
+    return cls
+
+
+@pytest.fixture(params=_get_backends_to_test(), scope="session")
+def backend(request, data_dir, tmp_path_factory, worker_id) -> BackendTest:
     """Return an instance of BackendTest, loaded with data."""
 
     cls = _get_backend_conf(request.param)
-    return cls.load_data(data_directory, script_directory, tmp_path_factory, worker_id)
+    with cls.load_data(data_dir, tmp_path_factory, worker_id) as be:
+        yield be
 
 
 @pytest.fixture(scope="session")
@@ -525,100 +396,80 @@ def con(backend):
     return backend.connection
 
 
-@pytest.fixture(params=_get_backends_to_test(), scope='session')
-def backend_nodata(request, data_directory):
-    """Return an instance of BackendTest, loaded with data."""
-
+@pytest.fixture(params=_get_backends_to_test(), scope="session")
+def backend_no_data(request, data_dir, tmp_path_factory, worker_id):
+    """Return an instance of BackendTest, with no data loaded."""
     cls = _get_backend_conf(request.param)
-    return cls(data_directory)
+    with cls(data_dir=data_dir, tmpdir=tmp_path_factory, worker_id=worker_id) as be:
+        yield be
 
 
 @pytest.fixture(scope="session")
-def con_nodata(backend_nodata):
-    """Instance of a backend client."""
-    return backend_nodata.connection
+def con_no_data(backend_no_data):
+    """Return an Ibis backend instance, with no data loaded."""
+    return backend_no_data.connection
 
 
-def _setup_backend(
-    request, data_directory, script_directory, tmp_path_factory, worker_id
-):
-    if (backend := request.param) == "duckdb" and platform.system() == "Windows":
+@pytest.fixture(scope="session")
+def con_create_catalog(con):
+    if isinstance(con, CanCreateCatalog):
+        return con
+    else:
+        pytest.skip(f"{con.name} backend cannot create databases")
+
+
+@pytest.fixture(scope="session")
+def con_create_database(con):
+    if isinstance(con, CanCreateDatabase):
+        return con
+    else:
+        pytest.skip(f"{con.name} backend cannot create schemas")
+
+
+@pytest.fixture(scope="session")
+def con_create_catalog_database(con):
+    if isinstance(con, CanCreateCatalog) and isinstance(con, CanCreateDatabase):
+        return con
+    else:
+        pytest.skip(f"{con.name} backend cannot create both database and schemas")
+
+
+def _setup_backend(request, data_dir, tmp_path_factory, worker_id):
+    if (backend := request.param) == "duckdb" and WINDOWS:
         pytest.xfail(
             "windows prevents two connections to the same duckdb file "
             "even in the same process"
         )
-        return None
     else:
         cls = _get_backend_conf(backend)
-        return cls.load_data(
-            data_directory, script_directory, tmp_path_factory, worker_id
-        )
+        return cls.load_data(data_dir, tmp_path_factory, worker_id)
 
 
 @pytest.fixture(
-    params=_get_backends_to_test(discard=("dask", "pandas")),
-    scope='session',
+    params=_get_backends_to_test(),
+    scope="session",
 )
-def ddl_backend(request, data_directory, script_directory, tmp_path_factory, worker_id):
+def ddl_backend(request, data_dir, tmp_path_factory, worker_id):
     """Set up the backends that are SQL-based."""
-    return _setup_backend(
-        request, data_directory, script_directory, tmp_path_factory, worker_id
-    )
+    with _setup_backend(request, data_dir, tmp_path_factory, worker_id) as be:
+        yield be
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def ddl_con(ddl_backend):
     """Instance of Client, already connected to the db (if applies)."""
     return ddl_backend.connection
 
 
-@pytest.fixture(
-    params=_get_backends_to_test(
-        keep=(
-            "duckdb",
-            "mssql",
-            "mysql",
-            "oracle",
-            "postgres",
-            "snowflake",
-            "sqlite",
-            "trino",
-        )
-    ),
-    scope='session',
-)
-def alchemy_backend(
-    request, data_directory, script_directory, tmp_path_factory, worker_id
-):
-    """Set up the SQLAlchemy-based backends."""
-    return _setup_backend(
-        request, data_directory, script_directory, tmp_path_factory, worker_id
-    )
-
-
-@pytest.fixture(scope='session')
-def alchemy_con(alchemy_backend):
-    """Instance of Client, already connected to the db (if applies)."""
-    return alchemy_backend.connection
-
-
-@pytest.fixture(
-    params=_get_backends_to_test(keep=("dask", "pandas", "pyspark")),
-    scope='session',
-)
-def udf_backend(request, data_directory, script_directory, tmp_path_factory, worker_id):
+@pytest.fixture(params=_get_backends_to_test(keep=("pyspark",)), scope="session")
+def udf_backend(request, data_dir, tmp_path_factory, worker_id):
     """Runs the UDF-supporting backends."""
     cls = _get_backend_conf(request.param)
-    return cls.load_data(data_directory, script_directory, tmp_path_factory, worker_id)
+    with cls.load_data(data_dir, tmp_path_factory, worker_id) as be:
+        yield be
 
 
-@pytest.fixture(scope='session')
-def udf_con(udf_backend):
-    """Instance of Client, already connected to the db (if applies)."""
-    return udf_backend.connection
-
-
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def alltypes(backend):
     return backend.functional_alltypes
 
@@ -628,114 +479,78 @@ def json_t(backend):
     return backend.json_t
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def struct(backend):
     return backend.struct
 
 
-@pytest.fixture(scope='session')
-def sorted_alltypes(alltypes):
-    return alltypes.order_by('id')
-
-
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def udf_alltypes(udf_backend):
     return udf_backend.functional_alltypes
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def batting(backend):
     return backend.batting
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def awards_players(backend):
     return backend.awards_players
 
 
-@pytest.fixture
-def analytic_alltypes(alltypes):
-    return alltypes
-
-
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def df(alltypes):
     return alltypes.execute()
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def struct_df(struct):
     return struct.execute()
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def udf_df(udf_alltypes):
     return udf_alltypes.execute()
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def sorted_df(df):
-    return df.sort_values('id').reset_index(drop=True)
+    return df.sort_values("id").reset_index(drop=True)
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def batting_df(batting):
     return batting.execute(limit=None)
 
 
-@pytest.fixture(scope='session')
+@pytest.fixture(scope="session")
 def awards_players_df(awards_players):
     return awards_players.execute(limit=None)
 
 
-@pytest.fixture(scope='session')
-def geo_df(geo):
-    if geo is not None:
-        return geo.execute(limit=None)
-    return None
-
-
 @pytest.fixture
-def alchemy_temp_table(alchemy_con) -> str:
+def temp_table(con):
     """Return a temporary table name.
 
     Parameters
     ----------
-    alchemy_con : ibis.backends.base.Client
+    con : ibis.backends.Client
 
     Yields
     ------
     name : string
         Random table name for a temporary usage.
     """
-    name = util.gen_name('alchemy_table')
-    yield name
-    with contextlib.suppress(NotImplementedError):
-        alchemy_con.drop_table(name, force=True)
-
-
-@pytest.fixture
-def temp_table(con) -> str:
-    """Return a temporary table name.
-
-    Parameters
-    ----------
-    con : ibis.backends.base.Client
-
-    Yields
-    ------
-    name : string
-        Random table name for a temporary usage.
-    """
-    name = util.gen_name('temp_table')
+    name = util.gen_name("temp_table")
     yield name
     with contextlib.suppress(NotImplementedError):
         con.drop_table(name, force=True)
 
 
 @pytest.fixture
-def temp_table2(con) -> str:
-    name = util.gen_name('temp_table2')
+def temp_table2(con):
+    name = util.gen_name("temp_table2")
     yield name
     with contextlib.suppress(NotImplementedError):
         con.drop_table(name, force=True)
@@ -750,7 +565,7 @@ def temp_table_orig(con, temp_table):
 
 
 @pytest.fixture
-def temp_view(ddl_con) -> str:
+def temp_view(ddl_con):
     """Return a temporary view name.
 
     Parameters
@@ -762,77 +577,16 @@ def temp_view(ddl_con) -> str:
     name : string
         Random view name for a temporary usage.
     """
-    name = util.gen_name('view')
+    name = util.gen_name("view")
     yield name
     with contextlib.suppress(NotImplementedError):
         ddl_con.drop_view(name, force=True)
 
 
-@pytest.fixture(scope='session')
-def current_data_db(ddl_con) -> str:
-    """Return current database name."""
-    return ddl_con.current_database
-
-
 @pytest.fixture
-def alternate_current_database(ddl_con, ddl_backend) -> str:
-    """Create a temporary database and yield its name. Drops the created
-    database upon completion.
+def assert_sql(con, snapshot):
+    def checker(expr, file_name="out.sql"):
+        sql = con.compile(expr, pretty=True)
+        snapshot.assert_match(sql, file_name)
 
-    Parameters
-    ----------
-    ddl_con : ibis.backends.base.Client
-    current_data_db : str
-    Yields
-    -------
-    str
-    """
-    name = util.gen_name('database')
-    try:
-        ddl_con.create_database(name)
-    except NotImplementedError:
-        pytest.skip(f"{ddl_backend.name()} doesn't have create_database method.")
-    yield name
-    ddl_con.drop_database(name, force=True)
-
-
-@pytest.fixture
-def test_employee_schema() -> ibis.schema:
-    sch = ibis.schema(
-        [
-            ('first_name', 'string'),
-            ('last_name', 'string'),
-            ('department_name', 'string'),
-            ('salary', 'float64'),
-        ]
-    )
-
-    return sch
-
-
-@pytest.fixture
-def test_employee_data_1():
-    df = pd.DataFrame(
-        {
-            'first_name': ['A', 'B', 'C'],
-            'last_name': ['D', 'E', 'F'],
-            'department_name': ['AA', 'BB', 'CC'],
-            'salary': [100.0, 200.0, 300.0],
-        }
-    )
-
-    return df
-
-
-@pytest.fixture
-def test_employee_data_2():
-    df2 = pd.DataFrame(
-        {
-            'first_name': ['X', 'Y', 'Z'],
-            'last_name': ['A', 'B', 'C'],
-            'department_name': ['XX', 'YY', 'ZZ'],
-            'salary': [400.0, 500.0, 600.0],
-        }
-    )
-
-    return df2
+    return checker

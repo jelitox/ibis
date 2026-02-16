@@ -14,7 +14,7 @@ module.exports = {
   options: {
     preset: {
       name: "conventionalcommits",
-      types: extractConventionalCommitsConfig(releaseConfig),
-    },
-  },
+      types: extractConventionalCommitsConfig(releaseConfig)
+    }
+  }
 };

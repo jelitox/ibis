@@ -1,36 +1,32 @@
+from __future__ import annotations
+
 import datetime
 from collections import OrderedDict
 
-import numpy as np
-import pandas as pd
-import pandas.testing as tm
 import pytest
-import sqlalchemy as sa
 from pytest import param
 
 import ibis
 import ibis.expr.datatypes as dt
 from ibis import _
+from ibis.backends.tests.errors import OracleDatabaseError
 
-try:
-    from google.api_core.exceptions import BadRequest as GoogleBadRequest
-except ImportError:
-    GoogleBadRequest = None
+np = pytest.importorskip("numpy")
+pd = pytest.importorskip("pandas")
 
 
 @pytest.mark.parametrize(
-    ('column', 'raw_value'),
+    ("column", "raw_value"),
     [
-        ('double_col', 0.0),
-        ('double_col', 10.1),
-        ('float_col', 1.1),
-        ('float_col', 2.2),
+        ("double_col", 0.0),
+        ("double_col", 10.1),
+        ("float_col", 1.1),
+        ("float_col", 2.2),
     ],
 )
-@pytest.mark.notimpl(["datafusion"])
 def test_floating_scalar_parameter(backend, alltypes, df, column, raw_value):
     value = ibis.param(dt.double)
-    expr = (alltypes[column] + value).name('tmp')
+    expr = (alltypes[column] + value).name("tmp")
     expected = df[column] + raw_value
     result = expr.execute(params={value: raw_value})
     expected = backend.default_series_rename(expected)
@@ -38,17 +34,17 @@ def test_floating_scalar_parameter(backend, alltypes, df, column, raw_value):
 
 
 @pytest.mark.parametrize(
-    ('start_string', 'end_string'),
-    [('2009-03-01', '2010-07-03'), ('2014-12-01', '2017-01-05')],
+    ("start_string", "end_string"),
+    [("2009-03-01", "2010-07-03"), ("2014-12-01", "2017-01-05")],
 )
-@pytest.mark.notimpl(["datafusion", "mssql", "trino", "druid"])
-@pytest.mark.broken(["oracle"], raises=sa.exc.DatabaseError)
+@pytest.mark.notimpl(["trino", "druid", "athena"])
+@pytest.mark.notimpl(["oracle"], raises=OracleDatabaseError)
 def test_date_scalar_parameter(backend, alltypes, start_string, end_string):
     start, end = ibis.param(dt.date), ibis.param(dt.date)
 
     col = alltypes.timestamp_col.date()
-    expr = col.between(start, end).name('output')
-    expected_expr = col.between(start_string, end_string).name('output')
+    expr = col.between(start, end).name("output")
+    expected_expr = col.between(start_string, end_string).name("output")
 
     result = expr.execute(params={start: start_string, end: end_string})
     expected = expected_expr.execute()
@@ -56,20 +52,18 @@ def test_date_scalar_parameter(backend, alltypes, start_string, end_string):
     backend.assert_series_equal(result, expected)
 
 
-@pytest.mark.notimpl(["datafusion"])
 def test_timestamp_accepts_date_literals(alltypes):
-    date_string = '2009-03-01'
+    date_string = "2009-03-01"
     param = ibis.param(dt.timestamp)
     expr = alltypes.mutate(param=param)
     params = {param: date_string}
     assert expr.compile(params=params) is not None
 
 
-@pytest.mark.notimpl(
-    ["dask", "datafusion", "impala", "pandas", "pyspark", "druid", "oracle"]
-)
+@pytest.mark.notimpl(["impala", "druid", "oracle", "exasol"])
 @pytest.mark.never(
-    ["mysql", "sqlite", "mssql"], reason="backend will never implement array types"
+    ["mysql", "singlestoredb", "sqlite", "mssql"],
+    reason="backend will never implement array types",
 )
 def test_scalar_param_array(con):
     value = [1, 2, 3]
@@ -78,10 +72,15 @@ def test_scalar_param_array(con):
     assert result == len(value)
 
 
-@pytest.mark.notimpl(["datafusion", "impala", "postgres", "pyspark", "druid", "oracle"])
+@pytest.mark.notimpl(["impala", "postgres", "risingwave", "druid", "oracle", "exasol"])
 @pytest.mark.never(
-    ["mysql", "sqlite", "mssql"],
+    ["mysql", "singlestoredb", "sqlite", "mssql"],
     reason="mysql and sqlite will never implement struct types",
+)
+@pytest.mark.notyet(
+    ["materialize"],
+    raises=Exception,
+    reason="Materialize doesn't support ROW constructor syntax for struct params",
 )
 def test_scalar_param_struct(con):
     value = dict(a=1, b="abc", c=3.0)
@@ -90,19 +89,22 @@ def test_scalar_param_struct(con):
     assert result == value["a"]
 
 
-@pytest.mark.notimpl(
-    ["clickhouse", "datafusion", "impala", "pyspark", "polars", "druid", "oracle"]
-)
+@pytest.mark.notimpl(["datafusion", "impala", "polars", "druid", "oracle", "exasol"])
 @pytest.mark.never(
-    ["mysql", "sqlite", "mssql"],
+    ["mysql", "singlestoredb", "sqlite", "mssql"],
     reason="mysql and sqlite will never implement map types",
 )
 @pytest.mark.notyet(["bigquery"])
+@pytest.mark.notyet(
+    ["materialize"],
+    raises=Exception,
+    reason="Materialize doesn't support jsonb_extract_path_text function",
+)
 def test_scalar_param_map(con):
-    value = {'a': 'ghi', 'b': 'def', 'c': 'abc'}
+    value = {"a": "ghi", "b": "def", "c": "abc"}
     param = ibis.param(dt.Map(dt.string, dt.string))
-    result = con.execute(param['b'], params={param: value})
-    assert result == value['b']
+    result = con.execute(param["b"], params={param: value})
+    assert result == value["b"]
 
 
 @pytest.mark.parametrize(
@@ -119,51 +121,23 @@ def test_scalar_param_map(con):
             marks=[pytest.mark.notimpl(["druid"])],
         ),
         param(
-            "2009-01-20 01:02:03",
-            "timestamp",
-            "timestamp_col",
-            id="string_timestamp",
-            marks=[
-                pytest.mark.notimpl(["druid"]),
-                pytest.mark.broken(
-                    ["bigquery"],
-                    raises=GoogleBadRequest,
-                    reason="No matching for operator = for argument types: DATETIME, TIMESTAMP",
-                ),
-            ],
+            "2009-01-20 01:02:03", "timestamp", "timestamp_col", id="string_timestamp"
         ),
         param(
             datetime.date(2009, 1, 20),
             "timestamp",
             "timestamp_col",
             id="date_timestamp",
-            marks=[
-                pytest.mark.notimpl(["druid"]),
-                pytest.mark.broken(
-                    ["bigquery"],
-                    raises=GoogleBadRequest,
-                    reason="No matching for operator = for argument types: DATETIME, TIMESTAMP",
-                ),
-            ],
         ),
         param(
             datetime.datetime(2009, 1, 20, 1, 2, 3),
             "timestamp",
             "timestamp_col",
             id="datetime_timestamp",
-            marks=[
-                pytest.mark.notimpl(["druid"]),
-                pytest.mark.broken(
-                    ["bigquery"],
-                    raises=GoogleBadRequest,
-                    reason="No matching for operator = for argument types: DATETIME, TIMESTAMP",
-                ),
-            ],
         ),
     ],
 )
-@pytest.mark.notimpl(["datafusion"])
-def test_scalar_param(alltypes, df, value, dtype, col):
+def test_scalar_param(backend, alltypes, df, value, dtype, col):
     param = ibis.param(dtype)
     expr = alltypes.filter([_[col] == param])
 
@@ -171,7 +145,7 @@ def test_scalar_param(alltypes, df, value, dtype, col):
         expr.execute(params={param: value}).sort_values("id").reset_index(drop=True)
     )
     expected = df.loc[df[col] == value].sort_values("id").reset_index(drop=True)
-    tm.assert_frame_equal(result, expected)
+    backend.assert_frame_equal(result, expected)
 
 
 @pytest.mark.parametrize(
@@ -179,8 +153,7 @@ def test_scalar_param(alltypes, df, value, dtype, col):
     ["2009-01-20", datetime.date(2009, 1, 20), datetime.datetime(2009, 1, 20)],
     ids=["string", "date", "datetime"],
 )
-@pytest.mark.notimpl(["datafusion", "druid", "oracle"])
-@pytest.mark.notyet(["impala"], reason="impala doesn't support dates")
+@pytest.mark.notimpl(["druid"])
 def test_scalar_param_date(backend, alltypes, value):
     param = ibis.param("date")
     ds_col = alltypes.date_string_col
@@ -201,7 +174,10 @@ def test_scalar_param_date(backend, alltypes, value):
     )
     df = base.execute()
     expected = (
-        df.loc[df.date_col.dt.normalize() == pd.Timestamp(value).normalize()]
+        df.loc[
+            pd.to_datetime(df.date_col).dt.normalize().dt.date
+            == pd.Timestamp(value).normalize().date()
+        ]
         .sort_values("id")
         .reset_index(drop=True)
         .drop(columns=["date_col"])
@@ -209,26 +185,27 @@ def test_scalar_param_date(backend, alltypes, value):
     backend.assert_frame_equal(result, expected)
 
 
-@pytest.mark.notyet(["mysql"], reason="no struct support")
+@pytest.mark.notyet(["flink", "mysql", "singlestoredb"], reason="no struct support")
 @pytest.mark.notimpl(
     [
         "postgres",
+        "risingwave",
         "datafusion",
-        "clickhouse",
-        "polars",
-        "duckdb",
         "sqlite",
-        "snowflake",
         "impala",
         "oracle",
-        "pyspark",
         "mssql",
-        "trino",
         "druid",
+        "exasol",
     ]
+)
+@pytest.mark.notimpl(
+    ["materialize"],
+    reason="Nested parameter support not yet implemented for Materialize",
+    # See: https://materialize.com/docs/sql/types/
 )
 def test_scalar_param_nested(con):
     param = ibis.param("struct<x: array<struct<y: array<double>>>>")
     value = OrderedDict([("x", [OrderedDict([("y", [1.0, 2.0, 3.0])])])])
-    result = con.execute(param, {param: value})
+    result = con.execute(param, params={param: value})
     assert pytest.approx(result["x"][0]["y"]) == np.array([1.0, 2.0, 3.0])

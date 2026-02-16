@@ -13,6 +13,35 @@ CREATE TABLE diamonds (
     z FLOAT
 ) DEFAULT CHARACTER SET = utf8;
 
+DROP TABLE IF EXISTS astronauts;
+
+CREATE TABLE astronauts (
+    `id` BIGINT,
+    `number` BIGINT,
+    `nationwide_number` BIGINT,
+    `name` TEXT,
+    `original_name` TEXT,
+    `sex` TEXT,
+    `year_of_birth` BIGINT,
+    `nationality` TEXT,
+    `military_civilian` TEXT,
+    `selection` TEXT,
+    `year_of_selection` BIGINT,
+    `mission_number` BIGINT,
+    `total_number_of_missions` BIGINT,
+    `occupation` TEXT,
+    `year_of_mission` BIGINT,
+    `mission_title` TEXT,
+    `ascend_shuttle` TEXT,
+    `in_orbit` TEXT,
+    `descend_shuttle` TEXT,
+    `hours_mission` FLOAT,
+    `total_hrs_sum` FLOAT,
+    `field21` BIGINT,
+    `eva_hrs_mission` FLOAT,
+    `total_eva_hrs` FLOAT
+);
+
 DROP TABLE IF EXISTS batting;
 
 CREATE TABLE batting (
@@ -71,22 +100,35 @@ CREATE TABLE functional_alltypes (
 
 DROP TABLE IF EXISTS json_t CASCADE;
 
-CREATE TABLE IF NOT EXISTS json_t (js JSON);
+CREATE TABLE IF NOT EXISTS json_t (rowid BIGINT, js JSON);
 
 INSERT INTO json_t VALUES
-    ('{"a": [1,2,3,4], "b": 1}'),
-    ('{"a":null,"b":2}'),
-    ('{"a":"foo", "c":null}'),
-    ('null'),
-    ('[42,47,55]'),
-    ('[]');
+    (1, '{"a": [1,2,3,4], "b": 1}'),
+    (2, '{"a":null,"b":2}'),
+    (3, '{"a":"foo", "c":null}'),
+    (4, 'null'),
+    (5, '[42,47,55]'),
+    (6, '[]'),
+    (7, '"a"'),
+    (8, '""'),
+    (9, '"b"'),
+    (10, NULL),
+    (11, 'true'),
+    (12, 'false'),
+    (13, '42'),
+    (14, '37.37');
 
 DROP TABLE IF EXISTS win CASCADE;
 
-CREATE TABLE win (g TEXT, x BIGINT, y BIGINT);
+CREATE TABLE win (g TEXT, x BIGINT NOT NULL, y BIGINT);
 INSERT INTO win VALUES
     ('a', 0, 3),
     ('a', 1, 2),
     ('a', 2, 0),
     ('a', 3, 1),
     ('a', 4, 1);
+
+DROP TABLE IF EXISTS topk CASCADE;
+
+CREATE TABLE topk (x BIGINT);
+INSERT INTO topk VALUES (1), (1), (NULL);

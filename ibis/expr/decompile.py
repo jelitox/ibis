@@ -10,6 +10,7 @@ import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
 from ibis.common.graph import Graph
+from ibis.expr.rewrites import simplify
 from ibis.util import experimental
 
 _method_overrides = {
@@ -20,8 +21,8 @@ _method_overrides = {
     ops.ExtractDayOfYear: "day_of_year",
     ops.ExtractEpochSeconds: "epoch_seconds",
     ops.ExtractHour: "hour",
+    ops.ExtractMicrosecond: "microsecond",
     ops.ExtractMillisecond: "millisecond",
-    ops.ExtractMinute: "minute",
     ops.ExtractMinute: "minute",
     ops.ExtractMonth: "month",
     ops.ExtractQuarter: "quarter",
@@ -30,16 +31,13 @@ _method_overrides = {
     ops.ExtractYear: "year",
     ops.Intersection: "intersect",
     ops.IsNull: "isnull",
-    ops.LeftAntiJoin: "anti_join",
-    ops.LeftSemiJoin: "semi_join",
     ops.Lowercase: "lower",
     ops.RegexSearch: "re_search",
-    ops.SelfReference: "view",
     ops.StartsWith: "startswith",
     ops.StringContains: "contains",
     ops.StringSQLILike: "ilike",
     ops.StringSQLLike: "like",
-    ops.TimestampNow: "now",
+    ops.Uppercase: "upper",
 }
 
 
@@ -85,12 +83,12 @@ def translate(op, *args, **kwargs):
     raise NotImplementedError(op)
 
 
-# TODO(kszucs): we do rewrites on construction, so we need to handle specific
-# cases like when reduction_to_aggregation is called
+@translate.register(ops.TimestampNow)
+def now(_):
+    return "ibis.now()"
 
 
 @translate.register(ops.Value)
-@translate.register(ops.TableNode)
 def value(op, *args, **kwargs):
     method = _get_method_name(op)
     kwargs = [(k, v) for k, v in kwargs.items() if v is not None]
@@ -128,44 +126,103 @@ def _try_unwrap(stmt):
     if len(stmt) == 1:
         return stmt[0]
     else:
-        return f"[{', '.join(stmt)}]"
+        stmt = map(str, stmt)
+        values = ", ".join(stmt)
+        return f"[{values}]"
 
 
-@translate.register(ops.Selection)
-def selection(op, table, selections, predicates, sort_keys):
-    out = f"{table}"
-    if selections:
-        out = f"{out}.select({_try_unwrap(selections)})"
+def _wrap_alias(values, rendered):
+    result = []
+    for k, v in values.items():
+        text = rendered[k]
+        if v.name != k:
+            if isinstance(v, ops.Binary):
+                text = f"({text}).name({k!r})"
+            else:
+                text = f"{text}.name({k!r})"
+        result.append(text)
+    return result
+
+
+def _inline(args):
+    return ", ".join(map(str, args))
+
+
+@translate.register(ops.Project)
+def project(op, parent, values):
+    out = f"{parent}"
+    if not values:
+        return out
+
+    values = _wrap_alias(op.values, values)
+    return f"{out}.select({_inline(values)})"
+
+
+@translate.register(ops.Filter)
+def filter_(op, parent, predicates):
+    out = f"{parent}"
     if predicates:
-        out = f"{out}.filter({_try_unwrap(predicates)})"
-    if sort_keys:
-        out = f"{out}.order_by({_try_unwrap(sort_keys)})"
+        out = f"{out}.filter({_inline(predicates)})"
     return out
 
 
-@translate.register(ops.Aggregation)
-def aggregation(op, table, by, metrics, predicates, having, sort_keys):
-    out = f"{table}"
-    if predicates:
-        out = f"{out}.filter({_try_unwrap(predicates)})"
-    if by:
-        out = f"{out}.group_by({_try_unwrap(by)})"
-    if having:
-        out = f"{out}.having({_try_unwrap(having)})"
-    if metrics:
-        out = f"{out}.aggregate({_try_unwrap(metrics)})"
-    if sort_keys:
-        out = f"{out}.order_by({_try_unwrap(sort_keys)})"
+@translate.register(ops.Sort)
+def sort(op, parent, keys):
+    out = f"{parent}"
+    if keys:
+        out = f"{out}.order_by({_inline(keys)})"
     return out
 
 
-@translate.register(ops.Join)
-def join(op, left, right, predicates):
-    method = _get_method_name(op)
-    return f"{left}.{method}({right}, {_try_unwrap(predicates)})"
+@translate.register(ops.Aggregate)
+def aggregation(op, parent, groups, metrics):
+    groups = _wrap_alias(op.groups, groups)
+    metrics = _wrap_alias(op.metrics, metrics)
+    if groups and metrics:
+        return f"{parent}.aggregate([{_inline(metrics)}], by=[{_inline(groups)}])"
+    elif metrics:
+        return f"{parent}.aggregate([{_inline(metrics)}])"
+    else:
+        raise ValueError("No metrics to aggregate")
 
 
-@translate.register(ops.SetOp)
+@translate.register(ops.Distinct)
+def distinct(op, parent):
+    return f"{parent}.distinct()"
+
+
+@translate.register(ops.DropColumns)
+def drop(op, parent, columns_to_drop):
+    return f"{parent}.drop({_inline(map(repr, columns_to_drop))})"
+
+
+@translate.register(ops.SelfReference)
+def self_reference(op, parent, identifier):
+    return f"{parent}.view()"
+
+
+@translate.register(ops.JoinReference)
+def join_reference(op, parent, identifier):
+    return parent
+
+
+@translate.register(ops.JoinLink)
+def join_link(op, table, predicates, how):
+    return f".{how}_join({table}, {_try_unwrap(predicates)})"
+
+
+@translate.register(ops.JoinChain)
+def join(op, first, rest, values):
+    calls = "".join(rest)
+    pieces = [f"{first}{calls}"]
+    if values:
+        values = _wrap_alias(op.values, values)
+        pieces.append(f"select({_inline(values)})")
+    result = ".".join(pieces)
+    return result
+
+
+@translate.register(ops.Set)
 def union(op, left, right, distinct):
     method = _get_method_name(op)
     if distinct:
@@ -175,24 +232,27 @@ def union(op, left, right, distinct):
 
 
 @translate.register(ops.Limit)
-def limit(op, table, n, offset):
+def limit(op, parent, n, offset):
     if offset:
-        return f"{table}.limit({n}, {offset})"
+        return f"{parent}.limit({n}, offset={offset})"
     else:
-        return f"{table}.limit({n})"
+        return f"{parent}.limit({n})"
 
 
-@translate.register(ops.TableColumn)
-def table_column(op, table, name):
-    return f"{table}.{name}"
+@translate.register(ops.Field)
+def table_column(op, rel, name):
+    if name.isidentifier():
+        return f"{rel}.{name}"
+    return f"{rel}[{name!r}]"
 
 
 @translate.register(ops.SortKey)
-def sort_key(op, expr, ascending):
-    if ascending:
-        return f"{expr}.asc()"
-    else:
-        return f"{expr}.desc()"
+def sort_key(op, arg, ascending, nulls_first):
+    method = "asc" if ascending else "desc"
+    call = f"{arg}.{method}"
+    if nulls_first:
+        return f"{call}(nulls_first={nulls_first})"
+    return f"{call}()"
 
 
 @translate.register(ops.Reduction)
@@ -241,23 +301,19 @@ def between(op, arg, lower_bound, upper_bound):
     return f"{arg}.between({lower_bound}, {upper_bound})"
 
 
-@translate.register(ops.Where)
-def where(op, bool_expr, true_expr, false_null_expr):
+@translate.register(ops.IfElse)
+def ifelse(op, bool_expr, true_expr, false_null_expr):
     return f"{bool_expr}.ifelse({true_expr}, {false_null_expr})"
 
 
 @translate.register(ops.SimpleCase)
 @translate.register(ops.SearchedCase)
-def switch_case(op, cases, results, default, base=None):
-    out = f"{base}.case()" if base else "ibis.case()"
-
-    for case, result in zip(cases, results):
-        out = f"{out}.when({case}, {result})"
-
-    if default is not None:
-        out = f"{out}.else_({default})"
-
-    return f"{out}.end()"
+def switch_cases(op, cases, results, default, base=None):
+    namespace = f"{base}" if base else "ibis"
+    case_strs = [f"({case}, {result})" for case, result in zip(cases, results)]
+    cases_str = ", ".join(case_strs)
+    else_str = f", else_={default}" if default is not None else ""
+    return f"{namespace}.cases({cases_str}{else_str})"
 
 
 _infix_ops = {
@@ -286,27 +342,46 @@ def binary(op, left, right):
     operator = _infix_ops[type(op)]
     left = _maybe_add_parens(op.left, left)
     right = _maybe_add_parens(op.right, right)
-    return f"{left} {operator} {right}"
+    return _maybe_add_parens(op, f"{left} {operator} {right}")
+
+
+@translate.register(ops.InValues)
+def isin(op, value, options):
+    return f"{value}.isin(({', '.join([str(option) for option in options])}))"
 
 
 class CodeContext:
-    always_assign = (ops.ScalarParameter, ops.UnboundTable, ops.Aggregation)
-    always_ignore = (ops.TableColumn, dt.Primitive, dt.Variadic, dt.Temporal)
+    always_assign = (
+        ops.ScalarParameter,
+        ops.Aggregate,
+        ops.PhysicalTable,
+        ops.SelfReference,
+    )
+
+    always_ignore = (
+        ops.JoinReference,
+        ops.Field,
+        dt.Primitive,
+        dt.Variadic,
+        dt.Temporal,
+    )
     shorthands = {
-        ops.Aggregation: "agg",
+        ops.Aggregate: "agg",
         ops.Literal: "lit",
         ops.ScalarParameter: "param",
-        ops.Selection: "proj",
-        ops.TableNode: "t",
+        ops.Project: "p",
+        ops.Relation: "r",
+        ops.Filter: "f",
+        ops.Sort: "s",
     }
 
-    def __init__(self, assign_result_to='result'):
+    def __init__(self, assign_result_to="result"):
         self.assign_result_to = assign_result_to
         self._shorthand_counters = collections.defaultdict(itertools.count)
 
     def variable_for(self, node):
         klass = type(node)
-        if isinstance(node, ops.TableNode) and isinstance(node, ops.Named):
+        if isinstance(node, ops.Relation) and hasattr(node, "name"):
             name = node.name
         elif klass in self.shorthands:
             name = self.shorthands[klass]
@@ -314,7 +389,7 @@ class CodeContext:
             name = klass.__name__.lower()
 
         # increment repeated type names: table, table1, table2, ...
-        nth = next(self._shorthand_counters[name]) or ''
+        nth = next(self._shorthand_counters[name]) or ""
         return f"{name}{nth}"
 
     def render(self, node, code, n_dependents):
@@ -343,16 +418,16 @@ class CodeContext:
 
 @experimental
 def decompile(
-    node: ops.Node | ir.Expr,
+    expr: ir.Expr,
     render_import: bool = True,
-    assign_result_to: str = 'result',
+    assign_result_to: str = "result",
     format: bool = False,
 ) -> str:
     """Decompile an ibis expression into Python source code.
 
     Parameters
     ----------
-    node
+    expr
         node or expression to decompile
     render_import
         Whether to add `import ibis` to the result.
@@ -365,14 +440,13 @@ def decompile(
     -------
     str
         Equivalent Python source code for `node`.
-    """
-    if isinstance(node, ir.Expr):
-        node = node.op()
-    elif not isinstance(node, ops.Node):
-        raise TypeError(
-            f"Expected ibis expression or operation, got {type(node).__name__}"
-        )
 
+    """
+    if not isinstance(expr, ir.Expr):
+        raise TypeError(f"Expected ibis expression, got {type(expr).__name__}")
+
+    node = expr.op()
+    node = simplify(node)
     out = io.StringIO()
     ctx = CodeContext(assign_result_to=assign_result_to)
     dependents = Graph(node).invert()

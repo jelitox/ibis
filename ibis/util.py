@@ -1,50 +1,45 @@
 """Ibis utility functions."""
+
 from __future__ import annotations
 
+import base64
 import collections
+import collections.abc
 import functools
 import importlib.metadata
 import itertools
-import logging
 import operator
 import os
+import re
 import sys
+import tempfile
 import textwrap
 import types
 import uuid
 import warnings
-from numbers import Real
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Iterator,
-    Mapping,
-    Sequence,
-    TypeVar,
-)
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 from uuid import uuid4
 
-import numpy as np
 import toolz
 
+from ibis.common.typing import Coercible
+
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Iterator, Sequence
     from pathlib import Path
 
-    import ibis.expr.operations as ops
-
-    Graph = Mapping[ops.Node, Sequence[ops.Node]]
+    import ibis.expr.types as ir
 
 T = TypeVar("T", covariant=True)
+S = TypeVar("S", bound=T, covariant=True)
 U = TypeVar("U", covariant=True)
 K = TypeVar("K")
 V = TypeVar("V")
 
 
-# https://www.compart.com/en/unicode/U+22EE
-VERTICAL_ELLIPSIS = "\u22EE"
-# https://www.compart.com/en/unicode/U+2026
-HORIZONTAL_ELLIPSIS = "\u2026"
+VERTICAL_ELLIPSIS = "⋮"
+HORIZONTAL_ELLIPSIS = "…"
 
 
 def guid() -> str:
@@ -66,6 +61,7 @@ def indent(text: str, spaces: int) -> str:
     -------
     str
         Indented text
+
     """
     prefix = " " * spaces
     return textwrap.indent(text, prefix=prefix)
@@ -84,6 +80,7 @@ def is_one_of(values: Sequence[T], t: type[U]) -> Iterator[bool]:
     Returns
     -------
     tuple
+
     """
     return (isinstance(x, t) for x in values)
 
@@ -92,7 +89,7 @@ any_of = toolz.compose(any, is_one_of)
 all_of = toolz.compose(all, is_one_of)
 
 
-def promote_list(val: V | Sequence[V]) -> list[V]:
+def promote_list(val: V | Iterable[V]) -> list[V]:
     """Ensure that the value is a list.
 
     Parameters
@@ -103,9 +100,12 @@ def promote_list(val: V | Sequence[V]) -> list[V]:
     Returns
     -------
     list
+
     """
     if isinstance(val, list):
         return val
+    elif isinstance(val, dict):
+        return [val]
     elif is_iterable(val):
         return list(val)
     elif val is None:
@@ -114,7 +114,7 @@ def promote_list(val: V | Sequence[V]) -> list[V]:
         return [val]
 
 
-def promote_tuple(val: V | Sequence[V]) -> tuple[V]:
+def promote_tuple(val: V | Iterable[V]) -> tuple[V]:
     """Ensure that the value is a tuple.
 
     Parameters
@@ -125,6 +125,7 @@ def promote_tuple(val: V | Sequence[V]) -> tuple[V]:
     Returns
     -------
     tuple
+
     """
     if isinstance(val, tuple):
         return val
@@ -143,56 +144,17 @@ def is_function(v: Any) -> bool:
     -------
     bool
         Whether `v` is a function
+
     """
     return isinstance(v, (types.FunctionType, types.LambdaType))
 
 
 def log(msg: str) -> None:
-    """Log `msg` using ``options.verbose_log`` if set, otherwise ``print``."""
+    """Log `msg` using `options.verbose_log` if set, otherwise `print`."""
     from ibis.config import options
 
     if options.verbose:
         (options.verbose_log or print)(msg)
-
-
-def approx_equal(a: Real, b: Real, eps: Real):
-    """Return whether the difference between `a` and `b` is less than `eps`.
-
-    Raises
-    ------
-    AssertionError
-    """
-    assert abs(a - b) < eps
-
-
-def safe_index(elements: Sequence[int], value: int) -> int:
-    """Find the location of `value` in `elements`.
-
-    Return -1 if `value` is not found instead of raising ``ValueError``.
-
-    Parameters
-    ----------
-    elements
-        Elements to index into
-    value : int
-        Index of the given sequence/elements
-
-    Returns
-    -------
-    int
-
-    Examples
-    --------
-    >>> sequence = [1, 2, 3]
-    >>> safe_index(sequence, 2)
-    1
-    >>> safe_index(sequence, 4)
-    -1
-    """
-    try:
-        return elements.index(value)
-    except ValueError:
-        return -1
 
 
 def is_iterable(o: Any) -> bool:
@@ -209,11 +171,11 @@ def is_iterable(o: Any) -> bool:
 
     Examples
     --------
-    >>> is_iterable('1')
+    >>> is_iterable("1")
     False
-    >>> is_iterable(b'1')
+    >>> is_iterable(b"1")
     False
-    >>> is_iterable(iter('1'))
+    >>> is_iterable(iter("1"))
     True
     >>> is_iterable(i for i in range(1))
     True
@@ -221,8 +183,17 @@ def is_iterable(o: Any) -> bool:
     False
     >>> is_iterable([])
     True
+
     """
-    return not isinstance(o, (str, bytes)) and isinstance(o, collections.abc.Iterable)
+    if isinstance(o, (str, bytes)):
+        return False
+
+    try:
+        iter(o)
+    except TypeError:
+        return False
+    else:
+        return True
 
 
 def convert_unit(value, unit, to, floor: bool = True):
@@ -250,29 +221,30 @@ def convert_unit(value, unit, to, floor: bool = True):
     Examples
     --------
     >>> one_second = 1000
-    >>> x = convert_unit(one_second, 'ms', 's')
+    >>> x = convert_unit(one_second, "ms", "s")
     >>> x
     1
     >>> one_second = 1
-    >>> x = convert_unit(one_second, 's', 'ms')
+    >>> x = convert_unit(one_second, "s", "ms")
     >>> x
     1000
-    >>> x = convert_unit(one_second, 's', 's')
+    >>> x = convert_unit(one_second, "s", "s")
     >>> x
     1
-    >>> x = convert_unit(one_second, 's', 'M')
+    >>> x = convert_unit(one_second, "s", "M")
     Traceback (most recent call last):
         ...
-    ValueError: Cannot convert to or from variable length interval
+    ValueError: Cannot convert to or from unit ... to unit ...
+
     """
     # Don't do anything if from and to units are equivalent
     if unit == to:
         return value
 
-    units = ('W', 'D', 'h', 'm', 's', 'ms', 'us', 'ns')
+    units = ("W", "D", "h", "m", "s", "ms", "us", "ns")
     factors = (7, 24, 60, 60, 1000, 1000, 1000)
 
-    monthly_units = ('Y', 'Q', 'M')
+    monthly_units = ("Y", "Q", "M")
     monthly_factors = (4, 3)
 
     try:
@@ -282,7 +254,9 @@ def convert_unit(value, unit, to, floor: bool = True):
             i, j = monthly_units.index(unit), monthly_units.index(to)
             factors = monthly_factors
         except ValueError:
-            raise ValueError('Cannot convert to or from variable length interval')
+            raise ValueError(
+                f"Cannot convert interval value from unit {unit} to unit {to}"
+            )
 
     factor = functools.reduce(operator.mul, factors[min(i, j) : max(i, j)], 1)
     assert factor > 1
@@ -298,50 +272,6 @@ def convert_unit(value, unit, to, floor: bool = True):
         return op(value, factor)
 
 
-def get_logger(
-    name: str,
-    level: str | None = None,
-    format: str | None = None,
-    propagate: bool = False,
-) -> logging.Logger:
-    """Get a logger.
-
-    Parameters
-    ----------
-    name
-        Logger name
-    level
-        Logging level
-    format
-        Format string
-    propagate
-        Propagate the logger
-
-    Returns
-    -------
-    logging.Logger
-    """
-    logging.basicConfig()
-    handler = logging.StreamHandler()
-
-    if format is None:
-        format = (
-            '%(relativeCreated)6d '
-            '%(name)-20s '
-            '%(levelname)-8s '
-            '%(threadName)-25s '
-            '%(message)s'
-        )
-    handler.setFormatter(logging.Formatter(fmt=format))
-    logger = logging.getLogger(name)
-    logger.propagate = propagate
-    logger.setLevel(
-        level or getattr(logging, os.environ.get('LOGLEVEL', 'WARNING').upper())
-    )
-    logger.addHandler(handler)
-    return logger
-
-
 # taken from the itertools documentation
 def consume(iterator: Iterator[T], n: int | None = None) -> None:
     """Advance `iterator` n-steps ahead. If `n` is `None`, consume entirely."""
@@ -352,16 +282,6 @@ def consume(iterator: Iterator[T], n: int | None = None) -> None:
     else:
         # advance to the empty slice starting at position n
         next(itertools.islice(iterator, n, n), None)
-
-
-# TODO(kszucs): make it a more robust to better align with graph._flatten_collections()
-def recursive_get(obj, mapping):
-    if isinstance(obj, tuple):
-        return tuple(recursive_get(o, mapping) for o in obj)
-    elif isinstance(obj, dict):
-        return {k: recursive_get(v, mapping) for k, v in obj.items()}
-    else:
-        return mapping.get(obj, obj)
 
 
 def flatten_iterable(iterable):
@@ -389,7 +309,7 @@ def deprecated_msg(name, *, instead, as_of="", removed_in=""):
 
     if msgs:
         msg += f" {', '.join(msgs)}"
-    msg += f'; {instead}'
+    msg += f"; {instead}"
     return msg
 
 
@@ -416,14 +336,16 @@ def append_admonition(
             1 for _ in itertools.takewhile(str.isspace, rest[0] if rest else [])
         )
 
-        admonition_doc = f'{leading_spaces}!!! {kind} "{msg}"'
+        lines = [f"::: {{.callout-{kind}}}", f"## {msg}", ":::"]
+        admonition_doc = textwrap.indent("\n".join(lines), leading_spaces)
 
         if body:
             rest = [indent(body, spaces=len(leading_spaces) + 4), *rest]
 
         docstr = "\n\n".join([preamble, admonition_doc, *rest])
     else:
-        admonition_doc = f'!!! {kind} "{msg}"'
+        lines = [f"::: {{.callout-{kind}}}", f"## {msg}", ":::"]
+        admonition_doc = "\n".join(lines)
         if body:
             admonition_doc += f"\n\n{indent(body, spaces=4)}"
         docstr = admonition_doc
@@ -479,14 +401,24 @@ def experimental(func):
     return func
 
 
+@functools.cache
 def backend_entry_points() -> list[importlib.metadata.EntryPoint]:
     """Get the list of installed `ibis.backend` entrypoints."""
+    return sorted(importlib.metadata.entry_points(group="ibis.backends"))
 
-    if sys.version_info < (3, 10):
-        eps = importlib.metadata.entry_points()["ibis.backends"]
-    else:
-        eps = importlib.metadata.entry_points(group="ibis.backends")
-    return sorted(eps)
+
+_common_package_aliases = {
+    "pa": "pyarrow",
+    "pd": "pandas",
+    "np": "numpy",
+    "sk": "sklearn",
+    "sp": "scipy",
+    "tf": "tensorflow",
+}
+
+
+def unalias_package(name: str) -> str:
+    return _common_package_aliases.get(name, name)
 
 
 def import_object(qualname: str) -> Any:
@@ -499,6 +431,7 @@ def import_object(qualname: str) -> Any:
     Is the same as
 
     >>> from ibis import examples as ex
+
     """
     mod_name, name = qualname.rsplit(".", 1)
     mod = importlib.import_module(mod_name)
@@ -509,13 +442,6 @@ def import_object(qualname: str) -> Any:
 
 
 def normalize_filename(source: str | Path) -> str:
-    def _removeprefix(text, prefix):
-        # TODO: remove when we drop Python 3.8
-        try:
-            return text.removeprefix(prefix)
-        except AttributeError:
-            return text[text.startswith(prefix) and len(prefix) :]
-
     source = str(source)
     for prefix in (
         "parquet",
@@ -527,10 +453,10 @@ def normalize_filename(source: str | Path) -> str:
         "tsv.gz",
         "file",
     ):
-        source = _removeprefix(source, f"{prefix}://")
+        source = source.removeprefix(f"{prefix}://")
 
     def _absolufy_paths(name):
-        if not name.startswith(("http", "s3")):
+        if re.search(r"^(?:.+)://", name) is None:
             return os.path.abspath(name)
         return name
 
@@ -538,6 +464,252 @@ def normalize_filename(source: str | Path) -> str:
     return source
 
 
+def normalize_filenames(source_list):
+    # Promote to list
+    source_list = promote_list(source_list)
+
+    return list(map(normalize_filename, source_list))
+
+
 def gen_name(namespace: str) -> str:
-    """Create a case-insensitive uuid4 unique table name."""
-    return f"_ibis_{namespace}_{np.base_repr(uuid.uuid4().int, 36)}".lower()
+    """Create a unique identifier."""
+    uid = base64.b32encode(uuid.uuid4().bytes).decode().rstrip("=").lower()
+    return f"ibis_{namespace}_{uid}"
+
+
+def slice_to_limit_offset(
+    what: slice, count: ir.IntegerScalar
+) -> tuple[int | ir.IntegerScalar, int | ir.IntegerScalar]:
+    """Convert a Python [`slice`](slice) to a `limit`, `offset` pair.
+
+    Parameters
+    ----------
+    what
+        The slice to convert
+    count
+        The total number of rows in the table as an expression
+
+    Returns
+    -------
+    tuple[int | ir.IntegerScalar, int | ir.IntegerScalar]
+        The offset and limit to use in a `Table.limit` call
+
+    Examples
+    --------
+    >>> import ibis
+    >>> t = ibis.table(dict(a="int", b="string"), name="t")
+
+    First 10 rows
+    >>> count = t.count()
+    >>> what = slice(0, 10)
+    >>> limit, offset = slice_to_limit_offset(what, count)
+    >>> limit
+    10
+    >>> offset
+    0
+
+    Last 10 rows
+    >>> what = slice(-10, None)
+    >>> limit, offset = slice_to_limit_offset(what, count)
+    >>> limit
+    10
+    >>> offset
+    r0 := UnboundTable: t
+      a int64
+      b string
+    <BLANKLINE>
+    Add(CountStar(t), -10): CountStar(r0) + -10
+
+    From 5th row to 10th row
+    >>> what = slice(5, 10)
+    >>> limit, offset = slice_to_limit_offset(what, count)
+    >>> limit, offset
+    (5, 5)
+
+    """
+    if (step := what.step) is not None and step != 1:
+        raise ValueError("Slice step can only be 1")
+
+    import ibis
+
+    start = what.start
+    stop = what.stop
+
+    if start is None or start >= 0:
+        offset = start or 0
+
+        if stop is None:
+            limit = None
+        elif stop == 0:
+            limit = 0
+        elif stop < 0:
+            limit = count + (stop - offset)
+        else:  # stop > 0
+            limit = max(stop - offset, 0)
+    else:  # start < 0
+        offset = count + start
+
+        if stop is None:
+            limit = -start
+        elif stop == 0:
+            limit = offset = 0
+        elif stop < 0:
+            limit = max(stop - start, 0)
+            if limit == 0:
+                offset = 0
+        else:  # stop > 0
+            limit = ibis.greatest((stop - start) - count, 0)
+    return limit, offset
+
+
+class Namespace:
+    """Convenience class for creating patterns for various types from a module.
+
+    Useful to reduce boilerplate when creating patterns for various types from
+    a module.
+
+    Parameters
+    ----------
+    factory
+        The pattern to construct with the looked up types.
+    module
+        The module object or name to look up the types.
+
+    """
+
+    __slots__ = ("_factory", "_module")
+    _factory: Callable
+    _module: ModuleType
+
+    def __init__(self, factory, module):
+        if isinstance(module, str):
+            module = sys.modules[module]
+        self._module = module
+        self._factory = factory
+
+    def __getattr__(self, name: str, /):
+        obj = getattr(self._module, name)
+        return self._factory(obj)
+
+
+class PseudoHashable(Coercible, Generic[V]):
+    """A wrapper that provides a best effort precomputed hash."""
+
+    __slots__ = ("hash", "obj")
+    obj: V
+
+    def __init__(self, obj: V):
+        if isinstance(obj, collections.abc.Hashable):
+            raise TypeError(f"Cannot wrap a hashable object: {obj!r}")
+        elif isinstance(obj, collections.abc.Sequence):
+            hashable_obj = tuple(obj)
+        elif isinstance(obj, collections.abc.Mapping):
+            hashable_obj = tuple(obj.items())
+        elif isinstance(obj, collections.abc.Set):
+            hashable_obj = frozenset(obj)
+        else:
+            hashable_obj = id(obj)
+
+        self.obj = obj
+        self.hash = hash((type(obj), hashable_obj))
+
+    @classmethod
+    def __coerce__(cls, value: V, /, **kwargs) -> PseudoHashable[V]:
+        if isinstance(value, cls):
+            return value
+        return cls(value)
+
+    def __hash__(self):
+        return self.hash
+
+    def __eq__(self, other):
+        if isinstance(other, PseudoHashable):
+            return self.obj == other.obj
+        else:
+            return NotImplemented
+
+    def __ne__(self, other):
+        if isinstance(other, PseudoHashable):
+            return self.obj != other.obj
+        else:
+            return NotImplemented
+
+
+def chunks(n: int, *, chunk_size: int) -> Iterator[tuple[int, int]]:
+    """Return an iterator of chunk start and end indices.
+
+    Parameters
+    ----------
+    n
+        The total number of elements.
+    chunk_size
+        The size of each chunk.
+
+    Returns
+    -------
+    int
+        THE start and end indices of each chunk.
+
+    Examples
+    --------
+    >>> list(chunks(10, chunk_size=3))
+    [(0, 3), (3, 6), (6, 9), (9, 10)]
+    >>> list(chunks(10, chunk_size=4))
+    [(0, 4), (4, 8), (8, 10)]
+    """
+    return ((start, min(start + chunk_size, n)) for start in range(0, n, chunk_size))
+
+
+def get_subclasses(obj: type[T]) -> Iterator[type[S]]:
+    """Recursively compute all subclasses of `obj`.
+
+    ::: {.callout-note}
+    ## The resulting iterator does **not** include the input type object.
+    :::
+
+    Parameters
+    ----------
+    obj
+        Any type object
+
+    Examples
+    --------
+    >>> class Base: ...
+    >>> class Subclass1(Base): ...
+    >>> class Subclass2(Base): ...
+    >>> class TransitiveSubclass(Subclass2): ...
+
+    Everything inherits `Base` (directly or transitively)
+
+    >>> list(get_subclasses(Base))
+    [<class 'ibis.util.Subclass1'>, <class 'ibis.util.Subclass2'>, <class 'ibis.util.TransitiveSubclass'>]
+
+    Nothing inherits from `Subclass1`
+
+    >>> list(get_subclasses(Subclass1))
+    []
+
+    Only `TransitiveSubclass` inherits from `Subclass2`
+
+    >>> list(get_subclasses(Subclass2))
+    [<class 'ibis.util.TransitiveSubclass'>]
+
+    Nothing inherits from `TransitiveSubclass`
+
+    >>> list(get_subclasses(TransitiveSubclass))
+    []
+    """
+    for child_class in obj.__subclasses__():
+        yield child_class
+        yield from get_subclasses(child_class)
+
+
+def mktempd():
+    return tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+
+
+def version(package: str) -> str:
+    try:
+        return importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        return None

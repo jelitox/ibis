@@ -3,17 +3,17 @@ from __future__ import annotations
 import collections
 import itertools
 import math
-from typing import Any, Hashable, Iterable, Iterator, Mapping, Set, TypeVar
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping
+from typing import Any, TypeVar
 
-from typing_extensions import Self
-
+from ibis.common.bases import FrozenSlotted as Slotted
 from ibis.common.graph import Node
 from ibis.util import promote_list
 
 K = TypeVar("K", bound=Hashable)
 
 
-class DisjointSet(Mapping[K, Set[K]]):
+class DisjointSet(Mapping[K, set[K]]):
     """Disjoint set data structure.
 
     Also known as union-find data structure. It is a data structure that keeps
@@ -47,9 +47,12 @@ class DisjointSet(Mapping[K, Set[K]]):
     1
     >>> ds.union(1, 3)
     False
+
     """
 
-    __slots__ = ("_parents", "_classes")
+    __slots__ = ("_classes", "_parents")
+    _parents: dict
+    _classes: dict
 
     def __init__(self, data: Iterable[K] | None = None):
         self._parents = {}
@@ -70,6 +73,7 @@ class DisjointSet(Mapping[K, Set[K]]):
         -------
         ined:
             True if the id is in the disjoint set, False otherwise.
+
         """
         return id in self._parents
 
@@ -86,6 +90,7 @@ class DisjointSet(Mapping[K, Set[K]]):
         class:
             The set of ids that are in the same class as the given id, including
             the given id.
+
         """
         id = self._parents[id]
         return self._classes[id]
@@ -98,7 +103,7 @@ class DisjointSet(Mapping[K, Set[K]]):
         """Get the number of ids in the disjoint set."""
         return len(self._parents)
 
-    def __eq__(self, other: Self[K]) -> bool:
+    def __eq__(self, other: object) -> bool:
         """Check if the disjoint set is equal to another disjoint set.
 
         Parameters
@@ -110,10 +115,27 @@ class DisjointSet(Mapping[K, Set[K]]):
         -------
         equal:
             True if the disjoint sets are equal, False otherwise.
+
         """
         if not isinstance(other, DisjointSet):
             return NotImplemented
         return self._parents == other._parents
+
+    __hash__ = None  # disjoint sets are mutable, so they are not hashable
+
+    def copy(self) -> DisjointSet:
+        """Make a copy of the disjoint set.
+
+        Returns
+        -------
+        copy:
+            A copy of the disjoint set.
+
+        """
+        ds = DisjointSet()
+        ds._parents = self._parents.copy()
+        ds._classes = self._classes.copy()
+        return ds
 
     def add(self, id: K) -> K:
         """Add a new id to the disjoint set.
@@ -130,6 +152,7 @@ class DisjointSet(Mapping[K, Set[K]]):
         -------
         id:
             The id that was added to the disjoint set.
+
         """
         if id in self._parents:
             return self._parents[id]
@@ -151,6 +174,7 @@ class DisjointSet(Mapping[K, Set[K]]):
         -------
         id:
             The canonicalized id for the given id.
+
         """
         return self._parents[id]
 
@@ -171,6 +195,7 @@ class DisjointSet(Mapping[K, Set[K]]):
         -------
         merged:
             True if the classes were merged, False otherwise.
+
         """
         # Find the root of each class
         id1 = self._parents[id1]
@@ -212,6 +237,7 @@ class DisjointSet(Mapping[K, Set[K]]):
         -------
         connected:
             True if the ids are connected, False otherwise.
+
         """
         return self._parents[id1] == self._parents[id2]
 
@@ -226,43 +252,13 @@ class DisjointSet(Mapping[K, Set[K]]):
         -------
         verified:
             True if the disjoint set is not corrupted, False otherwise.
+
         """
         for id in self._parents:
             if id not in self._classes[self._parents[id]]:
                 raise RuntimeError(
                     f"DisjointSet is corrupted: {id} is not in its class"
                 )
-
-
-class Slotted:
-    """A lightweight alternative to `ibis.common.grounds.Concrete`.
-
-    This class is used to create immutable dataclasses with slots and a precomputed
-    hash value for quicker dictionary lookups.
-    """
-
-    __slots__ = ('__precomputed_hash__',)
-
-    def __init__(self, *args):
-        for name, value in itertools.zip_longest(self.__slots__, args):
-            object.__setattr__(self, name, value)
-        object.__setattr__(self, "__precomputed_hash__", hash(args))
-
-    def __eq__(self, other):
-        if self is other:
-            return True
-        if type(self) is not type(other):
-            return NotImplemented
-        for name in self.__slots__:
-            if getattr(self, name) != getattr(other, name):
-                return False
-        return True
-
-    def __hash__(self):
-        return self.__precomputed_hash__
-
-    def __setattr__(self, name, value):
-        raise AttributeError("Can't set attributes on immutable ENode instance")
 
 
 class Variable(Slotted):
@@ -272,14 +268,16 @@ class Variable(Slotted):
     ----------
     name : str
         The name of the variable.
+
     """
 
     __slots__ = ("name",)
+    name: str
 
     def __init__(self, name: str):
         if name is None:
             raise ValueError("Variable name cannot be None")
-        super().__init__(name)
+        super().__init__(name=name)
 
     def __repr__(self):
         return f"${self.name}"
@@ -300,11 +298,12 @@ class Variable(Slotted):
         -------
         value : Any
             The substituted value.
+
         """
         return subst[self.name]
 
 
-# Pattern corresponsds to a selection which is flattened to a join of selections
+# Pattern corresponds to a selection which is flattened to a join of selections
 class Pattern(Slotted):
     """A non-ground term, tree of enodes possibly containing variables.
 
@@ -320,15 +319,19 @@ class Pattern(Slotted):
         variables or leaf values.
     name : str, optional
         The name of the pattern which is used to refer to it in a rewrite rule.
+
     """
 
-    __slots__ = ("head", "args", "name")
+    __slots__ = ("args", "head", "name")
+    head: type
+    args: tuple
+    name: str | None
 
     # TODO(kszucs): consider to raise if the pattern matches none
     def __init__(self, head, args, name=None, conditions=None):
         # TODO(kszucs): ensure that args are either patterns, variables or leaf values
         assert all(not isinstance(arg, (ENode, Node)) for arg in args)
-        super().__init__(head, tuple(args), name)
+        super().__init__(head=head, args=tuple(args), name=name)
 
     def matches_none(self):
         """Evaluate whether the pattern is guaranteed to match nothing.
@@ -364,7 +367,7 @@ class Pattern(Slotted):
         """Recursively flatten the pattern to a join of selections.
 
         `Pattern(Add, (Pattern(Mul, ($x, 1)), $y))` is turned into a join of
-        selections by introducing auxilary variables where each selection gets
+        selections by introducing auxiliary variables where each selection gets
         executed as a dictionary lookup.
 
         In SQL terms this is equivalent to the following query:
@@ -375,7 +378,7 @@ class Pattern(Slotted):
         var : Variable
             The variable to assign to the flattened pattern.
         counter : Iterator[int]
-            The counter to generate unique variable names for auxilary variables
+            The counter to generate unique variable names for auxiliary variables
             connecting the selections.
 
         Yields
@@ -383,6 +386,7 @@ class Pattern(Slotted):
         (var, pattern) : tuple[Variable, Pattern]
             The variable and the flattened pattern where the flattened pattern
             cannot contain any patterns just variables.
+
         """
         # TODO(kszucs): convert a pattern to a query object instead by flattening it
         counter = counter or itertools.count()
@@ -423,6 +427,7 @@ class Pattern(Slotted):
         -------
         enode : ENode
             The substituted pattern which is a ground term aka. an ENode.
+
         """
         args = []
         for arg in self.args:
@@ -436,6 +441,10 @@ class DynamicApplier(Slotted):
     """A dynamic applier which calls a function to compute the result."""
 
     __slots__ = ("func",)
+    func: Callable
+
+    def __init__(self, func):
+        super().__init__(func=func)
 
     def substitute(self, egraph, enode, subst):
         kwargs = {k: v for k, v in subst.items() if isinstance(k, str)}
@@ -448,7 +457,9 @@ class DynamicApplier(Slotted):
 class Rewrite(Slotted):
     """A rewrite rule which matches a pattern and applies a pattern or a function."""
 
-    __slots__ = ("matcher", "applier")
+    __slots__ = ("applier", "matcher")
+    matcher: Pattern
+    applier: Callable | Pattern | Variable
 
     def __init__(self, matcher, applier):
         if callable(applier):
@@ -457,7 +468,7 @@ class Rewrite(Slotted):
             raise TypeError(
                 "applier must be a Pattern or a Variable returning an ENode"
             )
-        super().__init__(matcher, applier)
+        super().__init__(matcher=matcher, applier=applier)
 
     def __repr__(self):
         return f"{self.lhs} >> {self.rhs}"
@@ -472,14 +483,17 @@ class ENode(Slotted, Node):
         The type of the Node the ENode represents.
     args : tuple
         The arguments of the ENode which are either ENodes or leaf values.
+
     """
 
-    __slots__ = ("head", "args")
+    __slots__ = ("args", "head")
+    head: type
+    args: tuple
 
     def __init__(self, head, args):
         # TODO(kszucs): ensure that it is a ground term, this check should be removed
         assert all(not isinstance(arg, (Pattern, Variable)) for arg in args)
-        super().__init__(head, tuple(args))
+        super().__init__(head=head, args=tuple(args))
 
     @property
     def __argnames__(self):
@@ -522,7 +536,10 @@ class ENode(Slotted, Node):
 
 
 class EGraph:
-    __slots__ = ("_nodes", "_etables", "_eclasses")
+    __slots__ = ("_eclasses", "_etables", "_nodes")
+    _nodes: dict
+    _etables: collections.defaultdict
+    _eclasses: DisjointSet
 
     def __init__(self):
         # store the nodes before converting them to enodes, so we can spare the initial
@@ -562,6 +579,7 @@ class EGraph:
         -------
         enode :
             The canonical enode.
+
         """
         enode = self._as_enode(node)
         if enode in self._eclasses:
@@ -597,6 +615,7 @@ class EGraph:
         -------
         enode :
             The canonical enode.
+
         """
         enode1 = self._as_enode(node1)
         enode2 = self._as_enode(node2)
@@ -617,13 +636,14 @@ class EGraph:
             are either enodes or leaf values.
         patargs : tuple
             The arguments of the pattern. Since a pattern is a flat term (flattened
-            using auxilliary variables), the arguments are either variables or leaf
+            using auxiliary variables), the arguments are either variables or leaf
             values.
 
         Returns
         -------
         dict[str, Any] :
             The mapping of variable names to enodes or leaf values.
+
         """
         subst = {}
         for arg, patarg in zip(args, patargs):
@@ -658,6 +678,7 @@ class EGraph:
         -------
         matches :
             A dictionary mapping the matched enodes to their substitutions.
+
         """
         # patterns could be reordered to match on the most selective one first
         patterns = dict(reversed(list(pattern.flatten())))
@@ -704,6 +725,7 @@ class EGraph:
         -------
         n_changes
             The number of changes made to the egraph.
+
         """
         n_changes = 0
         for rewrite in promote_list(rewrites):
@@ -727,6 +749,7 @@ class EGraph:
         -------
         saturated :
             True if the egraph is saturated, False otherwise.
+
         """
         return any(not self.apply(rewrites) for _i in range(n))
 
@@ -748,10 +771,11 @@ class EGraph:
         -------
         node :
             The extracted node.
+
         """
         enode = self._as_enode(node)
         enode = self._eclasses.find(enode)
-        costs = {en: (math.inf, None) for en in self._eclasses.keys()}
+        costs = dict.fromkeys(self._eclasses.keys(), (math.inf, None))
 
         def enode_cost(enode):
             cost = 1
@@ -797,6 +821,7 @@ class EGraph:
         -------
         equivalent :
             True if the nodes are equivalent, False otherwise.
+
         """
         enode1 = self._as_enode(node1)
         enode2 = self._as_enode(node2)

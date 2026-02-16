@@ -6,18 +6,18 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import chain, repeat
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import pytest
 from requests import Session
 
 import ibis
-from ibis.backends.tests.base import (
-    RoundHalfToEven,
-    ServiceBackendTest,
-    ServiceSpec,
-)
+from ibis.backends.tests.base import ServiceBackendTest
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from pathlib import Path
+
+    import ibis.expr.types as ir
 
 DRUID_URL = os.environ.get(
     "DRUID_URL", "druid://localhost:8082/druid/v2/sql?header=true"
@@ -90,27 +90,43 @@ def run_query(session: Session, query: str) -> None:
         time.sleep(REQUEST_INTERVAL)
 
 
-class TestConf(ServiceBackendTest, RoundHalfToEven):
+class TestConf(ServiceBackendTest):
     # druid has the same rounding behavior as postgres
     check_dtype = False
-    supports_window_operations = False
-    returned_timestamp_unit = 's'
+    returned_timestamp_unit = "ms"
     supports_arrays = False
-    supports_arrays_outside_of_select = supports_arrays
     native_bool = True
     supports_structs = False
     supports_json = False  # it does, but we haven't implemented it
+    rounding_method = "half_to_even"
+    service_name = "druid-middlemanager"
+    deps = ("pydruid.db",)
 
-    @classmethod
-    def service_spec(cls, data_dir: Path) -> ServiceSpec:
-        return ServiceSpec(
-            name="druid-middlemanager",
-            data_volume="/data",
-            files=data_dir.joinpath("parquet").glob("*.parquet"),
+    @property
+    def functional_alltypes(self) -> ir.Table:
+        t = self.connection.table("functional_alltypes")
+        return t.mutate(
+            # The parquet loading for booleans appears to be broken in Druid, so
+            # I'm using this as a workaround to make the data match what's on disk.
+            bool_col=1 - t.id % 2,
+            # timestamp_col is loaded as a long because druid's type system is
+            # awful: it does 99% of the work of a proper timestamp type, but
+            # encodes it as an integer. I've never seen or heard of any other
+            # tool that calls itself a time series database or "good for
+            # working with time series", that lacks a first-class timestamp
+            # type.
+            timestamp_col=t.timestamp_col.as_timestamp("ms"),
         )
 
-    @staticmethod
-    def _load_data(data_dir: Path, script_dir: Path, **_: Any) -> None:
+    @property
+    def test_files(self) -> Iterable[Path]:
+        return [
+            path
+            for path in self.data_dir.joinpath("parquet").glob("*.parquet")
+            if path.name != "functional_alltypes.parquet"
+        ] + [self.data_dir.joinpath("csv", "functional_alltypes.csv")]
+
+    def _load_data(self, **_: Any) -> None:
         """Load test data into a druid backend instance.
 
         Parameters
@@ -120,28 +136,14 @@ class TestConf(ServiceBackendTest, RoundHalfToEven):
         script_dir
             Location of scripts defining schemas
         """
-        # copy data into the volume mount
-        queries = filter(
-            None,
-            map(
-                str.strip,
-                (script_dir / "schema" / "druid.sql").read_text().split(";"),
-            ),
-        )
-
         # run queries concurrently using threads; lots of time is spent on IO
         # making requests to check whether data loading is complete
         with Session() as session, ThreadPoolExecutor() as executor:
             for fut in as_completed(
-                executor.submit(run_query, session, query) for query in queries
+                executor.submit(run_query, session, query) for query in self.ddl_script
             ):
                 fut.result()
 
     @staticmethod
-    def connect(_: Path):
-        return ibis.connect(DRUID_URL)
-
-
-@pytest.fixture(scope='session')
-def con():
-    return ibis.connect(DRUID_URL)
+    def connect(*, tmpdir, worker_id, **kw):  # noqa: ARG004
+        return ibis.connect(DRUID_URL, **kw)

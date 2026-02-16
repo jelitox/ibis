@@ -1,8 +1,7 @@
-SELECT t0.`a`
-FROM (
-  SELECT t1.*
-  FROM t0 t1
-  INTERSECT DISTINCT
-  SELECT t1.*
-  FROM t1 t1
-) t0
+SELECT
+  *
+FROM `t0` AS `t0`
+INTERSECT DISTINCT
+SELECT
+  *
+FROM `t1` AS `t1`

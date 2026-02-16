@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import pytest
 
 import ibis.common.exceptions as com
@@ -7,21 +9,29 @@ import ibis.common.exceptions as com
     [
         "bigquery",
         "clickhouse",
-        "dask",
         "datafusion",
+        "exasol",
         "impala",
         "mssql",
         "mysql",
         "oracle",
-        "pandas",
         "polars",
         "postgres",
+        "risingwave",
         "pyspark",
         "snowflake",
         "trino",
         "druid",
+        "flink",
+        "databricks",
+        "athena",
     ],
     raises=com.OperationNotDefinedError,
+)
+@pytest.mark.notyet(
+    ["materialize"],
+    raises=com.OperationNotDefinedError,
+    reason="Materialize doesn't have a rowid pseudo-column like SQLite/Oracle (backend limitation).",
 )
 def test_rowid(backend):
     t = backend.diamonds
@@ -39,7 +49,6 @@ def test_rowid(backend):
     "column",
     ["string_col", "double_col", "date_string_col", "timestamp_col"],
 )
-@pytest.mark.notimpl(["datafusion"], raises=com.OperationNotDefinedError)
 def test_distinct_column(alltypes, df, column):
     expr = alltypes[[column]].distinct()
     result = expr.execute()

@@ -1,14 +1,15 @@
-import contextlib
-from typing import Any, Callable, Optional
+from __future__ import annotations
+
+from collections.abc import Callable  # noqa: TC003
+from typing import Annotated, Any, Optional
 
 from public import public
-from typing_extensions import Annotated
 
 import ibis.common.exceptions as com
 from ibis.common.grounds import Annotable
-from ibis.common.validators import min_
+from ibis.common.patterns import Between
 
-PosInt = Annotated[int, min_(0)]
+PosInt = Annotated[int, Between(lower=0)]
 
 
 class Config(Annotable):
@@ -25,47 +26,24 @@ class Config(Annotable):
             conf = getattr(conf, field)
         setattr(conf, key, value)
 
-    @contextlib.contextmanager
-    def _with_temporary(self, options):
-        try:
-            old = {}
-            for key, value in options.items():
-                old[key] = self.get(key)
-                self.set(key, value)
-            yield
-        finally:
-            for key, value in old.items():
-                self.set(key, value)
-
-    def __call__(self, options):
-        return self._with_temporary(options)
-
-
-class ContextAdjustment(Config):
-    """Options related to time context adjustment.
-
-    Attributes
-    ----------
-    time_col : str
-        Name of the timestamp column for execution with a `timecontext`. See
-        `ibis/expr/timecontext.py` for details.
-    """
-
-    time_col: str = "time"
-
 
 class SQL(Config):
     """SQL-related options.
 
     Attributes
     ----------
+    fuse_selects : bool
+        Whether to fuse consecutive select queries into a single query where
+        possible.
     default_limit : int | None
         Number of rows to be retrieved for a table expression without an
-        explicit limit. [`None`][None] means no limit.
+        explicit limit. [](`None`) means no limit.
     default_dialect : str
         Dialect to use for printing SQL when the backend cannot be determined.
+
     """
 
+    fuse_selects: bool = True
     default_limit: Optional[PosInt] = None
     default_dialect: str = "duckdb"
 
@@ -89,6 +67,7 @@ class Interactive(Config):
         Maximum depth for nested data types.
     show_types : bool
         Show the inferred type of value expressions in the interactive repr.
+
     """
 
     max_rows: int = 10
@@ -108,19 +87,26 @@ class Repr(Config):
         The maximum number of expression nodes to print when repring.
     table_columns : int
         The number of columns to show in leaf table expressions.
+    table_rows : int
+        The number of rows to show for in memory tables.
     query_text_length : int
         The maximum number of characters to show in the `query` field repr of
         SQLQueryResult operations.
     show_types : bool
         Show the inferred type of value expressions in the repr.
+    show_variables : bool
+        Show the variables in the repr instead of generated names. This is
+        an advanced option and may not work in all scenarios.
     interactive : bool
         Options controlling the interactive repr.
     """
 
     depth: Optional[PosInt] = None
     table_columns: Optional[PosInt] = None
+    table_rows: PosInt = 10
     query_text_length: PosInt = 80
     show_types: bool = False
+    show_variables: bool = False
     interactive: Interactive = Interactive()
 
 
@@ -134,28 +120,25 @@ class Options(Config):
     repr : Repr
         Options controlling expression printing.
     verbose : bool
-        Run in verbose mode if [`True`][True]
+        Run in verbose mode if [](`True`)
     verbose_log: Callable[[str], None] | None
         A callable to use when logging.
     graphviz_repr : bool
         Render expressions as GraphViz PNGs when running in a Jupyter notebook.
-    default_backend : Optional[ibis.backends.base.BaseBackend], default None
+    default_backend : Optional[ibis.backends.BaseBackend]
         The default backend to use for execution, defaults to DuckDB if not
         set.
-    context_adjustment : ContextAdjustment
-        Options related to time context adjustment.
     sql: SQL
         SQL-related options.
     clickhouse : Config | None
         Clickhouse specific options.
-    dask : Config | None
-        Dask specific options.
     impala : Config | None
         Impala specific options.
     pandas : Config | None
         Pandas specific options.
     pyspark : Config | None
         PySpark specific options.
+
     """
 
     interactive: bool = False
@@ -164,10 +147,8 @@ class Options(Config):
     verbose_log: Optional[Callable] = None
     graphviz_repr: bool = False
     default_backend: Optional[Any] = None
-    context_adjustment: ContextAdjustment = ContextAdjustment()
     sql: SQL = SQL()
     clickhouse: Optional[Config] = None
-    dask: Optional[Config] = None
     impala: Optional[Config] = None
     pandas: Optional[Config] = None
     pyspark: Optional[Config] = None
@@ -208,11 +189,6 @@ For more information on available backends, visit https://ibis-project.org/insta
 
 
 options = Options()
-
-
-@public
-def option_context(key, new_value):
-    return options({key: new_value})
 
 
 public(options=options)

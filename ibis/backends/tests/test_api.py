@@ -1,10 +1,11 @@
-import contextlib
+from __future__ import annotations
 
 import pytest
 from pytest import param
 
 import ibis.expr.types as ir
 from ibis.backends.conftest import TEST_TABLES
+from ibis.backends.tests.errors import PyDruidProgrammingError
 
 
 def test_backend_name(backend):
@@ -12,48 +13,53 @@ def test_backend_name(backend):
     assert backend.api.name == backend.name()
 
 
-@pytest.mark.notimpl(
-    ["druid"], raises=TypeError, reason="'NoneType' object is not iterable"
-)
+@pytest.mark.notyet(["druid"], raises=PyDruidProgrammingError)
+@pytest.mark.notyet(["athena"], raises=NotImplementedError)
 def test_version(backend):
     assert isinstance(backend.api.version, str)
 
 
-# 1. `current_database` returns '.', but isn't listed in list_databases()
+# 1. `current_catalog` returns '.', but isn't listed in list_catalogs()
 @pytest.mark.never(
-    ["polars", "dask", "pandas"],
-    reason="backends does not support databases",
-    raises=NotImplementedError,
+    [
+        "polars",
+        "clickhouse",
+        "sqlite",
+        "exasol",
+        "druid",
+        "oracle",
+        "bigquery",
+        "mysql",
+        "singlestoredb",
+        "impala",
+        "flink",
+    ],
+    reason="backend does not support catalogs",
+    raises=AttributeError,
 )
-@pytest.mark.notimpl(
-    ["duckdb", "mssql", "trino", "druid", "oracle"],
-    raises=AssertionError,
-)
-@pytest.mark.notimpl(
-    ["datafusion"],
-    raises=NotImplementedError,
-)
-def test_database_consistency(backend, con):
-    # every backend has a different set of databases, not testing the
-    # exact names for now
-    databases = con.list_databases()
-    assert isinstance(databases, list)
-    assert len(databases) >= 1
-    assert all(isinstance(database, str) for database in databases)
+def test_catalog_consistency(backend, con):
+    catalogs = con.list_catalogs()
+    assert isinstance(catalogs, list)
+    assert len(catalogs) >= 1
+    assert all(isinstance(catalog, str) for catalog in catalogs)
 
-    current_database = con.current_database
-    assert isinstance(current_database, str)
-    if backend.name() == "snowflake":
-        assert current_database.upper() in databases
+    # every backend has a different set of catalogs, not testing the
+    # exact names for now
+    current_catalog = con.current_catalog
+    assert isinstance(current_catalog, str)
+    if (name := backend.name()) in "snowflake":
+        assert current_catalog.upper() in catalogs
+    elif name == "athena":
+        assert current_catalog.lower() in list(map(str.lower, catalogs))
     else:
-        assert current_database in databases
+        assert current_catalog in catalogs
 
 
 def test_list_tables(con):
     tables = con.list_tables()
     assert isinstance(tables, list)
     # only table that is guaranteed to be in all backends
-    key = 'functional_alltypes'
+    key = "functional_alltypes"
     assert key in tables or key.upper() in tables
     assert all(isinstance(table, str) for table in tables)
 
@@ -62,29 +68,23 @@ def test_tables_accessor_mapping(con):
     if con.name == "snowflake":
         pytest.skip("snowflake sometimes counts more tables than are around")
 
-    with contextlib.suppress(KeyError):
-        assert isinstance(con.tables["functional_alltypes"], ir.Table) or isinstance(
-            con.tables["FUNCTIONAL_ALLTYPES"], ir.Table
-        )
+    name = "functional_alltypes"
+
+    assert isinstance(con.tables[name], ir.Table)
 
     with pytest.raises(KeyError, match="doesnt_exist"):
         con.tables["doesnt_exist"]
 
     # temporary might pop into existence in parallel test runs, in between the
-    # first `list_tables` call and the second, so we check a subset relationship
-    assert TEST_TABLES.keys() <= set(map(str.lower, con.list_tables()))
-    assert TEST_TABLES.keys() <= set(map(str.lower, con.tables))
+    # first `list_tables` call and the second, so we check that there's a
+    # non-empty intersection
+    assert TEST_TABLES.keys() & set(map(str.lower, con.list_tables()))
+    assert TEST_TABLES.keys() & set(map(str.lower, con.tables))
 
 
 def test_tables_accessor_getattr(con):
-    assert isinstance(
-        getattr(
-            con.tables,
-            "functional_alltypes",
-            getattr(con.tables, "FUNCTIONAL_ALLTYPES", None),
-        ),
-        ir.Table,
-    )
+    name = "functional_alltypes"
+    assert isinstance(getattr(con.tables, name), ir.Table)
 
     with pytest.raises(AttributeError, match="doesnt_exist"):
         con.tables.doesnt_exist  # noqa: B018
@@ -96,17 +96,19 @@ def test_tables_accessor_getattr(con):
 
 
 def test_tables_accessor_tab_completion(con):
+    name = "functional_alltypes"
     attrs = dir(con.tables)
-    assert 'functional_alltypes' in attrs or "FUNCTIONAL_ALLTYPES" in attrs
-    assert 'keys' in attrs  # type methods also present
+    assert name in attrs
+    assert "keys" in attrs  # type methods also present
 
     keys = con.tables._ipython_key_completions_()
-    assert 'functional_alltypes' in keys or "FUNCTIONAL_ALLTYPES" in keys
+    assert name in keys
 
 
 def test_tables_accessor_repr(con):
+    name = "functional_alltypes"
     result = repr(con.tables)
-    assert '- functional_alltypes' in result or '- FUNCTIONAL_ALLTYPES' in result
+    assert f"- {name}" in result
 
 
 @pytest.mark.parametrize(
@@ -126,7 +128,7 @@ def test_limit_chain(alltypes, expr_fn):
     "expr_fn",
     [
         param(lambda t: t, id="alltypes table"),
-        param(lambda t: t.join(t.view(), t.id == t.view().int_col), id="self join"),
+        param(lambda t: t.join(t.view(), [("id", "int_col")]), id="self join"),
     ],
 )
 def test_unbind(alltypes, expr_fn):
@@ -136,3 +138,13 @@ def test_unbind(alltypes, expr_fn):
 
     assert "Unbound" not in repr(expr)
     assert "Unbound" in repr(expr.unbind())
+
+
+def test_get_backend(con, alltypes):
+    assert alltypes.get_backend() is con
+    assert alltypes.id.min().get_backend() is con
+
+
+def test_backend_equality(con):
+    assert con == con
+    assert con != "a non backend object"

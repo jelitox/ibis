@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-project(impala_test_udfs LANGUAGES CXX)
 cmake_minimum_required(VERSION 3.22)
+
+project(impala_test_udfs LANGUAGES CXX)
 set(CMAKE_CXX_COMPILER clang++)
 
 # where to put generated libraries and binaries
@@ -42,6 +43,6 @@ endfunction(COMPILE_TO_IR)
 add_library(udfsample SHARED udf-sample.cc)
 add_library(udasample SHARED uda-sample.cc)
 
-# Custom targest to cross compile UDA/UDF to ir
+# Custom targets to cross compile UDA/UDF to ir
 COMPILE_TO_IR(udf-sample.cc)
 COMPILE_TO_IR(uda-sample.cc)

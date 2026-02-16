@@ -1,1 +1,0 @@
-if(float_col > 0, int_col, bigint_col)

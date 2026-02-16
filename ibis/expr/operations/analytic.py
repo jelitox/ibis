@@ -1,182 +1,97 @@
+"""Operations for analytic window functions."""
+
 from __future__ import annotations
+
+from typing import Optional
 
 from public import public
 
+import ibis.expr.datashape as ds
 import ibis.expr.datatypes as dt
 import ibis.expr.rules as rlz
-from ibis.common.annotations import attribute
-from ibis.expr.operations.core import Value
+from ibis.expr.operations.core import Column, Scalar, Value
 
 
 @public
 class Analytic(Value):
-    output_shape = rlz.Shape.COLUMNAR
+    """Base class for analytic window function operations."""
 
-    @property
-    def __window_op__(self):
-        return self
+    shape = ds.columnar
 
 
-@public
 class ShiftBase(Analytic):
-    arg = rlz.column(rlz.any)
+    """Base class for shift operations."""
 
-    offset = rlz.optional(rlz.one_of((rlz.integer, rlz.interval)))
-    default = rlz.optional(rlz.any)
+    arg: Column[dt.Any]
+    offset: Optional[Value[dt.Integer | dt.Interval]] = None
+    default: Optional[Value] = None
 
-    output_dtype = rlz.dtype_like("arg")
+    dtype = rlz.dtype_like("arg")
 
 
 @public
 class Lag(ShiftBase):
-    pass
+    """Shift a column forward."""
 
 
 @public
 class Lead(ShiftBase):
-    pass
+    """Shift a column backward."""
 
 
 @public
 class RankBase(Analytic):
-    output_dtype = dt.int64
+    """Base class for ranking operations."""
+
+    dtype = dt.int64
 
 
 @public
 class MinRank(RankBase):
-    arg = rlz.column(rlz.any)
+    """Rank within an ordered partition."""
 
 
 @public
 class DenseRank(RankBase):
-    arg = rlz.column(rlz.any)
+    """Rank within an ordered partition, consecutively."""
 
 
 @public
 class RowNumber(RankBase):
-    """Compute the row number over a window, starting from 0.
-
-    Equivalent to SQL's `ROW_NUMBER()`.
-
-    Examples
-    --------
-    >>> import ibis
-    >>> t = ibis.table([('values', dt.int64)])
-    >>> w = ibis.window(order_by=t.values)
-    >>> row_num = ibis.row_number().over(w)
-    >>> result = t[t.values, row_num.name('row_num')]
-
-    Returns
-    -------
-    IntegerColumn
-        Row number
-    """
-
-
-@public
-class CumulativeOp(Analytic):
-    pass
-
-
-@public
-class CumulativeSum(CumulativeOp):
-    """Cumulative sum.
-
-    Requires an ordering window.
-    """
-
-    arg = rlz.column(rlz.numeric)
-
-    @attribute.default
-    def output_dtype(self):
-        return dt.higher_precedence(self.arg.output_dtype.largest, dt.int64)
-
-
-@public
-class CumulativeMean(CumulativeOp):
-    """Cumulative mean.
-
-    Requires an order window.
-    """
-
-    arg = rlz.column(rlz.numeric)
-
-    @attribute.default
-    def output_dtype(self):
-        return dt.higher_precedence(self.arg.output_dtype.largest, dt.float64)
-
-
-@public
-class CumulativeMax(CumulativeOp):
-    arg = rlz.column(rlz.any)
-    output_dtype = rlz.dtype_like("arg")
-
-
-@public
-class CumulativeMin(CumulativeOp):
-    """Cumulative min.
-
-    Requires an order window.
-    """
-
-    arg = rlz.column(rlz.any)
-    output_dtype = rlz.dtype_like("arg")
-
-
-@public
-class CumulativeAny(CumulativeOp):
-    arg = rlz.column(rlz.boolean)
-    output_dtype = rlz.dtype_like("arg")
-
-
-@public
-class CumulativeAll(CumulativeOp):
-    arg = rlz.column(rlz.boolean)
-    output_dtype = rlz.dtype_like("arg")
+    """Compute the row number over a window, starting from 0."""
 
 
 @public
 class PercentRank(Analytic):
-    arg = rlz.column(rlz.any)
-    output_dtype = dt.double
+    """Compute the percentile rank over a window."""
+
+    dtype = dt.double
 
 
 @public
 class CumeDist(Analytic):
-    arg = rlz.column(rlz.any)
-    output_dtype = dt.double
+    """Compute the cumulative distribution function of a column over a window."""
+
+    dtype = dt.double
 
 
 @public
 class NTile(Analytic):
-    arg = rlz.column(rlz.any)
-    buckets = rlz.scalar(rlz.integer)
-    output_dtype = dt.int64
+    """Compute the percentile of a column over a window."""
 
+    buckets: Scalar[dt.Integer]
 
-@public
-class FirstValue(Analytic):
-    """Retrieve the first element."""
-
-    arg = rlz.column(rlz.any)
-    output_dtype = rlz.dtype_like("arg")
-
-
-@public
-class LastValue(Analytic):
-    """Retrieve the last element."""
-
-    arg = rlz.column(rlz.any)
-    output_dtype = rlz.dtype_like("arg")
+    dtype = dt.int64
 
 
 @public
 class NthValue(Analytic):
-    """Retrieve the Nth element."""
+    """Retrieve the Nth element of a column over a window."""
 
-    arg = rlz.column(rlz.any)
-    nth = rlz.integer
-    output_dtype = rlz.dtype_like("arg")
+    arg: Column[dt.Any]
+    nth: Value[dt.Integer]
+
+    dtype = rlz.dtype_like("arg")
 
 
 public(AnalyticOp=Analytic)

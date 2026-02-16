@@ -1,22 +1,28 @@
 from __future__ import annotations
 
+import inspect
 from functools import partial
 
-import sqlalchemy.types as sat
-from sqlalchemy.dialects import mysql
+from MySQLdb.constants import FIELD_TYPE, FLAG
 
 import ibis.expr.datatypes as dt
-from ibis.backends.base.sql.alchemy.datatypes import (
-    dtype_from_sqlalchemy,
-    dtype_to_sqlalchemy,
+
+TEXT_TYPES = (
+    FIELD_TYPE.BIT,
+    FIELD_TYPE.BLOB,
+    FIELD_TYPE.LONG_BLOB,
+    FIELD_TYPE.MEDIUM_BLOB,
+    FIELD_TYPE.STRING,
+    FIELD_TYPE.TINY_BLOB,
+    FIELD_TYPE.VAR_STRING,
+    FIELD_TYPE.VARCHAR,
+    FIELD_TYPE.GEOMETRY,
 )
 
-# binary character set
-# used to distinguish blob binary vs blob text
-MY_CHARSET_BIN = 63
 
-
-def _type_from_cursor_info(descr, field) -> dt.DataType:
+def _type_from_cursor_info(
+    *, flags, type_code, field_length, scale, multi_byte_maximum_length
+) -> dt.DataType:
     """Construct an ibis type from MySQL field descr and field result metadata.
 
     This method is complex because the MySQL protocol is complex.
@@ -28,19 +34,14 @@ def _type_from_cursor_info(descr, field) -> dt.DataType:
     strings, because the protocol does not appear to preserve the logical
     type, only the physical type.
     """
-    from pymysql.connections import TEXT_TYPES
-
-    _, type_code, _, _, field_length, scale, _ = descr
-    flags = _FieldFlags(field.flags)
+    flags = _FieldFlags(flags)
     typename = _type_codes.get(type_code)
     if typename is None:
         raise NotImplementedError(f"MySQL type code {type_code:d} is not supported")
 
     if typename in ("DECIMAL", "NEWDECIMAL"):
         precision = _decimal_length_to_precision(
-            length=field_length,
-            scale=scale,
-            is_unsigned=flags.is_unsigned,
+            length=field_length, scale=scale, is_unsigned=flags.is_unsigned
         )
         typ = partial(_type_mapping[typename], precision=precision, scale=scale)
     elif typename == "BIT":
@@ -53,20 +54,23 @@ def _type_from_cursor_info(descr, field) -> dt.DataType:
         elif field_length <= 64:
             typ = dt.int64
         else:
-            raise AssertionError('invalid field length for BIT type')
+            raise AssertionError("invalid field length for BIT type")
     elif flags.is_set:
         # sets are limited to strings
         typ = dt.Array(dt.string)
-    elif flags.is_unsigned and flags.is_num:
-        typ = getattr(dt, f"U{typ.__name__}")
     elif type_code in TEXT_TYPES:
-        # binary text
-        if field.charsetnr == MY_CHARSET_BIN:
+        if flags.is_binary:
             typ = dt.Binary
         else:
-            typ = dt.String
+            typ = partial(dt.String, length=field_length // multi_byte_maximum_length)
+    elif flags.is_timestamp or typename == "TIMESTAMP":
+        typ = partial(dt.Timestamp, timezone="UTC", scale=scale or None)
+    elif typename == "DATETIME":
+        typ = partial(dt.Timestamp, scale=scale or None)
     else:
         typ = _type_mapping[typename]
+        if issubclass(typ, dt.SignedInteger) and flags.is_unsigned:
+            typ = getattr(dt, f"U{typ.__name__}")
 
     # projection columns are always nullable
     return typ(nullable=True)
@@ -77,35 +81,7 @@ def _decimal_length_to_precision(*, length: int, scale: int, is_unsigned: bool) 
     return length - (scale > 0) - (not (is_unsigned or not length))
 
 
-_type_codes = {
-    0: "DECIMAL",
-    1: "TINY",
-    2: "SHORT",
-    3: "LONG",
-    4: "FLOAT",
-    5: "DOUBLE",
-    6: "NULL",
-    7: "TIMESTAMP",
-    8: "LONGLONG",
-    9: "INT24",
-    10: "DATE",
-    11: "TIME",
-    12: "DATETIME",
-    13: "YEAR",
-    15: "VARCHAR",
-    16: "BIT",
-    245: "JSON",
-    246: "NEWDECIMAL",
-    247: "ENUM",
-    248: "SET",
-    249: "TINY_BLOB",
-    250: "MEDIUM_BLOB",
-    251: "LONG_BLOB",
-    252: "BLOB",
-    253: "VAR_STRING",
-    254: "STRING",
-    255: "GEOMETRY",
-}
+_type_codes = {v: k for k, v in inspect.getmembers(FIELD_TYPE) if not k.startswith("_")}
 
 
 _type_mapping = {
@@ -116,18 +92,17 @@ _type_mapping = {
     "FLOAT": dt.Float32,
     "DOUBLE": dt.Float64,
     "NULL": dt.Null,
-    "TIMESTAMP": lambda nullable: dt.Timestamp(timezone="UTC", nullable=nullable),
     "LONGLONG": dt.Int64,
     "INT24": dt.Int32,
     "DATE": dt.Date,
     "TIME": dt.Time,
     "DATETIME": dt.Timestamp,
-    "YEAR": dt.Int8,
+    "YEAR": dt.UInt8,
     "VARCHAR": dt.String,
     "JSON": dt.JSON,
     "NEWDECIMAL": dt.Decimal,
     "ENUM": dt.String,
-    "SET": lambda nullable: dt.Array(dt.string, nullable=nullable),
+    "SET": partial(dt.Array, dt.string),
     "TINY_BLOB": dt.Binary,
     "MEDIUM_BLOB": dt.Binary,
     "LONG_BLOB": dt.Binary,
@@ -146,10 +121,6 @@ class _FieldFlags:
     is a primary key or not.
     """
 
-    UNSIGNED = 1 << 5
-    SET = 1 << 11
-    NUM = 1 << 15
-
     __slots__ = ("value",)
 
     def __init__(self, value: int) -> None:
@@ -157,96 +128,20 @@ class _FieldFlags:
 
     @property
     def is_unsigned(self) -> bool:
-        return (self.UNSIGNED & self.value) != 0
+        return (FLAG.UNSIGNED & self.value) != 0
+
+    @property
+    def is_timestamp(self) -> bool:
+        return (FLAG.TIMESTAMP & self.value) != 0
 
     @property
     def is_set(self) -> bool:
-        return (self.SET & self.value) != 0
+        return (FLAG.SET & self.value) != 0
 
     @property
     def is_num(self) -> bool:
-        return (self.NUM & self.value) != 0
+        return (FLAG.NUM & self.value) != 0
 
-
-class MySQLDateTime(mysql.DATETIME):
-    """Custom DATETIME type for MySQL that handles zero values."""
-
-    def result_processor(self, *_):
-        return lambda v: None if v == "0000-00-00 00:00:00" else v
-
-
-_to_mysql_types = {
-    dt.Boolean: mysql.BOOLEAN,
-    dt.Int8: mysql.TINYINT,
-    dt.Int16: mysql.SMALLINT,
-    dt.Int32: mysql.INTEGER,
-    dt.Int64: mysql.BIGINT,
-    dt.Float16: mysql.FLOAT,
-    dt.Float32: mysql.FLOAT,
-    dt.Float64: mysql.DOUBLE,
-    dt.String: mysql.TEXT,
-    dt.JSON: mysql.JSON,
-    dt.Timestamp: MySQLDateTime,
-}
-
-_from_mysql_types = {
-    mysql.BIGINT: dt.Int64,
-    mysql.BINARY: dt.Binary,
-    mysql.BLOB: dt.Binary,
-    mysql.BOOLEAN: dt.Boolean,
-    mysql.DATETIME: dt.Timestamp,
-    mysql.DOUBLE: dt.Float64,
-    mysql.FLOAT: dt.Float32,
-    mysql.INTEGER: dt.Int32,
-    mysql.JSON: dt.JSON,
-    mysql.LONGBLOB: dt.Binary,
-    mysql.LONGTEXT: dt.String,
-    mysql.MEDIUMBLOB: dt.Binary,
-    mysql.MEDIUMINT: dt.Int32,
-    mysql.MEDIUMTEXT: dt.String,
-    mysql.REAL: dt.Float64,
-    mysql.SMALLINT: dt.Int16,
-    mysql.TEXT: dt.String,
-    mysql.DATE: dt.Date,
-    mysql.TINYBLOB: dt.Binary,
-    mysql.TINYINT: dt.Int8,
-    mysql.VARBINARY: dt.Binary,
-    mysql.VARCHAR: dt.String,
-    mysql.ENUM: dt.String,
-    mysql.CHAR: dt.String,
-    mysql.TIME: dt.Time,
-    mysql.YEAR: dt.Int8,
-    MySQLDateTime: dt.Timestamp,
-}
-
-
-def dtype_to_mysql(dtype):
-    try:
-        return _to_mysql_types[type(dtype)]
-    except KeyError:
-        return dtype_to_sqlalchemy(dtype, converter=dtype_to_mysql)
-
-
-def dtype_from_mysql(typ, nullable=True):
-    if isinstance(typ, (sat.NUMERIC, mysql.NUMERIC, mysql.DECIMAL)):
-        # https://dev.mysql.com/doc/refman/8.0/en/fixed-point-types.html
-        return dt.Decimal(typ.precision or 10, typ.scale or 0, nullable=nullable)
-    elif isinstance(typ, mysql.BIT):
-        if 1 <= (length := typ.length) <= 8:
-            return dt.Int8(nullable=nullable)
-        elif 9 <= length <= 16:
-            return dt.Int16(nullable=nullable)
-        elif 17 <= length <= 32:
-            return dt.Int32(nullable=nullable)
-        elif 33 <= length <= 64:
-            return dt.Int64(nullable=nullable)
-        else:
-            raise ValueError(f"Invalid MySQL BIT length: {length:d}")
-    elif isinstance(typ, mysql.TIMESTAMP):
-        return dt.Timestamp(timezone="UTC", nullable=nullable)
-    elif isinstance(typ, mysql.SET):
-        return dt.Set(dt.string, nullable=nullable)
-    elif dtype := _from_mysql_types[type(typ)]:
-        return dtype(nullable=nullable)
-    else:
-        return dtype_from_sqlalchemy(dtype, converter=dtype_from_mysql)
+    @property
+    def is_binary(self) -> bool:
+        return (FLAG.BINARY & self.value) != 0

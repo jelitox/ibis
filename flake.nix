@@ -2,11 +2,6 @@
   description = "Expressive Python analytics at any scale.";
 
   inputs = {
-    flake-compat = {
-      url = "github:edolstra/flake-compat";
-      flake = false;
-    };
-
     flake-utils.url = "github:numtide/flake-utils";
 
     gitignore = {
@@ -16,140 +11,230 @@
 
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable-small";
 
-    poetry2nix = {
-      url = "github:nix-community/poetry2nix";
+    pyproject-nix = {
+      url = "github:nix-community/pyproject.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
+    uv2nix = {
+      url = "github:adisbladis/uv2nix";
       inputs = {
+        pyproject-nix.follows = "pyproject-nix";
         nixpkgs.follows = "nixpkgs";
-        flake-utils.follows = "flake-utils";
+      };
+    };
+
+    pyproject-build-systems = {
+      url = "github:pyproject-nix/build-system-pkgs";
+      inputs = {
+        pyproject-nix.follows = "pyproject-nix";
+        uv2nix.follows = "uv2nix";
+        nixpkgs.follows = "nixpkgs";
       };
     };
   };
 
-  outputs = { self, flake-utils, gitignore, nixpkgs, poetry2nix, ... }: {
-    overlays.default = nixpkgs.lib.composeManyExtensions [
-      gitignore.overlay
-      poetry2nix.overlay
-      (import ./nix/overlay.nix)
-    ];
-  } // flake-utils.lib.eachDefaultSystem (
-    localSystem:
-    let
-      pkgs = import nixpkgs {
-        inherit localSystem;
-        overlays = [ self.overlays.default ];
-      };
-
-      backendDevDeps = with pkgs; [
-        # impala UDFs
-        clang_15
-        cmake
-        ninja
-        # snowflake
-        openssl
-        # backend test suite
-        docker-compose
-        # visualization
-        graphviz-nox
-        # duckdb
-        duckdb
-        # mysql
-        mariadb-client
-        # pyspark
-        openjdk17_headless
-        # postgres
-        postgresql
-        # sqlite
-        sqlite-interactive
+  outputs =
+    {
+      self,
+      flake-utils,
+      gitignore,
+      nixpkgs,
+      pyproject-nix,
+      uv2nix,
+      pyproject-build-systems,
+      ...
+    }:
+    {
+      overlays.default = nixpkgs.lib.composeManyExtensions [
+        gitignore.overlay
+        (import ./nix/overlay.nix { inherit uv2nix pyproject-nix pyproject-build-systems; })
       ];
-      shellHook = ''
-        ${pkgs.rsync}/bin/rsync \
-          --chmod=Du+rwx,Fu+rw --archive --delete \
-          "${pkgs.ibisTestingData}/" "$PWD/ci/ibis-testing-data"
-
-        # necessary for mkdocs
-        export PYTHONPATH=''${PWD}''${PYTHONPATH:+:}''${PYTHONPATH}
-      '';
-
-      preCommitDeps = with pkgs; [
-        actionlint
-        deadnix
-        git
-        just
-        nixpkgs-fmt
-        nodePackages.prettier
-        shellcheck
-        shfmt
-        statix
-        taplo-cli
-      ];
-
-      mkDevShell = env: pkgs.mkShell {
-        name = "ibis-${env.python.version}";
-        nativeBuildInputs = (with pkgs; [
-          # python dev environment
-          env
-          # poetry executable
-          env.pkgs.poetry
-          # rendering release notes
-          changelog
-          glow
-          # used in the justfile
-          jq
-          yj
-          # commit linting
-          commitlint
-          # link checking
-          lychee
-          # release automation
-          nodejs
-          # used in notebooks to download data
-          curl
-        ])
-        ++ preCommitDeps
-        ++ backendDevDeps;
-
-        inherit shellHook;
-
-        PGPASSWORD = "postgres";
-        MYSQL_PWD = "ibis";
-        MSSQL_SA_PASSWORD = "1bis_Testing!";
-        DRUID_URL = "druid://localhost:8082/druid/v2/sql";
-
-        __darwinAllowLocalNetworking = true;
-      };
-    in
-    rec {
-      packages = {
-        inherit (pkgs) ibis38 ibis39 ibis310 ibis311;
-
-        default = pkgs.ibis310;
-
-        inherit (pkgs) update-lock-files gen-all-extras gen-examples check-poetry-version;
-      };
-
-      devShells = rec {
-        ibis38 = mkDevShell pkgs.ibisDevEnv38;
-        ibis39 = mkDevShell pkgs.ibisDevEnv39;
-        ibis310 = mkDevShell pkgs.ibisDevEnv310;
-        ibis311 = mkDevShell pkgs.ibisDevEnv311;
-
-        default = ibis310;
-
-        preCommit = pkgs.mkShell {
-          name = "preCommit";
-          nativeBuildInputs = [ pkgs.ibisSmallDevEnv ] ++ preCommitDeps;
-        };
-
-        links = pkgs.mkShell {
-          name = "links";
-          nativeBuildInputs = with pkgs; [ just lychee ];
-        };
-
-        release = pkgs.mkShell {
-          name = "release";
-          nativeBuildInputs = with pkgs; [ git poetry nodejs unzip gnugrep ];
-        };
-      };
     }
-  );
+    // flake-utils.lib.eachDefaultSystem (
+      localSystem:
+      let
+        pkgs = import nixpkgs {
+          inherit localSystem;
+          overlays = [ self.overlays.default ];
+        };
+
+        backendDevDeps = [
+          # impala UDFs
+          pkgs.clang_18
+          pkgs.cmake
+          pkgs.ninja
+          # snowflake
+          pkgs.openssl
+          # backend test suite
+          pkgs.docker-compose
+          # visualization
+          pkgs.graphviz-nox
+          # duckdb
+          pkgs.duckdb
+          # mysql
+          pkgs.mariadb.client
+          # pyodbc setup debugging
+          # in particular: odbcinst -j
+          pkgs.unixODBC
+          # pyspark
+          pkgs.openjdk17_headless
+          # postgres client
+          pkgs.libpq.pg_config
+          pkgs.postgresql
+          # sqlite with readline
+          pkgs.sqlite-interactive
+          # mysqlclient build
+          pkgs.libmysqlclient
+          pkgs.pkg-config
+          # new hotness for build orchestration (?)
+          pkgs.docker-buildx
+          # toml setting
+          pkgs.toml-cli
+          # sponge
+          pkgs.moreutils
+        ];
+        shellHook = ''
+          rm -f "$PWD/ci/ibis-testing-data"
+          ln -s "${pkgs.ibisTestingData}" "$PWD/ci/ibis-testing-data"
+
+          # Undo dependency propagation by nixpkgs.
+          unset PYTHONPATH
+
+          # Get repository root using git. This is expanded at runtime by the editable `.pth` machinery.
+          export REPO_ROOT=$(git rev-parse --show-toplevel)
+
+          # pure python implementation of psycopg needs to be able to find
+          # libpq
+          #
+          # AFAIK there isn't another way to force the lookup to occur where it
+          # needs to in the nix store without setting LD_LIBRARY_PATH
+          export LD_LIBRARY_PATH="$(pg_config --libdir)"
+        '';
+
+        preCommitDeps =
+          pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
+            pkgs.actionlint
+          ]
+          ++ [
+            pkgs.codespell
+            pkgs.deadnix
+            pkgs.git
+            pkgs.just
+            pkgs.nixfmt
+            pkgs.nodejs.pkgs.prettier
+            pkgs.shellcheck
+            pkgs.shfmt
+            pkgs.statix
+            pkgs.taplo
+          ];
+
+        mkDevShell =
+          env:
+          pkgs.mkShell {
+            inherit (env) name;
+            packages = [
+              # python dev environment
+              env
+            ]
+            ++ [
+              # uv executable
+              pkgs.uv
+              # rendering release notes
+              pkgs.changelog
+              pkgs.glow
+              # used in the justfile
+              pkgs.jq
+              pkgs.yj
+              # commit linting
+              pkgs.commitlint
+              # link checking
+              pkgs.lychee
+              # release automation
+              pkgs.nodejs
+              # used in notebooks to download data
+              pkgs.curl
+              # docs
+              pkgs.quarto
+            ]
+            ++ preCommitDeps
+            ++ backendDevDeps;
+
+            inherit shellHook;
+
+            PYSPARK_PYTHON = "${env}/bin/python";
+
+            AWS_PROFILE = "ibis-testing";
+
+            # needed for mssql+pyodbc
+            ODBCSYSINI = pkgs.writeTextDir "odbcinst.ini" ''
+              [FreeTDS]
+              Driver = ${pkgs.lib.makeLibraryPath [ pkgs.freetds ]}/libtdsodbc.so
+            '';
+
+            GDAL_DATA = "${pkgs.gdal}/share/gdal";
+            PROJ_DATA = "${pkgs.proj}/share/proj";
+
+            __darwinAllowLocalNetworking = true;
+          };
+      in
+      rec {
+        packages = {
+          default = packages.ibis314;
+
+          inherit (pkgs)
+            ibis310
+            ibis311
+            ibis312
+            ibis313
+            ibis314
+            check-release-notes-spelling
+            get-latest-quarto-hash
+            ;
+        };
+
+        checks = {
+          ibis310-pytest = pkgs.ibis310.passthru.tests.pytest;
+          ibis311-pytest = pkgs.ibis311.passthru.tests.pytest;
+          ibis312-pytest = pkgs.ibis312.passthru.tests.pytest;
+          ibis313-pytest = pkgs.ibis313.passthru.tests.pytest;
+          ibis314-pytest = pkgs.ibis314.passthru.tests.pytest;
+        };
+
+        devShells = rec {
+          ibis310 = mkDevShell pkgs.ibisDevEnv310;
+          ibis311 = mkDevShell pkgs.ibisDevEnv311;
+          ibis312 = mkDevShell pkgs.ibisDevEnv312;
+          ibis313 = mkDevShell pkgs.ibisDevEnv313;
+          ibis314 = mkDevShell pkgs.ibisDevEnv314;
+
+          default = ibis314;
+
+          preCommit = pkgs.mkShell {
+            name = "preCommit";
+            packages = preCommitDeps ++ [ pkgs.ibisSmallDevEnv ];
+          };
+
+          links = pkgs.mkShell {
+            name = "links";
+            packages = [
+              pkgs.just
+              pkgs.lychee
+            ];
+          };
+
+          release = pkgs.mkShell {
+            name = "release";
+            packages = [
+              pkgs.git
+              pkgs.uv
+              pkgs.nodejs
+              pkgs.unzip
+              pkgs.gnugrep
+              (pkgs.python3.withPackages (p: [ p.packaging ]))
+            ];
+          };
+        };
+      }
+    );
 }

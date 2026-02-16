@@ -1,49 +1,20 @@
-SELECT
-  t4.key
-FROM (
+WITH "t1" AS (
   SELECT
-    t1.key
-  FROM (
-    SELECT
-      *
-    FROM leaf AS t0
-    WHERE
-      1
-  ) AS t1
-  INNER JOIN (
-    SELECT
-      t1.key
-    FROM (
-      SELECT
-        *
-      FROM leaf AS t0
-      WHERE
-        1
-    ) AS t1
-  ) AS t2
-    ON t1.key = t2.key
-) AS t4
+    *
+  FROM "leaf" AS "t0"
+  WHERE
+    TRUE
+)
+SELECT
+  "t3"."key" AS "key"
+FROM "t1" AS "t3"
+INNER JOIN "t1" AS "t4"
+  ON "t3"."key" = "t4"."key"
 INNER JOIN (
   SELECT
-    t1.key
-  FROM (
-    SELECT
-      *
-    FROM leaf AS t0
-    WHERE
-      1
-  ) AS t1
-  INNER JOIN (
-    SELECT
-      t1.key
-    FROM (
-      SELECT
-        *
-      FROM leaf AS t0
-      WHERE
-        1
-    ) AS t1
-  ) AS t2
-    ON t1.key = t2.key
-) AS t5
-  ON t4.key = t5.key
+    "t3"."key" AS "key"
+  FROM "t1" AS "t3"
+  INNER JOIN "t1" AS "t4"
+    ON "t3"."key" = "t4"."key"
+) AS "t6"
+  ON "t3"."key" = "t6"."key"

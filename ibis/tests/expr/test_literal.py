@@ -1,10 +1,14 @@
+from __future__ import annotations
+
 import datetime
+import decimal
 import uuid
 
 import pytest
 
 import ibis
 import ibis.expr.datatypes as dt
+from ibis import _
 from ibis.common.collections import frozendict
 from ibis.expr.operations import Literal
 from ibis.tests.util import assert_pickle_roundtrip
@@ -47,7 +51,7 @@ def test_literal_equality_interval():
 
     assert a != b
 
-    # Currently these does't equal, but perhaps should be?
+    # Currently these don't equal, but perhaps should?
     c = ibis.interval(seconds=60).op()
     d = ibis.interval(minutes=1).op()
 
@@ -94,33 +98,34 @@ def test_normalized_underlying_value(userinput, literal_type, expected_type):
 
 
 @pytest.mark.parametrize(
-    'value',
+    "value",
     [
-        dict(field1='value1', field2=3.14),
-        dict(field1='value1', field2=1),  # coerceable type
-        dict(field2=2.72, field1='value1'),  # wrong field order
-        dict(field1='value1', field2=3.14, field3='extra'),  # extra field
+        dict(field1="value1", field2=3.14),
+        dict(field1="value1", field2="3.14"),  # coerceable type
+        dict(field1="value1", field2=1),  # coerceable type
+        dict(field2=2.72, field1="value1"),  # wrong field order
+        dict(field1="value1", field2=3.14, field3="extra"),  # extra field
     ],
 )
 def test_struct_literal(value):
     typestr = "struct<field1: string, field2: float64>"
     a = ibis.struct(value, type=typestr)
-    assert a.op().value == frozendict(field1=value['field1'], field2=value['field2'])
+    assert a.op().value == frozendict(
+        field1=str(value["field1"]), field2=float(value["field2"])
+    )
     assert a.type() == dt.dtype(typestr)
 
 
 @pytest.mark.parametrize(
-    'value',
+    "value",
     [
-        dict(field1='value1', field2='3.14'),  # non-coerceable type
-        dict(field1='value1', field3=3.14),  # wrong field name
-        dict(field1='value1'),  # missing field
+        pytest.param(dict(field1="value1", field3=3.14), id="wrong_field"),
+        pytest.param(dict(field1="value1"), id="missing_field"),
     ],
 )
 def test_struct_literal_non_castable(value):
-    typestr = "struct<field1: string, field2: float64>"
-    with pytest.raises((KeyError, TypeError, ibis.common.exceptions.IbisTypeError)):
-        ibis.struct(value, type=typestr)
+    with pytest.raises(TypeError, match="Unable to normalize"):
+        ibis.struct(value, type="struct<field1: string, field2: float64>")
 
 
 def test_struct_cast_to_empty_struct():
@@ -128,24 +133,17 @@ def test_struct_cast_to_empty_struct():
     assert value.type().castable(dt.Struct({}))
 
 
-@pytest.mark.parametrize(
-    'value',
-    [
-        dict(key1='value1', key2='value2'),
-    ],
-)
-def test_map_literal(value):
-    typestr = "map<string, int8>"
+def test_map_literal():
     a = ibis.map(["a", "b"], [1, 2])
     assert a.op().keys.value == ("a", "b")
     assert a.op().values.value == (1, 2)
-    assert a.type() == dt.dtype(typestr)
+    assert a.type() == dt.dtype("map<string, int8>")
 
 
 @pytest.mark.parametrize(
-    'value',
+    "value",
     [
-        dict(key1='value1', key2=6.25),  # heterogenous map values
+        dict(key1="value1", key2=6.25),  # heterogeneous map values
     ],
 )
 def test_map_literal_non_castable(value):
@@ -155,12 +153,25 @@ def test_map_literal_non_castable(value):
 
 
 def test_literal_mixed_type_fails():
-    data = [1, 'a']
-    with pytest.raises(TypeError):
+    data = [1, "a"]
+    with pytest.raises(TypeError, match="Cannot compute precedence"):
         ibis.literal(data)
 
 
 def test_timestamp_literal_without_tz():
-    now_raw = datetime.datetime.utcnow()
+    now_raw = datetime.datetime.now()
     assert now_raw.tzinfo is None
     assert ibis.literal(now_raw).type().timezone is None
+
+
+def test_integer_as_decimal():
+    lit = ibis.literal(12, type="decimal")
+    assert lit.op().value == decimal.Decimal(12)
+
+
+def test_deferred(table):
+    expr = _.g.get_name()
+    dtype = _.g.type()
+    deferred = ibis.literal(expr, type=dtype)
+    result = deferred.resolve(table)
+    assert result.op().value == "g"

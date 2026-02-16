@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import datetime
 import operator
 
@@ -8,16 +10,17 @@ import ibis
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.types as ir
+from ibis import _
 from ibis.common.temporal import IntervalUnit
 from ibis.expr import api
 from ibis.tests.util import assert_equal
 
 
 def test_temporal_literals():
-    date = ibis.literal('2015-01-01', 'date')
+    date = ibis.literal("2015-01-01", "date")
     assert isinstance(date, ir.DateScalar)
 
-    timestamp = ibis.literal('2017-01-01 12:00:33', 'timestamp')
+    timestamp = ibis.literal("2017-01-01 12:00:33", "timestamp")
     assert isinstance(timestamp, ir.TimestampScalar)
 
 
@@ -89,30 +92,33 @@ def test_interval_function_invalid():
 
 
 @pytest.mark.parametrize(
-    ('interval', 'unit', 'expected'),
+    ("interval", "unit", "expected"),
     [
-        (api.interval(months=3), 'Q', api.interval(quarters=1)),
-        (api.interval(months=12), 'Y', api.interval(years=1)),
-        (api.interval(quarters=8), 'Y', api.interval(years=2)),
-        (api.interval(days=14), 'W', api.interval(weeks=2)),
-        (api.interval(minutes=240), 'h', api.interval(hours=4)),
-        (api.interval(seconds=360), 'm', api.interval(minutes=6)),
-        (api.interval(seconds=3 * 86400), 'D', api.interval(days=3)),
-        (api.interval(milliseconds=5000), 's', api.interval(seconds=5)),
-        (api.interval(microseconds=5000000), 's', api.interval(seconds=5)),
-        (api.interval(nanoseconds=5000000000), 's', api.interval(seconds=5)),
+        (api.interval(months=3), "Q", api.interval(quarters=1)),
+        (api.interval(months=12), "Y", api.interval(years=1)),
+        (api.interval(quarters=8), "Y", api.interval(years=2)),
+        (api.interval(days=14), "W", api.interval(weeks=2)),
+        (api.interval(minutes=240), "h", api.interval(hours=4)),
+        (api.interval(seconds=360), "m", api.interval(minutes=6)),
+        (api.interval(milliseconds=5000), "s", api.interval(seconds=5)),
+        (api.interval(microseconds=5000000), "s", api.interval(seconds=5)),
+        (api.interval(nanoseconds=5000000000), "s", api.interval(seconds=5)),
+        (api.interval(seconds=3 * 86400), "D", api.interval(days=3)),
     ],
 )
-def test_upconvert(interval, unit, expected):
-    result = interval.to_unit(unit)
+def test_upconvert_interval(interval, unit, expected):
+    result_as = interval.as_unit(unit)
 
-    assert isinstance(result, ir.IntervalScalar)
-    assert result.type().unit == expected.type().unit
+    with pytest.warns(FutureWarning, match="v10.0"):
+        result_to = interval.to_unit(unit)
+
+    assert result_as.equals(expected)
+    assert result_to.equals(expected)
 
 
-@pytest.mark.parametrize('target', ['Y', 'Q', 'M'])
+@pytest.mark.parametrize("target", ["Y", "Q", "M"])
 @pytest.mark.parametrize(
-    'delta',
+    "delta",
     [
         api.interval(weeks=1),
         api.interval(days=1),
@@ -126,11 +132,11 @@ def test_upconvert(interval, unit, expected):
 )
 def test_cannot_upconvert(delta, target):
     with pytest.raises(ValueError):
-        delta.to_unit(target)
+        delta.as_unit(target)
 
 
 @pytest.mark.parametrize(
-    'expr',
+    "expr",
     [
         api.interval(days=2) * 2,
         api.interval(days=2) * (-2),
@@ -140,23 +146,23 @@ def test_cannot_upconvert(delta, target):
 )
 def test_multiply(expr):
     assert isinstance(expr, ir.IntervalScalar)
-    assert expr.type().unit == IntervalUnit('D')
+    assert expr.type().unit == IntervalUnit("D")
 
 
 @pytest.mark.parametrize(
-    ('expr', 'expected_unit'),
+    ("expr", "expected_unit"),
     [
         (
             api.interval(days=1) + api.interval(days=1),
-            IntervalUnit('D'),
+            IntervalUnit("D"),
         ),
         (
             api.interval(days=2) + api.interval(hours=4),
-            IntervalUnit('h'),
+            IntervalUnit("h"),
         ),
         (
             api.interval(seconds=1) + ibis.interval(minutes=2),
-            IntervalUnit('s'),
+            IntervalUnit("s"),
         ),
     ],
 )
@@ -166,19 +172,19 @@ def test_add(expr, expected_unit):
 
 
 @pytest.mark.parametrize(
-    ('expr', 'expected_unit'),
+    ("expr", "expected_unit"),
     [
         (
             api.interval(days=3) - api.interval(days=1),
-            IntervalUnit('D'),
+            IntervalUnit("D"),
         ),
         (
             api.interval(days=2) - api.interval(hours=4),
-            IntervalUnit('h'),
+            IntervalUnit("h"),
         ),
         (
             api.interval(minutes=2) - api.interval(seconds=1),
-            IntervalUnit('s'),
+            IntervalUnit("s"),
         ),
     ],
 )
@@ -188,43 +194,43 @@ def test_subtract(expr, expected_unit):
 
 
 @pytest.mark.parametrize(
-    ('case', 'expected'),
+    ("case", "expected"),
     [
-        (api.interval(seconds=2).to_unit('s'), api.interval(seconds=2)),
+        (api.interval(seconds=2).as_unit("s"), api.interval(seconds=2)),
         (
-            api.interval(seconds=2).to_unit('ms'),
+            api.interval(seconds=2).as_unit("ms"),
             api.interval(milliseconds=2 * 1000),
         ),
         (
-            api.interval(seconds=2).to_unit('us'),
+            api.interval(seconds=2).as_unit("us"),
             api.interval(microseconds=2 * 1000000),
         ),
         (
-            api.interval(seconds=2).to_unit('ns'),
+            api.interval(seconds=2).as_unit("ns"),
             api.interval(nanoseconds=2 * 1000000000),
         ),
         (
-            api.interval(milliseconds=2).to_unit('ms'),
+            api.interval(milliseconds=2).as_unit("ms"),
             api.interval(milliseconds=2),
         ),
         (
-            api.interval(milliseconds=2).to_unit('us'),
+            api.interval(milliseconds=2).as_unit("us"),
             api.interval(microseconds=2 * 1000),
         ),
         (
-            api.interval(milliseconds=2).to_unit('ns'),
+            api.interval(milliseconds=2).as_unit("ns"),
             api.interval(nanoseconds=2 * 1000000),
         ),
         (
-            api.interval(microseconds=2).to_unit('us'),
+            api.interval(microseconds=2).as_unit("us"),
             api.interval(microseconds=2),
         ),
         (
-            api.interval(microseconds=2).to_unit('ns'),
+            api.interval(microseconds=2).as_unit("ns"),
             api.interval(nanoseconds=2 * 1000),
         ),
         (
-            api.interval(nanoseconds=2).to_unit('ns'),
+            api.interval(nanoseconds=2).as_unit("ns"),
             api.interval(nanoseconds=2),
         ),
     ],
@@ -236,21 +242,21 @@ def test_downconvert_second_parts(case, expected):
 
 
 @pytest.mark.parametrize(
-    ('case', 'expected'),
+    ("case", "expected"),
     [
-        (api.interval(hours=2).to_unit('h'), api.interval(hours=2)),
-        (api.interval(hours=2).to_unit('m'), api.interval(minutes=2 * 60)),
-        (api.interval(hours=2).to_unit('s'), api.interval(seconds=2 * 3600)),
+        (api.interval(hours=2).as_unit("h"), api.interval(hours=2)),
+        (api.interval(hours=2).as_unit("m"), api.interval(minutes=2 * 60)),
+        (api.interval(hours=2).as_unit("s"), api.interval(seconds=2 * 3600)),
         (
-            api.interval(hours=2).to_unit('ms'),
+            api.interval(hours=2).as_unit("ms"),
             api.interval(milliseconds=2 * 3600000),
         ),
         (
-            api.interval(hours=2).to_unit('us'),
+            api.interval(hours=2).as_unit("us"),
             api.interval(microseconds=2 * 3600000000),
         ),
         (
-            api.interval(hours=2).to_unit('ns'),
+            api.interval(hours=2).as_unit("ns"),
             api.interval(nanoseconds=2 * 3600000000000),
         ),
     ],
@@ -262,40 +268,61 @@ def test_downconvert_hours(case, expected):
 
 
 @pytest.mark.parametrize(
-    ('case', 'expected'),
+    ("case", "expected"),
     [
-        (api.interval(weeks=2).to_unit('D'), api.interval(days=2 * 7)),
-        (api.interval(weeks=2).to_unit('h'), api.interval(hours=2 * 7 * 24)),
-        (api.interval(days=2).to_unit('D'), api.interval(days=2)),
-        (api.interval(days=2).to_unit('h'), api.interval(hours=2 * 24)),
-        (api.interval(days=2).to_unit('m'), api.interval(minutes=2 * 1440)),
-        (api.interval(days=2).to_unit('s'), api.interval(seconds=2 * 86400)),
+        (api.interval(minutes=2).as_unit("m"), api.interval(minutes=2)),
+        (api.interval(minutes=2).as_unit("s"), api.interval(seconds=2 * 60)),
         (
-            api.interval(days=2).to_unit('ms'),
-            api.interval(milliseconds=2 * 86400000),
+            api.interval(minutes=2).as_unit("ms"),
+            api.interval(milliseconds=2 * 60 * 1000),
         ),
         (
-            api.interval(days=2).to_unit('us'),
-            api.interval(microseconds=2 * 86400000000),
+            api.interval(minutes=2).as_unit("us"),
+            api.interval(microseconds=2 * 60 * 1000000),
         ),
         (
-            api.interval(days=2).to_unit('ns'),
-            api.interval(nanoseconds=2 * 86400000000000),
+            api.interval(minutes=2).as_unit("ns"),
+            api.interval(nanoseconds=2 * 60 * 1000000000),
+        ),
+        (api.interval(hours=2).as_unit("h"), api.interval(hours=2)),
+        (api.interval(hours=2).as_unit("m"), api.interval(minutes=2 * 60)),
+        (api.interval(hours=2).as_unit("s"), api.interval(seconds=2 * 3600)),
+        (api.interval(weeks=2).as_unit("D"), api.interval(days=2 * 7)),
+        (api.interval(days=2).as_unit("D"), api.interval(days=2)),
+        (api.interval(years=2).as_unit("Y"), api.interval(years=2)),
+        (api.interval(years=2).as_unit("M"), api.interval(months=24)),
+        (api.interval(years=2).as_unit("Q"), api.interval(quarters=8)),
+        (api.interval(months=2).as_unit("M"), api.interval(months=2)),
+        (api.interval(weeks=2).as_unit("h"), api.interval(hours=2 * 7 * 24)),
+        (api.interval(days=2).as_unit("h"), api.interval(hours=2 * 24)),
+        (api.interval(days=2).as_unit("m"), api.interval(minutes=2 * 24 * 60)),
+        (api.interval(days=2).as_unit("s"), api.interval(seconds=2 * 24 * 60 * 60)),
+        (
+            api.interval(days=2).as_unit("ms"),
+            api.interval(milliseconds=2 * 24 * 60 * 60 * 1_000),
+        ),
+        (
+            api.interval(days=2).as_unit("us"),
+            api.interval(microseconds=2 * 24 * 60 * 60 * 1_000_000),
+        ),
+        (
+            api.interval(days=2).as_unit("ns"),
+            api.interval(nanoseconds=2 * 24 * 60 * 60 * 1_000_000_000),
         ),
     ],
 )
-def test_downconvert_day(case, expected):
+def test_downconvert_interval(case, expected):
     assert isinstance(case, ir.IntervalScalar)
     assert isinstance(expected, ir.IntervalScalar)
     assert case.type().unit == expected.type().unit
 
 
 @pytest.mark.parametrize(
-    ('a', 'b', 'unit'),
+    ("a", "b", "unit"),
     [
-        (api.interval(days=1), api.interval(days=3), 'D'),
-        (api.interval(seconds=1), api.interval(hours=10), 's'),
-        (api.interval(hours=3), api.interval(days=2), 'h'),
+        (api.interval(days=1), api.interval(days=3), "D"),
+        (api.interval(seconds=1), api.interval(hours=10), "s"),
+        (api.interval(hours=3), api.interval(days=2), "h"),
     ],
 )
 def test_combine_with_different_kinds(a, b, unit):
@@ -303,7 +330,7 @@ def test_combine_with_different_kinds(a, b, unit):
 
 
 @pytest.mark.parametrize(
-    ('case', 'expected'),
+    ("case", "expected"),
     [
         (api.interval(quarters=2), api.interval(quarters=2)),
         (api.interval(weeks=2), api.interval(weeks=2)),
@@ -457,7 +484,7 @@ def test_interval_arithmetic(
 
 
 @pytest.mark.parametrize(
-    'literal',
+    "literal",
     [
         api.interval(3600),
         api.interval(datetime.timedelta(days=3)),
@@ -486,7 +513,7 @@ def test_timestamp_arithmetics():
     for expr in [ts2 - ts1, ts1 - ts2]:
         assert isinstance(expr, ir.IntervalScalar)
         assert isinstance(expr.op(), ops.TimestampDiff)
-        assert expr.type() == dt.Interval('s')
+        assert expr.type() == dt.Interval("s")
 
     for expr in [ts1 - i1, ts2 - i1]:
         assert isinstance(expr, ir.TimestampScalar)
@@ -498,14 +525,14 @@ def test_timestamp_arithmetics():
 
 
 def test_date_arithmetics():
-    d1 = api.date('2015-01-02')
-    d2 = api.date('2017-01-01')
+    d1 = api.date("2015-01-02")
+    d2 = api.date("2017-01-01")
     i1 = api.interval(weeks=3)
 
     for expr in [d1 - d2, d2 - d1]:
         assert isinstance(expr, ir.IntervalScalar)
         assert isinstance(expr.op(), ops.DateDiff)
-        assert expr.type() == dt.Interval('D')
+        assert expr.type() == dt.Interval("D")
 
     for expr in [d1 - i1, d2 - i1]:
         assert isinstance(expr, ir.DateScalar)
@@ -517,14 +544,14 @@ def test_date_arithmetics():
 
 
 def test_time_arithmetics():
-    t1 = api.time('18:00')
-    t2 = api.time('19:12')
+    t1 = api.time("18:00")
+    t2 = api.time("19:12")
     i1 = api.interval(minutes=3)
 
     for expr in [t1 - t2, t2 - t1]:
         assert isinstance(expr, ir.IntervalScalar)
         assert isinstance(expr.op(), ops.TimeDiff)
-        assert expr.type() == dt.Interval('s')
+        assert expr.type() == dt.Interval("s")
 
     for expr in [t1 - i1, t2 - i1]:
         assert isinstance(expr, ir.TimeScalar)
@@ -536,7 +563,7 @@ def test_time_arithmetics():
 
 
 def test_invalid_date_arithmetics():
-    d1 = api.date('2015-01-02')
+    d1 = api.date("2015-01-02")
     i1 = api.interval(seconds=300)
     i2 = api.interval(minutes=15)
     i3 = api.interval(hours=1)
@@ -549,41 +576,40 @@ def test_invalid_date_arithmetics():
 
 
 @pytest.mark.parametrize(
-    ('prop', 'expected_unit'),
+    ("value", "prop", "expected_unit"),
     [
-        ('nanoseconds', 'ns'),
-        ('microseconds', 'us'),
-        ('milliseconds', 'ms'),
-        ('seconds', 's'),
-        ('minutes', 'm'),
-        ('hours', 'h'),
-        ('days', 'D'),
-        ('weeks', 'W'),
+        (api.interval(seconds=3600), "nanoseconds", "ns"),
+        (api.interval(seconds=3600), "microseconds", "us"),
+        (api.interval(seconds=3600), "milliseconds", "ms"),
+        (api.interval(seconds=3600), "seconds", "s"),
+        (api.interval(seconds=3600), "minutes", "m"),
+        (api.interval(seconds=3600), "hours", "h"),
+        (api.interval(weeks=3), "days", "D"),
+        (api.interval(days=21), "weeks", "W"),
     ],
 )
-def test_interval_properties(prop, expected_unit):
-    i = api.interval(seconds=3600)
-    assert getattr(i, prop).type().unit == IntervalUnit(expected_unit)
+def test_interval_properties(value, prop, expected_unit):
+    assert getattr(value, prop).type().unit == IntervalUnit(expected_unit)
 
 
 @pytest.mark.parametrize(
-    'interval',
+    "interval",
     [api.interval(years=1), api.interval(quarters=4), api.interval(months=12)],
 )
 @pytest.mark.parametrize(
-    ('prop', 'expected_unit'),
-    [('months', 'M'), ('quarters', 'Q'), ('years', 'Y')],
+    ("prop", "expected_unit"),
+    [("months", "M"), ("quarters", "Q"), ("years", "Y")],
 )
 def test_interval_monthly_properties(interval, prop, expected_unit):
     assert getattr(interval, prop).type().unit == IntervalUnit(expected_unit)
 
 
 @pytest.mark.parametrize(
-    ('interval', 'prop'),
+    ("interval", "prop"),
     [
-        (api.interval(hours=48), 'months'),
-        (api.interval(years=2), 'seconds'),
-        (api.interval(quarters=1), 'weeks'),
+        (api.interval(hours=48), "months"),
+        (api.interval(years=2), "seconds"),
+        (api.interval(quarters=1), "weeks"),
     ],
 )
 def test_unsupported_properties(interval, prop):
@@ -591,31 +617,32 @@ def test_unsupported_properties(interval, prop):
         getattr(interval, prop)
 
 
-@pytest.mark.parametrize('column', ['a', 'b', 'c', 'd'])  # integer columns
+@pytest.mark.parametrize("column", ["a", "b", "c", "d"])  # integer columns
 @pytest.mark.parametrize(
-    'unit', ['Y', 'Q', 'M', 'D', 'W', 'h', 'm', 's', 'ms', 'us', 'ns']
+    "unit", ["Y", "Q", "M", "D", "W", "h", "m", "s", "ms", "us", "ns"]
 )
 def test_integer_to_interval(column, unit, table):
     c = table[column]
-    i = c.to_interval(unit)
+    i = c.as_interval(unit)
+
     assert isinstance(i, ir.IntervalColumn)
     assert i.type().unit == IntervalUnit(unit)
 
 
 @pytest.mark.parametrize(
-    'unit', ['Y', 'Q', 'M', 'D', 'W', 'h', 'm', 's', 'ms', 'us', 'ns']
+    "unit", ["Y", "Q", "M", "D", "W", "h", "m", "s", "ms", "us", "ns"]
 )
 @pytest.mark.parametrize(
-    'operands',
+    "operands",
     [
-        lambda t, u: (api.interval(3, unit=u), api.interval(2, unit=u)),
-        lambda t, u: (api.interval(3, unit=u), api.interval(3, unit=u)),
-        lambda t, u: (t.c.to_interval(unit=u), api.interval(2, unit=u)),
-        lambda t, u: (t.c.to_interval(unit=u), t.d.to_interval(unit=u)),
+        lambda _, u: (api.interval(3, unit=u), api.interval(2, unit=u)),
+        lambda _, u: (api.interval(3, unit=u), api.interval(3, unit=u)),
+        lambda t, u: (t.c.as_interval(u), api.interval(2, unit=u)),
+        lambda t, u: (t.c.as_interval(u), t.d.as_interval(u)),
     ],
 )
 @pytest.mark.parametrize(
-    'operator',
+    "operator",
     [
         operator.eq,
         operator.ne,
@@ -636,54 +663,54 @@ def test_interval_comparisons(unit, operands, operator, table):
 
 
 @pytest.mark.parametrize(
-    'operands',
+    "operands",
     [
-        lambda t: (api.date('2016-01-01'), api.date('2016-02-02')),
-        lambda t: (t.j, api.date('2016-01-01')),
-        lambda t: (api.date('2016-01-01'), t.j),
+        lambda _: (api.date("2016-01-01"), api.date("2016-02-02")),
+        lambda t: (t.j, api.date("2016-01-01")),
+        lambda t: (api.date("2016-01-01"), t.j),
         lambda t: (t.j, t.i.date()),
         lambda t: (t.i.date(), t.j),
     ],
     ids=[
-        'literal-literal',
-        'column-literal',
-        'literal-column',
-        'column-casted',
-        'casted-column',
+        "literal-literal",
+        "column-literal",
+        "literal-column",
+        "column-casted",
+        "casted-column",
     ],
 )
 @pytest.mark.parametrize(
-    'interval',
+    "interval",
     [
-        lambda t: api.interval(years=4),
-        lambda t: api.interval(quarters=4),
-        lambda t: api.interval(months=3),
-        lambda t: api.interval(weeks=2),
-        lambda t: api.interval(days=1),
-        lambda t: t.c.to_interval(unit='Y'),
-        lambda t: t.c.to_interval(unit='M'),
-        lambda t: t.c.to_interval(unit='W'),
-        lambda t: t.c.to_interval(unit='D'),
+        lambda _: api.interval(years=4),
+        lambda _: api.interval(quarters=4),
+        lambda _: api.interval(months=3),
+        lambda _: api.interval(weeks=2),
+        lambda _: api.interval(days=1),
+        lambda t: t.c.as_interval("Y"),
+        lambda t: t.c.as_interval("M"),
+        lambda t: t.c.as_interval("W"),
+        lambda t: t.c.as_interval("D"),
     ],
     ids=[
-        'years',
-        'quarters',
-        'months',
-        'weeks',
-        'days',
-        'to-years',
-        'to-months',
-        'to-weeks',
-        'to-days',
+        "years",
+        "quarters",
+        "months",
+        "weeks",
+        "days",
+        "to-years",
+        "to-months",
+        "to-weeks",
+        "to-days",
     ],
 )
 @pytest.mark.parametrize(
-    'arithmetic',
+    "arithmetic",
     [lambda a, i: a - i, lambda a, i: a + i, lambda a, i: i + a],
-    ids=['subtract', 'radd', 'add'],
+    ids=["subtract", "radd", "add"],
 )
 @pytest.mark.parametrize(
-    'operator',
+    "operator",
     [
         operator.eq,
         operator.ne,
@@ -709,62 +736,62 @@ def test_complex_date_comparisons(operands, interval, arithmetic, operator, tabl
 
 def test_interval_column_name(table):
     c = table.i
-    expr = (c - c).name('foo')
-    assert expr.get_name() == 'foo'
+    expr = (c - c).name("foo")
+    assert expr.get_name() == "foo"
 
 
 @pytest.mark.parametrize(
-    'operand',
-    [lambda t: api.timestamp(datetime.datetime.now()), lambda t: t.i],
-    ids=['column', 'literal'],
+    "operand",
+    [lambda _: api.timestamp(datetime.datetime.now()), lambda t: t.i],
+    ids=["column", "literal"],
 )
 @pytest.mark.parametrize(
-    'unit',
+    "unit",
     [
-        'Y',
-        'y',
-        'year',
-        'YEAR',
-        'YYYY',
-        'SYYYY',
-        'YYY',
-        'YY',
-        'Q',
-        'q',
-        'quarter',
-        'QUARTER',
-        'M',
-        'month',
-        'MONTH',
-        'w',
-        'W',
-        'week',
-        'WEEK',
-        'd',
-        'J',
-        'day',
-        'DAY',
-        'h',
-        'H',
-        'HH24',
-        'hour',
-        'HOUR',
-        'm',
-        'MI',
-        'minute',
-        'MINUTE',
-        's',
-        'second',
-        'SECOND',
-        'ms',
-        'millisecond',
-        'MILLISECOND',
-        'us',
-        'microsecond',
-        'MICROSECOND',
-        'ns',
-        'nanosecond',
-        'NANOSECOND',
+        "Y",
+        "y",
+        "year",
+        "YEAR",
+        "YYYY",
+        "SYYYY",
+        "YYY",
+        "YY",
+        "Q",
+        "q",
+        "quarter",
+        "QUARTER",
+        "M",
+        "month",
+        "MONTH",
+        "w",
+        "W",
+        "week",
+        "WEEK",
+        "d",
+        "J",
+        "day",
+        "DAY",
+        "h",
+        "H",
+        "HH24",
+        "hour",
+        "HOUR",
+        "m",
+        "MI",
+        "minute",
+        "MINUTE",
+        "s",
+        "second",
+        "SECOND",
+        "ms",
+        "millisecond",
+        "MILLISECOND",
+        "us",
+        "microsecond",
+        "MICROSECOND",
+        "ns",
+        "nanosecond",
+        "NANOSECOND",
     ],
 )
 def test_timestamp_truncate(table, operand, unit):
@@ -773,23 +800,137 @@ def test_timestamp_truncate(table, operand, unit):
     assert isinstance(expr.op(), ops.TimestampTruncate)
 
 
-@pytest.mark.parametrize('operand', [lambda t: api.date('2018-01-01'), lambda t: t.j])
-@pytest.mark.parametrize('unit', ['Y', 'Q', 'M', 'D', 'W'])
+@pytest.mark.parametrize("operand", [lambda _: api.date("2018-01-01"), lambda t: t.j])
+@pytest.mark.parametrize("unit", ["Y", "Q", "M", "D", "W"])
 def test_date_truncate(table, operand, unit):
     expr = operand(table).truncate(unit)
     assert isinstance(expr, ir.DateValue)
     assert isinstance(expr.op(), ops.DateTruncate)
 
 
-@pytest.mark.parametrize('operand', [lambda t: api.time('18:00'), lambda t: t.k])
-@pytest.mark.parametrize('unit', ['h', 'm', 's', 'ms', 'us', 'ns'])
+@pytest.mark.parametrize("operand", [lambda _: api.time("18:00"), lambda t: t.k])
+@pytest.mark.parametrize("unit", ["h", "m", "s", "ms", "us", "ns"])
 def test_time_truncate(table, operand, unit):
     expr = operand(table).truncate(unit)
     assert isinstance(expr, ir.TimeValue)
     assert isinstance(expr.op(), ops.TimeTruncate)
 
 
-def test_date_time_literals():
-    assert ibis.date(2022, 2, 4).type() == dt.date
-    assert ibis.time(16, 20, 00).type() == dt.time
+def test_date_literal():
+    expr = ibis.date(2022, 2, 4)
+    sol = ops.DateFromYMD(2022, 2, 4).to_expr()
+    assert expr.equals(sol)
+
+    expr = ibis.date("2022-02-04")
+    sol = ibis.literal("2022-02-04", type=dt.date)
+    assert expr.equals(sol)
+
+
+def test_date_expression():
+    t = ibis.table({"x": "int", "y": "int", "z": "int", "s": "string"})
+    deferred = ibis.date(_.x, _.y, _.z)
+    expr = ibis.date(t.x, t.y, t.z)
+    assert isinstance(expr.op(), ops.DateFromYMD)
+    assert deferred.resolve(t).equals(expr)
+    assert repr(deferred) == "date(_.x, _.y, _.z)"
+
+    deferred = ibis.date(_.s)
+    expr = ibis.date(t.s)
+    assert deferred.resolve(t).equals(expr)
+    assert repr(deferred) == "date(_.s)"
+
+
+def test_time_literal():
+    expr = ibis.time(1, 2, 3)
+    sol = ops.TimeFromHMS(1, 2, 3).to_expr()
+    assert expr.equals(sol)
+
+    expr = ibis.time("01:02:03")
+    sol = ibis.literal("01:02:03", type=dt.time)
+    assert expr.equals(sol)
+
+
+def test_time_expression():
+    t = ibis.table({"x": "int", "y": "int", "z": "int", "s": "string"})
+    deferred = ibis.time(_.x, _.y, _.z)
+    expr = ibis.time(t.x, t.y, t.z)
+    assert isinstance(expr.op(), ops.TimeFromHMS)
+    assert deferred.resolve(t).equals(expr)
+    assert repr(deferred) == "time(_.x, _.y, _.z)"
+
+    deferred = ibis.time(_.s)
+    expr = ibis.time(t.s)
+    assert deferred.resolve(t).equals(expr)
+    assert repr(deferred) == "time(_.s)"
+
+
+def test_timestamp_literals():
     assert ibis.timestamp(2022, 2, 4, 16, 20, 00).type() == dt.timestamp
+
+
+def test_timestamp_literal():
+    expr = ibis.timestamp(2022, 2, 4, 16, 20, 0)
+    sol = ops.TimestampFromYMDHMS(2022, 2, 4, 16, 20, 0).to_expr()
+    assert expr.equals(sol)
+
+    expr = ibis.timestamp("2022-02-04T01:02:03")
+    sol = ibis.literal("2022-02-04T01:02:03", type=dt.timestamp)
+    assert expr.equals(sol)
+
+    expr = ibis.timestamp("2022-02-04T01:02:03Z")
+    sol = ibis.literal("2022-02-04T01:02:03", type=dt.Timestamp(timezone="UTC"))
+    assert expr.equals(sol)
+
+
+def test_timestamp_expression():
+    t = ibis.table(dict.fromkeys("abcdef", "int"))
+    deferred = ibis.timestamp(_.a, _.b, _.c, _.d, _.e, _.f)
+    expr = ibis.timestamp(t.a, t.b, t.c, t.d, t.e, t.f)
+    assert isinstance(expr.op(), ops.TimestampFromYMDHMS)
+    assert deferred.resolve(t).equals(expr)
+    assert repr(deferred) == "timestamp(_.a, _.b, _.c, _.d, _.e, _.f)"
+
+    t2 = ibis.table({"s": "string"})
+    deferred = ibis.timestamp(_.s, timezone="UTC")
+    expr = ibis.timestamp(t2.s, timezone="UTC")
+    assert deferred.resolve(t2).equals(expr)
+    assert repr(deferred) == "timestamp(_.s, timezone='UTC')"
+
+
+def test_timestamp_bucket():
+    ts = ibis.table({"ts": "timestamp"}).ts
+
+    components = [
+        "nanoseconds",
+        "microseconds",
+        "milliseconds",
+        "seconds",
+        "minutes",
+        "hours",
+        "days",
+        "weeks",
+        "months",
+        "quarters",
+        "years",
+    ]
+    for component in components:
+        kws = {component: 2}
+        expr1 = ts.bucket(**kws)
+        expr2 = ts.bucket(ibis.interval(**kws))
+        assert expr1.equals(expr2)
+
+    with pytest.raises(
+        ValueError, match="Must specify either interval value or components"
+    ):
+        ts.bucket(ibis.interval(seconds=1), minutes=2)
+
+    with pytest.raises(
+        ValueError, match="Must specify either interval value or components"
+    ):
+        ts.bucket()
+
+
+def test_today():
+    result = ibis.today()
+    assert isinstance(result, ir.DateScalar)
+    assert isinstance(result.op(), ops.DateNow)

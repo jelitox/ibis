@@ -2,85 +2,80 @@ from __future__ import annotations
 
 import collections
 from keyword import iskeyword
-from typing import TYPE_CHECKING, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any
 
 from public import public
 
 import ibis.expr.operations as ops
+from ibis.common.deferred import deferrable
+from ibis.common.exceptions import IbisError
 from ibis.expr.types.generic import Column, Scalar, Value, literal
-from ibis.expr.types.typing import V
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping, Sequence
+
     import ibis.expr.datatypes as dt
     import ibis.expr.types as ir
 
 
 @public
+@deferrable
 def struct(
-    value: Iterable[tuple[str, V]] | Mapping[str, V],
+    value: Iterable[tuple[str, Value | Any]] | Mapping[str, Value | Any],
+    *,
     type: str | dt.DataType | None = None,
 ) -> StructValue:
     """Create a struct expression.
 
-    If the input expressions are all column expressions, then the output will be
-    a `StructColumn`.
-
-    If the input expressions are Python literals, then the output will be a
-    `StructScalar`.
+    If any of the inputs are Columns, then the output will be a `StructColumn`.
+    Otherwise, the output will be a `StructScalar`.
 
     Parameters
     ----------
     value
-        The underlying data for literal struct value or a pairs of field names
-        and column expressions.
+        Either a `{str: Value}` mapping, or an iterable of tuples of the form
+        `(str, Value)`.
     type
         An instance of `ibis.expr.datatypes.DataType` or a string indicating
-        the ibis type of `value`. This is only used if all of the input values
-        are literals.
+        the Ibis type of `value`. This is only used if all of the input values
+        are Python literals. eg `struct<a: float, b: string>`.
 
     Returns
     -------
     StructValue
-        An expression representing a literal or column struct (compound type with
-        fields of fixed types)
+        An StructScalar or StructColumn expression.
 
     Examples
     --------
-    Create a struct literal from a [`dict`][dict] with the type inferred
+    Create a struct scalar literal from a `dict` with the type inferred
+
     >>> import ibis
-    >>> t = ibis.struct(dict(a=1, b='foo'))
-
-    Create a struct literal from a [`dict`][dict] with a specified type
-    >>> t = ibis.struct(dict(a=1, b='foo'), type='struct<a: float, b: string>')
-
-    Specify a specific type for the struct literal
-    >>> t = ibis.struct(dict(a=1, b=40), type='struct<a: float, b: int32>')
-
-    Create a struct array from multiple arrays
     >>> ibis.options.interactive = True
-    >>> t = ibis.memtable({'a': [1, 2, 3], 'b': ['foo', 'bar', 'baz']})
-    >>> ibis.struct([('a', t.a), ('b', t.b)])
-    ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-    ┃ StructColumn()              ┃
-    ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-    │ struct<a: int64, b: string> │
-    ├─────────────────────────────┤
-    │ {'a': 1, 'b': 'foo'}        │
-    │ {'a': 2, 'b': 'bar'}        │
-    │ {'a': 3, 'b': 'baz'}        │
-    └─────────────────────────────┘
+    >>> ibis.struct(dict(a=1, b="foo"))
+    ┌──────────────────────┐
+    │ {'a': 1, 'b': 'foo'} │
+    └──────────────────────┘
 
-    Create a struct array from columns and literals
-    >>> ibis.struct([('a', t.a), ('b', 'foo')])
-    ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-    ┃ StructColumn()              ┃
-    ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-    │ struct<a: int64, b: string> │
-    ├─────────────────────────────┤
-    │ {'a': 1, 'b': 'foo'}        │
-    │ {'a': 2, 'b': 'foo'}        │
-    │ {'a': 3, 'b': 'foo'}        │
-    └─────────────────────────────┘
+    Specify a type (note the 1 is now a `float`):
+
+    >>> ibis.struct(dict(a=1, b="foo"), type="struct<a: float, b: string>")
+    ┌────────────────────────┐
+    │ {'a': 1.0, 'b': 'foo'} │
+    └────────────────────────┘
+
+    Create a struct column from a column and a scalar literal
+
+    >>> t = ibis.memtable({"a": [1, 2, 3]})
+    >>> ibis.struct([("a", t.a), ("b", "foo")])
+    ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+    ┃ StructColumn({'a': a, 'b': 'foo'}) ┃
+    ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+    │ struct<a: int64, b: string>        │
+    ├────────────────────────────────────┤
+    │ {'a': 1, 'b': 'foo'}               │
+    │ {'a': 2, 'b': 'foo'}               │
+    │ {'a': 3, 'b': 'foo'}               │
+    └────────────────────────────────────┘
     """
     import ibis.expr.operations as ops
 
@@ -95,15 +90,20 @@ def struct(
 
 @public
 class StructValue(Value):
-    """A struct literal or column.
+    """A Struct is a nested type with ordered fields of any type.
 
-    Can be constructed with [`ibis.struct()`][ibis.expr.types.struct].
+    For example, a Struct might have a field `a` of type `int64` and a field `b`
+    of type `string`.
+
+    Structs can be constructed with [`ibis.struct()`](#ibis.expr.types.struct).
 
     Examples
     --------
+    Construct a `Struct` column with fields `a: int64` and `b: string`
+
     >>> import ibis
     >>> ibis.options.interactive = True
-    >>> t = ibis.memtable({'s': [{'a': 1, 'b': 'foo'}, {'a': 3, 'b': None}, None]})
+    >>> t = ibis.memtable({"s": [{"a": 1, "b": "foo"}, {"a": 3, "b": None}, None]})
     >>> t
     ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
     ┃ s                           ┃
@@ -115,7 +115,8 @@ class StructValue(Value):
     │ NULL                        │
     └─────────────────────────────┘
 
-    Can use either `.` or `[]` to access fields:
+    You can use dot notation (`.`) or square-bracket syntax (`[]`) to access
+    struct column fields
 
     >>> t.s.a
     ┏━━━━━━━┓
@@ -127,7 +128,7 @@ class StructValue(Value):
     │     3 │
     │  NULL │
     └───────┘
-    >>> t.s['a']
+    >>> t.s["a"]
     ┏━━━━━━━┓
     ┃ a     ┃
     ┡━━━━━━━┩
@@ -166,7 +167,7 @@ class StructValue(Value):
         --------
         >>> import ibis
         >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({'s': [{'a': 1, 'b': 'foo'}, {'a': 3, 'b': None}, None]})
+        >>> t = ibis.memtable({"s": [{"a": 1, "b": "foo"}, {"a": 3, "b": None}, None]})
         >>> t
         ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
         ┃ s                           ┃
@@ -177,7 +178,7 @@ class StructValue(Value):
         │ {'a': 3, 'b': None}         │
         │ NULL                        │
         └─────────────────────────────┘
-        >>> t.s['a']
+        >>> t.s["a"]
         ┏━━━━━━━┓
         ┃ a     ┃
         ┡━━━━━━━┩
@@ -187,7 +188,7 @@ class StructValue(Value):
         │     3 │
         │  NULL │
         └───────┘
-        >>> t.s['b']
+        >>> t.s["b"]
         ┏━━━━━━━━┓
         ┃ b      ┃
         ┡━━━━━━━━┩
@@ -197,19 +198,33 @@ class StructValue(Value):
         │ NULL   │
         │ NULL   │
         └────────┘
-        >>> t.s['foo_bar']
+        >>> t.s["foo_bar"]
         Traceback (most recent call last):
             ...
         KeyError: 'foo_bar'
         """
         if name not in self.names:
             raise KeyError(name)
-        return ops.StructField(self, name).to_expr()
 
-    def __setstate__(self, instance_dictionary):
+        op = self.op()
+
+        # if the underlying operation is a simple struct column access, then
+        # just inline the underlying field access
+        if isinstance(op, ops.StructColumn):
+            return op.values[op.names.index(name)].to_expr()
+        # and then do the same if the underlying value is a field access
+        elif isinstance(op, ops.Literal):
+            return ops.Literal(
+                op.value[name] if op.value is not None else None,
+                dtype=self.fields[name],
+            ).to_expr()
+        else:
+            return ops.StructField(self, name).to_expr()
+
+    def __setstate__(self, instance_dictionary, /):
         self.__dict__ = instance_dictionary
 
-    def __getattr__(self, name: str) -> ir.Value:
+    def __getattr__(self, name: str, /) -> ir.Value:
         """Extract the `name` field from this struct.
 
         Parameters
@@ -226,7 +241,7 @@ class StructValue(Value):
         --------
         >>> import ibis
         >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({'s': [{'a': 1, 'b': 'foo'}, {'a': 3, 'b': None}, None]})
+        >>> t = ibis.memtable({"s": [{"a": 1, "b": "foo"}, {"a": 3, "b": None}, None]})
         >>> t
         ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
         ┃ s                           ┃
@@ -330,63 +345,14 @@ class StructValue(Value):
 
         See Also
         --------
-        [`Table.unpack`][ibis.expr.types.relations.Table.unpack].
+        [`Table.unpack`](./expression-tables.qmd#ibis.expr.types.relations.Table.unpack)
         """
-        import ibis.expr.analysis as an
+        try:
+            (table,) = self.op().relations
+        except ValueError:
+            raise IbisError("StructValue must depend on exactly one table")
 
-        # TODO(kszucs): avoid expression roundtripping
-        table = an.find_first_base_table(self.op()).to_expr()
-        return table[[self[name] for name in self.names]]
-
-    def destructure(self) -> list[ir.ValueExpr]:
-        """Destructure a ``StructValue`` into the corresponding struct fields.
-
-        When assigned, a destruct value will be destructured and assigned to
-        multiple columns.
-
-        Returns
-        -------
-        list[AnyValue]
-            Value expressions corresponding to the struct fields.
-
-        Examples
-        --------
-        >>> import ibis
-        >>> ibis.options.interactive = True
-        >>> t = ibis.memtable({'s': [{'a': 1, 'b': 'foo'}, {'a': 3, 'b': None}, None]})
-        >>> t
-        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃ s                           ┃
-        ┡━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-        │ struct<a: int64, b: string> │
-        ├─────────────────────────────┤
-        │ {'a': 1, 'b': 'foo'}        │
-        │ {'a': 3, 'b': None}         │
-        │ NULL                        │
-        └─────────────────────────────┘
-        >>> a, b = t.s.destructure()
-        >>> a
-        ┏━━━━━━━┓
-        ┃ a     ┃
-        ┡━━━━━━━┩
-        │ int64 │
-        ├───────┤
-        │     1 │
-        │     3 │
-        │  NULL │
-        └───────┘
-        >>> b
-        ┏━━━━━━━━┓
-        ┃ b      ┃
-        ┡━━━━━━━━┩
-        │ string │
-        ├────────┤
-        │ foo    │
-        │ NULL   │
-        │ NULL   │
-        └────────┘
-        """
-        return [self[field_name] for field_name in self.type().names]
+        return table.to_expr().select([self[name] for name in self.names])
 
 
 @public
@@ -396,4 +362,5 @@ class StructScalar(Scalar, StructValue):
 
 @public
 class StructColumn(Column, StructValue):
-    pass
+    def __getitem__(self, name: str) -> ir.Column:
+        return StructValue.__getitem__(self, name)

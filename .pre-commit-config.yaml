@@ -3,32 +3,30 @@ ci:
   autofix_prs: false
   autoupdate_commit_msg: "chore(deps): pre-commit.ci autoupdate"
   skip:
-    - actionlint
+    - actionlint-system
     - deadnix
     - just
-    - nixpkgs-fmt
+    - nixfmt
     - prettier
     - ruff
+    - ruff-format
     - shellcheck
     - shfmt
     - statix
     - taplo
 default_stages:
-  - commit
+  - pre-commit
 repos:
   - repo: https://github.com/rhysd/actionlint
-    rev: v1.6.24
+    rev: v1.7.7
     hooks:
-      - id: actionlint
-  - repo: https://github.com/psf/black
-    rev: 23.3.0
+      - id: actionlint-system
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.0
     hooks:
-      - id: black
-  - repo: https://github.com/kynan/nbstripout
-    rev: 0.6.1
-    hooks:
-      - id: nbstripout
-        exclude: .+/rendered/.+
+      - id: codespell
+        additional_dependencies:
+          - tomli
   - repo: local
     hooks:
       - id: ruff
@@ -39,17 +37,31 @@ repos:
         types_or:
           - python
           - pyi
-        args: ["check", "--force-exclude", "--show-source", "--fix"]
+        args: ["check", "--force-exclude", "--output-format=full", "--fix"]
+        require_serial: true
+        minimum_pre_commit_version: "2.9.2"
+  - repo: local
+    hooks:
+      - id: ruff-format
+        name: ruff-format
+        description: "Run 'ruff' for extremely fast Python linting"
+        entry: ruff
+        language: system
+        types_or:
+          - python
+          - pyi
+        args: ["format", "--force-exclude"]
         require_serial: true
         minimum_pre_commit_version: "2.9.2"
   - repo: https://github.com/adrienverge/yamllint
-    rev: v1.32.0
+    rev: v1.35.1
     hooks:
       - id: yamllint
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.4.0
+    rev: v5.0.0
     hooks:
       - id: check-added-large-files
+        args: ["--maxkb=800"]
       - id: check-case-conflict
       - id: check-executables-have-shebangs
       - id: check-merge-conflict
@@ -60,12 +72,13 @@ repos:
         args: ["--allow-missing-credentials"]
       - id: detect-private-key
       - id: end-of-file-fixer
-        exclude: .+/snapshots/.+
+        exclude: (.+/snapshots/.+)|(.*docs/_freeze/.+\.json)|(.+\.excalidraw)
       - id: fix-byte-order-marker
       - id: mixed-line-ending
       - id: trailing-whitespace
         args: ["--markdown-linebreak-ext=md"]
         exclude: .+/snapshots/.+
+      - id: forbid-submodules
   - repo: meta
     hooks:
       - id: check-hooks-apply
@@ -93,6 +106,7 @@ repos:
         name: shellcheck
         language: system
         entry: shellcheck
+        args: ["--shell", "bash"]
         types_or:
           - sh
           - shell
@@ -121,10 +135,10 @@ repos:
         args: ["--fmt", "--unstable"]
         files: ^justfile$
         pass_filenames: false
-      - id: nixpkgs-fmt
-        name: nixpkgs-fmt
+      - id: nixfmt
+        name: nixfmt
         language: system
-        entry: nixpkgs-fmt
+        entry: nixfmt
         types:
           - nix
       - id: statix

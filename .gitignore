@@ -39,6 +39,15 @@ dist
 .coverage
 coverage.xml
 
+# Environments
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.env.local
+
 # OS generated files
 .directory
 .gdb_history
@@ -46,8 +55,6 @@ coverage.xml
 Icon?
 
 # documentation files
-docs/source/generated
-docs/source/generated-notebooks
 *.org
 
 # Ibis testing data
@@ -64,41 +71,83 @@ ci/udf/Makefile
 scripts/ibis-testing*
 ibis_testing*
 .tox/
-.asv/
 .ipynb_checkpoints/
 .pytest_cache
 .mypy_cache
-docs/source/backends/generated
-
-# temporary doc build
-docbuild
 
 # nix generated files
 .direnv
 result
 result-*
 
-# generated mkdocs website
 .benchmarks
-site
 
 # tutorial data
 geography.db
-*.pbf
-*.pbf.zst
+geography.duckdb
+
+# build artifacts
 ci/udf/.ninja_deps
 ci/udf/.ninja_log
 ci/udf/build.ninja
+
+# coverage
 junit.xml
+
+# spark generated files
 spark-warehouse
-docs/backends/*support_matrix.csv
+metastore_db
+
+# bytecode
 __pycache__
+
+# ctags
 tags
+
+# macos junk
 .DS_Store
+
+# profiling data
 prof/
+
+# hypothesis generated files
 .hypothesis
+
+# r junk
 .RData
 .Rhistory
+
+# coverage files
+.coverage*
+
+# quarto generated files
+.local
+
+# lang server generated
+.null-ls*
+
+# generated examples data
 ibis/examples/data
 ibis/examples/descriptions
-.coverage*
+
+# chat
+*zuliprc*
+
+# automatically generated odbc file for ci
+ci/odbc/odbc.ini
+*-citibike-tripdata.tar.xz
+
+# pixi environment directory
+.pixi
+
+
+# jupyterlite stuff
+.jupyterlite.doit.db
+jupyter_lite_config.json
+*.quarto_ipynb
+
+# pixi environments
+.pixi
+*.egg-info
+warehouse
+penguins.csv

@@ -1,1 +1,2 @@
-now()
+SELECT
+  NOW() AS `TimestampNow()`

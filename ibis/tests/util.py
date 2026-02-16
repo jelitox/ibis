@@ -3,22 +3,25 @@
 from __future__ import annotations
 
 import pickle
+from typing import TYPE_CHECKING
+
+import pytest
 
 import ibis
+import ibis.expr.types as ir
 from ibis import util
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 def assert_equal(left, right):
     """Assert that two ibis objects are equal."""
 
     if util.all_of([left, right], ibis.Schema):
-        assert left.equals(right), 'Comparing schemas: \n{!r} !=\n{!r}'.format(
-            left, right
-        )
+        assert left.equals(right), f"Comparing schemas: \n{left!r} !=\n{right!r}"
     else:
-        assert left.equals(right), 'Objects unequal: \n{}\nvs\n{}'.format(
-            repr(left), repr(right)
-        )
+        assert left.equals(right), f"Objects unequal: \n{left!r}\nvs\n{right!r}"
 
 
 def assert_pickle_roundtrip(obj):
@@ -31,18 +34,41 @@ def assert_pickle_roundtrip(obj):
         assert obj == loaded
 
 
-def assert_decompile_roundtrip(expr, snapshot=None, check_equality=True):
-    """Assert that an ibis expression remains the same after decompilation."""
+def schemas_eq(left: ir.Expr, right: ir.Expr) -> bool:
+    left_schema = left.as_table().schema()
+    right_schema = right.as_table().schema()
+    return left_schema == right_schema
+
+
+def assert_decompile_roundtrip(
+    expr: ir.Expr,
+    snapshot=None,
+    eq: Callable[[ir.Expr, ir.Expr], bool] = ir.Expr.equals,
+):
+    """Assert that an ibis expression remains the same after decompilation.
+
+    Parameters
+    ----------
+    expr
+        The expression to decompile.
+    snapshot
+        A snapshot fixture.
+    eq
+        A callable that returns whether two Ibis expressions are equal.
+        Defaults to `ibis.expr.types.Expr.equals`. Use this to adjust
+        comparison behavior for expressions that contain `SelfReference`
+        operations from table.view() calls, or other relations whose equality
+        is difficult to roundtrip.
+    """
+    pytest.importorskip("black")
+
     rendered = ibis.decompile(expr, format=True)
     if snapshot is not None:
         snapshot.assert_match(rendered, "decompiled.py")
 
     # execute the rendered python code
     locals_ = {}
-    exec(rendered, {}, locals_)
-    restored = locals_['result']
+    exec(rendered, {}, locals_)  # noqa: S102
+    restored = locals_["result"]
 
-    if check_equality:
-        assert expr.unbind().equals(restored)
-    else:
-        assert expr.as_table().schema().equals(restored.as_table().schema())
+    assert eq(expr.unbind(), restored)

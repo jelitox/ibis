@@ -1,72 +1,87 @@
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING, Any, Literal, Optional, Union
 
+import ibis
 import ibis.expr.datatypes as dt
 import ibis.expr.operations as ops
 import ibis.expr.rules as rlz
 import ibis.expr.types as ir
 from ibis import util
-from ibis.common.annotations import annotated
+from ibis.common.annotations import annotated, attribute
+from ibis.common.deferred import Deferred, Resolver, deferrable
 from ibis.common.exceptions import IbisInputError
 from ibis.common.grounds import Concrete
-from ibis.expr.deferred import Deferred
-from ibis.expr.types.relations import bind_expr
+from ibis.common.selectors import Selector  # noqa: TC001
+from ibis.common.typing import VarTuple  # noqa: TC001
+
+if TYPE_CHECKING:
+    from typing_extensions import Self
 
 
 class Builder(Concrete):
     pass
 
 
-class CaseBuilder(Builder):
-    results = rlz.optional(rlz.tuple_of(rlz.any), default=[])
-    default = rlz.optional(rlz.any)
+@deferrable(repr="<case>")
+def _finish_searched_case(cases, results, default) -> ir.Value:
+    """Finish constructing a SearchedCase expression.
 
-    def type(self):
-        return rlz.highest_precedence_dtype(self.results)
+    This is split out into a separate function to allow for deferred arguments
+    to resolve.
+    """
+    return ops.SearchedCase(cases=cases, results=results, default=default).to_expr()
 
-    def when(self, case_expr, result_expr):
-        """Add a new case-result pair.
+
+class SearchedCaseBuilder(Builder):
+    """A case builder, used for constructing `ibis.case()` expressions."""
+
+    cases: VarTuple[Union[Resolver, ops.Value[dt.Boolean]]] = ()
+    results: VarTuple[Union[Resolver, ops.Value]] = ()
+    default: Optional[Union[Resolver, ops.Value]] = None
+
+    def when(self, case_expr: Any, result_expr: Any) -> Self:
+        """Add a new condition and result to the `CASE` expression.
 
         Parameters
         ----------
         case_expr
-            Expression to equality-compare with base expression. Must be
-            comparable with the base.
+            Predicate expression to use for this case.
         result_expr
             Value when the case predicate evaluates to true.
-        """
-        cases = self.cases + (case_expr,)
-        results = self.results + (result_expr,)
-        return self.copy(cases=cases, results=results)
 
-    def else_(self, result_expr):
-        """Construct an `ELSE` expression."""
+        """
+        return self.copy(
+            cases=self.cases + (case_expr,), results=self.results + (result_expr,)
+        )
+
+    def else_(self, result_expr: Any) -> Self:
+        """Add a default value for the `CASE` expression.
+
+        Parameters
+        ----------
+        result_expr
+            Value to use when all case predicates evaluate to false.
+
+        """
         return self.copy(default=result_expr)
 
-    def end(self):
-        default = self.default
-        if default is None:
-            default = ir.null().cast(self.type())
-
-        kwargs = dict(zip(self.__argnames__, self.__args__))
-        kwargs["default"] = default
-
-        return self.__type__(**kwargs).to_expr()
+    def end(self) -> ir.Value | Deferred:
+        """Finish the `CASE` expression."""
+        return _finish_searched_case(self.cases, self.results, self.default)
 
 
-class SearchedCaseBuilder(CaseBuilder):
-    __type__ = ops.SearchedCase
-    cases = rlz.optional(rlz.tuple_of(rlz.boolean), default=[])
+class SimpleCaseBuilder(Builder):
+    """A case builder, used for constructing `Column.case()` expressions."""
 
+    base: ops.Value
+    cases: VarTuple[ops.Value] = ()
+    results: VarTuple[ops.Value] = ()
+    default: Optional[ops.Value] = None
 
-class SimpleCaseBuilder(CaseBuilder):
-    __type__ = ops.SimpleCase
-    base = rlz.any
-    cases = rlz.optional(rlz.tuple_of(rlz.any), default=[])
-
-    def when(self, case_expr, result_expr):
-        """Add a new case-result pair.
+    def when(self, case_expr: Any, result_expr: Any) -> Self:
+        """Add a new condition and result to the `CASE` expression.
 
         Parameters
         ----------
@@ -75,14 +90,38 @@ class SimpleCaseBuilder(CaseBuilder):
             comparable with the base.
         result_expr
             Value when the case predicate evaluates to true.
+
         """
-        case_expr = rlz.any(case_expr)
-        if not rlz.comparable(self.base, case_expr):
-            raise TypeError(
-                f'Base expression {rlz._arg_type_error_format(self.base)} and '
-                f'case {rlz._arg_type_error_format(case_expr)} are not comparable'
-            )
-        return super().when(case_expr, result_expr)
+        if not isinstance(case_expr, ir.Value):
+            case_expr = ibis.literal(case_expr)
+        if not isinstance(result_expr, ir.Value):
+            result_expr = ibis.literal(result_expr)
+        return self.copy(
+            cases=self.cases + (case_expr,), results=self.results + (result_expr,)
+        )
+
+    def else_(self, result_expr: Any) -> Self:
+        """Add a default value for the `CASE` expression.
+
+        Parameters
+        ----------
+        result_expr
+            Value to use when all case predicates evaluate to false.
+
+        """
+        return self.copy(default=result_expr)
+
+    def end(self) -> ir.Value:
+        """Finish the `CASE` expression."""
+        if (default := self.default) is None:
+            default = ibis.null().cast(rlz.highest_precedence_dtype(self.results))
+        return ops.SimpleCase(
+            cases=self.cases, results=self.results, default=default, base=self.base
+        ).to_expr()
+
+
+RowsWindowBoundary = ops.WindowBoundary[dt.Integer]
+RangeWindowBoundary = ops.WindowBoundary[dt.Numeric | dt.Interval]
 
 
 class WindowBuilder(Builder):
@@ -95,36 +134,45 @@ class WindowBuilder(Builder):
     Using `None` for `preceding` or `following` indicates an unbounded frame.
 
     Use 0 for `CURRENT ROW`.
+
     """
 
-    how = rlz.optional(rlz.isin({'rows', 'range'}), default="rows")
-    start = end = rlz.optional(rlz.option(rlz.range_window_boundary))
-    groupings = orderings = rlz.optional(
-        rlz.tuple_of(
-            rlz.one_of([rlz.column(rlz.any), rlz.instance_of((str, Deferred))])
-        ),
-        default=(),
-    )
-    max_lookback = rlz.optional(rlz.interval)
+    how: Literal["rows", "range"] = "rows"
+    start: Optional[RangeWindowBoundary] = None
+    end: Optional[RangeWindowBoundary] = None
+    groupings: VarTuple[Union[str, Resolver, Selector, ops.Value]] = ()
+    orderings: VarTuple[Union[str, Resolver, Selector, ops.SortKey]] = ()
 
-    def _maybe_cast_boundary(self, boundary, dtype):
-        if boundary.output_dtype == dtype:
-            return boundary
-
-        value = ops.Cast(boundary.value, dtype)
-        return boundary.copy(value=value)
+    @attribute
+    def _table(self):
+        inputs = (
+            self.start,
+            self.end,
+            *self.groupings,
+            *self.orderings,
+        )
+        valuerels = (v.relations for v in inputs if isinstance(v, ops.Value))
+        relations = frozenset().union(*valuerels)
+        if len(relations) == 0:
+            return None
+        elif len(relations) == 1:
+            (table,) = relations
+            return table
+        else:
+            raise IbisInputError("Window frame can only depend on a single relation")
 
     def _maybe_cast_boundaries(self, start, end):
         if start and end:
-            dtype = dt.higher_precedence(start.output_dtype, end.output_dtype)
-            start = self._maybe_cast_boundary(start, dtype)
-            end = self._maybe_cast_boundary(end, dtype)
+            if start.dtype.is_interval() and end.dtype.is_numeric():
+                return start, ops.Cast(end.value, start.dtype)
+            elif start.dtype.is_numeric() and end.dtype.is_interval():
+                return ops.Cast(start.value, end.dtype), end
         return start, end
 
     def _determine_how(self, start, end):
-        if start and not start.output_dtype.is_integer():
+        if start and not start.dtype.is_integer():
             return self.range
-        elif end and not end.output_dtype.is_integer():
+        elif end and not end.dtype.is_integer():
             return self.range
         else:
             return self.rows
@@ -141,66 +189,47 @@ class WindowBuilder(Builder):
                 "Window frame's start point must be greater than its end point"
             )
 
-    @annotated(
-        start=rlz.option(rlz.row_window_boundary),
-        end=rlz.option(rlz.row_window_boundary),
-    )
-    def rows(self, start, end):
+    @annotated
+    def rows(
+        self, start: Optional[RowsWindowBoundary], end: Optional[RowsWindowBoundary]
+    ):
         self._validate_boundaries(start, end)
         start, end = self._maybe_cast_boundaries(start, end)
         return self.copy(how="rows", start=start, end=end)
 
-    @annotated(
-        start=rlz.option(rlz.range_window_boundary),
-        end=rlz.option(rlz.range_window_boundary),
-    )
-    def range(self, start, end):
+    @annotated
+    def range(
+        self, start: Optional[RangeWindowBoundary], end: Optional[RangeWindowBoundary]
+    ):
         self._validate_boundaries(start, end)
         start, end = self._maybe_cast_boundaries(start, end)
         return self.copy(how="range", start=start, end=end)
 
-    @annotated(
-        start=rlz.option(rlz.range_window_boundary),
-        end=rlz.option(rlz.range_window_boundary),
-    )
-    def between(self, start, end):
+    @annotated
+    def between(
+        self, start: Optional[RangeWindowBoundary], end: Optional[RangeWindowBoundary]
+    ):
         self._validate_boundaries(start, end)
         start, end = self._maybe_cast_boundaries(start, end)
         method = self._determine_how(start, end)
         return method(start, end)
 
-    def group_by(self, expr):
+    def group_by(self, expr) -> Self:
         return self.copy(groupings=self.groupings + util.promote_tuple(expr))
 
-    def order_by(self, expr):
+    def order_by(self, expr) -> Self:
         return self.copy(orderings=self.orderings + util.promote_tuple(expr))
 
-    def lookback(self, value):
-        return self.copy(max_lookback=value)
-
-    @annotated(table=rlz.table)
     def bind(self, table):
-        groupings = bind_expr(table.to_expr(), self.groupings)
-        orderings = bind_expr(table.to_expr(), self.orderings)
-        if self.how == "rows":
-            return ops.RowsWindowFrame(
-                table=table,
-                start=self.start,
-                end=self.end,
-                group_by=groupings,
-                order_by=orderings,
-                max_lookback=self.max_lookback,
-            )
-        elif self.how == "range":
-            return ops.RangeWindowFrame(
-                table=table,
-                start=self.start,
-                end=self.end,
-                group_by=groupings,
-                order_by=orderings,
-            )
-        else:
-            raise ValueError(f"Unsupported `{self.how}` window type")
+        if table is None:
+            if self._table is None:
+                raise IbisInputError("Cannot bind window frame without a table")
+            else:
+                table = self._table.to_expr()
+
+        return self.copy(
+            groupings=table.bind(self.groupings), orderings=table.bind(self.orderings)
+        )
 
 
 class LegacyWindowBuilder(WindowBuilder):
@@ -211,7 +240,7 @@ class LegacyWindowBuilder(WindowBuilder):
             value = value.op().value
         return value < 0
 
-    def preceding_following(self, preceding, following, how=None):
+    def preceding_following(self, preceding, following, how=None) -> Self:
         preceding_tuple = has_preceding = False
         following_tuple = has_following = False
         if preceding is not None:
@@ -223,7 +252,7 @@ class LegacyWindowBuilder(WindowBuilder):
 
         if (preceding_tuple and has_following) or (following_tuple and has_preceding):
             raise IbisInputError(
-                'Can only specify one window side when you want an off-center window'
+                "Can only specify one window side when you want an off-center window"
             )
         elif preceding_tuple:
             start, end = preceding
